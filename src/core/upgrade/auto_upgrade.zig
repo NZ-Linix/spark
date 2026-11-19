@@ -75,6 +75,37 @@ pub const AutoUpgrade = struct {
 
     relaunch_request: ?RelaunchRequest = null,
 
+    /// Set by `/update` to end the wait before the next check.
+    check_now: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Counts finished checks, so `/update` can tell when its own one ends.
+    checks_completed: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    last_check: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(CheckResult.none)),
+
+    pub const CheckResult = enum(u8) { none, up_to_date, unreachable_server, update_found };
+
+    /// Checks for an update now instead of at the next interval.
+    pub fn checkNow(self: *AutoUpgrade) void {
+        self.check_now.store(true, .release);
+    }
+
+    pub fn checksCompleted(self: *const AutoUpgrade) u32 {
+        return self.checks_completed.load(.acquire);
+    }
+
+    pub fn lastCheck(self: *const AutoUpgrade) CheckResult {
+        return @fromBackingInt(self.last_check.load(.acquire));
+    }
+
+    /// The version being or last downloaded, without a leading `v`.
+    pub fn latestVersion(self: *AutoUpgrade, out: []u8) []const u8 {
+        return self.getLatestVersion(out);
+    }
+
+    /// True while the check thread runs; it ends once an update is ready.
+    pub fn running(self: *const AutoUpgrade) bool {
+        return self.thread != null and !self.stopped.load(.acquire);
+    }
+
     pub fn configure_channel(self: *AutoUpgrade, selected: update_target.Channel) void {
         self.selected_channel = selected;
     }
@@ -233,6 +264,8 @@ pub const AutoUpgrade = struct {
             if (self.getState() == .ready) return;
             self.setState(.checking);
             self.runOnce(alloc, current);
+            _ = self.checks_completed.fetchAdd(1, .acq_rel);
+            self.markRenderDirty();
 
             const post_state = self.getState();
             if (post_state == .ready) return;
@@ -251,10 +284,17 @@ pub const AutoUpgrade = struct {
         if (!helpers.release_server_configured) return;
         const cdn_base = helpers.resolveCdnBase();
         if (helpers.cancelRequested(&self.should_stop)) return;
-        var target = helpers.fetchTarget(alloc, self.selected_channel, cdn_base, self.transferControl()) catch return;
+        var target = helpers.fetchTarget(alloc, self.selected_channel, cdn_base, self.transferControl()) catch {
+            self.last_check.store(@backingInt(CheckResult.unreachable_server), .release);
+            return;
+        };
         defer target.deinit(alloc);
 
-        if (!target.shouldInstall(current)) return;
+        if (!target.shouldInstall(current)) {
+            self.last_check.store(@backingInt(CheckResult.up_to_date), .release);
+            return;
+        }
+        self.last_check.store(@backingInt(CheckResult.update_found), .release);
 
         var label_buf: [64]u8 = undefined;
         const label = target.writeDisplayLabel(&label_buf) catch return;
@@ -301,7 +341,7 @@ pub const AutoUpgrade = struct {
         const archive_path = alloc.print("{s}/spark.tar.gz", .{tmp_dir}) catch return error.AllocFailed;
         defer alloc.free(archive_path);
 
-        const archive_url = alloc.print("{s}/{s}/spark-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
+        const archive_url = helpers.artifactUrl(alloc, cdn_base, target.artifactRef(), "") catch return error.AllocFailed;
         defer alloc.free(archive_url);
 
         helpers.downloadFileStreaming(&client, archive_url, archive_path, self.transferControl()) catch |err| return switch (err) {
@@ -311,7 +351,7 @@ pub const AutoUpgrade = struct {
 
         if (self.should_stop.load(.acquire)) return error.Cancelled;
 
-        const checksum_url = alloc.print("{s}/{s}/spark-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
+        const checksum_url = helpers.artifactUrl(alloc, cdn_base, target.artifactRef(), ".sha256") catch return error.AllocFailed;
         defer alloc.free(checksum_url);
 
         helpers.verifyChecksum(&client, archive_path, checksum_url, self.transferControl()) catch |err| return switch (err) {
@@ -349,6 +389,7 @@ pub const AutoUpgrade = struct {
     fn sleepInterruptible(self: *AutoUpgrade, total_ms: u64) void {
         var remaining = total_ms;
         while (remaining > 0 and !self.should_stop.load(.acquire)) {
+            if (self.check_now.swap(false, .acq_rel)) return;
             const chunk = @min(remaining, sleep_increment_ms);
             io_mod.sleep(chunk * @as(u64, std.time.ns_per_ms));
             remaining -|= chunk;

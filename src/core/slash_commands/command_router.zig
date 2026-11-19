@@ -46,6 +46,7 @@ pub const ParsedCommand = union(enum) {
     prompt: []const u8,
     search: []const u8,
     version,
+    update,
     unknown,
 };
 
@@ -94,6 +95,7 @@ pub const CommandHandlers = struct {
     handle_prompt: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_search: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
+    check_update: *const fn (ctx: *anyopaque) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
@@ -129,6 +131,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .prompt => .{ .prompt = payload },
         .search => .{ .search = payload },
         .version => .version,
+        .update => .update,
     };
 }
 
@@ -200,6 +203,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .prompt => |rest| try handlers.handle_prompt(handlers.ctx, rest),
         .search => |rest| try handlers.handle_search(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
+        .update => try handlers.check_update(handlers.ctx),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
 }
@@ -537,6 +541,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_prompt = unexpectedPayload,
         .handle_search = unexpectedPayload,
         .show_version = unexpectedNoPayload,
+        .check_update = unexpectedNoPayload,
         .unknown = unexpectedPayload,
     };
 }

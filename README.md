@@ -24,6 +24,30 @@ One Zig binary · any OpenAI-compatible model · output that stays in your scrol
 
 ## Install
 
+macOS and Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NZ-Linix/spark/main/install.sh | sh
+```
+
+Windows (PowerShell, installs into WSL):
+
+```powershell
+irm https://raw.githubusercontent.com/NZ-Linix/spark/main/install.ps1 | iex
+```
+
+The installer puts `spark` in `~/.local/bin`. Run `sh -s -- --help` after the pipe for options such as `--version` and `--uninstall`.
+
+### Update
+
+```bash
+spark update
+```
+
+Inside spark, `/update` installs the newest release and restarts into the same session. spark also checks for updates in the background and shows `ctrl+g to reload` when one is ready.
+
+### Build from source
+
 You need [Zig 0.17.1](https://ziglang.org/download/) or newer.
 
 ```bash

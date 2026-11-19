@@ -180,9 +180,13 @@ pub fn isValidRevision(raw: []const u8) bool {
     return true;
 }
 
+/// Major, minor, and patch. A suffix such as `-d` or `+build` is ignored, so
+/// a local `26.11.19-d` build counts as release 26.11.19.
 fn parseVersionParts(raw: []const u8) [3]u32 {
     var values = [_]u32{ 0, 0, 0 };
-    var parts = std.mem.splitScalar(u8, normalizeVersion(raw), '.');
+    const normalized = normalizeVersion(raw);
+    const core = normalized[0 .. std.mem.findAny(u8, normalized, "-+") orelse normalized.len];
+    var parts = std.mem.splitScalar(u8, core, '.');
     for (&values) |*value| {
         const part = parts.next() orelse break;
         value.* = std.fmt.parseUnsigned(u32, part, 10) catch 0;
@@ -262,6 +266,12 @@ test "stable release ordering rejects older targets and preserves channel switch
         .version = "0.0.2",
         .revision = "abcdef012345",
     }));
+}
+
+test "a suffixed local build matches its release" {
+    try std.testing.expectEqual(std.math.Order.eq, compareVersions("v26.11.19", "26.11.19-d"));
+    try std.testing.expectEqual(std.math.Order.gt, compareVersions("v26.11.20", "26.11.19-d"));
+    try std.testing.expectEqual(std.math.Order.lt, compareVersions("26.11.18", "26.11.19+build"));
 }
 
 test "target freshness uses version for stable and revision for dev" {

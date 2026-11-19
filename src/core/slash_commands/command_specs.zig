@@ -63,6 +63,7 @@ pub const SlashKind = enum {
     prompt,
     search,
     version,
+    update,
 };
 
 /// The release that drops every old spelling spark still reads with a warning,

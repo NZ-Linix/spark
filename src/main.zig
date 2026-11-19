@@ -7,7 +7,7 @@ const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
 
-pub const version = "26.11.19-d";
+pub const version = "26.11.19";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -655,6 +655,9 @@ const App = struct {
     toolbox_behind: config_runtime.tool_placement.Behind = config_runtime.tool_placement.behindToolbox(.{}, &.{}),
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
+    /// `/update` is waiting for its check: it reports the result, or
+    /// restarts into the update once it is installed.
+    manual_update: app_upgrade_runtime.ManualUpdate = .{},
     /// Resolved review-model override for automatic permission review
     /// (`review_model` setting or SPARK_REVIEW_MODEL). Owned; empty keeps the
     /// reviewer's compiled default.
@@ -955,6 +958,11 @@ const App = struct {
 
     pub fn applyReadyUpgradeShortcut(self: *App, agent: *agents.Agent) !void {
         try UpgradeAppRuntime.applyReadyUpgrade(self, agent);
+    }
+
+    /// `/update`: restarts into an update that is ready, or checks GitHub now.
+    pub fn requestManualUpdate(self: *App, agent: *agents.Agent) !void {
+        try UpgradeAppRuntime.requestManualUpdate(self, agent);
     }
 
     pub fn prepareResumeHandoffForUpgrade(_: *App, agent: *agents.Agent) !void {

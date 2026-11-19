@@ -131,9 +131,9 @@ fn failureResult(
 
 fn failureMessage(err: RunError) []const u8 {
     return switch (err) {
-        error.FetchFailed => "failed to fetch latest version from CDN",
+        error.FetchFailed => "failed to fetch the latest version from GitHub",
         error.DownloadFailed => "failed to download release archive",
-        error.ChecksumFetchFailed => "failed to fetch checksum from CDN",
+        error.ChecksumFetchFailed => "failed to fetch the checksum from GitHub",
         error.ChecksumMismatch => "downloaded archive failed integrity check",
         error.ExtractionFailed => "failed to extract release archive",
         error.SelfExeNotFound => "could not determine path of running binary",
@@ -212,7 +212,7 @@ fn upgradeWorkerInner(
     const archive_path = try alloc.print("{s}/spark.tar.gz", .{tmp_dir});
     defer alloc.free(archive_path);
 
-    const archive_url = try alloc.print("{s}/{s}/spark-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform });
+    const archive_url = try helpers.artifactUrl(alloc, cdn_base, target.artifactRef(), "");
     defer alloc.free(archive_url);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
@@ -228,7 +228,7 @@ fn upgradeWorkerInner(
     };
     progress.markFinishing();
 
-    const checksum_url = try alloc.print("{s}/{s}/spark-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform });
+    const checksum_url = try helpers.artifactUrl(alloc, cdn_base, target.artifactRef(), ".sha256");
     defer alloc.free(checksum_url);
 
     helpers.verifyChecksum(&client, archive_path, checksum_url, .{}) catch |err| {

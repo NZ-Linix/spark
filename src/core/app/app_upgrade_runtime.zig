@@ -1,11 +1,19 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const app_agents_runtime = @import("app_agents_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const types = @import("../shared/types.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
 const editor_state = @import("../input/editor_state.zig");
 const paste_framing = @import("../input/paste_framing.zig");
+
+/// What `/update` waits for after it asks the updater to check now.
+pub const ManualUpdate = struct {
+    pending: bool = false,
+    /// The updater's finished-check count when `/update` ran.
+    baseline: u32 = 0,
+};
 
 pub const ApplyOutcome = enum {
     not_ready,
@@ -37,6 +45,80 @@ pub fn Runtime(comptime App: type) type {
                 if (comptime @hasDecl(@TypeOf(app.upgrader), "takeRenderDirty")) {
                     if (app.upgrader.takeRenderDirty()) requestFooterRender(app);
                 }
+            }
+            if (comptime @hasField(App, "manual_update")) {
+                collectManualUpdate(app) catch |err|
+                    debug_trace.logf("upgrade", "manual update report failed err={s}", .{@errorName(err)});
+            }
+        }
+
+        /// `/update`: restarts into an installed update, or asks the updater
+        /// to check GitHub now and reports what it finds.
+        pub fn requestManualUpdate(app: *App, agent: *AppAgent) !void {
+            if (!autoUpgradeEnabled(app)) {
+                const reason = if (comptime @hasField(App, "upgrader"))
+                    if (!auto_upgrade.shouldEnableForCurrentExecutable())
+                        "This is a development build in zig-out, which spark never replaces. Rebuild it with zig build, or install a release with the installer."
+                    else
+                        "Updates are turned off by SPARK_AUTO_UPGRADE. Unset it, or run spark update from your shell."
+                else
+                    "Updates are not available here.";
+                return writeUpgradeNotice(app, .neutral, reason);
+            }
+            switch (app.upgrader.getState()) {
+                .ready => {
+                    _ = try applyReadyUpgradeWithDeps(app, agent, .{});
+                    return;
+                },
+                .downloading => {
+                    var buf: [32]u8 = undefined;
+                    const version = app.upgrader.latestVersion(&buf);
+                    app.manual_update = .{ .pending = true, .baseline = app.upgrader.checksCompleted() };
+                    const body = try app.alloc.print("Downloading spark {s}. spark restarts into it when it is installed.", .{version});
+                    defer app.alloc.free(body);
+                    return writeUpgradeNotice(app, .neutral, body);
+                },
+                else => {},
+            }
+            if (!app.upgrader.running()) {
+                return writeUpgradeNotice(app, .neutral, "The updater is not running. Restart spark, or run spark update from your shell.");
+            }
+            app.manual_update = .{ .pending = true, .baseline = app.upgrader.checksCompleted() };
+            app.upgrader.checkNow();
+            try writeUpgradeNotice(app, .neutral, "Checking GitHub for a new spark...");
+        }
+
+        fn collectManualUpdate(app: *App) !void {
+            if (!app.manual_update.pending) return;
+            const state = app.upgrader.getState();
+            switch (state) {
+                .ready => {
+                    app.manual_update = .{};
+                    _ = try applyReadyUpgradeWithDeps(app, agents.screenAgentOf(app), .{});
+                    return;
+                },
+                .failed => {
+                    app.manual_update = .{};
+                    return writeUpgradeNotice(app, .@"error", "The update could not be installed. Try spark update from your shell to see why.");
+                },
+                .checking, .downloading => return,
+                .idle, .waiting => {},
+            }
+            if (app.upgrader.checksCompleted() == app.manual_update.baseline) return;
+            switch (app.upgrader.lastCheck()) {
+                .up_to_date => {
+                    app.manual_update = .{};
+                    const body = try app.alloc.print("spark {s} is up to date.", .{App.app_version});
+                    defer app.alloc.free(body);
+                    try writeUpgradeNotice(app, .neutral, body);
+                },
+                .unreachable_server => {
+                    app.manual_update = .{};
+                    try writeUpgradeNotice(app, .@"error", "Could not reach GitHub to check for updates.");
+                },
+                // An update was found; the download that follows ends in
+                // `.ready` or `.failed`.
+                .update_found, .none => {},
             }
         }
 

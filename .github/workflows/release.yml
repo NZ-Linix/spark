@@ -1,14 +1,18 @@
 name: Release
 
+# Publishes a GitHub release when src/main.zig carries a stable version
+# (X.Y.Z, no suffix) that has no tag yet. A dev version such as 26.11.19-d
+# never releases.
+#
+# Every release carries what install.sh and `spark update` read:
+#   latest.txt                      the release's tag, such as v26.11.19
+#   spark-<os>-<arch>.tar.gz        spark, LICENSE, THIRD_PARTY_NOTICES.md
+#   spark-<os>-<arch>.tar.gz.sha256 its checksum
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      validate_only:
-        description: Build all platforms and compare arm64 signing pages without publishing
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -17,376 +21,159 @@ concurrency:
   group: stable-release
   cancel-in-progress: false
 
+env:
+  ZIG_VERSION: "0.17.1"
+
 jobs:
   check-version:
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       needed: ${{ steps.check.outputs.needed }}
-      publish: ${{ steps.check.outputs.publish }}
-      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
-      - name: Check if release needed
+      - name: Check whether this version needs a release
         id: check
-        env:
-          VALIDATE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.validate_only }}
         run: |
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
           if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::src/main.zig version is not strict SemVer"
-            exit 1
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$VERSION is a dev version; nothing to release"
+            exit 0
           fi
           TAG="v${VERSION}"
-          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
-          if [[ "$VALIDATE_ONLY" == true ]]; then
-            echo "needed=true" >> "$GITHUB_OUTPUT"
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "Validating release artifacts without publishing"
-          elif git rev-parse "$TAG" >/dev/null 2>&1; then
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "needed=false" >> "$GITHUB_OUTPUT"
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "Tag ${TAG} exists, no release needed"
+            echo "::notice::$TAG is already released"
           else
             echo "needed=true" >> "$GITHUB_OUTPUT"
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "Tag ${TAG} missing, release needed"
+            echo "::notice::Releasing $TAG"
           fi
 
-  build-linux-aarch64:
+  build:
     needs: check-version
     if: needs.check-version.outputs.needed == 'true'
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/pgso-linux-arm64.yml
-    with:
-      # Keep release evidence long enough to serve as the main control for
-      # manual PGSO comparisons.
-      evidence-retention-days: 90
-
-  build-linux-x86_64:
-    needs: check-version
-    if: needs.check-version.outputs.needed == 'true'
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/pgso-linux-x86_64.yml
-    with:
-      evidence-retention-days: 90
-
-  package-linux:
-    needs: [check-version, build-linux-aarch64, build-linux-x86_64]
-    if: needs.check-version.outputs.needed == 'true'
-    name: Package ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
-    permissions:
-      actions: read
-      contents: read
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
-          - name: linux-aarch64
-            runner: ubuntu-24.04-arm
-            arch: aarch64
-            artifact-id: ${{ needs.build-linux-aarch64.outputs.artifact-id }}
           - name: linux-x86_64
-            runner: ubuntu-24.04
-            arch: x86_64
-            artifact-id: ${{ needs.build-linux-x86_64.outputs.artifact-id }}
-    env:
-      ARCH: ${{ matrix.arch }}
-      ARCHIVE: spark-${{ matrix.name }}.tar.gz
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Require native host
-        run: test "$(uname -m)" = "$ARCH"
-
-      - name: Download eligible candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ matrix.artifact-id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/spark-pgso
-
-      - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/spark-pgso/candidate/spark"
-
-      - name: Confirm release eligibility
-        run: python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/spark-pgso" >/dev/null
-
-      - name: Confirm the candidate is the qualified binary
-        run: |
-          python3 - "$RUNNER_TEMP/spark-pgso" <<'EOF'
-          import hashlib, json, pathlib, sys
-          root = pathlib.Path(sys.argv[1])
-          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-          expected = manifest["evidence"]["artifacts"]["candidate"]["sha256"]
-          actual = hashlib.sha256((root / "candidate/spark").read_bytes()).hexdigest()
-          if actual != expected:
-              sys.exit(f"candidate SHA-256 {actual} is not the qualified {expected}")
-          EOF
-
-      - name: Smoke-test the candidate
-        run: |
-          "$RUNNER_TEMP/spark-pgso/candidate/spark" --version
-          "$RUNNER_TEMP/spark-pgso/candidate/spark" help >/dev/null
-
-      - name: Package stable release candidate
-        run: |
-          python3 -c 'import pathlib, sys; n = pathlib.Path(sys.argv[1]).stat().st_size; print(f"linux PGSO executable: {n:,} bytes ({n / 1048576:.6f} MiB)")' "$RUNNER_TEMP/spark-pgso/candidate/spark" >> "$GITHUB_STEP_SUMMARY"
-          package_dir="$RUNNER_TEMP/spark-release-package"
-          mkdir -p "$package_dir"
-          cp "$RUNNER_TEMP/spark-pgso/candidate/spark" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf "$RUNNER_TEMP/$ARCHIVE" -C "$package_dir" spark LICENSE THIRD_PARTY_NOTICES.md
-          cd "$RUNNER_TEMP"
-          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
-
-      - name: Upload stable release artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: spark-${{ matrix.name }}
-          path: |
-            ${{ runner.temp }}/${{ env.ARCHIVE }}
-            ${{ runner.temp }}/${{ env.ARCHIVE }}.sha256
-          if-no-files-found: error
-
-  build-macos-x86_64:
-    needs: check-version
-    if: needs.check-version.outputs.needed == 'true'
-    name: Build macos-x86_64
-    runs-on: macos-15-intel
-    environment: apple-signing
+            target: x86_64-linux-gnu.2.34
+          - name: linux-aarch64
+            target: aarch64-linux-gnu.2.34
+          - name: macos-x86_64
+            target: x86_64-macos
+          - name: macos-aarch64
+            target: aarch64-macos
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: mlugg/setup-zig@v2
         with:
-          version: "0.17.1"
+          version: ${{ env.ZIG_VERSION }}
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos
-
-      - name: Sign and notarize
-        env:
-          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
-          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
-          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: scripts/sign-and-notarize-macos.sh zig-out/bin/spark
-
-      - name: Verify notarized Intel binary
-        if: github.event_name == 'workflow_dispatch' && inputs.validate_only
-        run: |
-          codesign --verify --strict --check-notarization -R=notarized ./zig-out/bin/spark
-          ./zig-out/bin/spark --version
-          ./zig-out/bin/spark help
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dcpu=baseline
 
       - name: Package
         run: |
-          python3 -c 'import pathlib; n = pathlib.Path("zig-out/bin/spark").stat().st_size; print(f"macOS Intel signed executable: {n:,} bytes ({n / 1048576:.6f} MiB)")' >> "$GITHUB_STEP_SUMMARY"
-          package_dir="$RUNNER_TEMP/spark-package-macos-x86_64"
+          set -euo pipefail
+          archive="spark-${{ matrix.name }}.tar.gz"
+          package_dir="$RUNNER_TEMP/package"
           mkdir -p "$package_dir"
           cp zig-out/bin/spark LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf spark-macos-x86_64.tar.gz -C "$package_dir" spark LICENSE THIRD_PARTY_NOTICES.md
-          shasum -a 256 spark-macos-x86_64.tar.gz > spark-macos-x86_64.tar.gz.sha256
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: spark-macos-x86_64
-          path: |
-            spark-macos-x86_64.tar.gz
-            spark-macos-x86_64.tar.gz.sha256
-
-  build-macos-arm64:
-    needs: check-version
-    if: needs.check-version.outputs.needed == 'true'
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/pgso-macos-arm64.yml
-    with:
-      # Keep release evidence long enough to serve as the main control for
-      # manual PGSO comparisons.
-      evidence-retention-days: 90
-
-  sign-macos-arm64:
-    needs: [check-version, build-macos-arm64]
-    if: needs.check-version.outputs.needed == 'true'
-    name: Sign macos-arm64
-    runs-on: macos-15
-    environment: apple-signing
-    timeout-minutes: 20
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Require native arm64 host
-        run: test "$(uname -m)" = arm64
-
-      - name: Download eligible candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          artifact-ids: ${{ needs.build-macos-arm64.outputs.artifact-id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/spark-pgso-aggregate
-
-      - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark"
-
-      - name: Confirm release eligibility
-        run: python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/spark-pgso-aggregate" >/dev/null
-
-      - name: Sign and notarize stable release candidate
-        env:
-          VALIDATE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.validate_only }}
-          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
-          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
-          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: |
-          if [[ "$VALIDATE_ONLY" == true ]]; then
-            control_dir="$RUNNER_TEMP/spark-signing-control"
-            mkdir -p "$control_dir"
-            cp "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark" "$control_dir/spark"
-            scripts/sign-and-notarize-macos.sh "$control_dir/spark" 4096
-            scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark" 16384
-          else
-            scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark"
-          fi
-
-      - name: Verify notarized arm64 binaries
-        if: github.event_name == 'workflow_dispatch' && inputs.validate_only
-        run: |
-          for binary in "$RUNNER_TEMP/spark-signing-control/spark" "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark"; do
-            codesign --verify --strict --check-notarization -R=notarized "$binary"
-            "$binary" --version
-            "$binary" help
-            python3 -c 'import pathlib, sys; n = pathlib.Path(sys.argv[1]).stat().st_size; print(f"{sys.argv[1]}: {n:,} bytes ({n / 1048576:.6f} MiB)")' "$binary" >> "$GITHUB_STEP_SUMMARY"
-            shasum -a 256 "$binary" >> "$GITHUB_STEP_SUMMARY"
-          done
-          tar -czf "$RUNNER_TEMP/spark-signing-control.tar.gz" -C "$RUNNER_TEMP/spark-signing-control" spark
-
-      - name: Upload arm64 signing control
-        if: github.event_name == 'workflow_dispatch' && inputs.validate_only
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: signing-control-macos-arm64
-          path: ${{ runner.temp }}/spark-signing-control.tar.gz
-          if-no-files-found: error
-
-      - name: Package stable release candidate
-        run: |
-          archive="$RUNNER_TEMP/spark-macos-aarch64.tar.gz"
-          package_dir="$RUNNER_TEMP/spark-release-package"
-          mkdir -p "$package_dir"
-          cp "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
           tar -czf "$archive" -C "$package_dir" spark LICENSE THIRD_PARTY_NOTICES.md
-          cd "$RUNNER_TEMP"
-          shasum -a 256 spark-macos-aarch64.tar.gz > spark-macos-aarch64.tar.gz.sha256
+          sha256sum "$archive" > "$archive.sha256"
+          ls -l "$archive"
 
-      - name: Upload stable release artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: spark-macos-aarch64
+          name: spark-${{ matrix.name }}
           path: |
-            ${{ runner.temp }}/spark-macos-aarch64.tar.gz
-            ${{ runner.temp }}/spark-macos-aarch64.tar.gz.sha256
+            spark-${{ matrix.name }}.tar.gz
+            spark-${{ matrix.name }}.tar.gz.sha256
           if-no-files-found: error
 
-  release:
-    needs: [check-version, package-linux, build-macos-x86_64, sign-macos-arm64]
-    if: needs.check-version.outputs.publish == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.validate_only)
+  smoke:
+    needs: build
+    name: Run ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - name: macos-aarch64
+            runner: macos-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: spark-${{ matrix.name }}
+
+      - name: Check the checksum and run the binary
+        run: |
+          set -euo pipefail
+          archive="spark-${{ matrix.name }}.tar.gz"
+          if command -v sha256sum >/dev/null; then sha256sum -c "$archive.sha256"; else shasum -a 256 -c "$archive.sha256"; fi
+          tar -xzf "$archive"
+          ./spark --version
+          ./spark help >/dev/null
+
+  publish:
+    needs: [check-version, build, smoke]
     runs-on: ubuntu-latest
-    environment: release
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Download artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: spark-*
+          path: dist
           merge-multiple: true
 
-      - name: Create git tag
+      - name: Write latest.txt and the release notes
         env:
-          RELEASE_TAG: ${{ needs.check-version.outputs.version }}
+          TAG: ${{ needs.check-version.outputs.tag }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          git tag -- "$RELEASE_TAG"
-          git push origin "refs/tags/${RELEASE_TAG}"
-
-      - name: Extract changelog entry
-        run: |
-          awk '/<!-- release:start -->/{found=1; next} /<!-- release:end -->/{found=0} found{print}' CHANGELOG.md > /tmp/release-notes.md
-          LINES=$(wc -l < /tmp/release-notes.md | tr -d ' ')
-          if [ "$LINES" -lt 2 ]; then
-            echo "Error: No release notes found between <!-- release:start --> and <!-- release:end --> markers in CHANGELOG.md"
-            exit 1
+          printf '%s\n' "$TAG" > dist/latest.txt
+          awk '/<!-- release:start -->/{found=1; next} /<!-- release:end -->/{found=0} found{print}' CHANGELOG.md > notes.md
+          if [ "$(grep -c . notes.md)" -lt 1 ]; then
+            printf 'spark %s\n' "$TAG" > notes.md
           fi
-          echo "Extracted release notes ($LINES lines)"
+          cat >> notes.md <<EOF
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          tag_name: ${{ needs.check-version.outputs.version }}
-          body_path: /tmp/release-notes.md
-          files: |
-            spark-*.tar.gz
-            spark-*.tar.gz.sha256
+          ### Install
 
-      - name: Publish to CDN
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh | sh
+          \`\`\`
+
+          Already installed? Run \`spark update\`, or \`/update\` inside spark.
+          EOF
+          ls -l dist
+
+      - name: Create the release
         env:
-          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
-          VERSION: ${{ needs.check-version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check-version.outputs.tag }}
         run: |
           set -euo pipefail
-          [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          CDN_BASE="cli"
-
-          for FILE in spark-*.tar.gz spark-*.tar.gz.sha256; do
-            [ -f "$FILE" ] || continue
-            CONTENT_TYPE="application/octet-stream"
-            [[ "$FILE" == *.sha256 ]] && CONTENT_TYPE="text/plain"
-            [[ "$FILE" == *.tar.gz ]] && [[ "$FILE" != *.sha256 ]] && CONTENT_TYPE="application/gzip"
-
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/${VERSION}/${FILE}" \
-              -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-              -H "x-api-version: 7" \
-              -H "x-content-type: ${CONTENT_TYPE}" \
-              -H "x-add-random-suffix: 0" \
-              -H "x-cache-control-max-age: 31536000" \
-              --data-binary "@${FILE}")
-            echo "Uploaded ${FILE} -> ${CDN_BASE}/${VERSION}/${FILE} ($HTTP_CODE)"
-            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-              echo "::error::Failed to upload ${FILE} to CDN ($HTTP_CODE)"
-              exit 1
-            fi
-          done
-
-          echo -n "$VERSION" > /tmp/latest.txt
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X PUT "https://blob.vercel-storage.com/${CDN_BASE}/latest.txt" \
-            -H "Authorization: Bearer ${BLOB_READ_WRITE_TOKEN}" \
-            -H "x-api-version: 7" \
-            -H "x-content-type: text/plain" \
-            -H "x-add-random-suffix: 0" \
-            -H "x-cache-control-max-age: 60" \
-            --data-binary "@/tmp/latest.txt")
-          echo "Updated latest.txt to $VERSION ($HTTP_CODE)"
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "spark $TAG" \
+            --notes-file notes.md \
+            --latest \
+            dist/spark-*.tar.gz dist/spark-*.tar.gz.sha256 dist/latest.txt

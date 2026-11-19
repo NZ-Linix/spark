@@ -20,11 +20,24 @@ fn setRecvTimeout(conn: *std.http.Client.Connection) void {
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 }
 
-pub const cdn_base = "https://releases.spark.sh";
+/// spark's releases on GitHub. Each release carries `latest.txt` (its tag),
+/// and `spark-<platform>.tar.gz` with a `.sha256` beside it.
+pub const cdn_base = "https://github.com/NZ-Linix/spark/releases";
 
-/// False until spark publishes its own releases. The inherited `cdn_base`
-/// host is not spark's, so nothing may be downloaded from it.
-pub const release_server_configured = false;
+pub const release_server_configured = true;
+
+/// `<base>/latest/download/<name>`: a file of the newest release. GitHub
+/// redirects it to that release's copy. Caller owns the result.
+pub fn latestFileUrl(alloc: Allocator, base_url: []const u8, name: []const u8) ![]u8 {
+    return alloc.print("{s}/latest/download/{s}", .{ base_url, name });
+}
+
+/// `<base>/download/<ref>/spark-<platform>.tar.gz<suffix>`: the archive of
+/// release `ref` for this platform, or its checksum with `.sha256`. Caller
+/// owns the result.
+pub fn artifactUrl(alloc: Allocator, base_url: []const u8, ref: []const u8, suffix: []const u8) ![]u8 {
+    return alloc.print("{s}/download/{s}/spark-{s}.tar.gz{s}", .{ base_url, ref, platform, suffix });
+}
 
 pub fn resolveCdnBase() []const u8 {
     if (io_mod.getenv("SPARK_TEST_UPGRADE_BASE_URL")) |url| {
@@ -84,7 +97,7 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8, con
         .dev => blk: {
             var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
             defer client.deinit();
-            const url = try alloc.print("{s}/dev.json", .{base_url});
+            const url = try latestFileUrl(alloc, base_url, "dev.json");
             defer alloc.free(url);
             const manifest = try fetchTextBounded(
                 &client,
@@ -102,7 +115,7 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8, con
 fn fetchLatestVersion(alloc: Allocator, base_url: []const u8, control: TransferControl) ![]u8 {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-    const url = try alloc.print("{s}/latest.txt", .{base_url});
+    const url = try latestFileUrl(alloc, base_url, "latest.txt");
     defer alloc.free(url);
 
     const raw = try fetchTextBounded(
@@ -514,8 +527,15 @@ test "E2E upgrade base accepts only explicit IPv4 loopback origins" {
     try std.testing.expect(!isLoopbackE2eUpgradeBase("http://localhost:1234"));
 }
 
-test "production upgrade base uses the spark release domain" {
-    try std.testing.expectEqualStrings("https://releases.spark.sh", resolveCdnBase());
+test "production upgrade base is spark's GitHub releases" {
+    try std.testing.expectEqualStrings("https://github.com/NZ-Linix/spark/releases", resolveCdnBase());
+    const alloc = std.testing.allocator;
+    const latest = try latestFileUrl(alloc, cdn_base, "latest.txt");
+    defer alloc.free(latest);
+    try std.testing.expectEqualStrings("https://github.com/NZ-Linix/spark/releases/latest/download/latest.txt", latest);
+    const sum = try artifactUrl(alloc, cdn_base, "v1.2.3", ".sha256");
+    defer alloc.free(sum);
+    try std.testing.expect(std.mem.endsWith(u8, sum, "/download/v1.2.3/spark-" ++ platform ++ ".tar.gz.sha256"));
 }
 
 test "extractChecksumHex parses sha256sum format" {

@@ -719,6 +719,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .prompt, .command = "/prompt", .help_entry = "/prompt [<name>|default|dir add PATH|dir remove PATH]", .completion_description = "replace the whole system prompt with one from your prompt folders", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .search, .command = "/search", .help_entry = "/search [vercel|firecrawl|auto]", .completion_description = "choose the web search provider: Vercel, Firecrawl, or Firecrawl with Vercel as fallback", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the spark version", .presentation_category = .general },
+    .{ .kind = .update, .command = "/update", .aliases = &.{"/upgrade"}, .help_entry = "/update", .completion_description = "update spark from GitHub and restart into this session", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };
 
@@ -833,6 +834,7 @@ test "built-in slash commands register exact active order" {
         "/prompt",
         "/search",
         "/version",
+        "/update",
         "/quit",
     };
 

@@ -666,15 +666,17 @@ exec ${shellQuote(SPARK_BIN)} "$@"
   const checksum = createHash("sha256").update(archive).digest("hex");
   const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
   const revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
-  const stableArchiveRoute = `/v9.9.9/spark-${platform}.tar.gz`;
-  const devArchiveRoute = `/dev/${revision}/spark-${platform}.tar.gz`;
+  // The same layout as GitHub releases: `latest/download/<file>` for the
+  // newest release and `download/<tag>/<file>` for one release.
+  const stableArchiveRoute = `/download/v9.9.9/spark-${platform}.tar.gz`;
+  const devArchiveRoute = `/download/dev/${revision}/spark-${platform}.tar.gz`;
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(request) {
       const path = new URL(request.url).pathname;
-      if (path === "/latest.txt") return new Response("v9.9.9\n");
-      if (path === "/dev.json") {
+      if (path === "/latest/download/latest.txt") return new Response("v9.9.9\n");
+      if (path === "/latest/download/dev.json") {
         return Response.json({ version: "9.9.9", commit: revision });
       }
       if (path === stableArchiveRoute || path === devArchiveRoute) {

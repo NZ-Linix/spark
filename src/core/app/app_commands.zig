@@ -563,6 +563,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_prompt = commandHandlePrompt,
                 .handle_search = commandHandleSearch,
                 .show_version = commandShowVersion,
+                .check_update = commandCheckUpdate,
                 .unknown = commandUnknown,
             };
         }
@@ -1749,6 +1750,18 @@ pub fn Handlers(comptime App: type) type {
                 .topic = "version",
                 .tone = .neutral,
                 .body = App.app_version,
+            }, true);
+        }
+
+        fn commandCheckUpdate(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasDecl(App, "requestManualUpdate")) {
+                return app.requestManualUpdate(agents.screenAgentOf(app));
+            }
+            try app.writeDomainNotice(.{
+                .topic = "update",
+                .tone = .neutral,
+                .body = "Run spark update from your shell.",
             }, true);
         }
 
