@@ -597,7 +597,7 @@ main() {
 	printf '\n'
 	printf '  %sStart%s         spark\n' "$GRAY" "$R"
 	printf '  %sAdd a model%s   /connect %sinside spark%s\n' "$GRAY" "$R" "$GRAY" "$R"
-	printf '  %sUpdate%s        run this installer again\n' "$GRAY" "$R"
+	printf '  %sUpdate%s        spark update, or /update inside spark\n' "$GRAY" "$R"
 	if [ -n "$PATH_HINT" ]; then
 		printf '\n'
 		note "$PATH_HINT"
