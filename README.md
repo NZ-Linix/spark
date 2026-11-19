@@ -1,19 +1,15 @@
-<div align="center">
-
 ```text
-                       _
-  ___ _ __   __ _ _ __| | __
- / __| '_ \ / _` | '__| |/ /     -=✦
- \__ \ |_) | (_| | |  |   <
- |___/ .__/ \__,_|_|  |_|\_\
-     |_|
+                      _
+ ___ _ __   __ _ _ __| | __
+/ __| '_ \ / _` | '__| |/ /
+\__ \ |_) | (_| | |  |   <
+|___/ .__/ \__,_|_|  |_|\_\    -=✦
+    |_|
 ```
 
 **A fast, native coding agent for your terminal.**
 
 One Zig binary · any OpenAI-compatible model · output that stays in your scrollback
-
-</div>
 
 > [!WARNING]
 > spark is experimental. It runs with full access: every tool call, file edit, and shell command runs without asking first. Use it in projects you can restore.
