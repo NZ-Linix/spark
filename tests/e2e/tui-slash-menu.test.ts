@@ -1,0 +1,4848 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync, execSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+import { SPARK_BIN } from "../evals/eval-helpers";
+import {
+  composerContains,
+  FAKE_GATEWAY_MODEL,
+  fakeGatewayFinalText,
+  fakeGatewaySse,
+  fakeGatewayToolCall,
+  hasEmptyComposer,
+  heldFakeGatewayFinalText,
+  isComposerLine,
+  startFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
+import { savedSessionIds } from "./saved-sessions";
+
+const SKIP = !tmuxAvailable();
+const TIMEOUT = 30_000;
+const TEST_TIMEOUT = 120_000;
+const SELECTED_COMPLETION_SGR = "\x1b[1m\x1b[38;5;255m";
+const DIM_SGR = "\x1b[38;5;245m";
+
+let session: TmuxSession | null = null;
+let gateway: ReturnType<typeof startFakeGateway> | null = null;
+const workDirs: string[] = [];
+
+afterEach(async () => {
+  if (session) {
+    await session.kill();
+    session = null;
+  }
+  gateway?.stop();
+  gateway = null;
+  for (const dir of workDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function isSlashCommandRow(line: string): boolean {
+  const visible = line
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .trimStart();
+  return visible.startsWith("/");
+}
+
+function selectedSlashRowIndex(escapes: string): number {
+  const rows = escapes.split("\n").filter(isSlashCommandRow);
+  return rows.findIndex((line) => line.includes(SELECTED_COMPLETION_SGR));
+}
+
+test("slash menu selection index ignores the welcome header help hint", () => {
+  const header = `${SELECTED_COMPLETION_SGR}-=✦\x1b[0m${DIM_SGR} v0.3.27 · Run /help for commands`;
+  const unselected = "\x1b[38;5;245m/help show available slash commands";
+  const selected = `${SELECTED_COMPLETION_SGR}  /clear\x1b[38;5;245m start a fresh session and keep background processes`;
+
+  expect(selectedSlashRowIndex(`${header}\n${unselected}\n${selected}`)).toBe(1);
+});
+
+function capturePaneHistory(session: TmuxSession, start = -120): string {
+  return execSync(`tmux capture-pane -t ${session.name} -p -S ${start}`, {
+    stdio: "pipe",
+    encoding: "utf-8",
+  });
+}
+
+function captureViewportEscapes(session: TmuxSession): string {
+  return execFileSync("tmux", ["capture-pane", "-t", session.name, "-e", "-p"], {
+    stdio: "pipe",
+    encoding: "utf-8",
+  });
+}
+
+function runningBinaryTitle(workspace: string): string {
+  const version = execFileSync(SPARK_BIN, ["--version"], { encoding: "utf8" }).trim();
+  expect(version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
+  return `spark v${version} | ${basename(workspace)}`;
+}
+
+async function waitForPaneTitle(
+  session: TmuxSession,
+  expected: string,
+  timeout: number,
+): Promise<void> {
+  const deadline = Date.now() + timeout;
+  let latest = "";
+  while (Date.now() < deadline) {
+    latest = await session.paneTitle();
+    if (latest === expected) return;
+    await Bun.sleep(50);
+  }
+  throw new Error(`pane title never became ${expected}; last saw ${latest}`);
+}
+
+async function waitForSkillsMenu(session: TmuxSession, count: number): Promise<string[]> {
+  const deadline = Date.now() + TIMEOUT;
+  let latest: string[] = [];
+  while (Date.now() < deadline) {
+    latest = await session.capturePaneGrid();
+    if (latest.join("\n").includes(`Skills ${count}`)) return latest;
+    await Bun.sleep(100);
+  }
+  throw new Error(`Timed out waiting for skills menu.\nPane:\n${latest.join("\n")}`);
+}
+
+async function waitForModelsMenu(session: TmuxSession, count: number): Promise<string[]> {
+  const deadline = Date.now() + TIMEOUT;
+  let latest: string[] = [];
+  while (Date.now() < deadline) {
+    latest = await session.capturePaneGrid();
+    if (latest.join("\n").includes(`Models ${count}`)) return latest;
+    await Bun.sleep(100);
+  }
+  throw new Error(`Timed out waiting for models menu.\nPane:\n${latest.join("\n")}`);
+}
+
+async function waitForHelpMenu(session: TmuxSession, count: number): Promise<string[]> {
+  const deadline = Date.now() + TIMEOUT;
+  let latest: string[] = [];
+  while (Date.now() < deadline) {
+    latest = await session.capturePaneGrid();
+    if (latest.join("\n").includes(`Commands ${count}`)) return latest;
+    await Bun.sleep(100);
+  }
+  throw new Error(`Timed out waiting for help menu.\nPane:\n${latest.join("\n")}`);
+}
+
+async function waitForSettingsMenu(session: TmuxSession): Promise<string[]> {
+  const deadline = Date.now() + TIMEOUT;
+  let latest: string[] = [];
+  while (Date.now() < deadline) {
+    latest = await session.capturePaneGrid();
+    const pane = latest.join("\n");
+    if (
+      pane.includes("←→ change") &&
+      (pane.includes("Settings") || pane.includes("Status line context"))
+    ) return latest;
+    await Bun.sleep(100);
+  }
+  throw new Error(`Timed out waiting for settings menu.\nPane:\n${latest.join("\n")}`);
+}
+
+async function waitForSettingValue(
+  settingsPath: string,
+  key: string,
+  expected: unknown,
+): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  let latest: unknown;
+  while (Date.now() < deadline) {
+    if (existsSync(settingsPath)) {
+      latest = JSON.parse(readFileSync(settingsPath, "utf8"))[key];
+      if (Object.is(latest, expected)) return;
+    }
+    await Bun.sleep(100);
+  }
+  throw new Error(
+    `Timed out waiting for ${key}=${JSON.stringify(expected)}; last=${JSON.stringify(latest)}`,
+  );
+}
+
+async function waitForStatuslineValue(
+  settingsPath: string,
+  key: string,
+  expected: boolean,
+): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  let latest: unknown;
+  while (Date.now() < deadline) {
+    if (existsSync(settingsPath)) {
+      latest = JSON.parse(readFileSync(settingsPath, "utf8")).status_line?.[key];
+      if (latest === expected) return;
+    }
+    await Bun.sleep(100);
+  }
+  throw new Error(
+    `Timed out waiting for status_line.${key}=${expected}; last=${JSON.stringify(latest)}`,
+  );
+}
+
+async function waitForStatuslineMenu(
+  session: TmuxSession,
+  expectedSelection?: string,
+): Promise<string[]> {
+  const deadline = Date.now() + TIMEOUT;
+  let latest: string[] = [];
+  while (Date.now() < deadline) {
+    latest = await session.capturePaneGrid();
+    const pane = latest.join("\n");
+    if (
+      pane.includes("Status line") &&
+      pane.includes("↑↓ navigate") &&
+      pane.includes("←→ change") &&
+      (expectedSelection === undefined || pane.includes(expectedSelection))
+    ) return latest;
+    await Bun.sleep(100);
+  }
+  throw new Error(`Timed out waiting for status line menu.\nPane:\n${latest.join("\n")}`);
+}
+
+async function waitForWorkspaceMenu(session: TmuxSession): Promise<string[]> {
+  const deadline = Date.now() + TIMEOUT;
+  let latest: string[] = [];
+  while (Date.now() < deadline) {
+    latest = await session.capturePaneGrid();
+    const pane = latest.join("\n");
+    if (
+      pane.includes("Workspace") &&
+      pane.includes("Additional directories") &&
+      pane.includes("Add directory…") &&
+      pane.includes("enter use")
+    ) return latest;
+    await Bun.sleep(100);
+  }
+  throw new Error(`Timed out waiting for workspace menu.\nPane:\n${latest.join("\n")}`);
+}
+
+type HeldSkillStream = {
+  cancelled: boolean;
+  release?: () => void;
+};
+
+function heldSkillStreamResponse(state: HeldSkillStream): Response {
+  const encoder = new TextEncoder();
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let closed = false;
+  const event = (value: object) =>
+    encoder.encode(`data: ${JSON.stringify(value)}\n\n`);
+
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(event({ type: "text-start", id: "answer_1" }));
+        controller.enqueue(event({
+          type: "text-delta",
+          id: "answer_1",
+          delta: "catalog stream active",
+        }));
+        timer = setInterval(() => {
+          if (!closed) controller.enqueue(encoder.encode(": hold-skill-stream\n\n"));
+        }, 50);
+        state.release = () => {
+          if (closed) return;
+          closed = true;
+          if (timer) clearInterval(timer);
+          controller.enqueue(event({
+            type: "text-delta",
+            id: "answer_1",
+            delta: " catalog stream completed",
+          }));
+          controller.enqueue(event({ type: "text-end", id: "answer_1" }));
+          controller.enqueue(event({
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+          }));
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        };
+      },
+      cancel() {
+        closed = true;
+        state.cancelled = true;
+        if (timer) clearInterval(timer);
+      },
+    }),
+    { headers: { "content-type": "text/event-stream" } },
+  );
+}
+
+async function waitForHeldSkillStream(state: HeldSkillStream): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  while (Date.now() < deadline) {
+    if (state.release) return;
+    await Bun.sleep(25);
+  }
+  throw new Error("Timed out waiting for the held skill stream.");
+}
+
+function leadingBlankLineCount(text: string): number {
+  let count = 0;
+  for (const line of text.split("\n")) {
+    if (line.trim().length > 0) return count;
+    count += 1;
+  }
+  return count;
+}
+
+function nestedText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map(nestedText).join("");
+  if (content && typeof content === "object") {
+    const value = content as Record<string, unknown>;
+    return [nestedText(value.text), nestedText(value.value), nestedText(value.content)].join("");
+  }
+  return "";
+}
+
+function gatewayPromptText(body: string): string {
+  const request = JSON.parse(body) as { prompt: Array<{ content: unknown }> };
+  return request.prompt.map((message) => nestedText(message.content)).join("\n");
+}
+
+function countOccurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1;
+}
+
+function fileMarkerCount(path: string, marker: string): number {
+  if (!existsSync(path)) return 0;
+  return countOccurrences(readFileSync(path, "utf8"), marker);
+}
+
+function createSkillsMenuFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-skills-menu-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(join(home, ".spark", "skills", "managed-menu"), { recursive: true });
+  mkdirSync(join(home, ".codex", "skills", "codex-menu"), { recursive: true });
+  mkdirSync(join(home, ".agents", "skills", "compat-menu"), { recursive: true });
+  mkdirSync(join(workspace, "skills", "workspace-menu"), { recursive: true });
+  writeFileSync(
+    join(home, ".spark", "skills", "managed-menu", "SKILL.md"),
+    "---\nname: managed-menu\ndescription: |\n  managed menu first line\n  managed menu second line\n---\n\nManaged body\n",
+  );
+  writeFileSync(
+    join(workspace, "skills", "workspace-menu", "SKILL.md"),
+    "---\nname: workspace-menu\ndescription: workspace menu skill\n---\n\nWorkspace body\n",
+  );
+  writeFileSync(
+    join(home, ".codex", "skills", "codex-menu", "SKILL.md"),
+    "---\nname: codex-menu\ndescription: codex menu skill\n---\n\nCodex body\n",
+  );
+  writeFileSync(
+    join(home, ".agents", "skills", "compat-menu", "SKILL.md"),
+    "---\nname: compat-menu\ndescription: compatibility menu skill\n---\n\nCompatibility body\n",
+  );
+  writeFileSync(stderrPath, "");
+  return { home, workspace, stderrPath };
+}
+
+function createSkillRankingFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-skill-rank-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(join(home, ".spark", "skills", "workflow-helper"), { recursive: true });
+  mkdirSync(join(home, ".codex", "skills", "zig-best-practices"), { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(
+    join(home, ".spark", "skills", "workflow-helper", "SKILL.md"),
+    "---\nname: workflow-helper\ndescription: simplify Zig workflows\n---\n\nWorkflow body\n",
+  );
+  writeFileSync(
+    join(home, ".codex", "skills", "zig-best-practices", "SKILL.md"),
+    "---\nname: zig-best-practices\ndescription: write robust Zig\n---\n\nZig body\n",
+  );
+  writeFileSync(stderrPath, "");
+  return { home, workspace, stderrPath };
+}
+
+function createLinkedSkillsMenuFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-linked-skills-menu-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const source = join(workspace, "skill-source", "linked-menu");
+  const skillsRoot = join(workspace, ".codex", "skills");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(join(home, ".spark"), { recursive: true });
+  mkdirSync(source, { recursive: true });
+  mkdirSync(skillsRoot, { recursive: true });
+  writeFileSync(join(home, ".spark", "settings.json"), "{}\n");
+  writeFileSync(
+    join(source, "SKILL.md"),
+    "---\nname: linked-menu\ndescription: linked menu skill\n---\n\nLINKED_MENU_BODY\n",
+  );
+  symlinkSync(
+    "../../skill-source/linked-menu",
+    join(skillsRoot, "linked-menu"),
+    "dir",
+  );
+  writeFileSync(stderrPath, "");
+  return { home, workspace, stderrPath };
+}
+
+function createLinkedMetadataSkillsMenuFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-linked-skill-metadata-menu-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const source = join(workspace, "skill-source", "linked-leaf");
+  const candidate = join(workspace, ".codex", "skills", "linked-leaf");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(join(home, ".spark"), { recursive: true });
+  mkdirSync(source, { recursive: true });
+  mkdirSync(candidate, { recursive: true });
+  writeFileSync(join(home, ".spark", "settings.json"), "{}\n");
+  writeFileSync(
+    join(source, "SKILL.md"),
+    "---\nname: linked-leaf\ndescription: linked metadata skill\n---\n\nLINKED_METADATA_BODY\n",
+  );
+  symlinkSync(
+    "../../../skill-source/linked-leaf/SKILL.md",
+    join(candidate, "SKILL.md"),
+    "file",
+  );
+  writeFileSync(stderrPath, "");
+  return { home, workspace, stderrPath };
+}
+
+function createUnavailableLinkedSkillFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-unavailable-linked-skill-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const skillsRoot = join(workspace, ".codex", "skills");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(join(home, ".spark"), { recursive: true });
+  mkdirSync(skillsRoot, { recursive: true });
+  writeFileSync(join(home, ".spark", "settings.json"), "{}\n");
+  symlinkSync(
+    "../../skill-source/missing-skill",
+    join(skillsRoot, "missing-skill"),
+    "dir",
+  );
+  writeFileSync(stderrPath, "");
+  return { home, workspace, stderrPath };
+}
+
+function createModelsMenuFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-models-menu-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const settingsPath = join(home, ".spark", "settings.json");
+  const tapePath = join(root, "models-menu.fxtape");
+  const stderrPath = join(root, "stderr.log");
+  mkdirSync(join(home, ".spark"), { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(settingsPath, "{}\n");
+  writeFileSync(stderrPath, "");
+  return { home, workspace, settingsPath, tapePath, stderrPath };
+}
+
+/// The models the Token Pass picker tests list: two Token Pass models that
+/// offer Fast mode, and two others.
+const tokenPassPickerModels = [
+  {
+    id: "zai/glm-5.3",
+    type: "language",
+    released: 300,
+    tags: ["reasoning", "tool-use"],
+    reasoning_options: [{ type: "effort", values: ["high"] }],
+    fast_options: [{ type: "toggle" }],
+    context_window: 200_000,
+  },
+  { id: "deepseek/deepseek-v4.1-flash", type: "language", released: 250, tags: ["tool-use"], fast_options: [{ type: "toggle" }], context_window: 128_000 },
+  { id: "provider/fast-model", type: "language", released: 200, tags: ["tool-use"], fast_options: [{ type: "toggle" }], context_window: 128_000 },
+  { id: "provider/plain-model", type: "language", released: 100, tags: ["tool-use"], context_window: 128_000 },
+];
+
+/// The picker catalog as AI Gateway sends it to a team with Token Pass: GLM
+/// 5.3 and DeepSeek V4.1 Flash carry `token_pass: true` while `marked` says
+/// the team has an active pass.
+function markedPickerModels(marked: () => boolean = () => true) {
+  const paid = ["zai/glm-5.3", "deepseek/deepseek-v4.1-flash"];
+  return () => tokenPassPickerModels.map((model) => marked() && paid.includes(model.id) ? { ...model, token_pass: true } : model);
+}
+
+/// A credits reply for a team with Token Pass, or for one without
+/// (`token_pass: null`), after `delayMs`.
+function tokenPassCredits(hasPass: () => boolean, delayMs = 0, onRequest?: () => void) {
+  return (url: URL) => {
+    if (url.pathname !== "/coding-agent/v1/credits") return null;
+    onRequest?.();
+    const reply = () => Response.json({
+      balance: "12.50",
+      total_used: "1.25",
+      token_pass: hasPass() ? { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" } : null,
+    });
+    return delayMs > 0 ? Bun.sleep(delayMs).then(reply) : reply();
+  };
+}
+
+/// The name spark saves an API key's Token Pass answer under, as
+/// `token_pass.identity` in src/core/gateway/token_pass.zig writes it.
+function tokenPassIdentity(apiKey: string): string {
+  return createHash("sha256").update(`api_key\0${apiKey}\0`).digest("hex").slice(0, 32);
+}
+
+function savedTokenPassAnswer(home: string, apiKey: string): string | undefined {
+  const path = join(home, ".spark", "token-pass.json");
+  if (!existsSync(path)) return undefined;
+  return JSON.parse(readFileSync(path, "utf8")).teams?.[tokenPassIdentity(apiKey)];
+}
+
+/// Waits until spark has taken the Token Pass check's answer, which its trace
+/// records.
+async function waitForTokenPassAnswer(tracePath: string, answer: "has_pass" | "no_pass") {
+  const line = `check answered answer=${answer}`;
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (existsSync(tracePath) && readFileSync(tracePath, "utf8").includes(line)) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`Timed out waiting for "${line}" in ${tracePath}`);
+}
+
+function tokenPassEnv(fixture: { home: string }, gateway: { baseUrl: string; chatUrl: string }, apiKey: string, tracePath: string) {
+  return {
+    HOME: fixture.home,
+    AI_GATEWAY_API_KEY: apiKey,
+    VERCEL_OIDC_TOKEN: undefined,
+    SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+    SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+    SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    SPARK_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+    SPARK_TRACE_LOG: tracePath,
+    SPARK_TRACE_SCOPES: "token_pass",
+    SPARK_AUTO_UPGRADE: "0",
+  };
+}
+
+const chatModelOf = (request: { headers: Headers }) => request.headers.get("ai-language-model-id");
+
+/// The answers saved in the profile's `token-pass.json`, one per team.
+function savedTokenPassAnswers(home: string): string[] {
+  const path = join(home, ".spark", "token-pass.json");
+  if (!existsSync(path)) return [];
+  try {
+    return Object.values(JSON.parse(readFileSync(path, "utf8")).teams ?? {}) as string[];
+  } catch {
+    return [];
+  }
+}
+
+// The menu matcher searches skill paths, so this fixture's home directory must
+// not contain the substring "home": a "home" path segment would make the
+// query HOME match every installed skill.
+function createMentionGuardFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-mention-guard-")));
+  workDirs.push(root);
+  const home = join(root, "hq");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".spark", "skills", "managed-menu"), { recursive: true });
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(
+    join(home, ".spark", "skills", "managed-menu", "SKILL.md"),
+    "---\nname: managed-menu\ndescription: managed menu skill\n---\n\nManaged body\n",
+  );
+  if (home.toLowerCase().includes("home")) {
+    throw new Error(`mention-guard fixture path leaks 'home': ${home}`);
+  }
+  return { home, workspace };
+}
+
+function createExactSkillsMenuFixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-exact-skills-menu-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const managed = join(home, ".spark", "skills", "exact-picker-managed");
+  const workspaceSkill = join(workspace, "skills", "exact-picker-workspace");
+  const malformed = join(home, ".agents", "skills", "malformed-picker");
+  const bodyA = "EXACT_PICKER_MANAGED_BODY";
+  const bodyB = "EXACT_PICKER_WORKSPACE_BODY";
+  const workspaceDescription = "workspace duplicate picker";
+
+  mkdirSync(managed, { recursive: true });
+  mkdirSync(workspaceSkill, { recursive: true });
+  mkdirSync(malformed, { recursive: true });
+  writeFileSync(
+    join(managed, "SKILL.md"),
+    `---\nname: exact-picker\ndescription: managed duplicate picker\n---\n\n${bodyA}\n`,
+  );
+  writeFileSync(
+    join(workspaceSkill, "SKILL.md"),
+    `---\nname: exact-picker\ndescription: ${workspaceDescription}\n---\n\n${bodyB}\n`,
+  );
+  writeFileSync(
+    join(malformed, "SKILL.md"),
+    "---\nname: malformed-picker\nname: duplicate-picker\n---\n\nMALFORMED_PICKER_BODY\n",
+  );
+
+  return {
+    root,
+    home,
+    workspace,
+    bodyA,
+    bodyB,
+    workspaceDescription,
+    malformedMarker: "malformed-picker",
+  };
+}
+
+function createManySkillsMenuFixture(count: number) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-skills-menu-many-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const stderrPath = join(root, "stderr.log");
+  for (let i = 0; i < count; i += 1) {
+    const name = `skill-${String(i).padStart(3, "0")}`;
+    mkdirSync(join(home, ".spark", "skills", name), { recursive: true });
+    writeFileSync(
+      join(home, ".spark", "skills", name, "SKILL.md"),
+      `---\nname: ${name}\ndescription: generated skill ${i}\n---\n\nGenerated body\n`,
+    );
+  }
+  mkdirSync(workspace, { recursive: true });
+  return { home, workspace, stderrPath };
+}
+
+function visibleFxSkillNames(grid: string[]): string[] {
+  return grid
+    .filter((line) => line.includes("skill-") && line.includes("spark · Global"))
+    .map((line) => line.match(/skill-\d+/)?.[0])
+    .filter((name): name is string => name !== undefined);
+}
+
+function selectedSkillName(escapes: string): string | null {
+  const row = escapes
+    .split("\n")
+    .find((line) => line.includes(SELECTED_COMPLETION_SGR) && line.includes("skill-"));
+  return row?.match(/skill-\d+/)?.[0] ?? null;
+}
+
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function submittedSkillRows(escapes: string): string[] {
+  return escapes.split("\n").filter((line) =>
+    /┃ managed-menu please/.test(stripAnsi(line))
+  );
+}
+
+function gridFromAnsiCapture(capture: string): string[] {
+  return capture.replace(/\n$/, "").split("\n").map(stripAnsi);
+}
+
+function lastRowMatching(grid: string[], predicate: (line: string) => boolean): number {
+  for (let index = grid.length - 1; index >= 0; index -= 1) {
+    if (predicate(grid[index] ?? "")) return index + 1;
+  }
+  throw new Error(`row not found in grid:\n${grid.join("\n")}`);
+}
+
+function composerRow(grid: string[]): number {
+  return lastRowMatching(grid, isComposerLine);
+}
+
+function footerStatusRow(grid: string[]): number {
+  return lastRowMatching(
+    grid,
+    (line) => line.includes("gpt-5") || line.includes("↑↓ navigate"),
+  );
+}
+
+function visibleTranscriptTailRow(grid: string[]): number {
+  return lastRowMatching(grid, (line) => line.includes("SLASH_FOOTER_E2E_"));
+}
+
+function assertNoBlankGapBetweenTranscriptAndComposer(grid: string[]) {
+  const transcriptTail = visibleTranscriptTailRow(grid);
+  const composer = composerRow(grid);
+  let consecutiveBlankRows = 0;
+  for (let row = transcriptTail + 1; row < composer; row += 1) {
+    if ((grid[row - 1] ?? "").trim() === "") {
+      consecutiveBlankRows += 1;
+      expect(consecutiveBlankRows, `blank block above composer reaches row ${row}`).toBeLessThanOrEqual(2);
+    } else {
+      consecutiveBlankRows = 0;
+    }
+  }
+}
+
+function longAssistantResponse(): string {
+  return Array.from({ length: 82 }, (_, index) => {
+    const line = String(index + 1).padStart(3, "0");
+    return `SLASH_FOOTER_E2E_${line} markdown transcript content that should fill the viewport above the composer.`;
+  }).join("\n");
+}
+
+const RENAME_MENU_SKILLS: Record<string, string> = {
+  deploy: "ship the app to production",
+  fix: "fix the failing test",
+  review: "review a pull request",
+  "rename-files": "rename files in bulk",
+};
+
+/// Starts spark in a workspace whose skills share names with likely session
+/// titles, with a trace log, so /rename can be driven from the slash menu.
+async function startRenameMenuSession(): Promise<{ tracePath: string; stderrPath: string }> {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-rename-menu-")));
+  workDirs.push(root);
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".spark"), { recursive: true });
+  for (const [name, description] of Object.entries(RENAME_MENU_SKILLS)) {
+    const dir = join(workspace, ".agents", "skills", name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "SKILL.md"),
+      `---\nname: ${name}\ndescription: ${description}\n---\n\nRENAME_MENU_SKILL_BODY\n`,
+    );
+  }
+  writeFileSync(
+    join(home, ".spark", "settings.json"),
+    JSON.stringify({ sandbox: "none", permission: {} }),
+  );
+  const stderrPath = join(root, "stderr.log");
+  const tracePath = join(root, "trace.log");
+  gateway = startFakeGateway([]);
+  session = await TmuxSession.create({
+    cwd: workspace,
+    env: {
+      HOME: home,
+      AI_GATEWAY_API_KEY: "fake-rename-menu-key",
+      VERCEL_OIDC_TOKEN: undefined,
+      SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+      SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+      SPARK_MODEL: FAKE_GATEWAY_MODEL,
+      SPARK_AUTO_UPGRADE: "0",
+      SPARK_TRACE: "1",
+      SPARK_TRACE_LOG: tracePath,
+    },
+    width: 110,
+    height: 30,
+    stderrPath,
+  });
+  await session.waitForComposer(10_000);
+  return { tracePath, stderrPath };
+}
+
+/// Waits until `ready` holds and the screen stops changing, so a menu that
+/// is about to appear has had its chance to.
+async function waitForSettledPane(
+  current: TmuxSession,
+  ready: (pane: string) => boolean,
+  timeoutMs = 5_000,
+): Promise<string> {
+  await current.waitForPane(ready, timeoutMs);
+  let previous = "";
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pane = await current.capturePane();
+    if (pane === previous && ready(pane)) return pane;
+    previous = pane;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  throw new Error(`pane did not settle:\n${previous}`);
+}
+
+async function clearRenameComposer(current: TmuxSession): Promise<void> {
+  await current.sendKeys("C-u");
+  await current.waitForPane((pane) => hasEmptyComposer(pane), 5_000);
+}
+
+describe.skipIf(SKIP)("tui: slash menu", () => {
+  test(
+    "a command that needs an argument waits for it when chosen from the slash menu",
+    async () => {
+      const { stderrPath } = await startRenameMenuSession();
+      const s = session!;
+
+      // A prefix, then the menu's own "enter use".
+      await s.sendLiteralText("/ren");
+      await s.waitForText("rename the current session", 5_000);
+      await s.sendKeys("Enter");
+      await s.sendLiteralText("picked from menu");
+      let pane = await s.waitForPane((current) => composerContains(current, "picked from menu"), 5_000);
+      expect(pane).not.toContain("usage: /rename <title>");
+      expect(composerContains(pane, "/rename picked from menu")).toBe(true);
+      await s.sendKeys("Enter");
+      await s.waitForText('renamed to "picked from menu"', 5_000);
+
+      // The whole command name, then Enter.
+      await s.sendLiteralText("/rename");
+      await s.waitForText("rename the current session", 5_000);
+      await s.sendKeys("Enter");
+      await s.sendLiteralText("typed in full");
+      pane = await s.waitForPane((current) => composerContains(current, "typed in full"), 5_000);
+      expect(pane).not.toContain("usage: /rename <title>");
+      expect(composerContains(pane, "/rename typed in full")).toBe(true);
+      await s.sendKeys("Enter");
+      await s.waitForText('renamed to "typed in full"', 5_000);
+
+      // Other commands whose argument is required.
+      for (const [typed, command, description, usage] of [
+        ["/ima", "/image", "attach an image by path", "usage: /image <path>"],
+        ["/she", "/shell", "reload shell startup files", "usage: /shell reload"],
+      ] as const) {
+        await s.sendLiteralText(typed);
+        await s.waitForText(description, 5_000);
+        await s.sendKeys("Enter");
+        await s.sendLiteralText("arg");
+        pane = await s.waitForPane((current) => composerContains(current, "arg"), 5_000);
+        expect(pane).not.toContain(usage);
+        expect(composerContains(pane, `${command} arg`)).toBe(true);
+        await clearRenameComposer(s);
+      }
+
+      // A command whose argument is optional still runs on Enter.
+      await s.sendLiteralText("/permis");
+      await s.waitForText("choose what spark is allowed to do", 5_000);
+      await s.sendKeys("Enter");
+      await s.waitForText("Configured rules", 5_000);
+      await s.sendKeys("Escape");
+      await s.waitForPane((current) => hasEmptyComposer(current) && !current.includes("Configured rules"), 5_000);
+
+      // An empty title sent on purpose still says how to use the command.
+      await s.sendLiteralText("/rename ");
+      await s.waitForText("rename the current session", 5_000);
+      await s.sendKeys("Enter");
+      await s.waitForText("usage: /rename <title>", 5_000);
+
+      expect(gateway!.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a /rename title that matches a skill stays a title",
+    async () => {
+      const { tracePath, stderrPath } = await startRenameMenuSession();
+      const s = session!;
+
+      await s.sendLiteralText("/rename deploy");
+      let pane = await waitForSettledPane(s, (current) => composerContains(current, "/rename deploy"));
+      expect(pane).not.toContain("ship the app to production");
+      await s.sendKeys("Tab");
+      pane = await waitForSettledPane(s, () => true);
+      expect(composerContains(pane, "/rename deploy")).toBe(true);
+      await s.sendKeys("Enter");
+      await s.waitForText('renamed to "deploy"', 5_000);
+
+      for (const title of ["dep", "rename-files"]) {
+        await s.sendLiteralText(`/rename ${title}`);
+        await waitForSettledPane(s, (current) => composerContains(current, `/rename ${title}`));
+        await s.sendKeys("Enter");
+        await s.waitForText(`renamed to "${title}"`, 5_000);
+      }
+
+      // A $ mention picked inside a title never turns the rename into the skill.
+      await s.sendLiteralText("/rename ship $dep");
+      await s.waitForText("Agents · Workspace", 5_000);
+      for (let press = 0; press < 4; press += 1) {
+        await s.sendKeys("Enter");
+        pane = await waitForSettledPane(s, () => true);
+        if (hasEmptyComposer(pane)) break;
+      }
+      pane = await s.captureFullScrollback();
+      expect(pane).toContain('renamed to "ship');
+      expect(pane).not.toContain("requested skill loaded");
+      expect(gateway!.requests).toHaveLength(0);
+
+      // The same rule on another command that takes free text.
+      await clearRenameComposer(s);
+      await s.sendLiteralText("/launch review");
+      pane = await waitForSettledPane(s, (current) => composerContains(current, "/launch review"));
+      expect(pane).not.toContain("review a pull request");
+      await clearRenameComposer(s);
+
+      // Picking a skill from the slash menu still works, and the trace says
+      // what it replaced.
+      await s.sendLiteralText("/dep");
+      await s.waitForText("ship the app to production", 5_000);
+      await s.sendKeys("Tab");
+      await s.waitForPane(
+        (current) => composerContains(current, "deploy") && !composerContains(current, "/dep"),
+        5_000,
+      );
+      const deadline = Date.now() + 5_000;
+      let trace = "";
+      while (Date.now() < deadline) {
+        trace = readFileSync(tracePath, "utf8");
+        if (trace.includes("slash menu replaced composer text with skill=deploy")) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(trace).toContain("slash menu replaced composer text with skill=deploy dropped_bytes=4");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "rename titles lose wrapping quotes and rename errors name the problem",
+    async () => {
+      const { stderrPath } = await startRenameMenuSession();
+      const s = session!;
+
+      await s.sendText('/rename "quoted title"');
+      await s.waitForText('renamed to "quoted title"', 5_000);
+      expect(await s.captureFullScrollback()).not.toContain('""quoted');
+      expect(await s.paneTitle()).toBe("quoted title");
+
+      // Quotes with nothing inside are an empty title, not text to replace.
+      await s.sendText('/rename ""');
+      await s.waitForText("usage: /rename <title>", 5_000);
+      expect(await s.paneTitle()).toBe("quoted title");
+
+      await s.sendText(`/rename ${"x".repeat(241)}`);
+      await s.waitForText("title is too long (at most 240 bytes)", 5_000);
+      // The notice wraps after "renamed to", so wait for the quoted title.
+      await s.sendText(`/rename ${"y".repeat(240)}`);
+      await s.waitForText(`"${"y".repeat(100)}`, 5_000);
+
+      await s.sendLiteralText("/rename line one");
+      await s.pasteText("\nline two");
+      await s.sendKeys("Enter");
+      await s.waitForText("title must be one line", 5_000);
+
+      await s.sendText("/rename same");
+      await s.waitForText('renamed to "same"', 5_000);
+      await s.sendText("/rename same");
+      await s.waitForText('already named "same"', 5_000);
+
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "linked workspace skill is visible and usable from the skills menu",
+    async () => {
+      const fixture = createLinkedSkillsMenuFixture();
+      gateway = startFakeGateway([
+        fakeGatewayFinalText("LINKED_MENU_COMPLETE"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-linked-menu-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_MODEL: FAKE_GATEWAY_MODEL,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+        stderrPath: fixture.stderrPath,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/skills");
+      const menu = await waitForSkillsMenu(session, 1);
+      expect(menu.join("\n")).toContain("linked-menu");
+      expect(menu.join("\n")).toContain("Codex · Workspace");
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) => composerContains(pane, "linked-menu"),
+        5_000,
+      );
+      await session.sendLiteralText(" apply it");
+      await session.sendKeys("Enter");
+      await session.waitForText("LINKED_MENU_COMPLETE", 10_000);
+
+      expect(gateway.requests).toHaveLength(1);
+      expect(gatewayPromptText(gateway.requests[0]!.body)).toContain(
+        "LINKED_MENU_BODY",
+      );
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "linked skill metadata is visible and usable from the skills menu",
+    async () => {
+      const fixture = createLinkedMetadataSkillsMenuFixture();
+      gateway = startFakeGateway([
+        fakeGatewayFinalText("LINKED_METADATA_COMPLETE"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-linked-metadata-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_MODEL: FAKE_GATEWAY_MODEL,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+        stderrPath: fixture.stderrPath,
+      });
+      await session.waitForComposer(10_000);
+      expect(await session.capturePane()).not.toContain("discovery issue");
+
+      await session.sendText("/skills");
+      const menu = await waitForSkillsMenu(session, 1);
+      expect(menu.join("\n")).toContain("linked-leaf");
+      expect(menu.join("\n")).toContain("Codex · Workspace");
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) => composerContains(pane, "linked-leaf"),
+        5_000,
+      );
+      await session.sendLiteralText(" apply it");
+      await session.sendKeys("Enter");
+      await session.waitForText("LINKED_METADATA_COMPLETE", 10_000);
+
+      expect(gateway.requests).toHaveLength(1);
+      expect(gatewayPromptText(gateway.requests[0]!.body)).toContain(
+        "LINKED_METADATA_BODY",
+      );
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "unavailable linked skill reports the failing directory boundary",
+    async () => {
+      const fixture = createUnavailableLinkedSkillFixture();
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+        stderrPath: fixture.stderrPath,
+      });
+
+      await session.waitForComposer(10_000);
+      await session.sendKeys("C-o");
+      await session.waitForPane(
+        (pane) => pane.replace(/\s+/g, " ").includes(
+          "linked skill directory could not be resolved to an authorized readable directory",
+        ),
+        5_000,
+      );
+      const detail = (await session.capturePane()).replace(/\s+/g, " ");
+      expect(detail).toContain("repair or remove the link");
+      expect(detail).not.toContain("SKILL.md is unreadable or not a regular file");
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendKeys("C-o");
+      await session.waitForComposer(5_000);
+      // The warning exists (Ctrl+O showed it) but never reaches the inline transcript.
+      const inline = await session.captureFullScrollback();
+      expect(inline).not.toContain("skills:");
+      expect(inline).not.toContain("skill discovery warning:");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "skill picker selects a name match before a metadata-only match",
+    async () => {
+      const fixture = createSkillRankingFixture();
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+        stderrPath: fixture.stderrPath,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendLiteralText("$zig");
+      const grid = await waitForSkillsMenu(session, 2);
+      const directIndex = grid.findIndex((line) => line.includes("zig-best-practices"));
+      const metadataIndex = grid.findIndex((line) => line.includes("workflow-helper"));
+      expect(directIndex).toBeGreaterThanOrEqual(0);
+      expect(metadataIndex).toBeGreaterThan(directIndex);
+
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) => composerContains(pane, "zig-best-practices"),
+        5_000,
+      );
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "fuzzy queries find commands, skills, and MCP servers",
+    async () => {
+      const fixture = createSkillRankingFixture();
+      writeFileSync(
+        join(fixture.home, ".spark", "mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            context7: { type: "http", url: "http://127.0.0.1:9/mcp" },
+            linear: { type: "http", url: "http://127.0.0.1:9/linear" },
+          },
+        }),
+      );
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+        stderrPath: fixture.stderrPath,
+      });
+      await session.waitForComposer(10_000);
+
+      // Each query holds its item's letters in order from the start of a
+      // word, and no item holds it as typed.
+      await session.sendLiteralText("/mdl");
+      await session.waitForPane(
+        (pane) => /Commands 1\b/.test(pane) && /^\s*\/model\s{2,}/m.test(pane),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText("$zbp");
+      const skills = await waitForSkillsMenu(session, 1);
+      expect(skills.some((line) => line.includes("zig-best-practices"))).toBe(true);
+      expect(skills.some((line) => line.includes("workflow-helper"))).toBe(false);
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) => composerContains(pane, "zig-best-practices"),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      const serverRow = (name: string) => new RegExp(`^\\s*(?:›\\s*)?${name}\\s{2,}.*profile\\s*$`, "m");
+      await session.sendText("/mcp");
+      await session.waitForPane(
+        (pane) => serverRow("context7").test(pane) && serverRow("linear").test(pane),
+        10_000,
+      );
+      await session.sendLiteralText("ctx7");
+      const filtered = await session.waitForText(/MCP servers\s+1 of 2/, 5_000);
+      expect(filtered).toMatch(serverRow("context7"));
+      expect(filtered).not.toMatch(serverRow("linear"));
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("MCP servers"), 5_000);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "terminal tab title shows the session title across rename, resume, and new session",
+    async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "spark-title-rename-e2e-"));
+      workDirs.push(workDir);
+      const home = join(workDir, "home");
+      const workspace = join(workDir, "spark");
+      const resumedWorkspace = join(workDir, "another project é");
+      const fallbackTitle = (dir: string) => runningBinaryTitle(dir);
+      mkdirSync(join(home, ".spark"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      mkdirSync(resumedWorkspace, { recursive: true });
+      writeFileSync(
+        join(home, ".spark", "settings.json"),
+        JSON.stringify({ sandbox: "none", permission: {} }),
+      );
+
+      const stderrPath = join(workDir, "stderr.log");
+      const resumedStderrPath = join(workDir, "resumed-stderr.log");
+      const model = "openai/gpt-5";
+      gateway = startFakeGateway([fakeGatewayFinalText("TITLE_RENAME_COMPLETE")]);
+
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-title-rename-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+        SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+        SPARK_MODEL: model,
+        SPARK_AUTO_UPGRADE: "0",
+        NO_COLOR: "1",
+      };
+
+      session = await TmuxSession.create({
+        cmd: SPARK_BIN,
+        cwd: workspace,
+        env,
+        stderrPath,
+        width: 120,
+        height: 32,
+        isolated: true,
+        remainOnExit: true,
+      });
+      await session.waitForComposer(10_000);
+      // Before any title exists, the tab falls back to the build and folder.
+      await waitForPaneTitle(session, fallbackTitle(workspace), 5_000);
+
+      // The first prompt's derived title becomes the tab title.
+      await session.sendText("generate the release notes");
+      await session.waitForText("TITLE_RENAME_COMPLETE", 30_000);
+      await session.waitForStableComposer();
+      await waitForPaneTitle(session, "generate the release notes", 5_000);
+
+      // A rename replaces the tab title.
+      await session.sendText("/rename deploy pipeline fix");
+      await session.waitForText("renamed to \"deploy pipeline fix\"", 10_000);
+      await session.waitForStableComposer();
+      await waitForPaneTitle(session, "deploy pipeline fix", 5_000);
+
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(session.isAlive()).toBe(true);
+      expect(await session.paneTitle()).toBe("");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.kill();
+      session = null;
+
+      const sessionIds = savedSessionIds(home);
+      expect(sessionIds).toHaveLength(1);
+
+      // A resumed session keeps its title in the tab, even in a new folder.
+      gateway.stop();
+      gateway = startFakeGateway([]);
+      session = await TmuxSession.create({
+        cmd: `${SPARK_BIN} --resume ${sessionIds[0]}`,
+        cwd: resumedWorkspace,
+        env: {
+          ...env,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+        },
+        stderrPath: resumedStderrPath,
+        width: 120,
+        height: 32,
+        isolated: true,
+        remainOnExit: true,
+      });
+      await session.waitForComposer(10_000);
+      await waitForPaneTitle(session, "deploy pipeline fix", 5_000);
+      expect(await session.captureFullScrollback()).toContain("TITLE_RENAME_COMPLETE");
+
+      // A fresh session resets the tab to the build and current folder.
+      await session.sendText("/new");
+      await session.waitForStableComposer();
+      await waitForPaneTitle(session, fallbackTitle(resumedWorkspace), 5_000);
+
+      await session.sendText("/quit");
+      await session.waitForPane(() => session!.paneStatus().dead, 10_000);
+      expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
+      expect(session.isAlive()).toBe(true);
+      expect(await session.paneTitle()).toBe("");
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+      await session.kill();
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "slash picker growth preserves displaced transcript history",
+    async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "spark-slash-footer-e2e-"));
+      workDirs.push(workDir);
+      const home = join(workDir, "home");
+      const workspace = join(workDir, "workspace");
+      mkdirSync(join(home, ".spark"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".spark", "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
+
+      const tracePath = join(workDir, "trace.log");
+      const tapePath = join(workDir, "resumed.fxtape");
+      const stderrPath = join(workDir, "stderr.log");
+      const resumedStderrPath = join(workDir, "resumed-stderr.log");
+      gateway = startFakeGateway([fakeGatewayFinalText(longAssistantResponse())]);
+
+      session = await TmuxSession.create({
+        cmd: SPARK_BIN,
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-slash-footer-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_MODEL: "openai/gpt-5",
+          SPARK_AUTO_UPGRADE: "0",
+          NO_COLOR: "1",
+        },
+        stderrPath,
+        width: 124,
+        height: 75,
+        isolated: true,
+        minimumHistoryLines: 500,
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("Print the deterministic slash footer transcript fixture.");
+      await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
+      await session.waitForPane(
+        (pane) => !pane.includes("esc interrupt") && !pane.includes("Thinking"),
+        5_000,
+      );
+      await Bun.sleep(300);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(10_000)).toBe(true);
+      await session.kill();
+      session = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      const sessionIds = savedSessionIds(home);
+      expect(sessionIds).toHaveLength(1);
+      gateway.stop();
+      gateway = startFakeGateway([]);
+      session = await TmuxSession.create({
+        cmd: `${SPARK_BIN} --resume ${sessionIds[0]}`,
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-slash-footer-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_MODEL: "openai/gpt-5",
+          SPARK_AUTO_UPGRADE: "0",
+          SPARK_RECORD: tapePath,
+          SPARK_RECORD_INPUT: "1",
+          SPARK_TRACE_LOG: tracePath,
+          SPARK_TRACE_SCOPES: "frame_plan,frame_layout,scroll,render,paint,frame_diff,frame_commit",
+          NO_COLOR: "1",
+        },
+        stderrPath: resumedStderrPath,
+        width: 124,
+        height: 75,
+        isolated: true,
+        minimumHistoryLines: 500,
+      });
+      await session.waitForComposer(10_000);
+      await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
+
+      async function capture(label: string): Promise<string[]> {
+        const deadline = Date.now() + 5_000;
+        let previous = "";
+        let viewportAnsi = "";
+        let stableSamples = 0;
+        while (Date.now() < deadline && stableSamples < 5) {
+          viewportAnsi = await session!.capturePaneEscapes();
+          if (viewportAnsi === previous) {
+            stableSamples += 1;
+          } else {
+            previous = viewportAnsi;
+            stableSamples = 0;
+          }
+          await Bun.sleep(50);
+        }
+        if (stableSamples < 5) {
+          throw new Error(`Timed out waiting for a stable viewport before ${label}`);
+        }
+        const fullAnsi = await session!.captureFullScrollbackEscapes();
+        writeFileSync(join(workDir, `${label}.ansi.txt`), fullAnsi);
+        writeFileSync(join(workDir, `${label}.pane.ansi.txt`), viewportAnsi);
+        writeFileSync(join(workDir, `${label}.pane.txt`), stripAnsi(viewportAnsi));
+        return gridFromAnsiCapture(viewportAnsi);
+      }
+
+      const afterResponse = await capture("after-response");
+      const closedComposerRow = composerRow(afterResponse);
+      expect(
+        visibleTranscriptTailRow(afterResponse),
+        `resumed baseline grid:\n${afterResponse.join("\n")}`,
+      ).toBe(69);
+      expect(closedComposerRow).toBe(73);
+      await session.sendLiteralText("/");
+      await session.waitForText("Commands 40", 5_000);
+      const afterSlash = await capture("after-slash");
+      expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
+      expect(composerRow(afterSlash)).toBe(64);
+      await session.sendLiteralText("f");
+      await session.waitForText("/feedback", 5_000);
+      const afterSlashF = await capture("after-slash-f");
+      await session.sendLiteralText("e");
+      await session.waitForText("/feedback", 5_000);
+      const afterSlashFe = await capture("after-slash-fe");
+      await session.sendLiteralText("edback");
+      await session.waitForText("/feedback", 5_000);
+      const afterSlashFeedback = await capture("after-slash-feedback");
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (pane) =>
+          composerContains(pane, "/feedback") &&
+          !pane.includes("open the spark feedback form"),
+        5_000,
+      );
+      const afterDismiss = await capture("after-dismiss");
+      expect(visibleTranscriptTailRow(afterDismiss)).toBe(60);
+      expect(composerRow(afterDismiss)).toBe(64);
+      expect(footerStatusRow(afterDismiss)).toBe(66);
+      await session.sendLiteralText("x");
+      await session.waitForPane(
+        (pane) =>
+          composerContains(pane, "/feedbackx") &&
+          !pane.includes("open the spark feedback form"),
+        5_000,
+      );
+      const afterDismissEdit = await capture("after-dismiss-edit");
+      expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(60);
+      expect(composerRow(afterDismissEdit)).toBe(64);
+      expect(footerStatusRow(afterDismissEdit)).toBe(66);
+
+      await session.sendKeys("C-u");
+      await session.waitForPane(hasEmptyComposer, 5_000);
+      const afterClear = await capture("after-clear");
+
+      const openComposerRows = [
+        composerRow(afterSlash),
+        composerRow(afterSlashF),
+        composerRow(afterSlashFe),
+        composerRow(afterSlashFeedback),
+      ];
+      const openFooterRows = [
+        footerStatusRow(afterSlash),
+        footerStatusRow(afterSlashF),
+        footerStatusRow(afterSlashFe),
+        footerStatusRow(afterSlashFeedback),
+      ];
+      expect(new Set(openComposerRows).size).toBe(1);
+      expect(new Set(openFooterRows).size).toBe(1);
+      expect(openComposerRows[0]).toBeLessThan(composerRow(afterResponse));
+      expect(composerRow(afterDismiss)).toBeLessThan(closedComposerRow);
+      expect(composerRow(afterDismissEdit)).toBe(composerRow(afterDismiss));
+      expect(composerRow(afterClear)).toBe(composerRow(afterDismiss));
+      expect(footerStatusRow(afterDismiss)).toBeLessThan(footerStatusRow(afterResponse));
+      expect(footerStatusRow(afterDismissEdit)).toBe(footerStatusRow(afterDismiss));
+      expect(footerStatusRow(afterClear)).toBe(footerStatusRow(afterDismiss));
+
+      for (const grid of [
+        afterResponse,
+        afterSlash,
+        afterSlashF,
+        afterSlashFe,
+        afterSlashFeedback,
+        afterDismiss,
+        afterDismissEdit,
+        afterClear,
+      ]) {
+        assertNoBlankGapBetweenTranscriptAndComposer(grid);
+      }
+
+      const historyLabels = [
+        "after-response",
+        "after-slash",
+        "after-slash-f",
+        "after-slash-fe",
+        "after-slash-feedback",
+        "after-dismiss",
+        "after-dismiss-edit",
+        "after-clear",
+      ];
+      const baselineScrollback = stripAnsi(
+        readFileSync(join(workDir, "after-response.ansi.txt"), "utf8"),
+      );
+      const expectedMarkerCopies = Array.from({ length: 82 }, (_, index) => {
+        const marker = `SLASH_FOOTER_E2E_${String(index + 1).padStart(3, "0")}`;
+        const copies = countOccurrences(baselineScrollback, marker);
+        expect(copies, `after-response: ${marker}`).toBeGreaterThanOrEqual(1);
+        expect(copies, `after-response: ${marker}`).toBeLessThanOrEqual(2);
+        return { marker, copies };
+      });
+      for (const label of historyLabels.slice(1)) {
+        const scrollback = stripAnsi(readFileSync(join(workDir, `${label}.ansi.txt`), "utf8"));
+        for (const { marker, copies } of expectedMarkerCopies) {
+          expect(countOccurrences(scrollback, marker), `${label}: ${marker}`).toBe(copies);
+        }
+      }
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(10_000)).toBe(true);
+      session = null;
+
+      const trace = readFileSync(tracePath, "utf8");
+      const traceLines = trace.split(/\r?\n/);
+      const footerUpdates = traceLines.filter((line) => line.includes("footer_extra_update"));
+      expect(footerUpdates.some((line) => /old=0 new=9 .*picker_rows=8 show_picker=true/.test(line))).toBe(true);
+      expect(footerUpdates.some((line) => /old=9 new=0 .*picker_rows=0 show_picker=false/.test(line))).toBe(true);
+      expect(footerUpdates.some((line) => /show_picker=true/.test(line) && /new=[1-8](?:\s|$)/.test(line))).toBe(false);
+      const openUpdateIndex = traceLines.findIndex((line) => /footer_extra_update old=0 new=9 /.test(line));
+      expect(openUpdateIndex).toBeGreaterThanOrEqual(0);
+      const openPlan = traceLines.slice(0, openUpdateIndex).reverse().find((line) =>
+        line.includes("transcript_transition_plan") &&
+        line.includes("replay_displaced_footer_history=true") &&
+        /planned_rows=[1-9][0-9]*/.test(line)
+      );
+      expect(openPlan).toContain("source_compatible=true");
+      const openCommit = traceLines.slice(openUpdateIndex + 1).find((line) =>
+        line.includes("[frame_diff] attempt_result") &&
+        /planned_scroll_rows=[1-9][0-9]*/.test(line)
+      );
+      expect(openCommit).toMatch(
+        /planned_scroll_rows=([1-9][0-9]*) committed_scroll_rows=\1 .*unplanned_scroll_rows=0/,
+      );
+      const closeUpdateIndex = traceLines.findIndex((line) => /footer_extra_update old=9 new=0 /.test(line));
+      expect(closeUpdateIndex).toBeGreaterThanOrEqual(0);
+      const closePlan = traceLines.slice(openUpdateIndex + 1, closeUpdateIndex).reverse().find((line) =>
+        line.includes("transcript_transition_plan") &&
+        line.includes("replay_displaced_footer_history=false")
+      );
+      expect(closePlan).toContain("planned_rows=0");
+      const closeFrame = traceLines.slice(closeUpdateIndex + 1).find((line) => line.includes("[frame_diff] result"));
+      expect(closeFrame).toMatch(/full_repaint=true invalidation=external_clear/);
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+
+      const replayOutput = execFileSync(SPARK_BIN, ["replay", tapePath, "--json"], {
+        encoding: "utf8",
+      });
+      writeFileSync(join(workDir, "replay.json"), replayOutput);
+      const replay = JSON.parse(replayOutput);
+      expect(replay.frame_count).toBeGreaterThan(0);
+      expect(replay.stdout_bytes).toBeGreaterThan(0);
+    },
+    90_000,
+  );
+
+  test(
+    "slash menu renders its header described rows categories and controls",
+    async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "spark-slash-main-menu-e2e-"));
+      workDirs.push(workDir);
+      const home = join(workDir, "home");
+      const workspace = join(workDir, "workspace");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 100,
+        height: 30,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendKeys("-l '/m'");
+      await session.waitForPane(
+        (pane) => pane.includes("Commands ") && pane.includes("/model"),
+        5_000,
+      );
+
+      const initialGrid = await session.capturePaneGrid();
+      const modelRow = initialGrid.find((line) =>
+        line.includes("/model") && line.includes("choose what model and reasoning effort to use")
+      );
+      expect(modelRow).toBeDefined();
+      expect(modelRow!.trimStart().startsWith("/model")).toBe(true);
+      const metadataColumn = modelRow!.lastIndexOf("Model");
+
+      await session.sendKeys("Down");
+      await session.waitForText(
+        "manage MCP servers and their logins",
+        5_000,
+      );
+      const scrolledGrid = await session.capturePaneGrid();
+      const mcpRow = scrolledGrid.find((line) =>
+        line.includes("/mcp") &&
+        line.includes("manage MCP servers and their logins")
+      );
+      expect(mcpRow).toBeDefined();
+      expect(mcpRow!.indexOf("Extensions")).toBe(metadataColumn);
+      expect(mcpRow!.indexOf("Extensions") + "Extensions".length).toBe(99);
+      expect(modelRow).toContain("Model");
+      expect(scrolledGrid.join("\n")).toContain("↑↓ navigate     enter use     esc close");
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "settings can hide slash menu metadata and persist the choice",
+    async () => {
+      const { home, workspace } = createSkillsMenuFixture();
+      const settingsPath = join(home, ".spark", "settings.json");
+
+      const launch = () =>
+        TmuxSession.create({
+          cwd: workspace,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            SPARK_AUTO_UPGRADE: "0",
+          },
+          width: 100,
+          height: 30,
+        });
+
+      session = await launch();
+      await session.waitForComposer(10_000);
+      await session.sendText("/settings");
+      let grid = await waitForSettingsMenu(session);
+      expect(grid.join("\n")).toContain("Slash menu categories");
+
+      for (let index = 0; index < 3; index += 1) {
+        await session.sendKeys("Down");
+      }
+      await session.sendKeys("Left");
+      await waitForSettingValue(settingsPath, "slash_menu_categories", false);
+      grid = await waitForSettingsMenu(session);
+      expect(grid.join("\n")).toContain("Slash menu categories");
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
+        5_000,
+      );
+      await session.sendLiteralText("/m");
+      await session.waitForPane(
+        (pane) => pane.includes("Results ") && pane.includes("/model"),
+        5_000,
+      );
+      grid = await session.capturePaneGrid();
+      const modelRow = grid.find((line) => line.includes("/model"));
+      const mcpRow = grid.find((line) => line.includes("/mcp"));
+      expect(modelRow).toContain("choose what model and reasoning effort to use");
+      expect(modelRow).not.toContain("Model");
+      expect(mcpRow).toContain(
+        "manage MCP servers and their logins",
+      );
+      expect(mcpRow).not.toContain("Extensions");
+
+      await session.sendKeys("C-u");
+      await session.sendLiteralText("/managed-menu");
+      await session.waitForText("managed menu first line", 5_000);
+      grid = await session.capturePaneGrid();
+      const skillRow = grid.find((line) => line.includes("managed menu first line"));
+      expect(skillRow).toContain("managed-menu");
+      expect(skillRow).not.toContain("global .spark");
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+
+      session = await launch();
+      await session.waitForComposer(10_000);
+      await session.sendLiteralText("/m");
+      await session.waitForPane(
+        (pane) => pane.includes("Results ") && pane.includes("/model"),
+        5_000,
+      );
+      grid = await session.capturePaneGrid();
+      const restartedModelRow = grid.find((line) => line.includes("/model"));
+      const restartedMcpRow = grid.find((line) => line.includes("/mcp"));
+      expect(restartedModelRow).toBeDefined();
+      expect(restartedMcpRow).toBeDefined();
+      expect(restartedModelRow).not.toContain("Model");
+      expect(restartedMcpRow).not.toContain("Extensions");
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "Escape closes slash picker until the slash trigger restarts",
+    async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "spark-slash-escape-e2e-"));
+      workDirs.push(workDir);
+      const home = join(workDir, "home");
+      const workspace = join(workDir, "workspace");
+      const stderrPath = join(workDir, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        stderrPath,
+        width: 100,
+        height: 30,
+      });
+      await session.waitForComposer(10_000);
+
+      const description = "choose what model and reasoning effort to use";
+      await session.sendLiteralText("/mo");
+      await session.waitForText(description, 5_000);
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (pane) => composerContains(pane, "/mo") && !pane.includes(description),
+        5_000,
+      );
+
+      await session.sendLiteralText("d");
+      await session.waitForPane(
+        (pane) => composerContains(pane, "/mod") && !pane.includes(description),
+        5_000,
+      );
+
+      await session.sendKeys("C-u");
+      await session.sendLiteralText("/mo");
+      await session.waitForText(description, 5_000);
+      await session.sendKeys("C-[");
+      await session.waitForPane(
+        (pane) => composerContains(pane, "/mo") && !pane.includes(description),
+        5_000,
+      );
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "slash query lifecycle keeps eligibility projection and submission aligned",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-slash-lifecycle-")));
+      workDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const skillDir = join(home, ".spark", "skills", "resume-helper");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(skillDir, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(
+        join(skillDir, "SKILL.md"),
+        "---\nname: resume-helper\ndescription: resume a named saved workflow\n---\n\nResume helper body\n",
+      );
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        stderrPath,
+        width: 88,
+        height: 24,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendLiteralText("/he");
+      await session.waitForText("/help", 5_000);
+      await session.sendLiteralText("zzzzz");
+      await session.waitForPane(
+        (current) => composerContains(current, "/hezzzzz"),
+        5_000,
+      );
+      await Bun.sleep(100);
+      let pane = await session.capturePane();
+      expect(composerContains(pane, "/hezzzzz")).toBe(true);
+      expect(pane).not.toContain("enter use");
+      expect(pane).not.toContain("no matching slash commands");
+
+      for (let index = 0; index < 5; index++) await session.sendKeys("BSpace");
+      await session.waitForPane(
+        (current) => composerContains(current, "/he") && current.includes("enter use"),
+        5_000,
+      );
+
+      await session.sendKeys("C-u");
+      const absolutePath = "/opt/project/src/main.zig";
+      await session.sendLiteralText(absolutePath);
+      await session.waitForPane(
+        (current) => composerContains(current, absolutePath),
+        5_000,
+      );
+      await Bun.sleep(100);
+      pane = await session.capturePane();
+      expect(pane).not.toContain("no matching slash commands");
+      expect(pane).not.toContain("enter use");
+
+      await session.sendKeys("C-u");
+      await session.sendLiteralText("/name");
+      pane = await session.waitForPane(
+        (current) => current.includes("/rename") && current.includes("resume-helper"),
+        5_000,
+      );
+      expect(pane.indexOf("/rename")).toBeLessThan(pane.indexOf("resume-helper"));
+
+      await session.sendKeys("C-u");
+      await session.pasteText("\n   ");
+      await session.sendLiteralText("/");
+      await session.waitForText("/help", 5_000);
+      await session.sendLiteralText("help");
+      await session.sendKeys("Enter");
+      pane = await session.waitForText("Commands", 5_000);
+      expect(pane).toContain("/help");
+      expect(pane).toContain("enter open");
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && current.includes("-=✦") && !current.includes("Commands"),
+        5_000,
+      );
+      await session.sendLiteralText("/resume ");
+      pane = await session.waitForPane(
+        (current) =>
+          composerContains(current, "/resume") &&
+          !current.includes("resume-helper") &&
+          !current.includes("enter use"),
+        5_000,
+      );
+      expect(pane).not.toContain("no matching slash commands");
+      await session.sendKeys("Enter");
+      await session.waitForText("Sessions 0", 5_000);
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && current.includes("-=✦") && !current.includes("Sessions"),
+        5_000,
+      );
+      for (const retired of ["/appearance", "/input", "/maxxing"]) {
+        await session.sendKeys("C-u");
+        await session.sendLiteralText(retired);
+        await session.waitForPane(
+          (current) => composerContains(current, retired),
+          5_000,
+        );
+        await Bun.sleep(100);
+        pane = await session.capturePane();
+        expect(composerContains(pane, retired)).toBe(true);
+        expect(pane).not.toContain("no matching slash commands");
+        expect(pane).not.toContain("minimal");
+        expect(pane).not.toContain("legacy");
+        expect(pane).not.toContain("resume-helper");
+        expect(session.isAlive()).toBe(true);
+      }
+
+      await session.sendKeys("C-u");
+      await session.pasteText("\n   ");
+      await session.sendLiteralText("/resume-helper");
+      await session.waitForText("enter use", 5_000);
+      await session.sendKeys("Enter");
+      pane = await session.waitForPane(
+        (current) =>
+          current.includes("resume-helper") &&
+          !current.includes("enter use") &&
+          !current.includes("spark needs access to the model connection"),
+        5_000,
+      );
+      expect(composerContains(pane, "resume-helper")).toBe(true);
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "help command filters the catalog and opens selected commands",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-help-menu-")));
+      workDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 100,
+        height: 30,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/help");
+      let grid = await waitForHelpMenu(session, 40);
+      let pane = grid.join("\n");
+      expect(pane).toContain("-=✦");
+      expect(pane).toContain("Run /help for commands");
+      expect(pane).toContain("[All]");
+      expect(pane).toContain("/help");
+      expect(pane).not.toContain("● /help");
+      expect(pane).toContain("show available slash commands");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("tab category");
+      expect(pane).toContain("enter open");
+
+      await session.sendKeys("Tab");
+      grid = await waitForHelpMenu(session, 5);
+      expect(grid.join("\n")).toContain("[General]");
+      await session.sendKeys("BTab");
+      grid = await waitForHelpMenu(session, 40);
+      expect(grid.join("\n")).toContain("[All]");
+
+      await session.sendLiteralText("clipboard");
+      grid = await waitForHelpMenu(session, 1);
+      pane = grid.join("\n");
+      expect(composerContains(pane, "clipboard")).toBe(true);
+      expect(pane).toContain("/paste");
+      expect(pane).not.toContain("/clear");
+
+      await session.sendKeys("C-u");
+      await waitForHelpMenu(session, 40);
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      pane = await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 40"),
+        5_000,
+      );
+      expect(composerContains(pane, "/clear")).toBe(false);
+      expect(capturePaneHistory(session, -1000)).not.toMatch(/[*✓!✗⊘i] help:/);
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendKeys("C-u");
+      await session.sendText("/help");
+      await waitForHelpMenu(session, 40);
+      await session.sendLiteralText("additional directories");
+      await waitForHelpMenu(session, 1);
+      await session.sendKeys("Enter");
+      pane = await session.waitForPane(
+        (current) =>
+          composerContains(current, "/workspace") &&
+          current.includes("list") &&
+          current.includes("add") &&
+          current.includes("-=✦"),
+        5_000,
+      );
+      expect(pane).not.toContain("Commands 1");
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendKeys("C-u");
+      await session.sendText("/help");
+      await waitForHelpMenu(session, 40);
+      await session.sendLiteralText("no command can match this query");
+      await session.waitForText("No commands found.", 5_000);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && current.includes("-=✦") && !current.includes("enter open"),
+        5_000,
+      );
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(10_000)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "settings command opens the inline list and saves selected values",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-settings-menu-")));
+      workDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "workspace-statusline-visible");
+      const settingsPath = join(home, ".spark", "settings.json");
+      mkdirSync(join(home, ".spark"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(
+        settingsPath,
+        `${JSON.stringify({
+          statusLine: { workspace: false },
+        })}\n`,
+      );
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 100,
+        height: 30,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/settings");
+      const grid = await waitForSettingsMenu(session);
+      let pane = grid.join("\n");
+      expect(pane).toContain("-=✦");
+      expect(pane).toContain("Run /help for commands");
+      expect(pane).toContain("Settings");
+      expect(pane).toContain("Interface");
+      expect(pane).toContain("[All]");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("tab category");
+      expect(pane).toContain("←→ change");
+      expect(pane).toContain("esc close");
+      expect(pane).not.toContain("Enter Change");
+
+      expect(pane).not.toContain("Input appearance");
+      expect(pane).not.toContain("Maxxing mode");
+      await session.sendKeys("Tab");
+      pane = (await waitForSettingsMenu(session)).join("\n");
+      expect(pane).toContain("[Interface]");
+      await session.sendKeys("BTab");
+      pane = (await waitForSettingsMenu(session)).join("\n");
+      expect(pane).toContain("[All]");
+      for (let index = 0; index < 2; index += 1) await session.sendKeys("Down");
+      await session.waitForText(/Status line workspace\s+off/, 5_000);
+      await session.sendKeys("Right");
+      await waitForStatuslineValue(settingsPath, "workspace", true);
+
+      await session.sendKeys("Escape");
+      pane = await session.waitForPane(
+        (current) =>
+          hasEmptyComposer(current) &&
+          current.includes("-=✦") &&
+          current.includes("workspace-statusline-visible") &&
+          !current.includes("←→ change"),
+        5_000,
+      );
+      expect(capturePaneHistory(session, -1000)).not.toMatch(/[*✓!✗⊘i] settings:/);
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(10_000)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "compact catalogs keep their actionable rows visible",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-compact-catalogs-")));
+      workDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".spark"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 60,
+        height: 6,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/help");
+      let pane = await session.waitForText("/help", 5_000);
+      expect(pane).toContain("/help");
+      expect(pane).not.toContain("● /help");
+      await session.sendKeys("Escape");
+
+      await session.resizeWindow(60, 7, 500);
+      await session.sendText("/settings");
+      pane = (await waitForSettingsMenu(session)).join("\n");
+      expect(pane).toContain("Status line context");
+      expect(pane).not.toContain("Input appearance");
+      expect(pane).not.toContain("Maxxing mode");
+
+      await session.resizeWindow(60, 9, 500);
+      pane = (await waitForSettingsMenu(session)).join("\n");
+      expect(pane).toContain("Status line context");
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("←→ change"),
+        5_000,
+      );
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "statusline command toggles independent items from a compact inline panel",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-statusline-menu-")));
+      workDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "compact-statusline-workspace");
+      const settingsPath = join(home, ".spark", "settings.json");
+      mkdirSync(join(home, ".spark"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(
+        settingsPath,
+        `${JSON.stringify({
+          statusLine: { sandbox: false, context: false, workspace: false },
+        })}\n`,
+      );
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 100,
+        height: 30,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/statusline");
+      let grid = await waitForStatuslineMenu(session);
+      let pane = grid.join("\n");
+      expect(pane).not.toContain("Sandbox");
+      expect(pane).toContain("Context");
+      expect(pane).toContain("Workspace");
+      expect(pane).toContain("off  on");
+      expect(pane).not.toContain("❯");
+      expect(pane).not.toContain("Choose what appears");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("←→ change");
+
+      await session.sendKeys("Right");
+      grid = await waitForStatuslineMenu(session, "off  on");
+      pane = grid.join("\n");
+      await waitForStatuslineValue(settingsPath, "context", true);
+
+      await session.sendKeys("Down");
+      await session.sendKeys("Right");
+      grid = await waitForStatuslineMenu(session, "Context");
+      pane = grid.join("\n");
+      expect(pane).not.toContain("saved to global settings");
+      expect(pane).not.toMatch(/[*✓!✗⊘i] statusline:/);
+      await waitForStatuslineValue(settingsPath, "session", true);
+
+      await session.sendKeys("Down");
+      await session.sendKeys("Right");
+      grid = await waitForStatuslineMenu(session, "Workspace");
+      pane = grid.join("\n");
+      expect(pane).not.toContain("saved to global settings");
+      await waitForStatuslineValue(settingsPath, "workspace", true);
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) =>
+          hasEmptyComposer(current) &&
+          current.includes("-=✦") &&
+          current.includes("compact-statusline-workspace") &&
+          !current.includes("←→ change"),
+        5_000,
+      );
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendText("/statusline workspace");
+      await session.waitForText("* statusline: workspace: off", 5_000);
+      await waitForStatuslineValue(settingsPath, "workspace", false);
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("compact-statusline-workspace"),
+        5_000,
+      );
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "workspace command opens a compact inline manager and prepares existing commands",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-workspace-menu-")));
+      workDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const shared = join(root, "shared");
+      mkdirSync(join(home, ".spark"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      mkdirSync(shared, { recursive: true });
+      const workspaceRoot = realpathSync(workspace);
+      const sharedRoot = realpathSync(shared);
+      writeFileSync(
+        join(home, ".spark", "settings.json"),
+        `${JSON.stringify({
+          workspaces: {
+            [workspaceRoot]: {
+              additional_directories: [sharedRoot],
+            },
+          },
+        })}\n`,
+      );
+
+      session = await TmuxSession.create({
+        cwd: workspaceRoot,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 30,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/workspace");
+      let grid = await waitForWorkspaceMenu(session);
+      let pane = grid.join("\n");
+      expect(pane).toContain("❯ Add directory…");
+      expect(
+        grid.some((line) => line.includes("Primary") && line.includes("/")),
+      ).toBe(true);
+      expect(
+        grid.some((line) =>
+          line.includes("/") && line.includes("Active · Saved")
+        ),
+      ).toBe(true);
+      expect(pane).toMatch(/Additional directories\s+1 \/ 16/);
+
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "/workspace add") &&
+          !current.includes("enter use"),
+        5_000,
+      );
+
+      await session.sendKeys("C-u");
+      await session.sendText("/workspace");
+      await waitForWorkspaceMenu(session);
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      pane = await session.waitForPane(
+        (current) =>
+          composerContains(current, `/workspace remove ${sharedRoot}`) &&
+          !current.includes("enter use"),
+        5_000,
+      );
+      expect(composerContains(pane, `/workspace remove ${sharedRoot}`)).toBe(true);
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "command and completion menus stay inline with the composer",
+    async () => {
+      const fixture = createSkillsMenuFixture();
+      const tapePath = join(fixture.home, "dollar-inline.fxtape");
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+          SPARK_RECORD: tapePath,
+        },
+        width: 120,
+        height: 32,
+        stderrPath: fixture.stderrPath,
+      });
+      await session.waitForComposer(10_000);
+      const alternateCount = (sequence: string) =>
+        countOccurrences(readFileSync(tapePath).toString("latin1"), sequence);
+      const entersBeforeSkills = alternateCount("\x1b[?1049h");
+      const leavesBeforeSkills = alternateCount("\x1b[?1049l");
+
+      await session.sendKeys("-l '/sk'");
+      await session.waitForText("browse and manage skills", 5_000);
+      let grid = await session.capturePaneGrid();
+      expect(grid.join("\n")).toContain("-=✦");
+      expect(grid.join("\n")).not.toContain("Skills 4");
+      await session.sendKeys("Enter");
+      grid = await waitForSkillsMenu(session, 4);
+      const pane = grid.join("\n");
+      expect(pane).toContain("-=✦");
+      expect(pane).toContain("Run /help for commands");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
+      expect(pane).toContain("[All]");
+      expect(pane).toContain("spark");
+      expect(pane).not.toContain("[Spark]");
+      expect(pane).toContain("Workspace");
+      expect(pane).toContain("Claude");
+      expect(pane).toContain("Codex");
+      expect(pane).toContain("Agents");
+      expect(pane).toContain("managed-menu");
+      expect(pane).toContain("spark · Global");
+      expect(pane).toContain("workspace-menu");
+      expect(pane).toContain("spark · Workspace");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("enter use");
+
+      const deep_history = capturePaneHistory(session, -1000);
+      const tail_history = capturePaneHistory(session, -80);
+      expect(deep_history).not.toContain("Visible skills (");
+      expect(deep_history).not.toContain("skill discovery warning:");
+      expect(leadingBlankLineCount(tail_history)).toBeLessThan(3);
+      expect(tail_history).not.toContain("-=✦ v0.3.7");
+      const escapes = await session.capturePaneEscapes();
+      expect(escapes).not.toContain(`${DIM_SGR}spark-review`);
+      expect(deep_history).not.toMatch(/┃ \/sk/);
+
+      await session.sendLiteralText("work");
+      grid = await waitForSkillsMenu(session, 1);
+      expect(composerContains(grid.join("\n"), "work")).toBe(true);
+      expect(grid.join("\n")).toContain("workspace-menu");
+      expect(grid.join("\n")).not.toContain("managed menu second line");
+
+      await session.sendKeys("C-[");
+      await session.waitForPane(
+        (current) =>
+          hasEmptyComposer(current) &&
+          current.includes("-=✦") &&
+          !current.includes("↑↓ navigate"),
+        5_000,
+      );
+
+      const entersBeforeDollar = alternateCount("\x1b[?1049h");
+      const leavesBeforeDollar = alternateCount("\x1b[?1049l");
+
+      await session.sendLiteralText("$work");
+      grid = await waitForSkillsMenu(session, 1);
+      expect(composerContains(grid.join("\n"), "$work")).toBe(true);
+      expect(grid.join("\n")).toContain("-=✦");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeDollar);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeDollar);
+      await session.sendKeys("C-[");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "$work") &&
+          current.includes("-=✦") &&
+          !current.includes("↑↓ navigate"),
+        5_000,
+      );
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeDollar);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeDollar);
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText(" $");
+      grid = await waitForSkillsMenu(session, 4);
+      expect(composerContains(grid.join("\n"), " $")).toBe(true);
+      await session.sendKeys("C-[");
+      await session.waitForPane(
+        (current) => composerContains(current, " $") && !current.includes("Skills 4"),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText("hello $");
+      grid = await waitForSkillsMenu(session, 4);
+      expect(composerContains(grid.join("\n"), "hello $")).toBe(true);
+      await session.sendKeys("C-[");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "hello $") &&
+          current.includes("-=✦") &&
+          !current.includes("Skills 4"),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText("price$");
+      grid = await waitForSkillsMenu(session, 4);
+      expect(composerContains(grid.join("\n"), "price$")).toBe(true);
+      await session.sendKeys("C-[");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "price$") &&
+          !current.includes("Skills 4"),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText("explain $man");
+      grid = await waitForSkillsMenu(session, 1);
+      expect(composerContains(grid.join("\n"), "explain $man")).toBe(true);
+      expect(await session.capturePaneEscapes()).not.toContain(`${DIM_SGR}aged-menu`);
+
+      await session.sendLiteralText("zzzzzz");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "explain $manzzzzzz") &&
+          !current.includes("Skills ") &&
+          !current.includes("No skills found.") &&
+          !current.includes("enter use"),
+        5_000,
+      );
+
+      await session.sendKeys("BSpace BSpace BSpace BSpace BSpace BSpace");
+      grid = await waitForSkillsMenu(session, 1);
+      expect(composerContains(grid.join("\n"), "explain $man")).toBe(true);
+
+      await session.sendKeys("C-[");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "explain $man") &&
+          !current.includes("Skills "),
+        5_000,
+      );
+      await session.sendLiteralText("x");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "explain $manx") &&
+          !current.includes("Skills ") &&
+          !current.includes("aged-menu"),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText("prefix$man");
+      grid = await waitForSkillsMenu(session, 1);
+      expect(composerContains(grid.join("\n"), "prefix$man")).toBe(true);
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "prefixmanaged-menu") &&
+          !current.includes("Skills "),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText("explain /sk");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "explain /skills") &&
+          !current.includes("browse and manage skills") &&
+          !current.includes("Skills 4"),
+        5_000,
+      );
+      let inlineEscapes = await session.capturePaneEscapes();
+      expect(inlineEscapes).toContain(`${DIM_SGR}ills`);
+
+      await session.sendKeys("C-[");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "explain /sk") &&
+          !current.includes("explain /skills"),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText("explain /sk");
+      await session.waitForPane(
+        (current) => composerContains(current, "explain /skills"),
+        5_000,
+      );
+      await session.sendKeys("Tab");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "explain /skills") &&
+          !current.includes("browse and manage skills") &&
+          !current.includes("Skills 4"),
+        5_000,
+      );
+      inlineEscapes = await session.capturePaneEscapes();
+      expect(inlineEscapes).not.toContain(`${DIM_SGR}ills`);
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText("explain /he");
+      await session.waitForPane(
+        (current) => composerContains(current, "explain /help"),
+        5_000,
+      );
+      await session.sendKeys("Right");
+      await session.waitForPane(
+        (current) =>
+          composerContains(current, "explain /help") &&
+          !current.includes("show available slash commands"),
+        5_000,
+      );
+      inlineEscapes = await session.capturePaneEscapes();
+      expect(inlineEscapes).not.toContain(`${DIM_SGR}lp`);
+      await session.sendKeys("C-u");
+
+      await session.sendText("/skills");
+      await waitForSkillsMenu(session, 4);
+      await session.sendKeys("Tab");
+      await session.waitForText("[spark]", 5_000);
+      await session.sendKeys("BTab");
+      await session.waitForText("[All]", 5_000);
+      await session.sendLiteralText("workspace");
+      await waitForSkillsMenu(session, 1);
+      await session.sendKeys("Enter");
+      grid = await session.capturePaneGrid();
+      expect(composerContains(grid.join("\n"), "workspace-menu")).toBe(true);
+      expect(grid.join("\n")).toContain("-=✦");
+      expect(grid.join("\n")).not.toContain("↑↓ navigate");
+      expect(capturePaneHistory(session, -1000)).not.toContain("Unknown command");
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendKeys("C-u");
+      await session.sendText("/skills");
+      await waitForSkillsMenu(session, 4);
+      await session.sendKeys("Tab");
+      await session.sendKeys("Tab");
+      await session.sendKeys("Tab");
+      await session.sendKeys("Tab");
+      grid = await session.capturePaneGrid();
+      const codexPane = grid.join("\n");
+      expect(codexPane).toContain("[Codex]");
+      expect(codexPane).toContain("codex-menu");
+      expect(codexPane).toContain("Codex · Global");
+
+      await session.sendKeys("C-[");
+      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
+
+      await session.sendText("/help");
+      grid = await waitForHelpMenu(session, 40);
+      expect(grid.join("\n")).toContain("Run /help for commands");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("enter open"),
+        5_000,
+      );
+
+      await session.sendText("/settings");
+      grid = await waitForSettingsMenu(session);
+      expect(grid.join("\n")).toContain("Run /help for commands");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("←→ change"),
+        5_000,
+      );
+
+      await session.sendText("/resume");
+      await session.waitForText("Sessions 0", 5_000);
+      grid = await session.capturePaneGrid();
+      expect(grid.join("\n")).toContain("Run /help for commands");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("enter resume"),
+        5_000,
+      );
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "large skills list moves through visible rows before scrolling",
+    async () => {
+      const fixture = createManySkillsMenuFixture(220);
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 28,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendLiteralText("$");
+      let grid = await waitForSkillsMenu(session, 220);
+      const initialNames = visibleFxSkillNames(grid);
+      expect(initialNames).toHaveLength(6);
+
+      for (let i = 0; i < initialNames.length - 1; i += 1) {
+        await session.sendKeys("Down");
+      }
+
+      grid = await session.capturePaneGrid();
+      expect(visibleFxSkillNames(grid)[0]).toBe(initialNames[0]);
+      expect(selectedSkillName(await session.capturePaneEscapes())).toBe(
+        initialNames[initialNames.length - 1],
+      );
+
+      await session.resizeWindow(72, 16);
+      grid = await waitForSkillsMenu(session, 220);
+      expect(visibleFxSkillNames(grid)).toHaveLength(4);
+      expect(selectedSkillName(await session.capturePaneEscapes())).toBe(
+        initialNames[initialNames.length - 1],
+      );
+
+      await session.resizeWindow(120, 28);
+      grid = await waitForSkillsMenu(session, 220);
+      expect(visibleFxSkillNames(grid)).toHaveLength(6);
+      expect(selectedSkillName(await session.capturePaneEscapes())).toBe(
+        initialNames[initialNames.length - 1],
+      );
+
+      await session.sendKeys("Down");
+      grid = await session.capturePaneGrid();
+      expect(visibleFxSkillNames(grid)[0]).toBe(initialNames[1]);
+
+      await session.sendKeys("Up");
+      grid = await session.capturePaneGrid();
+      expect(visibleFxSkillNames(grid)[0]).toBe(initialNames[1]);
+      expect(selectedSkillName(await session.capturePaneEscapes())).toBe(
+        initialNames[initialNames.length - 1],
+      );
+      expect(session.isAlive()).toBe(true);
+      expect(capturePaneHistory(session, -1000)).not.toContain("Unknown command");
+
+      await session.sendKeys("C-[");
+      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model Enter opens an inline provider catalog and selects through the existing model flow",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const currentModel = "anthropic/claude-opus-4.8";
+      const selectedModel = "private-team/plain-model";
+      gateway = startFakeGateway([], {
+        models: [
+          {
+            id: currentModel,
+            type: "language",
+            released: 400,
+            tags: ["reasoning", "tool-use", "vision", "file-input", "web-search"],
+            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
+            fast_options: [{ type: "toggle" }],
+            context_window: 1_000_000,
+            max_tokens: 32_000,
+          },
+          {
+            id: "openai/gpt-5.4",
+            type: "language",
+            released: 300,
+            tags: ["reasoning", "tool-use"],
+            context_window: 400_000,
+            max_tokens: 64_000,
+          },
+          {
+            id: "google/gemini-3-pro",
+            type: "language",
+            released: 200,
+            tags: ["tool-use", "vision"],
+            context_window: 2_000_000,
+          },
+          {
+            id: selectedModel,
+            type: "language",
+            released: 100,
+            tags: ["tool-use"],
+            context_window: 128_000,
+          },
+        ],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-models-menu-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          SPARK_MODEL: currentModel,
+          SPARK_AUTO_UPGRADE: "0",
+          SPARK_RECORD: fixture.tapePath,
+          SPARK_RECORD_INPUT: "1",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
+
+      const alternateCount = (sequence: string) =>
+        countOccurrences(readFileSync(fixture.tapePath).toString("latin1"), sequence);
+      const entersBeforeModelMenu = alternateCount("\x1b[?1049h");
+      const leavesBeforeModelMenu = alternateCount("\x1b[?1049l");
+
+      await session.sendLiteralText("/mode");
+      await session.sendKeys("Enter");
+      await waitForModelsMenu(session, 4);
+      expect(await session.captureFullScrollback()).not.toContain(`* model: ${currentModel}`);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("tab provider"),
+        5_000,
+      );
+
+      await session.sendLiteralText("/model");
+      await session.sendKeys("Tab");
+      const stagedPane = await session.waitForPane(
+        (current) =>
+          composerContains(current, "/model") &&
+          current.includes(currentModel) &&
+          !current.includes("tab provider"),
+        5_000,
+      );
+      expect(stagedPane).not.toContain("Models 4");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeModelMenu);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeModelMenu);
+      await session.sendKeys("Escape");
+      await session.sendKeys("C-u");
+      await session.waitForPane(hasEmptyComposer, 5_000);
+
+      await session.sendText("/model");
+      let grid = await waitForModelsMenu(session, 4);
+      let pane = grid.join("\n");
+      expect(pane).toContain("-=✦");
+      expect(pane).toContain("Run /help for commands");
+      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeModelMenu);
+      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeModelMenu);
+      expect(pane).toContain("[All]");
+      expect(pane).toContain("Anthropic");
+      expect(pane).toContain("OpenAI");
+      expect(pane).toContain("Others");
+      expect(pane).not.toContain("xAI");
+      expect(pane).not.toContain("Z.AI");
+      expect(pane).toContain(currentModel);
+      expect(pane).toContain("1M context   32K output   Fast mode");
+      expect(pane).toContain("Note: Gateway catalog is authenticated with an API key");
+      const headerRow = grid.findIndex((line) => line.includes("Models 4"));
+      const firstModelRow = grid.findIndex((line) => line.includes("openai/gpt-5.4"));
+      const lastModelRow = grid.findIndex((line) => line.includes(selectedModel));
+      const statusRow = grid.findIndex((line) =>
+        line.includes("Note: Gateway catalog is authenticated with an API key")
+      );
+      const currentRow = grid[firstModelRow + 1]!;
+      const openaiRow = grid[firstModelRow]!;
+      // Facts start three cells after the longest id, and numbers align on
+      // the right, so every `context` label shares one column.
+      const currentFactsColumn = currentRow.indexOf(" context");
+      const openaiFactsColumn = openaiRow.indexOf(" context");
+      const currentNameEnd = currentRow.indexOf(currentModel) + currentModel.length;
+      expect(firstModelRow).toBe(headerRow + 2);
+      expect(statusRow).toBe(lastModelRow + 2);
+      expect(openaiRow.indexOf("400K context") - currentNameEnd).toBe(3);
+      expect(openaiFactsColumn).toBe(currentFactsColumn);
+      expect(pane).not.toContain("Authenticated model catalog loaded.");
+      expect(pane).not.toContain("Current");
+      expect(pane).not.toContain("Reasoning");
+      expect(pane).toContain("↑↓ navigate");
+      expect(pane).toContain("tab provider");
+
+      await session.sendKeys("Tab");
+      grid = await waitForModelsMenu(session, 1);
+      expect(grid.join("\n")).toContain("[Anthropic]");
+
+      await session.sendKeys("BTab");
+      await waitForModelsMenu(session, 4);
+      await session.sendLiteralText("no-such-model");
+      await session.waitForText("No models found.", 5_000);
+      await session.sendKeys("C-u");
+      await waitForModelsMenu(session, 4);
+      await session.sendLiteralText("gemini");
+      grid = await waitForModelsMenu(session, 1);
+      pane = grid.join("\n");
+      expect(composerContains(pane, "gemini")).toBe(true);
+      expect(pane).toContain("google/gemini-3-pro");
+      expect(pane).not.toContain("openai/gpt-5.4");
+
+      await session.sendKeys("C-[");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && current.includes("-=✦") && !current.includes("tab provider"),
+        5_000,
+      );
+
+      await session.sendText("/model");
+      await waitForModelsMenu(session, 4);
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (current) => composerContains(current, `/model ${currentModel}`) && current.includes("default"),
+        5_000,
+      );
+      expect((JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } }).models?.gateway).toBeUndefined();
+      await session.sendKeys("C-u");
+      await session.waitForPane(hasEmptyComposer, 5_000);
+
+      await session.sendText("/model");
+      await waitForModelsMenu(session, 4);
+      await session.sendKeys("Down");
+      await session.sendKeys("Down");
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText(`* Switched to ${selectedModel}`, 5_000);
+
+      const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
+      expect(settings.models?.gateway).toBe(selectedModel);
+      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+      expect(existsSync(fixture.tapePath)).toBe(true);
+      const replay = JSON.parse(
+        execFileSync(SPARK_BIN, ["replay", fixture.tapePath, "--json"], { encoding: "utf8" }),
+      ) as { frame_count: number; stdout_bytes: number };
+      expect(replay.frame_count).toBeGreaterThan(0);
+      expect(replay.stdout_bytes).toBeGreaterThan(0);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "Ctrl+P opens the model picker and returns the draft untouched",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const currentModel = "private-team/staged-model";
+      const selectedModel = "private-team/plain-model";
+      gateway = startFakeGateway([], {
+        models: [
+          {
+            id: currentModel,
+            type: "language",
+            released: 200,
+            tags: ["reasoning", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
+            fast_options: [{ type: "toggle" }],
+            context_window: 1_000_000,
+            max_tokens: 32_000,
+          },
+          {
+            id: selectedModel,
+            type: "language",
+            released: 100,
+            tags: ["tool-use"],
+            context_window: 128_000,
+          },
+        ],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-model-shortcut-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          SPARK_MODEL: currentModel,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendLiteralText("hello draft");
+      await session.sendKeys("Left");
+      await session.sendKeys("Left");
+      await session.sendKeys("Left");
+
+      await session.sendKeys("C-p");
+      let grid = await waitForModelsMenu(session, 2);
+      let pane = grid.join("\n");
+      expect(pane).toContain("[All]");
+      expect(pane).toContain("tab provider");
+      expect(pane).not.toContain("hello draft");
+      expect(hasEmptyComposer(pane)).toBe(true);
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => composerContains(current, "hello draft") && !current.includes("tab provider"),
+        5_000,
+      );
+      // The cursor is restored with the text: typing lands mid-draft.
+      await session.sendLiteralText("X");
+      await session.waitForPane(
+        (current) => composerContains(current, "hello drXaft"),
+        5_000,
+      );
+
+      // A model without effort or Fast options applies on Enter and returns
+      // the draft.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 2);
+      await session.sendLiteralText("plain");
+      await session.waitForPane(
+        (current) => current.includes(selectedModel) && !current.includes(currentModel),
+        5_000,
+      );
+      await session.sendKeys("Enter");
+      await session.waitForText(`* Switched to ${selectedModel}`, 5_000);
+      pane = await session.capturePane();
+      expect(composerContains(pane, "hello drXaft")).toBe(true);
+      expect(composerContains(pane, "/model")).toBe(false);
+
+      const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
+      expect(settings.models?.gateway).toBe(selectedModel);
+
+      // A model with effort and Fast options continues into the same inline
+      // stages /model offers, and the draft returns once the model applies.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 2);
+      await session.sendLiteralText("staged");
+      // The transcript already names the plain model; only its catalog row
+      // must be filtered out.
+      await session.waitForPane(
+        (current) =>
+          current.includes(currentModel) &&
+          !current.split("\n").some((line) => line.includes(selectedModel) && !line.includes("Switched to")),
+        5_000,
+      );
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (current) => composerContains(current, `/model ${currentModel}`) && current.includes("xhigh"),
+        5_000,
+      );
+      pane = await session.capturePane();
+      expect(composerContains(pane, "hello drXaft")).toBe(false);
+      await session.sendLiteralText("xhigh");
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (current) => composerContains(current, `/model ${currentModel} xhigh`) && current.includes("normal"),
+        5_000,
+      );
+      await session.sendLiteralText("normal");
+      await session.sendKeys("Enter");
+      await session.waitForText(`* Switched to ${currentModel}`, 5_000);
+      await session.waitForPane((current) => composerContains(current, "hello drXaft"), 5_000);
+      pane = await session.capturePane();
+      expect(composerContains(pane, "/model")).toBe(false);
+
+      const staged = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as {
+        models?: { gateway?: string };
+        effort?: string;
+        fast_mode?: boolean;
+      };
+      expect(staged.models?.gateway).toBe(currentModel);
+      expect(staged.effort).toBe("xhigh");
+      expect(staged.fast_mode).toBe(false);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      // The restored cursor sits mid-draft; clear the whole line before /quit.
+      await session.sendKeys("C-e");
+      await session.sendKeys("C-u");
+      await session.waitForPane(hasEmptyComposer, 5_000);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker revalidates the catalog so a model released mid-session appears without a restart",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const currentModel = "acme/original-model";
+      const releasedModel = "acme/released-model";
+      const catalog = [
+        { id: currentModel, type: "language", released: 100, tags: ["tool-use"] },
+        { id: "acme/second-model", type: "language", released: 90, tags: ["tool-use"] },
+      ];
+      gateway = startFakeGateway([], { models: () => catalog });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-models-refresh-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          SPARK_MODEL: currentModel,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+      const closePicker = async () => {
+        await session!.sendKeys("Escape");
+        await session!.waitForPane((current) => !current.includes("tab provider"), 5_000);
+      };
+
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 2);
+      await closePicker();
+      // Wait out the picker's reopen floor first, so a revalidation from a
+      // slow startup's first open has landed before the baseline is read.
+      await Bun.sleep(5_500);
+      const requestsAfterStartup = gateway.modelRequests.length;
+
+      // The gateway ships a model while spark runs. Opening the picker lists the
+      // cached models and revalidates in the background; the open menu then
+      // picks up the new model.
+      catalog.unshift({ id: releasedModel, type: "language", released: 200, tags: ["tool-use"] });
+      await session.sendKeys("C-p");
+      const grid = await waitForModelsMenu(session, 3);
+      expect(grid.join("\n")).toContain(releasedModel);
+      expect(gateway.modelRequests.length).toBe(requestsAfterStartup + 1);
+
+      // Reopening right away reuses the catalog it just fetched.
+      await closePicker();
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 3);
+      expect(gateway.modelRequests.length).toBe(requestsAfterStartup + 1);
+
+      await closePicker();
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model inline catalog keeps shared-prefix ids distinguishable at narrow widths",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const modelIds = [
+        "provider/very-long-shared-family-production-reasoning-alpha",
+        "provider/very-long-shared-family-production-reasoning-beta",
+        "provider/very-long-shared-family-production-reasoning-gamma",
+        "provider/very-long-shared-family-production-reasoning-delta",
+      ];
+      gateway = startFakeGateway([], {
+        models: modelIds.map((id, index) => ({
+          id,
+          type: "language",
+          released: modelIds.length - index,
+          tags: ["reasoning"],
+          context_window: 128_000,
+        })),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-models-menu-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          SPARK_MODEL: modelIds[0],
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 40,
+        height: 24,
+        stderrPath: fixture.stderrPath,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/model");
+      const pane = (await waitForModelsMenu(session, modelIds.length)).join("\n");
+      for (const suffix of ["alpha", "beta", "gamma", "delta"]) {
+        expect(pane).toContain(`ing-${suffix}`);
+      }
+      const rows = pane
+        .split("\n")
+        .filter((line) => line.includes("ing-"))
+        .map((line) => stripAnsi(line).trim());
+      expect(new Set(rows).size).toBe(modelIds.length);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker leaves out a fast variant that Fast mode on a listed model runs",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const baseModel = "anthropic/claude-opus-5";
+      const foldedModel = `${baseModel}-fast`;
+      const plainModel = "provider/plain";
+      const keptModel = `${plainModel}-fast`;
+      gateway = startFakeGateway([], {
+        models: [
+          {
+            id: baseModel,
+            type: "language",
+            released: 400,
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+            context_window: 1_000_000,
+          },
+          {
+            id: foldedModel,
+            type: "language",
+            released: 400,
+            tags: ["tool-use"],
+            context_window: 1_000_000,
+            fast_variant_of: baseModel,
+          },
+          {
+            id: plainModel,
+            type: "language",
+            released: 200,
+            tags: ["tool-use"],
+            context_window: 128_000,
+          },
+          // Its base has no Fast mode, so this row is the only way to run it.
+          {
+            id: keptModel,
+            type: "language",
+            released: 200,
+            tags: ["tool-use"],
+            context_window: 128_000,
+            fast_variant_of: plainModel,
+          },
+        ],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-model-picker-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          SPARK_MODEL: plainModel,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/model");
+      const grid = await waitForModelsMenu(session, 3);
+      const rows = grid.filter((line) => line.includes(" context"));
+      expect(rows.map((line) => line.trim().split(/\s+/)[0])).toEqual([baseModel, plainModel, keptModel]);
+      expect(rows[0]).toContain("Fast mode");
+      expect(rows[2]).toMatch(/\bFast$/);
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && !current.includes("tab provider"),
+        5_000,
+      );
+
+      // The left-out model is still in the catalog, so its id selects it.
+      await session.sendLiteralText(`/model ${foldedModel}`);
+      await session.sendKeys("Enter");
+      await session.waitForText(`* Switched to ${foldedModel}`, 5_000);
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(foldedModel);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker skips effort stage for reasoning models without declared tiers",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const selectedModel = "deepseek/deepseek-v4-pro-0813";
+      gateway = startFakeGateway([], {
+        models: [
+          {
+            id: selectedModel,
+            type: "language",
+            released: 100,
+            tags: ["reasoning", "tool-use"],
+            context_window: 128_000,
+          },
+        ],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-model-picker-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          SPARK_MODEL: "openai/gpt-4o",
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendLiteralText("/model ");
+      await session.waitForText(selectedModel, 10_000);
+      await session.sendLiteralText(selectedModel);
+      await session.sendKeys("Enter");
+      await session.waitForText(`* Switched to ${selectedModel}`, 5_000);
+
+      const pane = (await session.capturePaneGrid()).join("\n");
+      expect(hasEmptyComposer(pane)).toBe(true);
+      expect(pane).not.toContain("Reasoning effort");
+      expect(pane).toContain(`Switched to ${selectedModel} (effort: default, speed: normal)`);
+      expect(pane.split("\n").find((line) => line.startsWith("auto · "))).toBe("auto · deepseek-v4-pro-0813");
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(selectedModel);
+      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model completion lists newer model versions first",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      // The Gateway lists models oldest first. The newest models fill the
+      // picker's highlight slots, so the sol models keep the catalog's order.
+      const catalog: Array<[string, number]> = [
+        ["openai/gpt-5.6-sol", 100],
+        ["openai/gpt-5.6-sol-fast", 100],
+        ["openai/gpt-6-sol", 200],
+        ["openai/gpt-6-sol-fast", 200],
+        ["openai/gpt-6.1-sol", 300],
+        ["openai/gpt-6.1-sol-fast", 300],
+        ["openai/gpt-6.1-terra", 400],
+        ["openai/gpt-6.1-terra-fast", 400],
+      ];
+      gateway = startFakeGateway([], {
+        models: catalog.map(([id, released]) => ({
+          id,
+          type: "language",
+          released,
+          tags: ["tool-use"],
+          context_window: 400_000,
+        })),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-model-order-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          SPARK_MODEL: "openai/gpt-6.1-terra",
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      const solRows = (pane: string) =>
+        pane
+          .split("\n")
+          .filter((line) => !isComposerLine(line))
+          .map((line) => line.trim().split(/\s+/)[0] ?? "")
+          .filter((id) => /^openai\/gpt-[\d.]+-sol/.test(id));
+
+      await session.sendLiteralText("/model sol");
+      const pane = await session.waitForPane((current) => solRows(current).length === 6, 10_000);
+      expect(solRows(pane)).toEqual([
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-sol-fast",
+        "openai/gpt-6-sol",
+        "openai/gpt-6-sol-fast",
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-sol-fast",
+      ]);
+
+      await session.sendKeys("C-u");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && solRows(current).length === 0,
+        5_000,
+      );
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker completes every stage while a turn is in flight",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const currentModel = "anthropic/claude-opus-4.8";
+      const fastOnlyModel = "provider/fast-only-model";
+      const held = heldFakeGatewayFinalText();
+      gateway = startFakeGateway([held.response], {
+        models: [
+          {
+            id: currentModel,
+            type: "language",
+            released: 100,
+            tags: ["reasoning", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
+            fast_options: [{ type: "toggle" }],
+            context_window: 1_000_000,
+            max_tokens: 32_000,
+          },
+          {
+            id: fastOnlyModel,
+            type: "language",
+            released: 90,
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+            context_window: 128_000,
+          },
+        ],
+      });
+
+      try {
+        session = await TmuxSession.create({
+          cwd: fixture.workspace,
+          stderrPath: fixture.stderrPath,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-in-flight-model-picker-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+            SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+            SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            SPARK_MODEL: currentModel,
+            SPARK_AUTO_UPGRADE: "0",
+          },
+          width: 120,
+          height: 32,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("Keep this model turn active.");
+        await session.waitForText("Thinking", 10_000);
+
+        await session.sendLiteralText("/model");
+        await session.sendKeys("Tab");
+        await session.waitForPane(
+          (pane) => pane.split("\n").some((line) =>
+            !isComposerLine(line) && line.includes(currentModel)
+          ),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForPane(
+          (pane) => pane.includes("default") && pane.includes("xhigh"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForPane(
+          (pane) => pane.includes("normal") && pane.includes("fast"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForText(`Next turn will use ${currentModel}`, 5_000);
+
+        await session.sendLiteralText(`/model ${fastOnlyModel}`);
+        await session.sendKeys("Enter");
+        await session.waitForPane(
+          (pane) => pane.includes("normal") && pane.includes("fast"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForText(`Next turn will use ${fastOnlyModel}`, 5_000);
+
+        expect(gateway.requests).toHaveLength(1);
+        held.release("IN_FLIGHT_MODEL_PICKER_COMPLETE");
+        await session.waitForText("IN_FLIGHT_MODEL_PICKER_COMPLETE", 10_000);
+        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        held.dispose();
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a team without Token Pass sees nothing about Token Pass and keeps the built-in default and Fast mode",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-no-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      gateway = startFakeGateway([fakeGatewayFinalText("PLAIN_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => false),
+        titleResponses: [fakeGatewayFinalText("Plain title")],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      await waitForTokenPassAnswer(tracePath, "no_pass");
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("no_pass");
+
+      // The session starts on the built-in default.
+      await session.sendText("Hello.");
+      await session.waitForText("PLAIN_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["spacexai/grok-4.7"]);
+
+      // The catalog's order, no headings, no tags, and Fast mode.
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      const row = (model: string) => menu.find((line) => !isComposerLine(line) && line.includes(model)) ?? "";
+      expect(menu.join("\n")).not.toContain("Token Pass");
+      expect(menu.join("\n")).not.toContain("All Models");
+      expect(row("zai/glm-5.3")).toContain("200K context   Fast mode");
+      expect(row("deepseek/deepseek-v4.1-flash")).toContain("128K context   Fast mode");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+
+      // A Token Pass model starts its speed stage on Fast, as any model
+      // that offers Fast mode does, with no warning.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 4);
+      await session.sendLiteralText("glm");
+      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes("zai/glm-5.3")), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => composerContains(pane, "/model zai/glm-5.3") && pane.includes("high"), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => pane.includes("normal") && pane.includes("fast"), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText("Switched to zai/glm-5.3 (effort: default, speed: fast)", 5_000);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).not.toContain("Token Pass");
+      expect(gateway.titleRequests.map(chatModelOf)).toEqual(["openai/gpt-5.6-luna"]);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a team with Token Pass starts on the Token Pass default, sees its models first without Fast mode, and stays on Token Pass credit",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-token-pass-picker-key";
+      const tracePath = join(fixture.home, "trace.log");
+      const fastWarning = "Fast mode bills AI Gateway credits, not Token Pass. Run /fast off to use Token Pass credit.";
+      // The team loses its pass with the 403 below, and its catalog loses
+      // the marks with it.
+      let denied = false;
+      gateway = startFakeGateway([
+        fakeGatewayFinalText("TOKEN_PASS_REPLY"),
+        () => {
+          denied = true;
+          return Response.json(
+            { error: { message: "This request requires an active Vercel Token Pass.", type: "no_providers_available" } },
+            { status: 403 },
+          );
+        },
+      ], {
+        models: markedPickerModels(() => !denied),
+        usage: tokenPassCredits(() => true),
+        titleResponses: [fakeGatewayFinalText("Token Pass title")],
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      // The first prompt goes out on the Token Pass default. The catalog does
+      // not mark GLM 5.3 Flash, spark's Token Pass title model, so the title
+      // keeps spark's usual model.
+      await session.sendText("Use Token Pass.");
+      await session.waitForText("TOKEN_PASS_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
+      const titleDeadline = Date.now() + 5_000;
+      while (gateway.titleRequests.length === 0 && Date.now() < titleDeadline) await Bun.sleep(50);
+      expect(gateway.titleRequests.map(chatModelOf)).toEqual(["openai/gpt-5.6-luna"]);
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("has_pass");
+      // spark starts the model for this run only: nothing in settings chose it.
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models).toBeUndefined();
+
+      // Token Pass models lead under their own heading, without Fast mode;
+      // the others keep it.
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      const row = (model: string) => menu.find((line) => !isComposerLine(line) && line.includes(model)) ?? "";
+      expect(menu.some((line) => /^\s*Token Pass\s+2\s*$/.test(line))).toBe(true);
+      expect(menu.some((line) => /^\s*All Models\s+2\s*$/.test(line))).toBe(true);
+      expect(row("zai/glm-5.3")).toContain("200K context");
+      expect(row("zai/glm-5.3")).not.toContain("Fast");
+      expect(row("deepseek/deepseek-v4.1-flash")).not.toContain("Fast");
+      expect(row("provider/fast-model")).toContain("128K context   Fast mode");
+      expect(row("zai/glm-5.3").indexOf(" context")).toBe(row("provider/plain-model").indexOf(" context"));
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+
+      // A Token Pass model has no speed stage: the pick sets normal speed.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 4);
+      await session.sendLiteralText("glm");
+      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes("zai/glm-5.3")), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => composerContains(pane, "/model zai/glm-5.3") && pane.includes("high"), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText("Switched to zai/glm-5.3 (effort: default, speed: normal)", 5_000);
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).fast_mode).toBe(false);
+
+      // Fast mode is still there by command, with a warning.
+      await session.sendText("/fast on");
+      await session.waitForText(fastWarning, 5_000);
+      await session.sendText("/fast off");
+      const fastDeadline = Date.now() + 5_000;
+      while (JSON.parse(readFileSync(fixture.settingsPath, "utf8")).fast_mode !== false && Date.now() < fastDeadline) await Bun.sleep(50);
+
+      // AI Gateway says the team has no active Token Pass: spark forgets it,
+      // and the menu has no Token Pass heading.
+      await session.sendText("Use Token Pass again.");
+      await session.waitForText("requires an active Vercel Token Pass", 10_000);
+      await session.waitForText("press Esc", 5_000);
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("press Esc"), 5_000);
+      await session.sendKeys("C-u");
+      await session.sendKeys("C-p");
+      const plain = await waitForModelsMenu(session, 4);
+      expect(plain.join("\n")).not.toContain("All Models");
+      // The transcript's Token Pass default line also names the model; read
+      // the picker's row.
+      expect(plain.find((line) => !isComposerLine(line) && !line.includes("Token Pass is active") && line.includes("deepseek/deepseek-v4.1-flash"))).toContain("Fast mode");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+
+      expect(gateway.requests).toHaveLength(2);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a saved Token Pass answer starts the session on the Token Pass default at once, and a new check replaces it",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-saved-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      writeFileSync(
+        join(fixture.home, ".spark", "token-pass.json"),
+        JSON.stringify({ teams: { [tokenPassIdentity(apiKey)]: "has_pass" } }),
+      );
+      let creditsAnsweredAt = 0;
+      const reply = tokenPassCredits(() => false, 3_000);
+      gateway = startFakeGateway([fakeGatewayFinalText("SAVED_REPLY"), fakeGatewayFinalText("AFTER_CHECK_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: (url) => {
+          const answer = reply(url);
+          return answer instanceof Promise ? answer.then((response) => { creditsAnsweredAt = Date.now(); return response; }) : answer;
+        },
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      // The saved answer decides the model while the check is still out.
+      await session.sendText("Use the saved answer.");
+      await session.waitForText("SAVED_REPLY", 10_000);
+      expect(creditsAnsweredAt).toBe(0);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
+
+      // The check then says the team has no Token Pass: spark saves that and
+      // drops the headings, and the session keeps the model it started on.
+      await waitForTokenPassAnswer(tracePath, "no_pass");
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("no_pass");
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      expect(menu.join("\n")).not.toContain("All Models");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      await session.sendText("Keep going.");
+      await session.waitForText("AFTER_CHECK_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash"]);
+      // Only a saved answer ever said the team has Token Pass, so the
+      // transcript never did.
+      expect(await session.captureFullScrollback()).not.toContain("Token Pass is active");
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a saved Token Pass answer the check says has ended moves the session back without saying Token Pass is active",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-ended-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      writeFileSync(
+        join(fixture.home, ".spark", "token-pass.json"),
+        JSON.stringify({ teams: { [tokenPassIdentity(apiKey)]: "has_pass" } }),
+      );
+      gateway = startFakeGateway([fakeGatewayFinalText("ENDED_PASS_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => false, 1_000),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      // The team's pass has ended: the check's answer moves the session back
+      // to the built-in default before the first prompt.
+      await waitForTokenPassAnswer(tracePath, "no_pass");
+      await session.waitForPane((pane) => pane.includes("grok-4.7"), 10_000);
+      await session.sendText("Use the built-in default.");
+      await session.waitForText("ENDED_PASS_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["spacexai/grok-4.7"]);
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("no_pass");
+      expect(await session.captureFullScrollback()).not.toContain("Token Pass is active");
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a saved Token Pass answer the check confirms says Token Pass is active once",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-confirmed-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      writeFileSync(
+        join(fixture.home, ".spark", "token-pass.json"),
+        JSON.stringify({ teams: { [tokenPassIdentity(apiKey)]: "has_pass" } }),
+      );
+      gateway = startFakeGateway([fakeGatewayFinalText("CONFIRMED_PASS_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => true, 1_000),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      const notice = "Token Pass is active, so spark uses deepseek/deepseek-v4.1-flash. Change it with /model.";
+      await waitForTokenPassAnswer(tracePath, "has_pass");
+      await session.waitForText(notice, 10_000);
+      await session.sendText("Use the Token Pass default.");
+      await session.waitForText("CONFIRMED_PASS_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
+      expect((await session.captureFullScrollback()).split(notice).length - 1).toBe(1);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "without a saved answer the first prompt waits at most two seconds for the Token Pass check",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-slow-token-pass-key";
+      const tracePath = join(fixture.home, "trace.log");
+      let chatRequestAt = 0;
+      let creditsRequestedAt = 0;
+      gateway = startFakeGateway([
+        () => {
+          chatRequestAt = Date.now();
+          return fakeGatewayFinalText("UNWAITED_REPLY");
+        },
+      ], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => true, 6_000, () => { creditsRequestedAt = Date.now(); }),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("Do not wait long.");
+      await session.waitForText("UNWAITED_REPLY", 10_000);
+      // The prompt waited about two seconds from the check's start, then
+      // went out on the built-in default before the check answered.
+      expect(creditsRequestedAt).toBeGreaterThan(0);
+      expect(chatRequestAt - creditsRequestedAt).toBeGreaterThanOrEqual(1_500);
+      expect(chatRequestAt - creditsRequestedAt).toBeLessThan(4_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["spacexai/grok-4.7"]);
+      expect(readFileSync(tracePath, "utf8")).toContain("first prompt sent before the check answered");
+
+      // The late answer still counts for the next session. This catalog
+      // marks no model, so the menu has no Token Pass group.
+      await waitForTokenPassAnswer(tracePath, "has_pass");
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("has_pass");
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      expect(menu.join("\n")).not.toContain("All Models");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a model picked while the Token Pass check runs keeps its place when the check answers",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-pick-during-check-key";
+      const tracePath = join(fixture.home, "trace.log");
+      const picked = "deepseek/deepseek-v4.1-flash";
+      gateway = startFakeGateway([fakeGatewayFinalText("PICKED_REPLY")], {
+        models: tokenPassPickerModels,
+        usage: tokenPassCredits(() => false, 8_000),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+
+      // Before the check answers, pick the model a team with Token Pass
+      // would start on.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 4);
+      await session.sendLiteralText("deepseek");
+      await session.waitForPane((pane) => pane.split("\n").some((line) => !isComposerLine(line) && line.includes(picked)), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => composerContains(pane, `/model ${picked}`) && pane.includes("normal") && pane.includes("fast"), 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForText(`Switched to ${picked}`, 5_000);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("check answered");
+
+      // The check then says the team has no Token Pass, and the pick stays.
+      await waitForTokenPassAnswer(tracePath, "no_pass");
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("start model settled reason=model_choice");
+      expect(trace).not.toContain("start model=");
+      await session.sendText("Use the picked model.");
+      await session.waitForText("PICKED_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual([picked]);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "the catalog's Token Pass marks decide the Token Pass group",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-catalog-marks-key";
+      const tracePath = join(fixture.home, "trace.log");
+      // AI Gateway marks GLM 5.3 and a model spark has never heard of, and not
+      // DeepSeek V4.1 Flash.
+      const paid = ["zai/glm-5.3", "provider/plain-model"];
+      gateway = startFakeGateway([], {
+        models: tokenPassPickerModels.map((model) => paid.includes(model.id) ? { ...model, token_pass: true } : model),
+        usage: tokenPassCredits(() => true),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: { ...tokenPassEnv(fixture, gateway, apiKey, tracePath), SPARK_MODEL: "provider/fast-model" },
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      await waitForTokenPassAnswer(tracePath, "has_pass");
+
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      const index = (model: string) => menu.findIndex((line) => !isComposerLine(line) && line.split(/\s+/).includes(model));
+      const tokenPassHeading = menu.findIndex((line) => /^\s*Token Pass\s+2\s*$/.test(line));
+      const allModelsHeading = menu.findIndex((line) => /^\s*All Models\s+2\s*$/.test(line));
+      expect(tokenPassHeading).toBeGreaterThanOrEqual(0);
+      expect(allModelsHeading).toBeGreaterThan(tokenPassHeading);
+      for (const model of paid) {
+        expect(index(model)).toBeGreaterThan(tokenPassHeading);
+        expect(index(model)).toBeLessThan(allModelsHeading);
+      }
+      // DeepSeek is not marked, so it sits with the other models and keeps
+      // Fast mode.
+      expect(index("deepseek/deepseek-v4.1-flash")).toBeGreaterThan(allModelsHeading);
+      expect(menu[index("deepseek/deepseek-v4.1-flash")]).toContain("Fast mode");
+      expect(menu[index("zai/glm-5.3")]).not.toContain("Fast");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a catalog with Token Pass marks tells spark the team has Token Pass when the credits check fails",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-catalog-only-key";
+      const tracePath = join(fixture.home, "trace.log");
+      gateway = startFakeGateway([fakeGatewayFinalText("CATALOG_PASS_REPLY")], {
+        models: markedPickerModels(),
+        // The credits endpoint fails at once, before the catalog loads.
+        usage: (url) => url.pathname === "/coding-agent/v1/credits"
+          ? new Response("unavailable", { status: 503 })
+          : null,
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: tokenPassEnv(fixture, gateway, apiKey, tracePath),
+        width: 160,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      const savedDeadline = Date.now() + 10_000;
+      while (savedTokenPassAnswer(fixture.home, apiKey) !== "has_pass" && Date.now() < savedDeadline) await Bun.sleep(50);
+      expect(savedTokenPassAnswer(fixture.home, apiKey)).toBe("has_pass");
+
+      // The marks start the session on the Token Pass default without
+      // waiting for the credits check.
+      await session.sendText("Use the catalog's answer.");
+      await session.waitForText("CATALOG_PASS_REPLY", 10_000);
+      expect(gateway.requests.map(chatModelOf)).toEqual(["deepseek/deepseek-v4.1-flash"]);
+      expect(readFileSync(tracePath, "utf8")).not.toContain("first prompt sent before the check answered");
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 4);
+      expect(menu.some((line) => /^\s*Token Pass\s+2\s*$/.test(line))).toBe(true);
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "/credits shows the Token Pass balance, and a reply without Token Pass drops its headings",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const apiKey = "fake-token-pass-credits-key";
+      const tracePath = join(fixture.home, "trace.log");
+      const tokenPassModel = "zai/glm-5.3-flash";
+      let creditsReplies = 0;
+      gateway = startFakeGateway([], {
+        // The catalog marks the Token Pass model while the credits replies
+        // say the team has a pass.
+        models: () => [
+          { id: "provider/plain-model", type: "language", released: 200, tags: ["tool-use"] },
+          { id: tokenPassModel, type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000, ...(creditsReplies <= 2 ? { token_pass: true } : {}) },
+        ],
+        // The launch check and the first /credits see Token Pass; the
+        // second /credits says the team no longer has an active one.
+        usage: tokenPassCredits(() => creditsReplies <= 2, 0, () => { creditsReplies += 1; }),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: { ...tokenPassEnv(fixture, gateway, apiKey, tracePath), SPARK_MODEL: "provider/plain-model" },
+        width: 140,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+      await waitForTokenPassAnswer(tracePath, "has_pass");
+
+      await session.sendText("/credits");
+      await session.waitForText("token_pass_remaining=79.92906", 10_000);
+      await session.waitForText("token_pass_resets_at=2026-12-05T08:00:00.000Z", 5_000);
+
+      // Token Pass models lead the default list, ahead of the newer model.
+      await session.sendKeys("C-p");
+      const menu = await waitForModelsMenu(session, 2);
+      const rows = menu.filter((line) => !isComposerLine(line) && (line.includes(tokenPassModel) || line.includes("provider/plain-model")));
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toContain(tokenPassModel);
+      expect(rows[1]).toContain("provider/plain-model");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+
+      // `token_pass: null` means the team has no active Token Pass, so spark
+      // forgets it: no headings and no tags.
+      await session.sendText("/credits");
+      await session.waitForPane(() => creditsReplies === 3, 10_000);
+      await session.waitForPane((pane) => (pane.match(/balance=12\.50/g) ?? []).length >= 2, 10_000);
+      await session.sendKeys("C-p");
+      const plain = await waitForModelsMenu(session, 2);
+      expect(plain.join("\n")).not.toContain("Token Pass");
+      expect(plain.join("\n")).not.toContain("All Models");
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  for (const chosen of [null, "provider/plain-model"] as const) {
+    test(
+      chosen === null
+        ? "a team with Token Pass and no chosen model starts on the Token Pass default model"
+        : "a chosen model stays when the team has Token Pass",
+      async () => {
+        const fixture = createModelsMenuFixture();
+        const tokenPassDefault = "deepseek/deepseek-v4.1-flash";
+        let creditsReplies = 0;
+        gateway = startFakeGateway([], {
+          models: [
+            { id: "provider/plain-model", type: "language", released: 200, tags: ["tool-use"] },
+            { id: tokenPassDefault, type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000 },
+          ],
+          usage: (url) => {
+            if (url.pathname !== "/coding-agent/v1/credits") return null;
+            creditsReplies += 1;
+            return Response.json({
+              balance: "12.50",
+              total_used: "1.25",
+              token_pass: { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" },
+            });
+          },
+        });
+        session = await TmuxSession.create({
+          cwd: fixture.workspace,
+          stderrPath: fixture.stderrPath,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-token-pass-default-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+            SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+            SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            SPARK_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+            SPARK_MODEL: chosen ?? undefined,
+            SPARK_AUTO_UPGRADE: "0",
+          },
+          width: 140,
+          height: 32,
+        });
+        await session.waitForComposer(10_000);
+
+        const notice = `Token Pass is active, so spark uses ${tokenPassDefault}. Change it with /model.`;
+        if (chosen === null) {
+          await session.waitForText(notice, 10_000);
+          await session.waitForPane((pane) => pane.includes("deepseek-v4.1-flash"), 5_000);
+          expect(creditsReplies).toBe(1);
+          // The run uses the default; it is not saved as the user's choice.
+          const settingsPath = join(fixture.home, ".spark", "settings.json");
+          const saved = existsSync(settingsPath) ? readFileSync(settingsPath, "utf8") : "";
+          expect(saved).not.toContain(tokenPassDefault);
+        } else {
+          // spark still learns the team's Token Pass, for the picker and side
+          // calls, but the chosen model keeps its place.
+          await session.waitForPane(() => savedTokenPassAnswers(fixture.home).includes("has_pass"), 10_000);
+          await session.waitForComposer(5_000);
+          expect(creditsReplies).toBe(1);
+          expect(await session.capturePane()).toContain("plain-model");
+          expect(await session.captureFullScrollback()).not.toContain(notice);
+        }
+        expect(gateway.requests).toHaveLength(0);
+        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      },
+      TEST_TIMEOUT,
+    );
+  }
+
+  test(
+    "a resumed session keeps its own model when the team has Token Pass",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const chosen = "provider/plain-model";
+      let creditsReplies = 0;
+      let hasTokenPass = false;
+      const usage = (url: URL) => {
+        if (url.pathname !== "/coding-agent/v1/credits") return null;
+        creditsReplies += 1;
+        return Response.json({
+          balance: "12.50",
+          total_used: "1.25",
+          token_pass: hasTokenPass ? { remaining: "79.92906", resets_at: "2026-12-05T08:00:00.000Z" } : null,
+        });
+      };
+      const models = [
+        { id: chosen, type: "language", released: 200, tags: ["tool-use"] },
+        { id: "deepseek/deepseek-v4.1-flash", type: "language", released: 100, tags: ["tool-use"], context_window: 1_000_000 },
+      ];
+      const env = {
+        HOME: fixture.home,
+        AI_GATEWAY_API_KEY: "fake-token-pass-resume-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        SPARK_AUTO_UPGRADE: "0",
+      };
+
+      // Before the team has Token Pass, the user picks a model; the session
+      // saves it with its own preferences.
+      gateway = startFakeGateway([fakeGatewayFinalText("RESUME_MODEL_REPLY")], { models, usage });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          ...env,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          SPARK_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+        },
+        width: 140,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+      await session.waitForPane(() => creditsReplies === 1, 10_000);
+      await session.sendText(`/model ${chosen}`);
+      await session.waitForText(`Switched to ${chosen}`, 10_000);
+      await session.sendText("remember this model");
+      await session.waitForText("RESUME_MODEL_REPLY", 15_000);
+      await session.waitForStableComposer();
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+      const sessionIds = savedSessionIds(fixture.home);
+      expect(sessionIds).toHaveLength(1);
+      gateway.stop();
+
+      // The profile no longer names a model, and the team now has Token
+      // Pass. The resumed session still runs its own model, so spark learns
+      // the team's Token Pass but does not move it to the Token Pass default.
+      writeFileSync(fixture.settingsPath, "{}\n");
+      hasTokenPass = true;
+      creditsReplies = 0;
+      gateway = startFakeGateway([], { models, usage });
+      session = await TmuxSession.create({
+        cmd: `${SPARK_BIN} --resume ${sessionIds[0]}`,
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          ...env,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          SPARK_TEST_GATEWAY_CREDITS_URL: `${gateway.baseUrl}/coding-agent/v1/credits`,
+        },
+        width: 140,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+      await session.waitForPane((pane) => pane.includes("plain-model"), 5_000);
+      await session.waitForPane(() => savedTokenPassAnswers(fixture.home).includes("has_pass"), 10_000);
+      await session.waitForComposer(5_000);
+      expect(creditsReplies).toBe(1);
+      expect(await session.capturePane()).toContain("plain-model");
+      expect(await session.captureFullScrollback()).not.toContain("Token Pass is active");
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker lines facts up in columns and drops whole columns on a narrow or short terminal",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      // `key` is a part of each id that survives the id's middle ellipsis.
+      const models = [
+        { id: "moonshotai/kimi-k3", key: "kimi-k3", context: 1_000_000, output: 131_072, fast: true },
+        { id: "zai/glm-5.3-flash", key: "glm-5.3-flash", context: 1_000_000, output: 131_000, fast: false },
+        { id: "openai/gpt-6.1-terra", key: "gpt-6.1-terra", context: 1_050_000, output: 128_000, fast: true },
+        { id: "amazon/nova-pro", key: "nova-pro", context: 300_000, output: 8_192, fast: false },
+        { id: "anthropic/claude-opus-5.5-fast", key: "5.5-fast", context: 1_000_000, output: 128_000, fast: false },
+      ];
+      const tracePath = join(fixture.home, "trace.log");
+      gateway = startFakeGateway([], {
+        models: models.map((model, index) => ({
+          id: model.id,
+          type: "language",
+          released: 500 - index,
+          tags: ["tool-use"],
+          context_window: model.context,
+          max_tokens: model.output,
+          ...(model.fast ? { fast_options: [{ type: "toggle" }] } : {}),
+          // The team's pass pays for the first two.
+          ...(index < 2 ? { token_pass: true } : {}),
+        })),
+        // The headings show only for a team with Token Pass.
+        usage: tokenPassCredits(() => true),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: { ...tokenPassEnv(fixture, gateway, "fake-model-columns-key", tracePath), SPARK_MODEL: "amazon/nova-pro" },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+      await waitForTokenPassAnswer(tracePath, "has_pass");
+
+      const row = (lines: string[], key: string) => lines.find((line) => !isComposerLine(line) && line.includes(key)) ?? "";
+      const columnsOf = (lines: string[], label: string) => models.map((model) => row(lines, model.key).indexOf(label));
+      const expectOneColumn = (lines: string[], label: string) => {
+        const columns = columnsOf(lines, label);
+        expect(columns.every((column) => column > 0)).toBe(true);
+        expect(new Set(columns).size).toBe(1);
+      };
+
+      // Wide: the headings, the cells as the design shows them, and every
+      // label in one column whatever the number before it.
+      await session.sendKeys("C-p");
+      let menu = await waitForModelsMenu(session, 5);
+      expect(menu.some((line) => /^\s*Token Pass\s+2\s*$/.test(line))).toBe(true);
+      expect(menu.some((line) => /^\s*All Models\s+3\s*$/.test(line))).toBe(true);
+      // A Token Pass model leaves Fast mode out for a team with Token Pass.
+      expect(row(menu, "kimi-k3")).toContain("   1M context   128K output");
+      expect(row(menu, "kimi-k3")).not.toContain("Fast");
+      expect(row(menu, "kimi-k3")).not.toContain("Token Pass");
+      expect(row(menu, "gpt-6.1-terra")).toContain("1.05M context   128K output   Fast mode");
+      expect(row(menu, "nova-pro")).toContain("300K context     8K output");
+      expect(row(menu, "5.5-fast")).toContain("1M context   128K output   Fast");
+      expectOneColumn(menu, " context");
+      expectOneColumn(menu, " output");
+      expect(new Set([row(menu, "gpt-6.1-terra").indexOf("Fast mode"), row(menu, "5.5-fast").indexOf("Fast", row(menu, "5.5-fast").indexOf(" output"))]).size).toBe(1);
+
+      // Narrow: the speed column goes first, then the output column, and the
+      // columns that stay still line up.
+      await session.resizeWindow(56, 32);
+      await session.waitForPane((pane) => pane.includes("Models 5") && pane.includes(" output") && !pane.includes("Fast mode"), 5_000);
+      menu = await session.capturePaneGrid();
+      expectOneColumn(menu, " context");
+      expectOneColumn(menu, " output");
+      expect(menu.every((line) => line.length <= 56)).toBe(true);
+
+      await session.resizeWindow(44, 32);
+      await session.waitForPane((pane) => pane.includes("Models 5") && pane.includes(" context") && !pane.includes(" output"), 5_000);
+      menu = await session.capturePaneGrid();
+      expectOneColumn(menu, " context");
+
+      // Short: with only a few rows the menu still shows the selected model,
+      // the first one the catalog marks in the picker's order, and marks it
+      // as Token Pass, by heading or by tag.
+      await session.resizeWindow(56, 12);
+      await session.waitForPane((pane) => pane.includes("Models 5") && pane.includes("glm-5.3-flash"), 5_000);
+      menu = await session.capturePaneGrid();
+      expect(menu.length).toBeLessThanOrEqual(12);
+      expect(menu.some((line) => line.includes("Token Pass"))).toBe(true);
+      expect(row(menu, "glm-5.3-flash")).not.toBe("");
+
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("tab provider"), 5_000);
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "skills catalog keeps direct Ctrl-X and escaped Ctrl-X returns to the composer",
+    async () => {
+      const fixture = createSkillsMenuFixture();
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("/skills");
+      await waitForSkillsMenu(session, 4);
+      await session.sendKeys("C-o");
+      await session.sendKeys("C-x");
+
+      const grid = await waitForSkillsMenu(session, 4);
+      expect(grid.join("\n")).toContain("↑↓ navigate");
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendKeys("C-[");
+      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
+      await session.sendText("/skills");
+      await waitForSkillsMenu(session, 4);
+      await session.sendHexBytes(["1b", "18"]);
+      await session.waitForComposer(5_000);
+      expect((await session.capturePane())).not.toContain("Agents & processes");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "Escape closes the inline skills menu without cancelling an active stream",
+    async () => {
+      const fixture = createSkillsMenuFixture();
+      const stream: HeldSkillStream = { cancelled: false };
+      gateway = startFakeGateway([() => heldSkillStreamResponse(stream)]);
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-active-skills-stream-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_MODEL: FAKE_GATEWAY_MODEL,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("Keep this response active.");
+      await waitForHeldSkillStream(stream);
+      await session.waitForText("Generating", 10_000);
+      await session.sendLiteralText("$");
+      await waitForSkillsMenu(session, 4);
+
+      await session.sendKeys("C-[");
+      await session.waitForPane(
+        (pane) => pane.includes("Generating") && !pane.includes("↑↓ navigate"),
+        5_000,
+      );
+      expect(stream.cancelled).toBe(false);
+
+      stream.release?.();
+      await session.waitForText("catalog stream completed", 10_000);
+      expect(stream.cancelled).toBe(false);
+      expect(gateway.requests).toHaveLength(1);
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "Escape closes a visible slash menu without cancelling an active stream",
+    async () => {
+      const fixture = createSkillsMenuFixture();
+      const stream: HeldSkillStream = { cancelled: false };
+      gateway = startFakeGateway([() => heldSkillStreamResponse(stream)]);
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-active-slash-stream-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_MODEL: FAKE_GATEWAY_MODEL,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 72,
+        height: 16,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("Keep this slash response active.");
+      await waitForHeldSkillStream(stream);
+      await session.waitForText("Generating", 10_000);
+      await session.sendLiteralText("/he");
+      await session.waitForText("esc close", 10_000);
+
+      await session.sendKeys("Escape");
+      await session.waitForPane(
+        (pane) =>
+          pane.includes("Generating") &&
+          pane.includes("/he") &&
+          !pane.includes("esc close"),
+        5_000,
+      );
+      expect(stream.cancelled).toBe(false);
+
+      stream.release?.();
+      await session.waitForText("catalog stream completed", 10_000);
+      expect(stream.cancelled).toBe(false);
+      expect(gateway.requests).toHaveLength(1);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "file approval returns to the preserved inline skills menu",
+    async () => {
+      const fixture = createSkillsMenuFixture();
+      const target = join(fixture.workspace, "catalog-approval.txt");
+      let releaseApproval: () => void = () => {};
+      const approvalReady = new Promise<void>((resolve) => {
+        releaseApproval = resolve;
+      });
+      gateway = startFakeGateway([
+        async () => {
+          await approvalReady;
+          return fakeGatewayToolCall("catalog_approval", "write_file", {
+            path: "catalog-approval.txt",
+            content: "must not be written\n",
+          });
+        },
+        fakeGatewayFinalText("catalog approval completed"),
+      ]);
+      const stderrPath = join(fixture.home, "catalog-approval.stderr");
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-catalog-approval-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_MODEL: FAKE_GATEWAY_MODEL,
+          SPARK_PERMISSION_MODE: "ask",
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendText("Request the catalog approval fixture.");
+      await session.waitForText("Thinking", 10_000);
+      await session.sendLiteralText("$");
+      await waitForSkillsMenu(session, 4);
+
+      releaseApproval();
+      await session.waitForText("catalog-approval.txt", 10_000);
+      expect(await session.capturePane()).not.toContain("↑↓ navigate");
+
+      await session.sendKeys("3");
+      let grid = await waitForSkillsMenu(session, 4);
+      expect(composerContains(grid.join("\n"), "$")).toBe(true);
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendKeys("C-[");
+      await session.waitForText("catalog approval completed", 10_000);
+      expect(existsSync(target)).toBe(false);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "selected dollar skill token stays formatted after submit and reflow",
+    async () => {
+      const fixture = createSkillsMenuFixture();
+      const gateway = startFakeGateway([fakeGatewayFinalText("skill token prompt complete")]);
+      try {
+        session = await TmuxSession.create({
+          cwd: fixture.workspace,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-skill-token-key",
+            SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+            SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+            SPARK_MODEL: FAKE_GATEWAY_MODEL,
+            SPARK_AUTO_UPGRADE: "0",
+          },
+          width: 120,
+          height: 32,
+        });
+        await session.waitForComposer(10_000);
+
+        await session.sendKeys("-l '$man'");
+        await session.waitForText("managed-menu", 5_000);
+        await session.sendKeys("Enter");
+        await session.waitForPane((pane) => composerContains(pane, "managed-menu"), 5_000);
+        await session.sendKeys("-l 'please'");
+
+        let escapes = await session.capturePaneEscapes();
+        expect(escapes).toContain("managed-menu");
+        expect(escapes).not.toContain("$managed-menu please");
+
+        await session.sendKeys("Enter");
+        await session.waitForText("skill token prompt complete", 10_000);
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0]!.body).toContain("$managed-menu please");
+        expect(gateway.requests[0]!.body).toContain(
+          join(fixture.home, ".spark", "skills", "managed-menu"),
+        );
+
+        let history = capturePaneHistory(session, -200);
+        expect(history).toMatch(/┃ managed-menu please/);
+        expect(history).not.toMatch(/┃ \$managed-menu please/);
+        escapes = await session.captureFullScrollbackEscapes();
+        let submittedRows = submittedSkillRows(escapes);
+        expect(submittedRows).toHaveLength(1);
+        expect(submittedRows[0]).toContain("\x1b[38;5;252mmanaged-menu");
+
+        await session.resizeWindow(80, 24);
+        history = capturePaneHistory(session, -200);
+        expect(history).toMatch(/┃ managed-menu please/);
+        expect(history).not.toMatch(/┃ \$managed-menu please/);
+        escapes = await session.captureFullScrollbackEscapes();
+        submittedRows = submittedSkillRows(escapes);
+        expect(submittedRows).toHaveLength(1);
+        expect(submittedRows[0]).toContain("\x1b[38;5;252mmanaged-menu");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        gateway.stop();
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "shell variable with no skill match keeps spaces and submits raw",
+    async () => {
+      const fixture = createMentionGuardFixture();
+      const gateway = startFakeGateway([fakeGatewayFinalText("raw variable prompt complete")]);
+      try {
+        session = await TmuxSession.create({
+          cwd: fixture.workspace,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-mention-guard-key",
+            SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+            SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+            SPARK_MODEL: FAKE_GATEWAY_MODEL,
+            SPARK_AUTO_UPGRADE: "0",
+          },
+          width: 120,
+          height: 32,
+        });
+        await session.waitForComposer(10_000);
+
+        await session.sendKeys("-l 'Explain echo '");
+        await session.sendKeys("-l '$HOME'");
+        await session.waitForPane(
+          (pane) =>
+            composerContains(pane, "Explain echo $HOME") &&
+            pane.includes("-=✦") &&
+            !pane.includes("No skills found."),
+          5_000,
+        );
+        await session.sendKeys("-l ' please'");
+        await session.waitForText("Explain echo $HOME please", 5_000);
+        expect(await session.capturePane()).not.toContain("Space details");
+
+        await session.sendKeys("Enter");
+        await session.waitForText("raw variable prompt complete", 10_000);
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0]!.body).toContain("Explain echo $HOME please");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        gateway.stop();
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "space after matched dollar token inserts and closes the menu",
+    async () => {
+      const fixture = createMentionGuardFixture();
+      const gateway = startFakeGateway([fakeGatewayFinalText("mention space prompt complete")]);
+      try {
+        session = await TmuxSession.create({
+          cwd: fixture.workspace,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-mention-space-key",
+            SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+            SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+            SPARK_MODEL: FAKE_GATEWAY_MODEL,
+            SPARK_AUTO_UPGRADE: "0",
+          },
+          width: 120,
+          height: 32,
+        });
+        await session.waitForComposer(10_000);
+
+        await session.sendKeys("-l '$man'");
+        await session.waitForText("managed-menu", 5_000);
+        await session.sendKeys("-l ' now'");
+        await session.waitForText("$man now", 5_000);
+        expect(await session.capturePane()).not.toContain("Space details");
+
+        await session.sendKeys("Enter");
+        await session.waitForText("mention space prompt complete", 10_000);
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0]!.body).toContain("$man now");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        gateway.stop();
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "selected duplicate skill binds one advertised location",
+    async () => {
+      const fixture = createExactSkillsMenuFixture();
+      const tracePath = join(fixture.root, "trace.log");
+      const stderrPath = join(fixture.root, "stderr.log");
+      gateway = startFakeGateway([
+        fakeGatewayFinalText("exact picker selection complete"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-exact-picker-key",
+          SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+          SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          SPARK_MODEL: FAKE_GATEWAY_MODEL,
+          SPARK_AUTO_UPGRADE: "0",
+          SPARK_TRACE_LOG: tracePath,
+          SPARK_TRACE_SCOPES: "skill,skills,agent,core",
+        },
+        stderrPath,
+        width: 120,
+        height: 36,
+      });
+
+      await session.waitForComposer(10_000);
+      await session.sendKeys("C-o");
+      await session.waitForText("skill discovery warning:", 5_000);
+      const tracePathPattern = tracePath
+        .split("/")
+        .map((segment) => segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join("/\\s*");
+      expect((await session.capturePane()).replace(/\s+/g, " ")).toMatch(
+        new RegExp(`see "${tracePathPattern}" for details`),
+      );
+      await session.sendKeys("C-o");
+      await session.waitForComposer(5_000);
+      const inline = await session.captureFullScrollback();
+      expect(inline).not.toContain("skills:");
+      expect(inline).not.toContain("skill discovery warning:");
+      const startupDiagnosticCount = fileMarkerCount(
+        tracePath,
+        fixture.malformedMarker,
+      );
+      expect(startupDiagnosticCount).toBeGreaterThan(0);
+
+      await session.sendLiteralText("$exact-picker");
+      await session.waitForPane(
+        (pane) => countOccurrences(pane, "exact-picker") >= 3,
+        5_000,
+      );
+      await session.sendKeys("Down");
+      const selectedRows = (await session.capturePaneEscapes())
+        .split("\n")
+        .filter((line) =>
+          line.includes(SELECTED_COMPLETION_SGR) && line.includes("exact-picker")
+        );
+      expect(selectedRows).toHaveLength(1);
+      expect(selectedRows[0]).toContain("Workspace");
+      await session.sendKeys("Enter");
+      await session.waitForPane((pane) => composerContains(pane, "exact-picker"), 5_000);
+      await session.sendLiteralText(" inspect the exact selection");
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) =>
+          pane.includes("exact picker selection complete") && hasEmptyComposer(pane),
+        15_000,
+      );
+
+      expect(gateway.requests).toHaveLength(1);
+      const firstPrompt = gatewayPromptText(gateway.requests[0]!.body);
+      expect(firstPrompt).toContain(
+        "Use every successfully loaded skill for this query.",
+      );
+      expect(firstPrompt).toContain(
+        "Report blocked or ambiguous requests.",
+      );
+      expect(firstPrompt).toContain('<skill_content name="exact-picker"');
+      expect(firstPrompt).toContain(fixture.workspaceDescription);
+      expect(firstPrompt).toContain(fixture.bodyB);
+      expect(firstPrompt).not.toContain(fixture.bodyA);
+
+      const loadScrollback = await session.captureFullScrollback();
+      expect(countOccurrences(loadScrollback, "1 requested skill loaded")).toBe(1);
+      expect(loadScrollback).toContain("Loaded skill exact-picker");
+      expect(loadScrollback.indexOf("1 requested skill loaded")).toBeLessThan(
+        loadScrollback.indexOf("exact picker selection complete"),
+      );
+      expect(loadScrollback).not.toContain("1 tool call");
+
+      const finalScrollback = await session.captureFullScrollback();
+      expect(finalScrollback).not.toContain("discovery issue");
+      expect(finalScrollback).not.toContain("skill discovery warning:");
+      expect(session.isAlive()).toBe(true);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    45_000,
+  );
+
+  test(
+    "slash menu highlight reaches bottom before the list scrolls",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-slash-highlight-")));
+      workDirs.push(root);
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 100,
+        height: 30,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendLiteralText("/");
+      await session.waitForText("Commands 40", 5_000);
+
+      for (let i = 0; i < 5; i += 1) {
+        await session.sendKeys("Down");
+      }
+
+      const selectedRow = selectedSlashRowIndex(await session.capturePaneEscapes());
+      expect(selectedRow).toBeGreaterThanOrEqual(5);
+
+      await session.sendKeys("Down");
+      await session.sendKeys("Up");
+
+      const reversedRow = selectedSlashRowIndex(await session.capturePaneEscapes());
+      expect(reversedRow).toBe(4);
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "submitting clear from the slash menu does not crash",
+    async () => {
+      session = await TmuxSession.create({ width: 100, height: 30 });
+      await session.waitForComposer(10_000);
+
+      await session.sendKeys("-l '/clear'");
+      await session.waitForText("start a fresh conversation", 5_000);
+      await session.sendKeys("Enter");
+      await session.waitForComposer(5_000);
+
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "slash menu remains alive when descriptions clip in a narrow terminal",
+    async () => {
+      const workDir = mkdtempSync(join(tmpdir(), "spark-slash-narrow-menu-e2e-"));
+      workDirs.push(workDir);
+      const home = join(workDir, "home");
+      const workspace = join(workDir, "workspace");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          SPARK_AUTO_UPGRADE: "0",
+        },
+        width: 42,
+        height: 18,
+      });
+      await session.waitForComposer(10_000);
+
+      await session.sendKeys("-l '/mo'");
+      await session.waitForText("/model", 5_000);
+
+      const grid = await session.capturePaneGrid();
+      const pane = grid.join("\n");
+      expect(pane).toContain("Commands 1");
+      expect(pane).toContain("/model");
+      expect(pane).toContain("…");
+      expect(pane).not.toMatch(/\sModel\s*$/m);
+      expect(session.isAlive()).toBe(true);
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+});

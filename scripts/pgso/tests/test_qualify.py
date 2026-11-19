@@ -1,0 +1,1207 @@
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import pathlib
+import tempfile
+import types
+import unittest
+from unittest import mock
+
+from scripts.pgso import linux, macos
+from scripts.pgso.model import PgsoError
+from scripts.pgso.pipeline import PipelinePaths
+from scripts.pgso.profile_supplement import MappedProfile, ProfileSupplement
+from scripts.pgso.qualify import (
+    BENCHMARK_PLANS,
+    STARTUP_COMMANDS,
+    BenchmarkPair,
+    EvidenceRecorder,
+    _read_hyperfine_samples,
+    build_benchmark_pair,
+    build_external_o2_control,
+    build_profile_linked_benchmarks,
+    compare_samples,
+    measure_alternating,
+    measure_heavy_workloads,
+    measure_startup,
+    measurement_payload,
+    percentile,
+    profile_linked_benchmark_evidence,
+    relink_profile_linked_benchmarks,
+    select_benchmark_plans,
+    select_startup_commands,
+)
+from scripts.pgso.runner import CommandResult
+
+
+class PgsoQualificationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory(
+            prefix="spark-pgso-qualify-"
+        )
+        self.root = pathlib.Path(self.temporary_directory.name)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def fake_startup_runner(
+        self,
+        *,
+        hyperfine: pathlib.Path,
+        control: pathlib.Path,
+        candidate: pathlib.Path,
+        candidate_seconds=lambda export_path: 0.9,
+    ):
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(argv, **_kwargs):
+            command = tuple(str(argument) for argument in argv)
+            calls.append(command)
+            if command[0] != str(hyperfine):
+                return CommandResult(command, 0, "output\n", "", 0.01)
+
+            export_path = pathlib.Path(
+                command[command.index("--export-json") + 1]
+            )
+            runs = int(command[command.index("--runs") + 1])
+            results = []
+            for index, argument in enumerate(command):
+                if argument != "--command-name":
+                    continue
+                label = command[index + 1]
+                binary = command[index + 2].split(" ", 1)[0]
+                if label == "control":
+                    self.assertEqual(str(self.measured_copy("control", control)), binary)
+                    times = [1.0] * runs
+                else:
+                    self.assertEqual("candidate", label)
+                    self.assertEqual(str(self.measured_copy("candidate", candidate)), binary)
+                    times = [candidate_seconds(export_path)] * runs
+                results.append({"command": label, "times": times})
+            export_path.parent.mkdir(parents=True, exist_ok=True)
+            export_path.write_text(json.dumps({"results": results}))
+            return CommandResult(command, 0, "", "", 0.01)
+
+        return calls, fake_run
+
+    def measured_copy(self, label: str, binary: pathlib.Path) -> pathlib.Path:
+        return self.root / "measurements" / "binaries" / label / binary.name
+
+    def write_hyperfine_export(self, results) -> pathlib.Path:
+        path = self.root / "hyperfine.json"
+        path.write_text(json.dumps({"results": results}))
+        return path
+
+    def test_percentile_uses_nearest_rank(self) -> None:
+        samples = tuple(float(value) for value in range(1, 101))
+
+        self.assertEqual(50.0, percentile(samples, 0.50))
+        self.assertEqual(95.0, percentile(samples, 0.95))
+
+    def test_production_plans_cover_four_startup_and_six_heavy_workloads(self) -> None:
+        # spark doctor waits on network checks, so it is not a startup command.
+        self.assertEqual(
+            ("help", "version", "status", "sessions"),
+            tuple(name for name, _argv in STARTUP_COMMANDS),
+        )
+        workload_names = tuple(
+            workload.name
+            for plan in BENCHMARK_PLANS
+            for workload in plan.workloads
+        )
+        self.assertEqual(
+            (
+                "file-index-100k",
+                "ui-activity",
+                "approval-transcript",
+                "approval-diff",
+                "approval-combined",
+                "approval-payload",
+            ),
+            workload_names,
+        )
+        self.assertEqual(
+            ("file_index", "ui_activity", "approval_review"),
+            tuple(plan.selector for plan in BENCHMARK_PLANS),
+        )
+        self.assertEqual(
+            (
+                "file-index-bench",
+                "ui-activity-progress-bench",
+                "approval-review-bench",
+            ),
+            tuple(plan.profile_module for plan in BENCHMARK_PLANS),
+        )
+        self.assertTrue(all(plan.function_prefixes for plan in BENCHMARK_PLANS))
+
+    def test_startup_selection_returns_only_the_assigned_command(self) -> None:
+        selected = select_startup_commands(("sessions",))
+
+        self.assertEqual((("sessions", ("sessions", "--json")),), selected)
+
+    def test_startup_selection_rejects_an_unknown_command(self) -> None:
+        with self.assertRaisesRegex(PgsoError, "unknown startup command: missing"):
+            select_startup_commands(("missing",))
+
+    def test_heavy_selection_keeps_only_the_assigned_workload(self) -> None:
+        selected = select_benchmark_plans(("approval-diff",))
+
+        self.assertEqual(1, len(selected))
+        self.assertEqual("approval_review", selected[0].selector)
+        self.assertEqual(("approval-diff",), tuple(item.name for item in selected[0].workloads))
+
+    def test_heavy_selection_rejects_duplicate_assignments(self) -> None:
+        with self.assertRaisesRegex(PgsoError, "duplicate heavy workload"):
+            select_benchmark_plans(("ui-activity", "ui-activity"))
+
+    def test_comparison_requires_fifty_samples_per_artifact(self) -> None:
+        with self.assertRaisesRegex(PgsoError, "at least 50"):
+            compare_samples((1.0,) * 49, (1.0,) * 50)
+
+    def test_comparison_accepts_the_boundary_and_rejects_either_regression(self) -> None:
+        boundary = compare_samples((10.0,) * 50, (11.0,) * 50)
+        self.assertTrue(boundary.passed)
+
+        p50_regression = compare_samples((10.0,) * 50, (11.01,) * 50)
+        self.assertFalse(p50_regression.passed)
+
+        p95_candidate = (10.0,) * 47 + (20.0,) * 3
+        p95_regression = compare_samples((10.0,) * 50, p95_candidate)
+        self.assertFalse(p95_regression.passed)
+
+    def test_measurement_alternates_ab_and_ba_order(self) -> None:
+        order: list[tuple[str, int]] = []
+
+        def sample_runner(label, binary, argv, sample_index):
+            order.append((label, sample_index))
+            return 1.0 if label == "control" else 0.9
+
+        result = measure_alternating(
+            name="startup-help",
+            control_binary=self.root / "control",
+            candidate_binary=self.root / "candidate",
+            argv=("help",),
+            samples=50,
+            sample_runner=sample_runner,
+        )
+
+        self.assertEqual(
+            [
+                ("control", 0),
+                ("candidate", 0),
+                ("candidate", 1),
+                ("control", 1),
+            ],
+            order[:4],
+        )
+        self.assertEqual(0, result.control_failures)
+        self.assertEqual(0, result.candidate_failures)
+        self.assertTrue(result.passed)
+        self.assertIsNotNone(result.comparison)
+
+    def test_measurement_counts_failures_without_replacement(self) -> None:
+        def sample_runner(label, binary, argv, sample_index):
+            if label == "candidate" and sample_index == 3:
+                raise PgsoError("candidate failed")
+            return 1.0
+
+        result = measure_alternating(
+            name="startup-help",
+            control_binary=self.root / "control",
+            candidate_binary=self.root / "candidate",
+            argv=("help",),
+            samples=50,
+            sample_runner=sample_runner,
+        )
+
+        self.assertEqual(0, result.control_failures)
+        self.assertEqual(1, result.candidate_failures)
+        self.assertFalse(result.passed)
+        self.assertIsNone(result.comparison)
+        self.assertEqual(49, len(result.candidate_samples))
+
+    def test_startup_measurement_executes_immutable_artifacts_directly(self) -> None:
+        control = self.root / "control" / "spark"
+        candidate = self.root / "candidate" / "spark"
+        hyperfine = self.root / "tools" / "hyperfine"
+        canonical = self.root / "zig-out" / "bin" / "spark"
+        for path, contents in (
+            (control, b"control"),
+            (candidate, b"candidate"),
+            (hyperfine, b"hyperfine"),
+            (canonical, b"canonical"),
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(contents)
+
+        calls, fake_run = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
+
+        with mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run):
+            results = measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+            )
+
+        self.assertTrue(all(result.passed for result in results))
+        self.assertEqual(b"canonical", canonical.read_bytes())
+        control_copy = self.measured_copy("control", control)
+        candidate_copy = self.measured_copy("candidate", candidate)
+        self.assertEqual(
+            [
+                (str(control_copy), "help"),
+                (str(candidate_copy), "help"),
+            ],
+            calls[:2],
+        )
+        self.assertEqual((b"control", b"candidate"), (control_copy.read_bytes(), candidate_copy.read_bytes()))
+        self.assertEqual((b"control", b"candidate"), (control.read_bytes(), candidate.read_bytes()))
+        self.assertNotIn(str(canonical), {command[0] for command in calls})
+
+    def test_startup_measurement_refuses_a_copy_that_differs_from_its_artifact(self) -> None:
+        control = self.root / "control" / "spark"
+        candidate = self.root / "candidate" / "spark"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+
+        def truncated_copy(source, destination):
+            pathlib.Path(destination).write_bytes(b"exec")
+
+        with (
+            mock.patch("scripts.pgso.qualify.shutil.copyfile", side_effect=truncated_copy),
+            mock.patch("scripts.pgso.qualify.run_checked") as run,
+            self.assertRaisesRegex(PgsoError, "does not match"),
+        ):
+            measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+            )
+        run.assert_not_called()
+
+    def test_startup_measurement_runs_only_the_assigned_command(self) -> None:
+        control = self.root / "control" / "spark"
+        candidate = self.root / "candidate" / "spark"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        calls, fake_run = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
+
+        with mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run):
+            results = measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                command_names=("sessions",),
+            )
+
+        self.assertEqual(("startup-sessions",), tuple(item.name for item in results))
+        self.assertEqual(100, sum(command[0] == str(hyperfine) for command in calls))
+        self.assertIsNone(results[0].first_attempt)
+
+    def measure_one_startup_command(self, candidate_seconds, **options):
+        self.progress = io.StringIO()
+        control = self.root / "control" / "spark"
+        candidate = self.root / "candidate" / "spark"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        calls, fake_run = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+            candidate_seconds=candidate_seconds,
+        )
+        with (
+            mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run),
+            contextlib.redirect_stdout(self.progress),
+        ):
+            results = measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                command_names=("help",),
+                **options,
+            )
+        exports = [
+            pathlib.Path(command[command.index("--export-json") + 1])
+            for command in calls
+            if command[0] == str(hyperfine)
+        ]
+        return results[0], exports
+
+    def test_startup_speed_failure_is_measured_again_and_the_second_attempt_decides(
+        self,
+    ) -> None:
+        retry_logs = self.root / "measurements" / "logs" / "retry"
+
+        result, exports = self.measure_one_startup_command(
+            lambda export_path: 0.9 if export_path.parent == retry_logs else 1.2
+        )
+
+        self.assertTrue(result.passed)
+        self.assertTrue(result.comparison.passed)
+        self.assertEqual(1_000, len(result.candidate_samples))
+        self.assertAlmostEqual(-0.1, result.comparison.p50_change)
+        self.assertFalse(result.first_attempt.passed)
+        self.assertAlmostEqual(0.2, result.first_attempt.p50_change)
+        self.assertEqual(200, len(exports))
+        self.assertEqual(100, sum(path.parent == retry_logs for path in exports))
+        payload = json.loads(json.dumps(measurement_payload((result,))))
+        self.assertFalse(payload[0]["first_attempt"]["passed"])
+        self.assertIn(
+            "measuring again after a speed failure: startup-help (p50 +20.0%, p95 +20.0%)",
+            self.progress.getvalue(),
+        )
+
+    def test_startup_measurement_without_retries_measures_a_speed_failure_once(
+        self,
+    ) -> None:
+        result, exports = self.measure_one_startup_command(
+            lambda export_path: 1.2, retry_speed_failures=False
+        )
+
+        self.assertFalse(result.passed)
+        self.assertIsNone(result.first_attempt)
+        self.assertEqual(100, len(exports))
+        self.assertEqual("", self.progress.getvalue())
+
+    def test_startup_regression_that_repeats_fails_after_one_retry(self) -> None:
+        result, exports = self.measure_one_startup_command(lambda export_path: 1.2)
+
+        self.assertFalse(result.passed)
+        self.assertFalse(result.first_attempt.passed)
+        self.assertAlmostEqual(0.2, result.comparison.p50_change)
+        self.assertEqual(200, len(exports))
+
+    def test_startup_measurement_uses_one_thousand_samples_in_balanced_blocks(self) -> None:
+        control = self.root / "control" / "spark"
+        candidate = self.root / "candidate" / "spark"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+
+        calls, fake_run = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
+        with mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run):
+            results = measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+            )
+
+        hyperfine_calls = [
+            command for command in calls if command[0] == str(hyperfine)
+        ]
+        # 100 rounds for each of the four startup commands.
+        self.assertEqual(400, len(hyperfine_calls))
+        for command_start in range(0, len(hyperfine_calls), 100):
+            command_rounds = hyperfine_calls[command_start : command_start + 100]
+            for round_index, command in enumerate(command_rounds):
+                self.assertIn("--shell=none", command)
+                self.assertEqual("10", command[command.index("--warmup") + 1])
+                self.assertEqual("10", command[command.index("--runs") + 1])
+                expected_order = (
+                    ["control", "candidate"]
+                    if round_index % 2 == 0
+                    else ["candidate", "control"]
+                )
+                self.assertEqual(
+                    expected_order,
+                    [
+                        command[index + 1]
+                        for index, value in enumerate(command)
+                        if value == "--command-name"
+                    ],
+                )
+        self.assertTrue(all(result.requested_samples == 1_000 for result in results))
+        self.assertTrue(all(len(result.control_samples) == 1_000 for result in results))
+        self.assertTrue(all(len(result.candidate_samples) == 1_000 for result in results))
+
+    def test_startup_measurement_caps_large_campaign_blocks_at_ten_runs(self) -> None:
+        control = self.root / "control" / "spark"
+        candidate = self.root / "candidate" / "spark"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+
+        calls, fake_run = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
+        with mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run):
+            results = measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=1_000,
+                timeout_s=10,
+                command_names=("status",),
+            )
+
+        hyperfine_calls = [
+            command for command in calls if command[0] == str(hyperfine)
+        ]
+        self.assertEqual(100, len(hyperfine_calls))
+        self.assertTrue(
+            all(command[command.index("--runs") + 1] == "10" for command in hyperfine_calls)
+        )
+        for round_index, command in enumerate(hyperfine_calls):
+            expected_order = (
+                ["control", "candidate"]
+                if round_index % 2 == 0
+                else ["candidate", "control"]
+            )
+            self.assertEqual(
+                expected_order,
+                [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--command-name"
+                ],
+            )
+        self.assertEqual((1_000,), tuple(result.requested_samples for result in results))
+        self.assertEqual((1_000,), tuple(len(result.control_samples) for result in results))
+        self.assertEqual((1_000,), tuple(len(result.candidate_samples) for result in results))
+
+    def test_startup_measurement_disables_external_keychain_reads(self) -> None:
+        control = self.root / "control" / "spark"
+        candidate = self.root / "candidate" / "spark"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+
+        _, base_runner = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
+        environments: list[dict[str, str]] = []
+
+        def fake_run(argv, **kwargs):
+            environments.append(kwargs["env"])
+            return base_runner(argv, **kwargs)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SPARK_DISABLE_KEYCHAIN": "0",
+                    "AI_GATEWAY_API_KEY": "must-not-leak",
+                    "SPARK_E2E_REAL_API": "1",
+                },
+            ),
+            mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run),
+        ):
+            measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+            )
+
+        self.assertTrue(environments)
+        self.assertTrue(
+            all(environment["SPARK_DISABLE_KEYCHAIN"] == "1" for environment in environments)
+        )
+        self.assertTrue(
+            all("AI_GATEWAY_API_KEY" not in environment for environment in environments)
+        )
+        self.assertTrue(
+            all("SPARK_E2E_REAL_API" not in environment for environment in environments)
+        )
+
+    def test_startup_measurement_rejects_a_truncated_hyperfine_round(self) -> None:
+        path = self.write_hyperfine_export(
+            [
+                {"command": "control", "times": [1.0] * 50},
+                {"command": "candidate", "times": [0.9] * 49},
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            PgsoError,
+            "Hyperfine round returned 49 candidate samples; expected 50",
+        ):
+            _read_hyperfine_samples(path, expected_samples=50)
+
+    def test_startup_measurement_rejects_duplicate_hyperfine_labels(self) -> None:
+        path = self.write_hyperfine_export(
+            [
+                {"command": "control", "times": [1.0] * 50},
+                {"command": "control", "times": [0.9] * 50},
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            PgsoError,
+            "Hyperfine round contains duplicate label: control",
+        ):
+            _read_hyperfine_samples(path, expected_samples=50)
+
+    def test_startup_measurement_rejects_nonpositive_hyperfine_time(self) -> None:
+        path = self.write_hyperfine_export(
+            [
+                {"command": "control", "times": [0.0] + [1.0] * 49},
+                {"command": "candidate", "times": [0.9] * 50},
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            PgsoError,
+            "Hyperfine control sample 0 must be finite and positive",
+        ):
+            _read_hyperfine_samples(path, expected_samples=50)
+
+    def test_startup_measurement_preserves_hyperfine_diagnostics(self) -> None:
+        control = self.root / "control" / "spark"
+        candidate = self.root / "candidate" / "spark"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+
+        _, base_runner = self.fake_startup_runner(
+            hyperfine=hyperfine,
+            control=control,
+            candidate=candidate,
+        )
+
+        def fake_run(argv, **kwargs):
+            command = tuple(str(argument) for argument in argv)
+            if command[0] == str(hyperfine):
+                self.assertFalse(kwargs["require_empty_stderr"])
+            return base_runner(argv, **kwargs)
+
+        with mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run):
+            results = measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+            )
+
+        self.assertTrue(all(result.passed for result in results))
+
+    def test_heavy_measurement_uses_the_prebuilt_profiled_pair(self) -> None:
+        control = self.root / "heavy" / "control"
+        candidate = self.root / "heavy" / "candidate"
+        for path in (control, candidate):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        pair = BenchmarkPair(
+            selector="file_index",
+            control_binary=control,
+            candidate_binary=candidate,
+            bitcode_sha256="b" * 64,
+            merged_raw_profiles=1,
+        )
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(argv, **_kwargs):
+            command = tuple(str(argument) for argument in argv)
+            calls.append(command)
+            elapsed = 1.0 if command[0] == str(control) else 0.9
+            return CommandResult(command, 0, "measured\n", "", elapsed)
+
+        with (
+            mock.patch(
+                "scripts.pgso.qualify.build_benchmark_pair",
+                side_effect=AssertionError("must use immutable prebuilt pair"),
+            ),
+            mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run),
+        ):
+            results = measure_heavy_workloads(
+                toolchain=None,
+                repo_root=self.root,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                workload_names=("file-index-100k",),
+                prebuilt_pairs={"file_index": pair},
+            )
+
+        self.assertEqual(("file-index-100k",), tuple(item.name for item in results))
+        self.assertEqual(100, len(calls))
+        self.assertEqual(str(control), calls[0][0])
+        self.assertEqual(str(candidate), calls[1][0])
+        self.assertTrue(results[0].passed)
+
+    def test_ui_activity_measurement_uses_alternating_hyperfine_rounds(self) -> None:
+        control = self.root / "heavy" / "control"
+        candidate = self.root / "heavy" / "candidate"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        pair = BenchmarkPair(
+            selector="ui_activity",
+            control_binary=control,
+            candidate_binary=candidate,
+            bitcode_sha256="b" * 64,
+            merged_raw_profiles=1,
+        )
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(argv, **kwargs):
+            command = tuple(str(argument) for argument in argv)
+            calls.append(command)
+            if command[0] != str(hyperfine):
+                return CommandResult(command, 0, "measured\n", "", 1.0)
+            export_path = pathlib.Path(
+                command[command.index("--export-json") + 1]
+            )
+            labels = [
+                command[index + 1]
+                for index, value in enumerate(command)
+                if value == "--command-name"
+            ]
+            export_path.write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "command": label,
+                                "times": [1.0 if label == "control" else 0.9],
+                            }
+                            for label in labels
+                        ]
+                    }
+                )
+            )
+            return CommandResult(command, 0, "", "", 1.0)
+
+        with (
+            mock.patch(
+                "scripts.pgso.qualify.build_benchmark_pair",
+                side_effect=AssertionError("must use immutable prebuilt pair"),
+            ),
+            mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run),
+        ):
+            results = measure_heavy_workloads(
+                toolchain=None,
+                repo_root=self.root,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                workload_names=("ui-activity",),
+                prebuilt_pairs={"ui_activity": pair},
+                hyperfine_binary=hyperfine,
+            )
+
+        hyperfine_calls = [
+            command for command in calls if command[0] == str(hyperfine)
+        ]
+        self.assertEqual(50, len(hyperfine_calls))
+        for round_index, command in enumerate(hyperfine_calls):
+            # The benchmark's own output must reach the round log, so a
+            # failed round shows why it failed.
+            self.assertIn("--output=inherit", command)
+            self.assertEqual("1", command[command.index("--runs") + 1])
+            self.assertEqual(
+                "0",
+                command[command.index("--warmup") + 1],
+            )
+            self.assertEqual(
+                (
+                    ("control", "candidate")
+                    if round_index % 2 == 0
+                    else ("candidate", "control")
+                ),
+                tuple(
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--command-name"
+                ),
+            )
+        self.assertEqual(50, len(results[0].control_samples))
+        self.assertEqual(50, len(results[0].candidate_samples))
+        self.assertTrue(results[0].passed)
+
+    def measure_one_heavy_workload(self, fake_run, workload, selector, hyperfine=None):
+        self.progress = io.StringIO()
+        control = self.root / "heavy" / "control"
+        candidate = self.root / "heavy" / "candidate"
+        for path in (control, candidate):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        pair = BenchmarkPair(
+            selector=selector,
+            control_binary=control,
+            candidate_binary=candidate,
+            bitcode_sha256="b" * 64,
+            merged_raw_profiles=1,
+        )
+        with (
+            mock.patch("scripts.pgso.qualify.run_checked", side_effect=fake_run),
+            contextlib.redirect_stdout(self.progress),
+        ):
+            results = measure_heavy_workloads(
+                toolchain=None,
+                repo_root=self.root,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                workload_names=(workload,),
+                prebuilt_pairs={selector: pair},
+                hyperfine_binary=hyperfine,
+            )
+        return results[0], control
+
+    def test_heavy_speed_failure_is_measured_again_into_its_own_logs(self) -> None:
+        retry_logs = self.root / "measurements" / "logs" / "file-index-100k" / "retry"
+        log_dirs: list[pathlib.Path] = []
+        control: list[pathlib.Path] = []
+
+        def fake_run(argv, **kwargs):
+            command = tuple(str(argument) for argument in argv)
+            log_dirs.append(kwargs["log_path"].parent)
+            if command[0] == str(control[0]):
+                elapsed = 1.0
+            else:
+                elapsed = 0.9 if kwargs["log_path"].parent == retry_logs else 1.3
+            return CommandResult(command, 0, "measured\n", "", elapsed)
+
+        control.append(self.root / "heavy" / "control")
+        result, _ = self.measure_one_heavy_workload(
+            fake_run, "file-index-100k", "file_index"
+        )
+
+        self.assertTrue(result.passed)
+        self.assertAlmostEqual(0.3, result.first_attempt.p50_change)
+        self.assertEqual(200, len(log_dirs))
+        self.assertEqual(100, log_dirs.count(retry_logs))
+
+    def test_heavy_execution_failure_is_not_measured_again(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(argv, **_kwargs):
+            command = tuple(str(argument) for argument in argv)
+            calls.append(command)
+            if command[0].endswith("candidate"):
+                raise PgsoError("candidate crashed")
+            return CommandResult(command, 0, "measured\n", "", 1.0)
+
+        result, _ = self.measure_one_heavy_workload(
+            fake_run, "file-index-100k", "file_index"
+        )
+
+        self.assertFalse(result.passed)
+        self.assertIsNone(result.comparison)
+        self.assertIsNone(result.first_attempt)
+        self.assertEqual(50, result.candidate_failures)
+        self.assertEqual(100, len(calls))
+
+    def test_microbenchmark_regression_that_repeats_fails_after_one_retry(self) -> None:
+        hyperfine = self.root / "tools" / "hyperfine"
+        hyperfine.parent.mkdir(parents=True, exist_ok=True)
+        hyperfine.write_bytes(b"executable")
+        exports: list[pathlib.Path] = []
+
+        def fake_run(argv, **_kwargs):
+            command = tuple(str(argument) for argument in argv)
+            if command[0] != str(hyperfine):
+                return CommandResult(command, 0, "measured\n", "", 1.0)
+            export_path = pathlib.Path(command[command.index("--export-json") + 1])
+            exports.append(export_path)
+            labels = [
+                command[index + 1]
+                for index, value in enumerate(command)
+                if value == "--command-name"
+            ]
+            export_path.write_text(
+                json.dumps(
+                    {
+                        "results": [
+                            {"command": label, "times": [1.0 if label == "control" else 1.2]}
+                            for label in labels
+                        ]
+                    }
+                )
+            )
+            return CommandResult(command, 0, "", "", 1.0)
+
+        result, _ = self.measure_one_heavy_workload(
+            fake_run, "ui-activity", "ui_activity", hyperfine
+        )
+
+        retry_logs = self.root / "measurements" / "logs" / "ui-activity" / "retry" / "logs"
+        self.assertFalse(result.passed)
+        self.assertFalse(result.first_attempt.passed)
+        self.assertEqual(100, len(exports))
+        self.assertEqual(50, sum(path.parent == retry_logs for path in exports))
+
+    def test_ui_activity_measurement_requires_hyperfine(self) -> None:
+        control = self.root / "heavy" / "control"
+        candidate = self.root / "heavy" / "candidate"
+        for path in (control, candidate):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+        pair = BenchmarkPair(
+            selector="ui_activity",
+            control_binary=control,
+            candidate_binary=candidate,
+            bitcode_sha256="b" * 64,
+            merged_raw_profiles=1,
+        )
+
+        with self.assertRaisesRegex(
+            PgsoError,
+            "microbenchmark measurement requires Hyperfine: ui_activity",
+        ):
+            measure_heavy_workloads(
+                toolchain=None,
+                repo_root=self.root,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+                workload_names=("ui-activity",),
+                prebuilt_pairs={"ui_activity": pair},
+            )
+
+    def build_fake_external_control(
+        self, platform: object, target: str, tool_names: tuple[str, ...]
+    ) -> tuple[pathlib.Path, list[str]]:
+        tools = self.root / "tools"
+        tools.mkdir()
+        actions = self.root / "actions.log"
+
+        def fake(name: str) -> pathlib.Path:
+            path = tools / name
+            path.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, sys\n"
+                f"with open({str(actions)!r}, 'a') as stream:\n"
+                f"    stream.write({name!r} + ' ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+                "if '-o' in sys.argv:\n"
+                "    pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')\n",
+                encoding="utf-8",
+            )
+            path.chmod(0o755)
+            return path
+
+        toolchain = types.SimpleNamespace(
+            opt=fake("opt"),
+            llc=fake("llc"),
+            zig=fake("zig"),
+            target=target,
+            platform=platform,
+            tools=types.SimpleNamespace(**{name: fake(name) for name in tool_names}),
+        )
+        paths = PipelinePaths.create(self.root / "run", selector="ui_activity")
+
+        binary = build_external_o2_control(toolchain, paths)
+
+        self.assertEqual(paths.root / "external-control" / paths.binary_name, binary)
+        return binary, actions.read_text(encoding="utf-8").splitlines()
+
+    def test_external_control_is_optimized_linked_and_stripped_with_platform_tools(self) -> None:
+        binary, lines = self.build_fake_external_control(macos, "aarch64-macos", ("strip",))
+
+        self.assertEqual(["opt", "llc", "zig", "strip"], [line.split()[0] for line in lines])
+        self.assertIn("-Wl,-dead_strip", lines[2].split())
+        self.assertEqual(f"strip -S -x {binary}", lines[3])
+
+    def test_linux_external_control_is_stripped_by_its_link(self) -> None:
+        _, lines = self.build_fake_external_control(linux, "aarch64-linux", ())
+
+        self.assertEqual(["opt", "llc", "zig"], [line.split()[0] for line in lines])
+        link = lines[2].split()
+        self.assertIn("-Wl,--gc-sections", link)
+        self.assertIn("-s", link)
+
+    def test_benchmark_pair_uses_the_external_control_for_minimum_macos(self) -> None:
+        plan = BENCHMARK_PLANS[0]
+        output = self.root / "pair"
+        external = self.root / "fixtures" / "external-control"
+        candidate = self.root / "fixtures" / "candidate"
+        raw_profile = self.root / "fixtures" / "training.profraw"
+        for path in (external, candidate, raw_profile):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"evidence")
+
+        with (
+            mock.patch(
+                "scripts.pgso.qualify.build_control",
+                side_effect=AssertionError("ordinary control build is wasteful"),
+                create=True,
+            ),
+            mock.patch("scripts.pgso.qualify.emit_bitcode", return_value="b" * 64),
+            mock.patch(
+                "scripts.pgso.qualify.build_external_o2_control",
+                return_value=external,
+            ),
+            mock.patch.object(
+                macos,
+                "read_control_identity",
+                return_value={"minimum_macos": "15.0"},
+            ) as read_identity,
+            mock.patch(
+                "scripts.pgso.qualify.build_instrumented",
+                return_value=(raw_profile,),
+            ) as instrument,
+            mock.patch("scripts.pgso.qualify.merge_profile_batch", return_value=1),
+            mock.patch("scripts.pgso.qualify.apply_profile") as apply,
+            mock.patch(
+                "scripts.pgso.qualify.link_candidate",
+                return_value=candidate,
+            ) as link,
+        ):
+            pair = build_benchmark_pair(
+                types.SimpleNamespace(platform=macos, target=macos.TARGET), self.root, output, plan,
+            )
+
+        self.assertEqual(external, pair.control_binary)
+        self.assertEqual(external, read_identity.call_args.args[1])
+        self.assertEqual({"minimum_macos": "15.0"}, instrument.call_args.args[2])
+        # The supplement build keeps the benchmark profile-use flags and the
+        # default code generation.
+        self.assertNotIn("production_flags", apply.call_args.kwargs)
+        self.assertNotIn("production_flags", link.call_args.kwargs)
+
+    def test_builds_all_profile_linked_benchmarks_before_candidate_link(self) -> None:
+        paths = PipelinePaths.create(self.root / "run")
+        paths.merged_profile.write_bytes(b"production profile")
+        built_selectors: list[str] = []
+        supplement_events: list[str] = []
+
+        def fake_build(_toolchain, _repo_root, output_dir, plan):
+            built_selectors.append(plan.selector)
+            control = output_dir / "external-control" / plan.profile_module
+            candidate = output_dir / "candidate" / plan.profile_module
+            profile = output_dir / "profiles" / "merged.profdata"
+            ir = output_dir / "ir" / "profile-use.ll"
+            for path in (control, candidate, profile, ir):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"evidence")
+            return BenchmarkPair(
+                selector=plan.selector,
+                control_binary=control,
+                candidate_binary=candidate,
+                bitcode_sha256="b" * 64,
+                merged_raw_profiles=1,
+                merged_profile=profile,
+                profile_use_ir=ir,
+            )
+
+        def fake_create(_toolchain, **kwargs):
+            supplement_events.append(f"create:{kwargs['output_text'].stem}")
+            output_text = kwargs["output_text"]
+            output_text.write_text("supplement\n")
+            return ProfileSupplement(
+                text="supplement\n",
+                function_names=("spark;core.output.diff.compute",),
+                total_counter_value=8,
+            )
+
+        def fake_merge(_toolchain, **kwargs):
+            supplement_events.append(
+                f"merge:{kwargs['supplement_text'].stem}"
+            )
+
+        with (
+            mock.patch(
+                "scripts.pgso.qualify.build_benchmark_pair",
+                side_effect=fake_build,
+            ),
+            mock.patch(
+                "scripts.pgso.qualify.create_profile_supplement",
+                side_effect=fake_create,
+            ),
+            mock.patch(
+                "scripts.pgso.qualify.merge_profile_supplement",
+                side_effect=fake_merge,
+            ) as merge,
+        ):
+            linked = build_profile_linked_benchmarks(
+                object(),
+                self.root,
+                paths,
+            )
+
+        self.assertEqual(
+            tuple(plan.selector for plan in BENCHMARK_PLANS),
+            tuple(linked),
+        )
+        self.assertEqual(
+            tuple(plan.selector for plan in BENCHMARK_PLANS),
+            tuple(built_selectors),
+        )
+        self.assertEqual(len(BENCHMARK_PLANS), merge.call_count)
+        self.assertEqual(
+            [
+                *(f"create:{plan.selector}" for plan in BENCHMARK_PLANS),
+                *(f"merge:{plan.selector}" for plan in BENCHMARK_PLANS),
+            ],
+            supplement_events,
+        )
+
+        def fake_map(_toolchain, **kwargs):
+            kwargs["output_text"].write_text("mapped text\n")
+            kwargs["output_profile"].write_bytes(b"mapped profile")
+            return MappedProfile(
+                text="mapped text\n",
+                compatible_function_names=("core.output.diff.compute",),
+                total_counter_value=16,
+            )
+
+        def fake_link(_toolchain, pair_paths, **_kwargs):
+            pair_paths.profile_use_ir.write_text("profile-use IR\n")
+            return pair_paths.candidate_binary
+
+        with (
+            mock.patch(
+                "scripts.pgso.qualify.create_mapped_benchmark_profile",
+                side_effect=fake_map,
+            ),
+            mock.patch("scripts.pgso.qualify.apply_profile") as apply,
+            mock.patch(
+                "scripts.pgso.qualify.link_candidate",
+                side_effect=fake_link,
+            ) as link,
+        ):
+            linked = relink_profile_linked_benchmarks(
+                object(),
+                paths,
+                linked,
+            )
+
+        # The measured candidates build with the production flags.
+        self.assertEqual(len(BENCHMARK_PLANS), apply.call_count)
+        self.assertEqual(len(BENCHMARK_PLANS), link.call_count)
+        for call in (*apply.call_args_list, *link.call_args_list):
+            self.assertIs(True, call.kwargs["production_flags"])
+
+        with mock.patch(
+            "scripts.pgso.qualify.verify_supplement_functions",
+            return_value={"core.output.diff.compute": "speed"},
+        ):
+            evidence = profile_linked_benchmark_evidence(
+                linked,
+                "production IR",
+            )
+        self.assertEqual(tuple(linked), tuple(evidence))
+        self.assertTrue(
+            all(
+                item["functions"]
+                == {"core.output.diff.compute": "speed"}
+                for item in evidence.values()
+            )
+        )
+
+    def test_evidence_recorder_is_fail_closed_and_writes_atomically(self) -> None:
+        manifest = self.root / "manifest.json"
+        recorder = EvidenceRecorder(
+            manifest,
+            command="all",
+            configuration={"target": "aarch64-macos", "samples": 50},
+        )
+        recorder.stage("validate", "passed", {"source_sha": "a" * 40})
+        recorder.fail("profile-use", PgsoError("optimizer warning"))
+
+        payload = json.loads(manifest.read_text())
+        self.assertEqual(1, payload["schema_version"])
+        self.assertEqual("failed", payload["status"])
+        self.assertEqual("profile-use", payload["stage"])
+        self.assertFalse(payload["eligible"])
+        self.assertEqual("optimizer warning", payload["error"])
+        self.assertFalse(any(self.root.glob(".manifest.json.*.tmp")))
+
+    def test_evidence_recorder_streams_stage_lifecycle_and_duration(self) -> None:
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            recorder = EvidenceRecorder(
+                self.root / "manifest.json",
+                command="all",
+                configuration={"target": "aarch64-macos", "samples": 50},
+            )
+            recorder.stage("validate", "running")
+            recorder.stage("validate", "passed")
+            recorder.stage("profile-use", "running")
+            recorder.fail("profile-use", PgsoError("optimizer warning"))
+
+        output = stdout.getvalue()
+        self.assertIn("[pgso] stage started: validate", output)
+        self.assertRegex(
+            output,
+            r"\[pgso\] stage passed in \d+\.\d{3}s: validate",
+        )
+        self.assertIn("[pgso] stage started: profile-use", output)
+        self.assertRegex(
+            output,
+            (
+                r"\[pgso\] stage failed in \d+\.\d{3}s: "
+                r"profile-use: optimizer warning"
+            ),
+        )
+        payload = json.loads((self.root / "manifest.json").read_text())
+        passed_stage = payload["stages"][1]
+        failed_stage = payload["stages"][3]
+        self.assertIn("elapsed_seconds", passed_stage)
+        self.assertIn("elapsed_seconds", failed_stage)
+        self.assertGreaterEqual(passed_stage["elapsed_seconds"], 0)
+        self.assertGreaterEqual(failed_stage["elapsed_seconds"], 0)
+
+    def test_evidence_recorder_cannot_mark_incomplete_work_eligible(self) -> None:
+        recorder = EvidenceRecorder(
+            self.root / "manifest.json",
+            command="all",
+            configuration={"target": "aarch64-macos", "samples": 50},
+        )
+        with self.assertRaisesRegex(PgsoError, "required evidence"):
+            recorder.complete()
+
+
+if __name__ == "__main__":
+    unittest.main()

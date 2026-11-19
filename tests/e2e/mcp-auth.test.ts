@@ -1,0 +1,3768 @@
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
+import { traceReportNames, waitForNewTraceReport, type TraceReport } from "./trace-report";
+import { spawnSync } from "node:child_process";
+import { SPARK_BIN, runFx } from "../evals/eval-helpers";
+import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
+import { startLegacyStreamableHttpFixture } from "./fixtures/mcp-legacy-remote";
+import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
+import { stdoutFrames } from "./render-lab/tape";
+import {
+  fakeGatewayFinalText,
+  fakeGatewayToolCall,
+  isComposerLine,
+  startFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
+import { zigGlobalCacheDir } from "./zig-build";
+
+const MODEL = "openai/gpt-5";
+const TOOL_NAME = "mcp_fixture_echo";
+const ACCESS_INITIAL = "mcp-access-initial-secret";
+const ACCESS_REFRESHED = "mcp-access-refreshed-secret";
+const REFRESH_INITIAL = "mcp-refresh-initial-secret";
+const REFRESH_ROTATED = "mcp-refresh-rotated-secret";
+const SPARK_SLACK_CLIENT_ID = "12364000946.12017137861236";
+const inheritedKeychainDisable = process.env.SPARK_DISABLE_KEYCHAIN;
+
+type AuthFixture = ReturnType<typeof startAuthFixture>;
+
+let cleanupRoot: string | null = null;
+let upstream: ReturnType<typeof startModernMcpHttpFixture> | null = null;
+let legacyStreamable:
+  | ReturnType<typeof startLegacyStreamableHttpFixture>
+  | null = null;
+let auth: AuthFixture | null = null;
+let gateway: ReturnType<typeof startFakeGateway> | null = null;
+let tui: TmuxSession | null = null;
+let tokenProxy: Awaited<ReturnType<typeof startIdleDropProxy>> | null = null;
+
+beforeAll(() => {
+  process.env.SPARK_DISABLE_KEYCHAIN = "1";
+});
+
+afterAll(() => {
+  if (inheritedKeychainDisable === undefined) {
+    delete process.env.SPARK_DISABLE_KEYCHAIN;
+  } else {
+    process.env.SPARK_DISABLE_KEYCHAIN = inheritedKeychainDisable;
+  }
+});
+
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await Bun.sleep(10);
+  }
+  return existsSync(path);
+}
+
+async function waitForFileText(
+  path: string,
+  expected: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path) && readFileSync(path, "utf8").includes(expected)) {
+      return true;
+    }
+    await Bun.sleep(10);
+  }
+  return existsSync(path) && readFileSync(path, "utf8").includes(expected);
+}
+
+function unusedCallbackPort(): number {
+  const listener = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: () => new Response("reserved"),
+  });
+  const port = listener.port;
+  listener.stop(true);
+  return port;
+}
+
+/** What `readLoginAddress` needs of a child made with `Bun.spawn` and three pipes. */
+type LoginChild = {
+  readonly exited: Promise<number>;
+  readonly signalCode: string | null;
+  readonly stderr: ReadableStream<Uint8Array>;
+  kill(): void;
+};
+
+const timedOut = Symbol("timed out");
+/** How long a child that closed its stdout is given to exit. */
+const exitGraceMs = 2_000;
+
+/** `work`, or `timedOut` once `ms` have passed; the timer never outlives the wait. */
+async function raceDeadline<T>(work: Promise<T>, ms: number): Promise<T | typeof timedOut> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<typeof timedOut>((resolve) => { timer = setTimeout(() => resolve(timedOut), Math.max(ms, 0)); })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Reads `reader`, the stdout of `child`, until the whole line holding the sign-in address has arrived (a long
+ * address can arrive in pieces), and returns the address with everything read so far. When stdout ends or
+ * `timeoutMs` passes first, it stops `child` and throws how it ended, what both streams held, and its trace at
+ * `tracePath`, so a failure says why there was no address.
+ */
+async function readLoginAddress(
+  child: LoginChild,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  tracePath: string,
+  timeoutMs = 15_000,
+): Promise<{ address: string; stdout: string }> {
+  const started = performance.now();
+  const decoder = new TextDecoder();
+  let stdout = "";
+  for (;;) {
+    const line = /^[^\n]*\/authorize\?[^\n]*(?=\n)/m.exec(stdout);
+    if (line) return { address: line[0].trim(), stdout };
+    const chunk = await raceDeadline(reader.read(), timeoutMs - (performance.now() - started));
+    if (chunk !== timedOut && !chunk.done) {
+      stdout += decoder.decode(chunk.value, { stream: true });
+      continue;
+    }
+    // A child that closed its stdout may still be running; give it a moment, then stop it so its stderr ends.
+    const exit = chunk === timedOut ? timedOut : await raceDeadline(child.exited, exitGraceMs);
+    if (exit === timedOut) child.kill();
+    const code = await child.exited;
+    const stderr = await new Response(child.stderr).text();
+    const trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8").trim() : "";
+    const how = exit !== timedOut
+      ? (child.signalCode ? `it was killed by ${child.signalCode}` : `it exited with code ${code}`)
+      : chunk === timedOut
+        ? `it was still running after ${timeoutMs} ms, so it was stopped`
+        : `it closed its stdout but was still running ${exitGraceMs} ms later, so it was stopped`;
+    throw new Error([
+      `spark mcp login printed no sign-in address, after ${Math.round(performance.now() - started)} ms: ${how}`,
+      `stdout: ${JSON.stringify(stdout)}`,
+      `stderr: ${JSON.stringify(stderr)}`,
+      `trace: ${trace === "" ? "(empty)" : trace}`,
+    ].join("\n"));
+  }
+}
+
+afterEach(async () => {
+  const activeTui = tui;
+  const activeGateway = gateway;
+  const activeAuth = auth;
+  const activeUpstream = upstream;
+  const activeLegacyStreamable = legacyStreamable;
+  const activeTokenProxy = tokenProxy;
+  const activeCleanupRoot = cleanupRoot;
+  tui = null;
+  gateway = null;
+  auth = null;
+  upstream = null;
+  legacyStreamable = null;
+  tokenProxy = null;
+  cleanupRoot = null;
+
+  if (activeTui) await activeTui.kill();
+  activeGateway?.stop();
+  activeTokenProxy?.stop();
+  activeAuth?.stop();
+  activeUpstream?.stop();
+  activeLegacyStreamable?.stop();
+  if (activeCleanupRoot) {
+    rmSync(activeCleanupRoot, { recursive: true, force: true });
+  }
+});
+
+function startAuthFixture(
+  upstreamUrl: string,
+  options: {
+    rejectRefresh?: boolean;
+    authorizationMetadataContentType?: string;
+    stallRefresh?: boolean;
+    rotateAuthorizationToken?: boolean;
+    /** Appended to the access token a code is exchanged for, such as "\r\n". */
+    accessTokenSuffix?: string;
+    omitScopes?: boolean;
+    /** The metadata's token endpoint, in place of its own. */
+    tokenEndpoint?: string;
+    slackBridgeClientId?: string;
+    /** spark's Slack app signs in with `http://localhost:<port>/callback`, as spark does now, not spark.sh's redirect. */
+    slackLocalhostRedirect?: boolean;
+    /** Answer every refresh with this status and body, such as Slack's HTTP-200 `ok:false`. */
+    refreshAnswer?: { status: number; body: unknown };
+    challengeScope?: string;
+    rejectCodeExchange?: boolean;
+    resourceAtOrigin?: boolean;
+    /** Answer revocations this late. */
+    revokeDelayMs?: number;
+    /** Answer revocations with this status, in place of 200. */
+    revokeStatus?: number;
+    /** Answer the authorization server's metadata this late, like a slow sign-in. */
+    discoveryDelayMs?: number;
+    /**
+     * Each refresh token works once, as WorkOS and RFC 9700 have it: a refresh
+     * returns a new one and retires the one sent. The one just retired still
+     * returns the same tokens for `graceMs`; after that it's refused, and with
+     * `revokeOnReplay` the newest login of the chain stops working too.
+     */
+    singleUseRefresh?: { graceMs: number; revokeOnReplay?: boolean };
+    /** With `singleUseRefresh`, answer each refresh this late, after retiring the token it sent. */
+    refreshDelayMs?: number;
+    /** The code exchange waits for this file, after writing the other. */
+    codeBarrierStartedPath?: string;
+    codeBarrierReleasePath?: string;
+    /** Lists a registration endpoint, so a server added without a client ID can sign in. */
+    registration?: boolean;
+    /**
+     * Every 401 names this error in its challenge and body, as ClickState's does:
+     * `Bearer error="invalid_token", error_description="No authorization provided"`.
+     */
+    refusal?: { error: string; description?: string };
+    /** A request that carries a token the server takes still gets the 401 when it is a `tools/call`, as a login that worked and then stops. */
+    refuseToolCalls?: boolean;
+    /** Every 401 comes without a WWW-Authenticate header. */
+    omitChallenge?: boolean;
+    /** Put in front of the Bearer challenge in each 401's header, such as `Basic realm="spark", `. */
+    challengePrefix?: string;
+    /** The code exchange brings no refresh token. */
+    noRefreshToken?: boolean;
+    /** The MCP endpoint holds each request that carries the rotated token (`ACCESS_REFRESHED`) until this file exists, after writing the other, then answers by whether the token is valid then. */
+    checkBarrierStartedPath?: string;
+    checkBarrierReleasePath?: string;
+    /** How long that hold lasts without the release file, in milliseconds (20 000 by default). */
+    checkBarrierMs?: number;
+  } = {},
+) {
+  const resourcePath = "/mcp";
+  const metadataResourcePath = (options.resourceAtOrigin ?? Boolean(options.slackBridgeClientId)) ? "" : resourcePath;
+  const requests: Array<{
+    method: string;
+    path: string;
+    authorization: string | null;
+    sessionId: string | null;
+    lastEventId: string | null;
+    body: string;
+  }> = [];
+  const validTokens = new Set([ACCESS_INITIAL, ACCESS_REFRESHED]);
+  // A scope the server asks for on top of a valid token: a step-up.
+  let moreScopes: string | null = null;
+  let authorizationRequests = 0;
+  let tokenExchanges = 0;
+  let refreshes = 0;
+  let replays = 0;
+  const chain = {
+    current: REFRESH_INITIAL,
+    issued: 0,
+    retired: "",
+    retiredAt: 0,
+    retiredAnswer: {} as Record<string, unknown>,
+  };
+  let refreshCancellations = 0;
+  let revocations = 0;
+  let registrations = 0;
+  let protectedToolCalls = 0;
+  let expectedChallenge = "";
+  let expectedScope = "tools.read offline_access";
+
+  const server = Bun.serve({
+    port: 0,
+    idleTimeout: 30,
+    async fetch(request) {
+      const url = new URL(request.url);
+      const body = request.method === "GET" ? "" : await request.text();
+      requests.push({
+        method: request.method,
+        path: url.pathname,
+        authorization: request.headers.get("authorization"),
+        sessionId: request.headers.get("mcp-session-id"),
+        lastEventId: request.headers.get("last-event-id"),
+        body,
+      });
+      const origin = `http://127.0.0.1:${server.port}`;
+      const resource = `${origin}${metadataResourcePath}`;
+      const protectedRoute = url.pathname === resourcePath;
+
+      if (url.pathname === "/api/slack/install/config" && options.slackBridgeClientId) {
+        expect(url.searchParams.get("flow")).toBe("auth");
+        return Response.json({
+          client_id: options.slackBridgeClientId,
+          redirect_uri: "https://github.com/NZ-Linix/spark",
+          user_scopes: ["tools.read"],
+        });
+      }
+
+      if (protectedRoute) {
+        const bearer = request.headers.get("authorization");
+        const token = bearer?.startsWith("Bearer ") ? bearer.slice(7) : "";
+        if (options.checkBarrierStartedPath && options.checkBarrierReleasePath && token === ACCESS_REFRESHED) {
+          writeFileSync(options.checkBarrierStartedPath, "check-started");
+          if (!await waitForFile(options.checkBarrierReleasePath, options.checkBarrierMs ?? 20_000)) return new Response("", { status: 504 });
+        }
+        const refusedCall = options.refuseToolCalls === true && body.includes("\"tools/call\"");
+        if (!validTokens.has(token) || refusedCall) {
+          const refusal = options.refusal;
+          const errorParams = refusal
+            ? `error="${refusal.error}", ${refusal.description === undefined ? "" : `error_description="${refusal.description}", `}`
+            : "";
+          const challenge = `${options.challengePrefix ?? ""}Bearer ${errorParams}${options.omitScopes
+            ? `resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`
+            : `resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="${options.challengeScope ?? "tools.read"}"`}`;
+          const headers = options.omitChallenge ? {} : { "www-authenticate": challenge };
+          if (!refusal) return new Response("", { status: 401, headers });
+          return Response.json(
+            refusal.description === undefined ? { error: refusal.error } : { error: refusal.error, error_description: refusal.description },
+            { status: 401, headers },
+          );
+        }
+        if (moreScopes) {
+          return new Response("", {
+            status: 403,
+            headers: {
+              "www-authenticate": `Bearer error="insufficient_scope", scope="${moreScopes}", resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`,
+            },
+          });
+        }
+        const message = body === "" ? null : JSON.parse(body);
+        if (message?.method === "tools/call") protectedToolCalls += 1;
+        const upstreamHeaders = new Headers(request.headers);
+        upstreamHeaders.set("connection", "close");
+        return await fetch(upstreamUrl, {
+          method: request.method,
+          headers: upstreamHeaders,
+          ...(body === "" ? {} : { body }),
+        });
+      }
+      if (
+        url.pathname ===
+          `/.well-known/oauth-protected-resource${resourcePath}`
+      ) {
+        return Response.json({
+          resource,
+          authorization_servers: [
+            origin,
+          ],
+          ...(options.omitScopes
+            ? {}
+            : { scopes_supported: ["tools.read", "tools.call", "offline_access"] }),
+        });
+      }
+      if (url.pathname === "/.well-known/oauth-authorization-server") {
+        if (options.discoveryDelayMs) await Bun.sleep(options.discoveryDelayMs);
+        const metadata = {
+          issuer: origin,
+          authorization_endpoint: `${origin}/authorize`,
+          token_endpoint: options.tokenEndpoint ?? `${origin}/token`,
+          revocation_endpoint: `${origin}/revoke`,
+          ...(options.omitScopes
+            ? {}
+            : { scopes_supported: ["tools.read", "tools.call", "offline_access"] }),
+          grant_types_supported: ["authorization_code", "refresh_token"],
+          token_endpoint_auth_methods_supported: ["none"],
+          code_challenge_methods_supported: ["S256"],
+          authorization_response_iss_parameter_supported: true,
+          ...(options.registration ? { registration_endpoint: `${origin}/register` } : {}),
+        };
+        if (options.authorizationMetadataContentType) {
+          return new Response(JSON.stringify(metadata), {
+            headers: {
+              "content-type": options.authorizationMetadataContentType,
+            },
+          });
+        }
+        return Response.json(metadata);
+      }
+      if (url.pathname === "/authorize") {
+        authorizationRequests += 1;
+        expect(url.searchParams.get("resource")).toBe(new URL(resource).href);
+        expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+        expectedChallenge = url.searchParams.get("code_challenge") ?? "";
+        expectedScope = url.searchParams.get("scope") ?? "";
+        const redirect = new URL(url.searchParams.get("redirect_uri")!);
+        redirect.searchParams.set("code", "fixture-code");
+        redirect.searchParams.set(
+          "state",
+          url.searchParams.get("state")!,
+        );
+        redirect.searchParams.set(
+          "iss",
+          origin,
+        );
+        return Response.redirect(redirect, 302);
+      }
+      if (url.pathname === "/token") {
+        const form = new URLSearchParams(body);
+        expect(form.get("resource")).toBe(new URL(resource).href);
+        if (form.get("grant_type") === "refresh_token") {
+          refreshes += 1;
+          const rule = options.singleUseRefresh;
+          if (rule) {
+            const sent = form.get("refresh_token") ?? "";
+            if (sent !== "" && sent === chain.current) {
+              chain.issued += 1;
+              const answer = {
+                access_token: `${ACCESS_REFRESHED}-${chain.issued}`,
+                refresh_token: `${REFRESH_ROTATED}-${chain.issued}`,
+                token_type: "Bearer",
+                scope: "tools.read offline_access",
+                expires_in: 3600,
+              };
+              Object.assign(chain, { current: answer.refresh_token, retired: sent, retiredAt: Date.now(), retiredAnswer: answer });
+              validTokens.add(answer.access_token);
+              if (options.refreshDelayMs) await Bun.sleep(options.refreshDelayMs);
+              return Response.json(answer);
+            }
+            if (sent === chain.retired && Date.now() - chain.retiredAt <= rule.graceMs) return Response.json(chain.retiredAnswer);
+            replays += 1;
+            if (rule.revokeOnReplay) {
+              chain.current = "";
+              validTokens.clear();
+            }
+            return Response.json({ error: "invalid_grant" }, { status: 400 });
+          }
+          // A refused refresh is refused whichever token it presents.
+          if (!options.rejectRefresh) expect(form.get("refresh_token")).toBe(options.rotateAuthorizationToken ? REFRESH_ROTATED : REFRESH_INITIAL);
+          if (options.stallRefresh && refreshes === 1) {
+            return new Response(
+              new ReadableStream({
+                cancel() {
+                  refreshCancellations += 1;
+                },
+              }),
+              { headers: { "content-type": "application/json" } },
+            );
+          }
+          if (options.rejectRefresh) {
+            return Response.json(
+              { error: "invalid_grant" },
+              { status: 400 },
+            );
+          }
+          if (options.refreshAnswer) return Response.json(options.refreshAnswer.body, { status: options.refreshAnswer.status });
+          return Response.json({
+            access_token: ACCESS_REFRESHED,
+            refresh_token: REFRESH_ROTATED,
+            token_type: "Bearer",
+            scope: "tools.read offline_access",
+            expires_in: 3600,
+          });
+        }
+        tokenExchanges += 1;
+        if (options.codeBarrierStartedPath && options.codeBarrierReleasePath) {
+          writeFileSync(options.codeBarrierStartedPath, "code-started");
+          if (!await waitForFile(options.codeBarrierReleasePath, 10_000)) {
+            return Response.json({ error: "code barrier timed out" }, { status: 504 });
+          }
+        }
+        // Only a server playing Slack's bridge gets spark.sh's redirect; another
+        // server that names spark's Slack app signs in on its own.
+        if (options.slackBridgeClientId && form.get("client_id") === SPARK_SLACK_CLIENT_ID) {
+          if (options.slackLocalhostRedirect) expect(form.get("redirect_uri")).toMatch(/^http:\/\/localhost:\d+\/callback$/);
+          else expect(form.get("redirect_uri")).toBe("https://github.com/NZ-Linix/spark");
+          expect(form.get("client_secret")).toBeNull();
+        }
+        if (options.rejectCodeExchange) return Response.json({ error: "invalid_grant" }, { status: 400 });
+        expect(form.get("grant_type")).toBe("authorization_code");
+        expect(form.get("code")).toBe("fixture-code");
+        const verifier = form.get("code_verifier") ?? "";
+        const actualChallenge = createHash("sha256")
+          .update(verifier)
+          .digest("base64url");
+        expect(actualChallenge).toBe(expectedChallenge);
+        return Response.json({
+          access_token: (options.rotateAuthorizationToken
+            ? ACCESS_REFRESHED
+            : ACCESS_INITIAL) + (options.accessTokenSuffix ?? ""),
+          ...(options.noRefreshToken
+            ? {}
+            : { refresh_token: options.rotateAuthorizationToken ? REFRESH_ROTATED : REFRESH_INITIAL }),
+          token_type: "Bearer",
+          ...(options.omitScopes ? {} : { scope: expectedScope }),
+          expires_in: 3600,
+        });
+      }
+      if (url.pathname === "/revoke") {
+        revocations += 1;
+        if (options.revokeDelayMs) await Bun.sleep(options.revokeDelayMs);
+        return new Response("", { status: options.revokeStatus ?? 200 });
+      }
+      if (url.pathname === "/register" && options.registration && request.method === "POST") {
+        registrations += 1;
+        const asked = JSON.parse(body) as { redirect_uris?: string[] };
+        return Response.json({ client_id: "spark-mcp-auth-test", token_endpoint_auth_method: "none", redirect_uris: asked.redirect_uris ?? [] }, { status: 201 });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+
+  return {
+    resource: `http://127.0.0.1:${server.port}${metadataResourcePath}`,
+    url: `http://127.0.0.1:${server.port}/mcp`,
+    requests,
+    /** The access tokens the server takes; a test may withdraw them. */
+    validTokens,
+    /** From now on, a valid token gets a 403 asking for `scope` too; null stops it. */
+    askForMoreScopes(scope: string | null) {
+      moreScopes = scope;
+    },
+    get authorizationRequests() {
+      return authorizationRequests;
+    },
+    get tokenExchanges() {
+      return tokenExchanges;
+    },
+    get registrations() {
+      return registrations;
+    },
+    get refreshes() {
+      return refreshes;
+    },
+    /** Refreshes with a retired refresh token, past its grace. */
+    get replays() {
+      return replays;
+    },
+    get refreshCancellations() {
+      return refreshCancellations;
+    },
+    get revocations() {
+      return revocations;
+    },
+    get protectedToolCalls() {
+      return protectedToolCalls;
+    },
+    stop() {
+      server.stop(true);
+    },
+  };
+}
+
+function createRoot(
+  activeAuth: AuthFixture,
+  configureOauth = true,
+  transport: "http" | "sse" = "http",
+  serverUrl = activeAuth.url,
+  followAuthorization = true,
+  clientId = "spark-mcp-auth-test",
+  startupMs = 5_000,
+) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "spark-mcp-auth-")));
+  cleanupRoot = root;
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const bin = join(root, "bin");
+  const trace = join(root, "trace.log");
+  const openLog = join(root, "open.log");
+  const callbackLog = join(root, "callback.html");
+  const stderr = join(root, "stderr.log");
+  mkdirSync(join(home, ".spark"), { recursive: true, mode: 0o700 });
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(
+    join(home, ".spark", "settings.json"),
+    JSON.stringify({}),
+  );
+  writeFileSync(
+    join(home, ".spark", "mcp.json"),
+    JSON.stringify({
+      mcp: {
+        fixture: {
+          type: transport,
+          url: serverUrl,
+          ...(configureOauth
+            ? {
+                oauth: {
+                  client_id: clientId,
+                  scopes: ["tools.read"],
+                },
+              }
+            : {}),
+          startup_timeout_ms: startupMs,
+        },
+      },
+    }),
+  );
+  const follow = followAuthorization
+    ? `nohup curl --location --silent --show-error "$1" > '${callbackLog}' 2>/dev/null &\n`
+    : "";
+  const opener =
+    `#!/bin/sh\nprintf '%s\\n' "$1" > '${openLog}'\n${follow}exit 0\n`;
+  for (const name of ["open", "xdg-open"]) {
+    const path = join(bin, name);
+    writeFileSync(path, opener);
+    chmodSync(path, 0o700);
+  }
+  return { root, home, workspace, bin, trace, openLog, callbackLog, stderr };
+}
+
+function moveAuthFixtureToWorkspace(root: ReturnType<typeof createRoot>): void {
+  const profilePath = join(root.home, ".spark", "mcp.json");
+  const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+  writeFileSync(
+    join(root.workspace, ".mcp.json"),
+    JSON.stringify({ mcpServers: { fixture: profile.mcp.fixture } }),
+  );
+  writeFileSync(profilePath, JSON.stringify({ mcp: {} }));
+}
+
+function baseEnv(root: ReturnType<typeof createRoot>) {
+  return {
+    HOME: root.home,
+    ZIG_GLOBAL_CACHE_DIR: zigGlobalCacheDir(),
+    PATH: `${root.bin}${delimiter}${process.env.PATH ?? ""}`,
+    AI_GATEWAY_API_KEY: "fake-mcp-auth-key",
+    VERCEL_OIDC_TOKEN: undefined,
+    SPARK_AUTO_UPGRADE: "0",
+    SPARK_PERMISSION_MODE: "auto",
+    SPARK_MODEL: MODEL,
+    SPARK_TRACE_LOG: root.trace,
+    SPARK_TRACE_SCOPES: "mcp,core",
+  };
+}
+
+/** spark exited 0. When it didn't, the failure shows what it printed. */
+function expectExit0(result: { code: number; stdout: string; stderr: string }): void {
+  expect({ code: result.code, stdout: result.stdout, stderr: result.stderr }).toMatchObject({ code: 0 });
+}
+
+function seedExpiredCredentials(
+  root: ReturnType<typeof createRoot>,
+  activeAuth: AuthFixture,
+  expiresAtMs = 0,
+) {
+  const endpoint = activeAuth.url;
+  const origin = new URL(endpoint).origin;
+  const directory = join(root.home, ".spark", "mcp-credentials");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const path = join(directory, "credentials.json");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      version: 1,
+      credentials: [{
+        server_identity: "fixture",
+        endpoint,
+        resource: new URL(activeAuth.resource).href,
+        issuer: origin,
+        client_id: "spark-mcp-auth-test",
+        client_secret: null,
+        access_token: ACCESS_INITIAL,
+        refresh_token: REFRESH_INITIAL,
+        scope: "tools.read offline_access",
+        token_type: "Bearer",
+        token_endpoint_auth_method: "none",
+        expires_at_ms: expiresAtMs,
+        authorization_endpoint: `${origin}/authorize`,
+        token_endpoint: `${origin}/token`,
+        revocation_endpoint: `${origin}/revoke`,
+      }],
+    }),
+    { mode: 0o600 },
+  );
+  chmodSync(path, 0o600);
+  return path;
+}
+
+/**
+ * Holds spark's MCP credential store lock from another process, as a busy spark would, for
+ * `seconds`; resolves once it is held.
+ */
+async function holdStoreLock(root: ReturnType<typeof createRoot>, seconds: number) {
+  const path = join(root.home, ".spark", "mcp-credentials", "credentials-v3.lock");
+  const holder = Bun.spawn(["perl", "-e", 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "held\n"; sleep $ARGV[1];', path, String(seconds)], { stdout: "pipe" });
+  const reader = holder.stdout.getReader();
+  const { value } = await reader.read();
+  expect(new TextDecoder().decode(value)).toBe("held\n");
+  return holder;
+}
+
+/** A login in spark's MCP credential store (SPARK_DISABLE_KEYCHAIN), as spark saves it. */
+function seedV2Credential(root: ReturnType<typeof createRoot>, activeAuth: AuthFixture, fields: Record<string, unknown> = {}) {
+  const origin = new URL(activeAuth.url).origin;
+  const directory = join(root.home, ".spark", "mcp-credentials");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const credential = JSON.stringify({
+    access: ACCESS_INITIAL, refresh: REFRESH_INITIAL, expires_at_ms: null, skew_ms: 30_000,
+    token_endpoint: `${origin}/token`, revocation_endpoint: `${origin}/revoke`,
+    resource: new URL(activeAuth.resource).href, client_id: "spark-mcp-auth-test", client_secret: null, method: "none", ...fields,
+  });
+  const path = join(directory, "credentials-v3.json");
+  writeFileSync(path, JSON.stringify({ version: 1, servers: [{ name: "fixture", url: activeAuth.url, credential }] }), { mode: 0o600 });
+  return path;
+}
+
+/**
+ * The MCP credential store's Keychain item for a throwaway account, through
+ * the same Security calls spark's osascript helper makes, so no other program
+ * needs Keychain access to it. `op` is "load" (the item's text, "" when
+ * there is none) or "delete".
+ */
+const MCP_KEYCHAIN_SERVICE = "SPARK_MCP_OAUTH_CREDENTIALS_V3";
+const MCP_KEYCHAIN_ACCOUNT_PREFIX = "spark-e2e-mcp-lock-";
+const MCP_KEYCHAIN_SCRIPT = `
+ObjC.import("Security");
+ObjC.import("Foundation");
+const object = (value) => ObjC.castRefToObject(value);
+function run(argv) {
+  const query = $.NSMutableDictionary.alloc.init;
+  query.setObjectForKey(object($.kSecClassGenericPassword), object($.kSecClass));
+  query.setObjectForKey($(argv[1]), object($.kSecAttrAccount));
+  query.setObjectForKey($(argv[2]), object($.kSecAttrService));
+  if (argv[0] === "delete") {
+    const status = $.SecItemDelete(query);
+    if (status !== 0 && status !== -25300) throw new Error("keychain status=" + status);
+    return "";
+  }
+  query.setObjectForKey($.NSNumber.numberWithBool(true), object($.kSecReturnData));
+  query.setObjectForKey(object($.kSecMatchLimitOne), object($.kSecMatchLimit));
+  const result = Ref();
+  const status = $.SecItemCopyMatching(query, result);
+  if (status === -25300) return "";
+  if (status !== 0) throw new Error("keychain status=" + status);
+  return $.NSString.alloc.initWithDataEncoding(ObjC.castRefToObject(result[0]), $.NSUTF8StringEncoding).js;
+}`;
+
+function mcpKeychainItem(op: "load" | "delete", account: string, home: string): string {
+  if (!account.startsWith(MCP_KEYCHAIN_ACCOUNT_PREFIX)) throw new Error("refusing to touch a non-test MCP Keychain account");
+  const result = spawnSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", MCP_KEYCHAIN_SCRIPT, op, account, MCP_KEYCHAIN_SERVICE], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: home, USER: account },
+  });
+  if (result.status !== 0) throw new Error(`MCP Keychain ${op} failed: ${result.stderr.trim()}`);
+  return result.stdout.trim();
+}
+
+/**
+ * Pauses the first Keychain read spark makes for `account` from now on, as a
+ * slow Keychain does; resolves with its pid, or null if none starts in 15 s.
+ */
+function pauseNextKeychainRead(account: string): { pid: Promise<number | null>; stop: () => void } {
+  const watcher = Bun.spawn(["/bin/sh", "-c", `while :; do p=$(pgrep -f "load ${account} ${MCP_KEYCHAIN_SERVICE}" | head -1); if [ -n "$p" ]; then kill -STOP "$p"; echo "$p"; exit 0; fi; done`], { stdout: "pipe" });
+  const pid = Promise.race([new Response(watcher.stdout).text(), Bun.sleep(15_000).then(() => "")]).then((out) => Number(out.trim()) || null);
+  return { pid, stop: () => { try { watcher.kill(); } catch {} } };
+}
+
+function releaseProcess(pid: number | null) {
+  if (pid) try { process.kill(pid, "SIGCONT"); } catch {}
+}
+
+function startToolGateway() {
+  return startFakeGateway([
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: { text: "authenticated" } }),
+    fakeGatewayFinalText("Authenticated MCP call complete."),
+  ], {
+    models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+  });
+}
+
+/// Holds the call to the protected tool until `callAt`, a wall-clock time in ms.
+function startDelayedToolGateway(callAt: number, finalText: string) {
+  return startFakeGateway([
+    fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+    async () => {
+      await Bun.sleep(Math.max(0, callAt - Date.now()));
+      return fakeGatewayToolCall("call_mcp", "toolbox", { run: TOOL_NAME, arguments: {
+        text: "authenticated",
+      } });
+    },
+    fakeGatewayFinalText(finalText),
+  ], {
+    models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+  });
+}
+
+/// Holds the first call to the protected tool until `callAt()`, a wall-clock
+/// time in ms.
+function startRefreshRecoveryGateway(callAt: () => number) {
+  return startFakeGateway([
+    fakeGatewayToolCall("select_cancel", "toolbox", { open: TOOL_NAME }),
+    async () => {
+      await Bun.sleep(Math.max(0, callAt() - Date.now()));
+      return fakeGatewayToolCall("call_cancel", "toolbox", { run: TOOL_NAME, arguments: {
+        text: "cancelled",
+      } });
+    },
+    fakeGatewayToolCall("select_retry", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_retry", "toolbox", { run: TOOL_NAME, arguments: {
+      text: "retried",
+    } }),
+    fakeGatewayFinalText("Retry ended."),
+    fakeGatewayToolCall("select_recovery", "toolbox", { open: TOOL_NAME }),
+    fakeGatewayToolCall("call_recovery", "toolbox", { run: TOOL_NAME, arguments: {
+      text: "recovered",
+    } }),
+    fakeGatewayFinalText("Refresh recovery complete."),
+  ], {
+    models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+  });
+}
+
+function collectRegularFiles(root: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(root)) {
+    const path = join(root, entry);
+    const stat = statSync(path);
+    if (stat.isDirectory()) {
+      files.push(...collectRegularFiles(path));
+    } else if (stat.isFile()) {
+      files.push(path);
+    }
+  }
+  return files;
+}
+
+function toolResultText(
+  body: string,
+  toolCallId: string,
+  outputType: "text" | "error-text" = "text",
+): string {
+  const request = JSON.parse(body) as {
+    prompt?: Array<{ content?: Array<Record<string, unknown>> }>;
+  };
+  const result = (request.prompt ?? [])
+    .flatMap((message) => message.content ?? [])
+    .find((part) =>
+      part.type === "tool-result" && part.toolCallId === toolCallId
+    );
+  if (!result) throw new Error(`Missing tool result for ${toolCallId}`);
+  const output = result.output as Record<string, unknown>;
+  if (output.type !== outputType || typeof output.value !== "string") {
+    throw new Error(`Invalid tool result for ${toolCallId}`);
+  }
+  return output.value;
+}
+
+describe("MCP login", () => {
+  test(
+    "spark ask isolates failed-server authentication from healthy tool search",
+    async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth);
+      writeFileSync(
+        join(root.home, ".spark", "mcp.json"),
+        JSON.stringify({
+          mcp: {
+            linear: {
+              type: "http",
+              url: upstream.url,
+              startup_timeout_ms: 5_000,
+              operation_timeout_ms: 5_000,
+            },
+            slack: {
+              type: "http",
+              url: auth.url,
+              oauth: {
+                client_id: "spark-mcp-auth-test",
+                scopes: ["tools.read"],
+              },
+              startup_timeout_ms: 5_000,
+              operation_timeout_ms: 5_000,
+            },
+          },
+        }),
+      );
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("search_exact", "toolbox", { search: "Please use mcp_linear_echo for this request" }),
+        fakeGatewayToolCall("search_noisy", "toolbox", { search: "linear issue" }),
+        fakeGatewayToolCall("search_auth_collision", "toolbox", { search: "slack data" }),
+        fakeGatewayToolCall("search_targeted", "toolbox", { search: "authenticate slack now" }),
+        fakeGatewayToolCall("search_healthy", "toolbox", { search: "linear echo" }),
+        fakeGatewayFinalText("MCP search isolation observed."),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Exercise mixed MCP search."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...baseEnv(root),
+            SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
+            SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
+          },
+          timeoutMs: 20_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      const finalBody = gateway.requests.at(-1)?.body ?? "";
+      const exact = toolResultText(finalBody, "search_exact");
+      expect(exact).toContain("mcp_linear_echo");
+      expect(exact).not.toContain("authentication_required");
+      const noisy = toolResultText(finalBody, "search_noisy");
+      expect(noisy).toContain("mcp_linear_echo");
+      expect(noisy).not.toContain("authentication_required");
+      const collision = toolResultText(finalBody, "search_auth_collision");
+      expect(collision).toContain("authentication_required");
+      expect(collision).toContain('\"server\":\"slack\"');
+      expect(collision).not.toContain("mcp_linear_echo");
+      const targeted = toolResultText(finalBody, "search_targeted");
+      expect(targeted).toContain("authentication_required");
+      expect(targeted).toContain('\"server\":\"slack\"');
+      expect(toolResultText(finalBody, "search_healthy")).toContain(
+        "mcp_linear_echo",
+      );
+      expect(auth.authorizationRequests).toBe(0);
+    },
+    30_000,
+  );
+
+  // Without a display (Linux with no DISPLAY, an SSH session, or
+  // SPARK_NO_OPEN_BROWSER) spark offers paste-back instead of opening a browser.
+  // These tests drive the fake browser, so they declare one everywhere.
+  const v2Env = (root: ReturnType<typeof createRoot>) => ({
+    ...baseEnv(root),
+    SPARK_DISABLE_KEYCHAIN: "1",
+    DISPLAY: ":0",
+    SSH_CONNECTION: undefined,
+    SPARK_NO_OPEN_BROWSER: undefined,
+  });
+  const statusOf = async (root: ReturnType<typeof createRoot>) => {
+    const list = await runFx(["mcp", "list", "--json"], { cwd: root.workspace, env: v2Env(root) });
+    expect(list.code).toBe(0);
+    return JSON.parse(list.stdout).servers[0].status;
+  };
+  // What the model is told to ask for depends on where the user is.
+  const searchNeedingLogin = () => startFakeGateway([
+    fakeGatewayToolCall("search_auth", "toolbox", { search: "fixture", server: "fixture" }),
+    fakeGatewayFinalText("Sign in first."),
+  ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+
+  test("spark ask tells the model the user signs in with spark mcp login in a terminal", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = searchNeedingLogin();
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Find the protected MCP tool."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 20_000,
+    });
+    expect(result.code).toBe(0);
+    expect(gateway.requests[1]?.body).toContain("Run spark mcp login fixture in a terminal, then search again.");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 30_000);
+
+  test("an open search that matches nothing names the servers it couldn't look in, and why", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const profile = join(root.home, ".spark", "mcp.json");
+    const config = JSON.parse(readFileSync(profile, "utf8"));
+    config.mcp.broken = { type: "local", command: ["false"], startup_timeout_ms: 5_000 };
+    writeFileSync(profile, JSON.stringify(config));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("search_open", "toolbox", { search: "weather forecast" }),
+      fakeGatewayFinalText("Nothing found."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "What's the weather?"], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    const told = toolResultText(gateway.requests[1]?.body ?? "", "search_open");
+    expect(told).toContain('"state":"no_match"');
+    expect(told).toContain('"mcp_unavailable":[');
+    expect(told).toContain("\"MCP server 'fixture' needs a login. Ask the user to run spark mcp login fixture in a terminal, then try again.\"");
+    expect(told).toContain("\"MCP server 'broken' is unavailable: ");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 45_000);
+
+  // A deny rule names the tool, but the server's list is not loaded until the
+  // user signs in, so open answers why, in the same words in every mode: full
+  // access ignores the rule and the login text is not a rule's doing.
+  test("a tool of a server that needs a login says so in the same words in full access and in auto, with a deny rule on it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const settingsPath = join(root.home, ".spark", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+    writeFileSync(settingsPath, JSON.stringify({ ...settings, permission: { [TOOL_NAME]: "deny" } }));
+    const told: Record<string, string> = {};
+    for (const mode of ["--auto", "--full-access"]) {
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("open_login", "toolbox", { open: TOOL_NAME }),
+        fakeGatewayFinalText("Sign in first."),
+      ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+      const result = await runFx(["ask", "--json", mode, "--no-save", "Open the protected tool."], {
+        cwd: root.workspace,
+        env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      told[mode] = toolResultText(gateway.requests[1]?.body ?? "", "open_login", "error-text");
+      gateway.stop();
+      gateway = null;
+    }
+    expect(told["--auto"]).toContain("needs a login");
+    expect(told["--full-access"]).toBe(told["--auto"]);
+    expect(auth.authorizationRequests).toBe(0);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("the shell tells the model the user signs in with /mcp login", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = searchNeedingLogin();
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Find the protected MCP tool.");
+    await tui.waitForText("Sign in first.", 20_000);
+    const told = gateway.requests[1]?.body ?? "";
+    expect(told).toContain("Run /mcp login fixture, then search again.");
+    expect(told).not.toContain("spark mcp login fixture in a terminal");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 45_000);
+
+  test("spark mcp login signs in through the browser, and logout signs out", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { revokeDelayMs: 500 });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expect(await statusOf(root)).toBe("not_started");
+
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.stderr).toBe("");
+    expectExit0(login);
+    expect(login.stdout).toContain("Approve in your browser.");
+    expect(login.stdout).toContain("Signed in to fixture.");
+    const opened = new URL(readFileSync(root.openLog, "utf8").trim());
+    expect(opened.pathname).toBe("/authorize");
+    expect(new URL(opened.searchParams.get("redirect_uri")!).hostname).toBe("127.0.0.1");
+    expect(auth.tokenExchanges).toBe(1);
+    expect(login.stdout).not.toContain(ACCESS_INITIAL);
+    expect(await statusOf(root)).toBe("signed_in");
+
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.stderr).toBe("");
+    expectExit0(show);
+    expect(show.stdout).toMatch(/status +ready/);
+    expect(show.stdout).not.toContain(ACCESS_INITIAL);
+
+    const logoutStart = Date.now();
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    const logoutMs = Date.now() - logoutStart;
+    expect(logout.code).toBe(0);
+    expect(logout.stdout).toBe("Signed out of fixture.\n");
+    // The refresh token is revoked, and spark waits for the answer before it
+    // exits: hanging up loses the revocation on a real network.
+    expect(auth.revocations).toBe(1);
+    expect(logoutMs).toBeGreaterThanOrEqual(500);
+    expect(await statusOf(root)).toBe("not_started");
+  }, 60_000);
+
+  // Before, a logout that sent no revocation, as for a server whose
+  // authorization server takes none, still said only "Signed out", though
+  // the tokens kept working there.
+  test("a logout that can't revoke the login at its server says the tokens stay valid", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    seedV2Credential(root, auth, { revocation_endpoint: null });
+    expect(await statusOf(root)).toBe("signed_in");
+
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(logout.stdout).toBe("Signed out of fixture here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
+    expect(logout.stderr).toBe("");
+    expect(logout.code).toBe(0);
+    expect(auth.revocations).toBe(0);
+    expect(await statusOf(root)).toBe("not_started");
+  }, 60_000);
+
+  // A revocation the server refused, or didn't answer before spark stopped
+  // waiting, may have left the tokens working there. Before, spark forgot them
+  // and never tried again; now it keeps them to revoke later.
+  const unconfirmedLogout =
+    "Signed out of fixture here, but its server didn't confirm the revocation, so its tokens may stay valid for now. spark will try again later.\n";
+  const keptSignOuts = (root: { home: string }) => join(root.home, ".spark", "mcp-revocations.json");
+  const revokedTokens = (fixture: AuthFixture) =>
+    fixture.requests.filter((request) => request.path === "/revoke").map((request) => new URLSearchParams(request.body).get("token"));
+
+  for (const [what, options] of [
+    ["refuses", { revokeStatus: 503 }],
+    ["doesn't answer in time", { revokeDelayMs: 4_000 }],
+  ] as const) {
+    test(`a logout whose revocation the server ${what} keeps it to try again later`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, options);
+      const root = createRoot(auth);
+      seedV2Credential(root, auth);
+      const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+      expect(logout.stdout).toBe(unconfirmedLogout);
+      expect(logout.stderr).toBe("");
+      expect(logout.code).toBe(0);
+      expect(auth.revocations).toBe(1);
+      expect(await statusOf(root)).toBe("not_started");
+      // Kept in a private file, with the refresh token the revocation sent.
+      expect(statSync(keptSignOuts(root)).mode & 0o777).toBe(0o600);
+      expect(readFileSync(keptSignOuts(root), "utf8")).toContain(`"refresh_token":"${REFRESH_INITIAL}"`);
+    }, 60_000);
+  }
+
+  test("a logout whose revocation can't reach the server keeps it to try again later", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    // A port that was just listening and is now closed refuses the connection.
+    const closed = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(null) });
+    const revokeUrl = `http://127.0.0.1:${closed.port}/revoke`;
+    closed.stop(true);
+    seedV2Credential(root, auth, { revocation_endpoint: revokeUrl });
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(logout.stdout).toBe(unconfirmedLogout);
+    expect(logout.stderr).toBe("");
+    expect(logout.code).toBe(0);
+    expect(auth.revocations).toBe(0);
+    expect(await statusOf(root)).toBe("not_started");
+    expect(existsSync(keptSignOuts(root))).toBe(true);
+  }, 60_000);
+
+  test("the next spark mcp logout revokes a sign-out its server didn't confirm, and forgets it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const first = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(first.stdout).toBe(unconfirmedLogout);
+    // The logout's own retry leaves the sign-out it just kept to itself.
+    expect(auth.revocations).toBe(1);
+    expect(existsSync(keptSignOuts(root))).toBe(true);
+
+    // The server works again. The next logout has nothing of its own to
+    // sign out of, and sends the kept revocation.
+    delete options.revokeStatus;
+    const second = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(second.stdout).toBe("fixture wasn't signed in.\n");
+    expect(second.stderr).toBe("");
+    expect(second.code).toBe(0);
+    expect(revokedTokens(auth)).toEqual([REFRESH_INITIAL, REFRESH_INITIAL]);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
+
+    // Nothing is kept, so a third sends nothing.
+    const third = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(third);
+    expect(auth.revocations).toBe(2);
+  }, 60_000);
+
+  // RFC 7009 confirms a revocation with any 2xx. Before, the retry took only
+  // a 200, so a server that answers 204 got the same kept sign-out again at
+  // every later command.
+  test("a kept sign-out its server confirms with a 204 is forgotten", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const first = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(first.stdout).toBe(unconfirmedLogout);
+
+    options.revokeStatus = 204;
+    const second = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(second);
+    expect(revokedTokens(auth)).toEqual([REFRESH_INITIAL, REFRESH_INITIAL]);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
+    const third = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(third);
+    expect(auth.revocations).toBe(2);
+  }, 60_000);
+
+  test("the next spark mcp login that signs in revokes a sign-out its server didn't confirm", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(logout.stdout).toBe(unconfirmedLogout);
+    expect(existsSync(keptSignOuts(root))).toBe(true);
+
+    delete options.revokeStatus;
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.stderr).toBe("");
+    expectExit0(login);
+    expect(login.stdout).toContain("Signed in to fixture.");
+    expect(auth.tokenExchanges).toBe(1);
+    // After the sign-in, the kept revocation goes, and nothing stays kept.
+    expect(revokedTokens(auth)).toEqual([REFRESH_INITIAL, REFRESH_INITIAL]);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
+    expect(await statusOf(root)).toBe("signed_in");
+  }, 60_000);
+
+  test("an spark mcp login that fails sends no kept sign-out and keeps it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { revokeStatus?: number; rejectCodeExchange?: boolean } = { revokeStatus: 503 };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const env = v2Env(root);
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(logout.stdout).toBe(unconfirmedLogout);
+
+    delete options.revokeStatus;
+    options.rejectCodeExchange = true;
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.code).toBe(1);
+    expect(login.stderr).toContain("Couldn't sign in to fixture");
+    expect(auth.revocations).toBe(1);
+    expect(readFileSync(keptSignOuts(root), "utf8")).toContain(`"refresh_token":"${REFRESH_INITIAL}"`);
+  }, 60_000);
+
+  test("a confirmed logout keeps nothing", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(logout.stdout).toBe("Signed out of fixture.\n");
+    expect(auth.revocations).toBe(1);
+    expect(existsSync(keptSignOuts(root))).toBe(false);
+  }, 60_000);
+
+  test("spark mcp login says why the server refused the sign-in, in its words", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { rejectCodeExchange: true });
+    const root = createRoot(auth);
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(login.code).toBe(1);
+    // The token endpoint's own error, not the stage's name.
+    expect(login.stderr).toBe("Couldn't sign in to fixture: it didn't accept the sign-in (invalid_grant).\n");
+    // The one exchange, refused.
+    expect(auth.tokenExchanges).toBe(1);
+    expect(await statusOf(root)).not.toBe("signed_in");
+  }, 30_000);
+
+  // ---- A server that refuses a login says so ----
+  //
+  // The server answers every request that carries spark's token with 401 invalid_token. The
+  // sign-in then ends with the server's own words and saves nothing, so the person can tell
+  // that the server refused the token, instead of finding only "needs login" later.
+  const REFUSAL = { error: "invalid_token", description: "No authorization provided" };
+  // The server's own words go in quotes inside spark's sentence, so they can't close it.
+  const REFUSED_NEW = 'fixture refused the new login (invalid_token: "No authorization provided")';
+  const REFUSED_SAVED = 'fixture refused the saved login (invalid_token: "No authorization provided")';
+  // A description that tries to end spark's sentence and start one of its own.
+  const FORGED = "x). Signed in to fixture";
+  // The model's search answer is JSON whose text the search escapes for HTML, so a quote reaches it as `&quot;`.
+  const inSearch = (words: string) => words.replaceAll('"', "&quot;");
+
+  test("spark mcp login to a server that refuses the new login says so, exits 1, and saves nothing", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refusal: REFUSAL });
+    auth.validTokens.clear();
+    const root = createRoot(auth);
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 30_000 });
+    expect(login.stdout).not.toContain("Signed in");
+    expect(login.stderr).toBe(`Couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
+    expect(login.code).toBe(1);
+    expect(auth.tokenExchanges).toBe(1);
+    // Forgetting the refused token is not a logout: nothing is revoked, and nothing says "Signed out".
+    expect(auth.revocations).toBe(0);
+    expect(login.stdout + login.stderr).not.toContain("Signed out");
+    // The server was asked once with the new token, and the refused token was never saved.
+    expect(auth.requests.filter((r) => r.authorization === `Bearer ${ACCESS_INITIAL}`).length).toBeGreaterThan(0);
+    expect(await statusOf(root)).toBe("not_started");
+  }, 60_000);
+
+  // The server refuses the new token with a 401, and the token endpoint then fails the refresh that
+  // 401 starts (a 500, a 429). The 401 is the server's answer to the new login, so the sign-in ends
+  // refused and nothing is saved, whatever happens to the refresh. spark used to take the failed refresh
+  // for "couldn't check", save the token the server had refused, and say it couldn't reach the server.
+  for (const [what, answer] of [
+    ["answers 500", { status: 500, body: { error: "server_error" } }],
+    ["answers 429", { status: 429, body: { error: "slow_down" } }],
+  ] as const) {
+    test(`spark mcp login to a server that refuses the new login, whose refresh then ${what}, is refused, exits 1, and saves nothing`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { refusal: REFUSAL, refreshAnswer: answer });
+      auth.validTokens.clear();
+      const root = createRoot(auth);
+      const store = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+      const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 30_000 });
+      expect(login.code).toBe(1);
+      expect(login.stdout).not.toContain("Signed in");
+      // The store holds nothing: the refused token was never written.
+      expect(existsSync(store)).toBe(false);
+      expect(await statusOf(root)).toBe("not_started");
+      expect(login.stderr).toBe(`Couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
+      // The 401 did start a refresh, and it was the one that failed.
+      expect(auth.refreshes).toBe(1);
+      expect(auth.revocations).toBe(0);
+    }, 60_000);
+  }
+
+  // The server refuses the new token with a 401 and takes the refresh that 401 starts, then holds
+  // the request that carries the refreshed token past the owner's 45 second wait for the check.
+  // The engine still holds the 401 when that wait ends, so the sign-in ends refused and nothing is
+  // saved. spark used to keep the login then, with a note, though the server had refused its token.
+  test("spark mcp login to a server that refuses the new login, whose retry then hangs past the wait, is refused, exits 1, and saves nothing", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const barrier = mkdtempSync(join(tmpdir(), "spark-mcp-check-barrier-"));
+    const started = join(barrier, "started");
+    const release = join(barrier, "release");
+    auth = startAuthFixture(upstream.url, { refusal: REFUSAL, checkBarrierStartedPath: started, checkBarrierReleasePath: release, checkBarrierMs: 80_000 });
+    // The new token is refused; the refresh brings one the server takes, and holds its request.
+    auth.validTokens.delete(ACCESS_INITIAL);
+    // The server's start budget is longer than the owner's 45 second wait, so the engine's own timer
+    // doesn't end the check first.
+    const root = createRoot(auth, true, "http", auth.url, true, "spark-mcp-auth-test", 120_000);
+    const store = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    const began = Date.now();
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 100_000 });
+    const seconds = (Date.now() - began) / 1000;
+    writeFileSync(release, "go");
+    expect(existsSync(started)).toBe(true);
+    expect(login.stdout).not.toContain("Signed in");
+    expect(login.stderr).toBe(`Couldn't sign in to fixture: ${REFUSED_NEW}.\n`);
+    expect(login.code).toBe(1);
+    // The wait ended it, not the engine: the request with the refreshed token was still held.
+    expect(seconds).toBeGreaterThan(40);
+    expect(auth.refreshes).toBe(1);
+    expect(auth.revocations).toBe(0);
+    expect(existsSync(store)).toBe(false);
+    expect(await statusOf(root)).toBe("not_started");
+  }, 150_000);
+
+  test("a new login the server refuses, whose refresh then fails, leaves the saved login as it was", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rotateAuthorizationToken?: boolean; refusal: typeof REFUSAL; refreshAnswer: { status: number; body: unknown } } = {
+      refusal: REFUSAL, refreshAnswer: { status: 500, body: { error: "server_error" } },
+    };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const store = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    const before = readFileSync(store, "utf8");
+    // The server takes the login it has and refuses the next one it issues.
+    auth.validTokens.clear();
+    auth.validTokens.add(ACCESS_INITIAL);
+    options.rotateAuthorizationToken = true;
+    const again = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(again.code).toBe(1);
+    expect(again.stdout).not.toContain("Signed in");
+    expect(readFileSync(store, "utf8")).toBe(before);
+    expect(again.stderr).toContain(REFUSED_NEW);
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(0);
+    expect(show.stdout).toMatch(/status +ready/);
+  }, 120_000);
+
+  // The host's store of saved logins turns unreadable while a new login waits for its check
+  // request (a reload read it for a server it added, and a newer spark had saved it). The
+  // branch for an unreadable store must not take the server's refusal of the new login:
+  // the sign-in still ends refused, with nothing saved.
+  test.skipIf(!tmuxAvailable())("a new login the server refuses is refused when the saved logins can't be read meanwhile, and nothing is saved", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const barrier = mkdtempSync(join(tmpdir(), "spark-mcp-check-barrier-"));
+    const started = join(barrier, "started");
+    const release = join(barrier, "release");
+    auth = startAuthFixture(upstream.url, {
+      rotateAuthorizationToken: true, noRefreshToken: true, refusal: REFUSAL, checkBarrierStartedPath: started, checkBarrierReleasePath: release,
+    });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = seedV2Credential(root, auth, { refresh: null });
+    auth.validTokens.delete(ACCESS_INITIAL);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...env, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp login fixture");
+    expect(await waitForFile(started, 20_000)).toBe(true);
+    // A newer spark saves the store, and a reload that adds a server reads it: it can't.
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
+    const before = readFileSync(storePath, "utf8");
+    await tui.sendText(`/mcp add --no-login web ${auth.url}`);
+    await tui.waitForText("Added web to ~/.spark/mcp.json.", 10_000);
+    await tui.sendText("/mcp show web");
+    await tui.waitForText("couldn't be read: a newer spark saved it, or it's damaged", 10_000);
+    // The server refuses the new login now.
+    auth.validTokens.delete(ACCESS_REFRESHED);
+    writeFileSync(release, "go");
+    await tui.waitForText(`Couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
+    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    expect(readFileSync(storePath, "utf8")).toBe(before);
+  }, 120_000);
+
+  test("spark mcp show says the server refused the saved login, with its error, in text and in --json", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, refusal: REFUSAL });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    // The server stops taking that login, and there is no refresh token to try.
+    auth.validTokens.clear();
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(1);
+    expect(show.stdout).toMatch(/status +needs login/);
+    expect(show.stdout).toContain(REFUSED_SAVED);
+    const json = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(json.code).toBe(1);
+    const shown = JSON.parse(json.stdout);
+    expect(shown.status).toBe("needs_login");
+    expect(shown.error).toContain(REFUSED_SAVED);
+    expect(`${show.stdout}${json.stdout}`).not.toContain(ACCESS_INITIAL);
+  }, 90_000);
+
+  test("spark mcp show with a refresh token tries one refresh and one retry, then says the server refused the login", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refusal: REFUSAL });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    // The server refuses the saved token, and the one a refresh brings.
+    auth.validTokens.clear();
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(1);
+    expect(show.stdout).toContain(REFUSED_SAVED);
+    expect(auth.refreshes).toBe(1);
+    expect(auth.requests.filter((r) => r.authorization === `Bearer ${ACCESS_REFRESHED}`).length).toBe(1);
+  }, 90_000);
+
+  test("spark mcp show with no saved login still says needs login, with no error and the command to run", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refusal: REFUSAL });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(1);
+    expect(show.stdout).toMatch(/status +needs login/);
+    expect(show.stdout).not.toContain("refused");
+    expect(show.stdout).toContain("spark mcp login fixture");
+    const json = JSON.parse((await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 30_000 })).stdout);
+    expect(json.status).toBe("needs_login");
+    expect(json.error ?? null).toBeNull();
+  }, 90_000);
+
+  test("a refused refresh keeps its own words, not the words for a refused login", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean; refusal?: typeof REFUSAL } = { refusal: REFUSAL };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    // The server stops taking that login, and refuses its refresh too.
+    auth.validTokens.clear();
+    options.rejectRefresh = true;
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.stdout).toMatch(/status +needs login/);
+    expect(show.stdout).not.toContain("refused the saved login");
+  }, 90_000);
+
+  test("a refusal's words hold no control characters and are cut at a bound", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const description = `bad\u007f\u009b[31mred${"x".repeat(1000)}`;
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, refusal: { error: "invalid_token", description } });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    auth.validTokens.clear();
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    const json = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    // The JSON output writes a quote as \".
+    for (const [text, opening] of [[show.stdout, 'refused the saved login (invalid_token: "bad'], [json.stdout, 'refused the saved login (invalid_token: \\"bad']] as const) {
+      expect(text).toContain(opening);
+      expect(text).not.toMatch(/[\u007f-\u009f]/);
+      expect(text).not.toContain("x".repeat(300));
+      expect(text).toContain("x".repeat(50));
+    }
+  }, 90_000);
+
+  test("a refusal with no challenge header is still named, with no server text", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, omitChallenge: true });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    auth.validTokens.clear();
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.stdout).toContain("fixture refused the saved login.");
+    expect(show.stdout).not.toContain("(");
+  }, 90_000);
+
+  test("a refusal that follows another scheme's challenge in the header is still named", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, challengePrefix: 'Basic realm="spark", ', refusal: REFUSAL });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    auth.validTokens.clear();
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.stdout).toContain(REFUSED_SAVED);
+  }, 90_000);
+
+  test("a refused new login leaves the saved login another sign-in made as it was", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rotateAuthorizationToken?: boolean; refusal?: typeof REFUSAL; noRefreshToken?: boolean } = { refusal: REFUSAL, noRefreshToken: true };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    // The server takes the login it has and refuses the next one it issues.
+    auth.validTokens.clear();
+    auth.validTokens.add(ACCESS_INITIAL);
+    options.rotateAuthorizationToken = true;
+    const again = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(again.code).toBe(1);
+    expect(again.stderr).toContain(REFUSED_NEW);
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(0);
+    expect(show.stdout).toMatch(/status +ready/);
+  }, 120_000);
+
+  // ---- Every surface says it in the same words (acceptance A8) ----
+  //
+  // One words function turns the login's reason into text. A saved login the server
+  // refuses reads the same on the model's search page, `spark mcp call`, the status
+  // line and /trace, with the server's error.
+  /** A login that worked, then the server stops taking it, with no refresh token to try. */
+  const refusedSavedLogin = async (refusal: { error: string; description?: string } = REFUSAL) => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, refusal });
+    const root = createRoot(auth);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 30_000 }));
+    auth.validTokens.clear();
+    return root;
+  };
+
+  test("capability_search tells the model the server refused the saved login, with its error", async () => {
+    const root = await refusedSavedLogin();
+    gateway = searchNeedingLogin();
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Find the protected MCP tool."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    const told = toolResultText(gateway.requests[1]?.body ?? "", "search_auth");
+    expect(told).toContain(inSearch(REFUSED_SAVED));
+    // The way back is still said.
+    expect(told).toContain("spark mcp login fixture");
+    expect(told).not.toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test("spark mcp call, run from the agent's shell, prints that the server refused the saved login", async () => {
+    const root = await refusedSavedLogin();
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: `"${SPARK_BIN}" mcp call list fixture; echo "list=$?"` }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("CALL_DONE");
+      },
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 60_000,
+    });
+    expect(result.code).toBe(0);
+    // What the shell printed comes back inside the tool result's JSON, which writes a quote as \".
+    expect(seen).toContain(`MCP server 'fixture' needs a login: ${REFUSED_SAVED.replaceAll('"', '\\"')}`);
+    expect(seen).not.toContain(ACCESS_INITIAL);
+  }, 90_000);
+
+  // A server's words go in quotes inside spark's sentence, so a description that tries to end it and
+  // start one of spark's own stays inside the quotes, wherever spark says it.
+  test("a server's words are quoted, so they cannot close spark's sentence, in the sign-in's words and the model's", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { noRefreshToken: true, refusal: { error: "invalid_token", description: FORGED } });
+    auth.validTokens.clear();
+    const refused = createRoot(auth);
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: refused.workspace, env: v2Env(refused), timeoutMs: 30_000 });
+    expect(login.code).toBe(1);
+    expect(login.stderr).toBe(`Couldn't sign in to fixture: fixture refused the new login (invalid_token: "${FORGED}").\n`);
+    expect(login.stdout).not.toContain("Signed in");
+
+    const root = await refusedSavedLogin({ error: "invalid_token", description: FORGED });
+    gateway = searchNeedingLogin();
+    const search = await runFx(["ask", "--json", "--auto", "--no-save", "Find the protected MCP tool."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 30_000,
+    });
+    expect(search.code).toBe(0);
+    const told = toolResultText(gateway.requests[1]?.body ?? "", "search_auth");
+    expect(told).toContain(inSearch(`fixture refused the saved login (invalid_token: "${FORGED}")`));
+    // The words are not spark's: nothing outside the quotes says the person is signed in.
+    expect(told.replace(inSearch(`"${FORGED}"`), "")).not.toContain("Signed in to fixture");
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 30_000 });
+    expect(show.stdout).toContain(`fixture refused the saved login (invalid_token: "${FORGED}")`);
+  }, 120_000);
+
+  // A login that worked and then stops: the server takes the token for initialize and the tool
+  // list, and refuses the tool call itself with a 401. The model hears the refusal, with the
+  // server's words, as it does when the server refused the saved login at start.
+  for (const [what, description] of [
+    ["its words", REFUSAL.description],
+    ["words that try to close spark's sentence", FORGED],
+  ] as const) {
+    test(`a tool call that gets the 401 itself tells the model the server refused the saved login, with ${what}`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { noRefreshToken: true, refuseToolCalls: true, refusal: { error: "invalid_token", description } });
+      const root = createRoot(auth);
+      const env = v2Env(root);
+      expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+      gateway = startToolGateway();
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
+        cwd: root.workspace,
+        env: { ...env, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      const told = toolResultText(gateway.requests[2]?.body ?? "", "call_mcp", "error-text");
+      expect(told).toContain(
+        `MCP server 'fixture' needs a login: fixture refused the saved login (invalid_token: "${description}"). Ask the user to run spark mcp login fixture in a terminal, then try again.`,
+      );
+      expect(told).not.toContain(ACCESS_INITIAL);
+      // The server never ran the tool.
+      expect(auth.protectedToolCalls).toBe(0);
+    }, 90_000);
+  }
+
+  test.skipIf(!tmuxAvailable())("the /mcp status line and /trace say the server refused the saved login", async () => {
+    const root = await refusedSavedLogin();
+    const traceDir = join(root.home, "tmp");
+    mkdirSync(traceDir, { recursive: true });
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), TMPDIR: traceDir, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // The shell starts the server on its own; the status line says why it needs a login.
+    await tui.waitForText("fixture refused the saved login · /mcp", 20_000);
+    const before = new Set(traceReportNames(traceDir));
+    await tui.sendText("/trace");
+    const report = await waitForNewTraceReport(traceDir, before);
+    // The trace's problem for the server names the refusal in the server's words, as the status line does.
+    const problem = report.problems("mcp_server").find((p) => p.name === "fixture");
+    expect(problem?.issue).toBe("needs_login");
+    expect(problem?.error).toContain(REFUSED_SAVED);
+    expect(report.text).not.toContain(ACCESS_INITIAL);
+    expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
+  }, 90_000);
+
+  // The shell reads the store of saved logins again for a server that needs a login
+  // (before a status, a tool list, a call), and takes the login saved there. A new
+  // login that waits for its check request is the one in use: a login another spark saved
+  // meanwhile is not taken in its place.
+  test.skipIf(!tmuxAvailable())("a login another spark saved is not taken in place of a new login that waits for its check request", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const barrier = mkdtempSync(join(tmpdir(), "spark-mcp-check-barrier-"));
+    const started = join(barrier, "started");
+    const release = join(barrier, "release");
+    auth = startAuthFixture(upstream.url, {
+      rotateAuthorizationToken: true, noRefreshToken: true, refusal: REFUSAL, checkBarrierStartedPath: started, checkBarrierReleasePath: release,
+    });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    // The saved login is one the server no longer takes: it needs a login.
+    const storePath = seedV2Credential(root, auth, { refresh: null });
+    auth.validTokens.delete(ACCESS_INITIAL);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...env, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +needs login/, 20_000);
+    await tui.waitForComposer(10_000);
+    await tui.sendText("/mcp login fixture");
+    expect(await waitForFile(started, 20_000)).toBe(true);
+    // Another spark saves a different login the server takes, while the new one waits for its check.
+    const other = "mcp-access-other-spark-secret";
+    auth.validTokens.add(other);
+    seedV2Credential(root, auth, { access: other, refresh: null });
+    // `/mcp list` reads the saved logins again before it shows the servers (`pickUpLogins`), and ends
+    // while the check is still held.
+    await tui.sendText("/mcp list");
+    await tui.waitForText("TRANSPORT  STATUS", 15_000);
+    writeFileSync(release, "go");
+    await tui.waitForText("Signed in to fixture.", 20_000);
+    // The server was never asked with the other login: the new one was kept, then saved.
+    expect(auth.requests.some((r) => r.authorization === `Bearer ${other}`)).toBe(false);
+    expect(auth.requests.some((r) => r.authorization === `Bearer ${ACCESS_REFRESHED}`)).toBe(true);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_REFRESHED);
+  }, 120_000);
+
+  // A logout while a new login waits for its check request ends that login with it: its tokens
+  // are gone, so the answer to the check has nothing to save, and "Signed in" is never said.
+  test.skipIf(!tmuxAvailable())("a logout while a new login waits for its check request ends that login: nothing is saved and nothing says signed in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const barrier = mkdtempSync(join(tmpdir(), "spark-mcp-check-barrier-"));
+    const started = join(barrier, "started");
+    const release = join(barrier, "release");
+    auth = startAuthFixture(upstream.url, {
+      rotateAuthorizationToken: true, noRefreshToken: true, checkBarrierStartedPath: started, checkBarrierReleasePath: release,
+    });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...env, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp login fixture");
+    expect(await waitForFile(started, 20_000)).toBe(true);
+    await tui.sendText("/mcp logout fixture");
+    await tui.waitForText("Couldn't sign in to fixture: signed out before the server answered.", 15_000);
+    // The server answers the held request now, to a login that is gone.
+    writeFileSync(release, "go");
+    await Bun.sleep(2_000);
+    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    const storePath = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    expect(existsSync(storePath) ? readFileSync(storePath, "utf8") : "").not.toContain(ACCESS_REFRESHED);
+    await tui.waitForComposer(10_000);
+    await tui.sendText("/mcp list");
+    await tui.waitForText(/fixture +~\/\.spark\/mcp\.json +http +needs login/, 15_000);
+  }, 120_000);
+
+  // A server that is up, with its tools listed, must still be asked about the new login: a
+  // list kept from the old one doesn't say the new tokens work.
+  test.skipIf(!tmuxAvailable())("a new login the server refuses is refused even while the server is up with its tools listed", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rotateAuthorizationToken?: boolean; refusal?: typeof REFUSAL; noRefreshToken?: boolean } = { refusal: REFUSAL, noRefreshToken: true };
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 }));
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...env, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // Up on the saved login, with the tools listed.
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +ready/, 20_000);
+    // The server keeps the login it has and refuses the next one it issues.
+    auth.validTokens.clear();
+    auth.validTokens.add(ACCESS_INITIAL);
+    options.rotateAuthorizationToken = true;
+    await tui.waitForComposer(10_000);
+    await tui.sendText("/mcp login fixture");
+    await tui.waitForText(`Couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
+    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    // The server comes back up on the saved login that worked. No sign-in happened, so neither the
+    // footer nor the transcript says the person signed in.
+    await tui.waitForComposer(10_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +ready/, 20_000);
+    const quiet = Date.now() + 2_500;
+    while (Date.now() < quiet) {
+      expect(await tui.capturePane()).not.toContain("Signed in to fixture");
+      await Bun.sleep(250);
+    }
+    expect(await tui.captureFullScrollback()).not.toContain("Signed in to fixture");
+    // The login the store holds is still the one that worked.
+    const show = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(show.code).toBe(0);
+    expect(show.stdout).toMatch(/status +ready/);
+  }, 120_000);
+
+  // The saved login a refusal takes back is taken without a notice, since no sign-in happened. That
+  // holds only for the moments after the refusal: a login another spark saves long after is a new login,
+  // and spark says so.
+  test.skipIf(!tmuxAvailable())("a login another spark saves long after a refused new login is taken with the notice", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refusal: REFUSAL, noRefreshToken: true });
+    auth.validTokens.clear();
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...env, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp login fixture");
+    await tui.waitForText(`Couldn't sign in to fixture: ${REFUSED_NEW}.`, 20_000);
+    await tui.waitForComposer(10_000);
+    // Long after, another spark saves a login the server takes.
+    await Bun.sleep(35_000);
+    auth.validTokens.add(ACCESS_INITIAL);
+    seedV2Credential(root, auth, { refresh: null });
+    // `/mcp list` reads the saved logins again before it shows the servers (`pickUpLogins`).
+    await tui.sendText("/mcp list");
+    await tui.waitForText("Signed in to fixture.", 20_000);
+  }, 120_000);
+
+  test("spark mcp login --no-browser takes the address pasted back", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const child = Bun.spawn([SPARK_BIN, "mcp", "login", "--no-browser", "fixture"], {
+      cwd: root.workspace,
+      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const reader = child.stdout.getReader();
+    const decoder = new TextDecoder();
+    const { address, stdout: printed } = await readLoginAddress(child, reader, root.trace);
+    let stdout = printed;
+    // The user approves in some other browser, which ends on the loopback address.
+    const approved = await fetch(address, { redirect: "manual" });
+    const back = approved.headers.get("location")!;
+    expect(new URL(back).hostname).toBe("127.0.0.1");
+    child.stdin.write(`${back}\n`);
+    child.stdin.flush();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      stdout += decoder.decode(value);
+    }
+    expect(await child.exited).toBe(0);
+    expect(await new Response(child.stderr).text()).toBe("");
+    expect(stdout).toContain("paste the address");
+    expect(stdout).toContain("Signed in to fixture.");
+    expect(existsSync(root.openLog)).toBe(false);
+    expect(auth.tokenExchanges).toBe(1);
+  }, 40_000);
+
+  test("spark mcp login takes only its own return: a stray return and a silent connection don't end or hold up the sign-in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const child = Bun.spawn([SPARK_BIN, "mcp", "login", "--no-browser", "fixture"], {
+      cwd: root.workspace,
+      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let silent: Awaited<ReturnType<typeof Bun.connect>> | undefined;
+    try {
+      const reader = child.stdout.getReader();
+      const decoder = new TextDecoder();
+      const { address, stdout: printed } = await readLoginAddress(child, reader, root.trace);
+      let stdout = printed;
+      const port = Number(new URL(new URL(address).searchParams.get("redirect_uri")!).port);
+      // A return with a state spark never made, from anything that can reach the
+      // port: a 404, and the sign-in goes on.
+      const stray = await fetch(`http://127.0.0.1:${port}/callback?code=stray&state=not-the-state-spark-made`, { signal: AbortSignal.timeout(5_000) });
+      expect(stray.status).toBe(404);
+      // A connection that sends nothing, as a browser's spare one does.
+      silent = await Bun.connect({ hostname: "127.0.0.1", port, socket: { data() {} } });
+      const approved = await fetch(address, { redirect: "manual" });
+      const back = approved.headers.get("location")!;
+      const page = await fetch(back, { signal: AbortSignal.timeout(5_000) });
+      expect(page.status).toBe(200);
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        stdout += decoder.decode(value);
+      }
+      expect(await child.exited).toBe(0);
+      expect(await new Response(child.stderr).text()).toBe("");
+      expect(stdout).toContain("Signed in to fixture.");
+      // Only the sign-in's own code was redeemed.
+      expect(auth.tokenExchanges).toBe(1);
+    } finally {
+      silent?.end();
+      child.kill();
+    }
+  }, 40_000);
+
+  test("spark mcp login asks for the oauth.scopes in the config when the server names none", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { omitScopes: true });
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const profile = join(root.home, ".spark", "mcp.json");
+    const config = JSON.parse(readFileSync(profile, "utf8"));
+    config.mcp.fixture.oauth.scopes = ["custom.scope", "other.scope"];
+    writeFileSync(profile, JSON.stringify(config));
+    const child = Bun.spawn([SPARK_BIN, "mcp", "login", "--no-browser", "fixture"], {
+      cwd: root.workspace,
+      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const { address } = await readLoginAddress(child, child.stdout.getReader(), root.trace);
+      const scopes = (new URL(address).searchParams.get("scope") ?? "").split(" ");
+      expect(scopes).toContain("custom.scope");
+      expect(scopes).toContain("other.scope");
+    } finally {
+      child.kill();
+      await child.exited;
+    }
+  }, 40_000);
+
+  // A listener on this machine that counts connections. 0.0.0.0 reaches it,
+  // as a sign-in server's metadata could point spark at it.
+  const internalListener = () => {
+    const seen = { connections: 0 };
+    const listener = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { open() { seen.connections++; }, data() {}, close() {} } });
+    return { seen, url: `https://0.0.0.0:${listener.port}/token`, stop: () => listener.stop(true) };
+  };
+
+  test("spark mcp login refuses a sign-in server whose token endpoint is an internal address, and contacts nothing there", async () => {
+    const internal = internalListener();
+    try {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { tokenEndpoint: internal.url });
+      const root = createRoot(auth);
+      const result = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+      // Refused before the browser: nothing at the address, and no sign-in page.
+      expect(internal.seen.connections).toBe(0);
+      expect(auth.authorizationRequests).toBe(0);
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toContain("Couldn't sign in to fixture: its sign-in server points at an internal address spark won't contact.");
+    } finally {
+      internal.stop();
+    }
+  }, 30_000);
+
+  test("an approved .mcp.json server doesn't use a login saved for another server with its name and URL", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    // A login for the profile's fixture, which then moves to the workspace.
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    const before = auth.requests.length;
+    moveAuthFixtureToWorkspace(root);
+    const approved = await runFx(["mcp", "approve", "fixture"], { cwd: root.workspace, env });
+    expect(approved.code).toBe(0);
+    const shown = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(shown.signal).toBeNull();
+    expect(JSON.parse(shown.stdout).status).toBe("needs_login");
+    expect(auth.requests.slice(before).some((r) => (r.authorization ?? "").includes(ACCESS_INITIAL))).toBe(false);
+  }, 30_000);
+
+  test("an approved .mcp.json server keeps its own login, in its own workspace only", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    moveAuthFixtureToWorkspace(root);
+    // A second workspace with the same .mcp.json.
+    const other = join(root.root, "other");
+    mkdirSync(other, { recursive: true });
+    writeFileSync(join(other, ".mcp.json"), readFileSync(join(root.workspace, ".mcp.json")));
+    const env = v2Env(root);
+    for (const cwd of [root.workspace, other]) {
+      expect((await runFx(["mcp", "approve", "fixture"], { cwd, env })).code).toBe(0);
+    }
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(login);
+    expect(login.stdout).toContain("Signed in to fixture.");
+    const status = async (cwd: string) =>
+      JSON.parse((await runFx(["mcp", "show", "fixture", "--json"], { cwd, env, timeoutMs: 20_000 })).stdout).status;
+    expect(await status(root.workspace)).toBe("ready");
+    expect(await status(other)).toBe("needs_login");
+    expect(auth.tokenExchanges).toBe(1);
+    // Removing it from the workspace deletes that workspace's login.
+    const removed = await runFx(["mcp", "remove", "fixture", "--project"], { cwd: root.workspace, env });
+    expect(removed.code).toBe(0);
+    expect(removed.stdout).toContain("and deleted its login");
+  }, 60_000);
+
+  test("a saved sign-in whose token endpoint is an internal address is never refreshed there", async () => {
+    const internal = internalListener();
+    try {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth);
+      // Expired, so its next use refreshes it at the saved endpoint.
+      seedV2Credential(root, auth, { expires_at_ms: 0, token_endpoint: internal.url });
+      const shown = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+      expect(internal.seen.connections).toBe(0);
+      expect(shown.signal).toBeNull();
+      expect(JSON.parse(shown.stdout).status).toBe("needs_login");
+    } finally {
+      internal.stop();
+    }
+  }, 30_000);
+
+  test("spark mcp login says why the sign-in page refused, in its words", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const child = Bun.spawn([SPARK_BIN, "mcp", "login", "--no-browser", "fixture"], {
+      cwd: root.workspace,
+      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const reader = child.stdout.getReader();
+    const { address } = await readLoginAddress(child, reader, root.trace);
+    // The user says no; the browser ends on the loopback address with the refusal.
+    const approved = await fetch(address, { redirect: "manual" });
+    const back = new URL(approved.headers.get("location")!);
+    back.searchParams.delete("code");
+    back.searchParams.set("error", "access_denied");
+    child.stdin.write(`${back}\n`);
+    child.stdin.flush();
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    expect(await child.exited).toBe(1);
+    expect(await new Response(child.stderr).text()).toBe("Couldn't sign in to fixture: the sign-in page returned an error (access_denied).\n");
+    expect(auth.tokenExchanges).toBe(0);
+  }, 40_000);
+
+  // What `readLoginAddress` throws when the login never prints its address.
+  const endOf = (waiting: Promise<unknown>) => waiting.then(() => "", (error: Error) => error.message);
+  const stub = (script: string) => Bun.spawn(["sh", "-c", script], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+
+  test("spark mcp login that ends before it prints its address is reported with its exit code and stderr", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    // A server that isn't configured: spark says so on stderr and exits 1, with nothing on stdout.
+    const child = Bun.spawn([SPARK_BIN, "mcp", "login", "--no-browser", "nosuchserver"], {
+      cwd: root.workspace,
+      env: Object.fromEntries(Object.entries({ ...process.env, ...v2Env(root) }).filter(([, v]) => v !== undefined)) as Record<string, string>,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const message = await endOf(readLoginAddress(child, child.stdout.getReader(), root.trace));
+    expect(message).toContain("spark mcp login printed no sign-in address");
+    expect(message).toContain("it exited with code 1");
+    expect(message).toContain('stderr: "No MCP server named nosuchserver.');
+  }, 20_000);
+
+  test("a login that is killed before it prints its address is reported with the signal and what both streams held", async () => {
+    // Killed by a signal after a line on each stream.
+    const killed = stub("echo starting; echo 'about to die' >&2; kill -9 $$");
+    const message = await endOf(readLoginAddress(killed, killed.stdout.getReader(), "/nonexistent/trace.log"));
+    expect(message).toContain("it was killed by SIGKILL");
+    expect(message).toContain('stdout: "starting\\n"');
+    expect(message).toContain('stderr: "about to die\\n"');
+  }, 20_000);
+
+  test("a login that lingers with its stdout closed before it prints its address is stopped after a moment and reported as such", async () => {
+    // Stdout closed, the process still alive: it is given a moment to exit, then stopped.
+    const lingering = stub("exec >&-; exec sleep 30");
+    const message = await endOf(readLoginAddress(lingering, lingering.stdout.getReader(), "/nonexistent/trace.log"));
+    expect(message).toContain(`it closed its stdout but was still running ${exitGraceMs} ms later, so it was stopped`);
+    expect(await lingering.exited).not.toBe(0);
+  }, 20_000);
+
+  test("a login that stays silent past the deadline before it prints its address is stopped at the deadline and reported as such", async () => {
+    // Alive and silent: the deadline ends the wait, and the child is stopped.
+    const silent = stub("exec sleep 30");
+    const started = performance.now();
+    const message = await endOf(readLoginAddress(silent, silent.stdout.getReader(), "/nonexistent/trace.log", 300));
+    expect(message).toContain("it was still running after 300 ms, so it was stopped");
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(await silent.exited).not.toBe(0);
+  }, 20_000);
+
+  test("a login address that arrives in pieces is read whole", async () => {
+    // The first piece ends inside the address, after the `?`, so the line holding it is not complete yet.
+    const child = stub("printf 'Open this address:\\n  http://127.0.0.1:1/authorize?sta'; sleep 0.3; printf 'te=s\\nThen paste it here\\n'; exec sleep 30");
+    try {
+      const { address, stdout } = await readLoginAddress(child, child.stdout.getReader(), "/nonexistent/trace.log");
+      expect(address).toBe("http://127.0.0.1:1/authorize?state=s");
+      expect(stdout).toStartWith("Open this address:\n");
+    } finally {
+      child.kill();
+      await child.exited;
+    }
+  }, 20_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp login signs in in the background and says when it's done", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp login fixture");
+    await tui.waitForText("Sign in to fixture in your browser.", 10_000);
+    // The fake browser approves on its own; the shell says so without a keypress.
+    await tui.waitForText("Signed in to fixture.", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+    await tui.sendText("/mcp list");
+    // The sign-in ended when the server answered a request with the new login, so it is up.
+    await tui.waitForText("ready, 1 tool", 10_000);
+    const pane = await tui.captureFullScrollback();
+    expect(pane).not.toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test("spark mcp add signs in to a new server that needs a login, --no-login skips it, and without a browser it names the command", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { registration: true });
+    const root = createRoot(auth);
+    writeFileSync(join(root.home, ".spark", "mcp.json"), JSON.stringify({ mcp: {} }));
+    const env = v2Env(root);
+
+    const added = await runFx(["mcp", "add", "web", auth.url], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(added.stderr).toBe("");
+    expectExit0(added);
+    expect(added.stdout).toStartWith("Added web to ~/.spark/mcp.json.\nweb needs a login.\nApprove in your browser.");
+    expect(added.stdout).toEndWith("Signed in to web.\n");
+    expect(added.stdout).not.toContain(ACCESS_INITIAL);
+    expect(new URL(readFileSync(root.openLog, "utf8").trim()).pathname).toBe("/authorize");
+    expect(auth.registrations).toBe(1);
+    expect(auth.tokenExchanges).toBe(1);
+
+    const skipped = await runFx(["mcp", "add", "--no-login", "quiet", auth.url], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expectExit0(skipped);
+    expect(skipped.stdout).toBe("Added quiet to ~/.spark/mcp.json.\n");
+    // Without a browser, taking the address pasted back is `spark mcp login`'s.
+    const headless = await runFx(["mcp", "add", "later", auth.url], { cwd: root.workspace, env: { ...env, SPARK_NO_OPEN_BROWSER: "1" }, timeoutMs: 30_000 });
+    expectExit0(headless);
+    expect(headless.stdout).toBe("Added later to ~/.spark/mcp.json.\nlater needs a login. Sign in with: spark mcp login later\n");
+    expect(auth.tokenExchanges).toBe(1);
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp add signs in to a new server that needs a login once the shell loads it, and --no-login leaves it on the status line", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { registration: true });
+    const root = createRoot(auth);
+    writeFileSync(join(root.home, ".spark", "mcp.json"), JSON.stringify({ mcp: {} }));
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText(`/mcp add web ${auth.url}`);
+    await tui.waitForText("Added web to ~/.spark/mcp.json.", 10_000);
+    // The shell loads it, sees it needs a login, and signs in as a typed /mcp login would.
+    await tui.waitForText("Sign in to web in your browser.", 15_000);
+    await tui.waitForText("Signed in to web.", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+    await tui.sendText(`/mcp add --no-login quiet ${auth.url}`);
+    await tui.waitForText("Added quiet to ~/.spark/mcp.json.", 10_000);
+    await tui.waitForText("quiet needs login · /mcp", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp login NAME --no-browser links the address and prints the outcome in the transcript", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const tapePath = join(root.root, "no-browser.fxtape");
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), SPARK_RECORD: tapePath, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // The flag after the name, which the parser takes like the flag before it.
+    await tui.sendText("/mcp login fixture --no-browser");
+    // The transcript: everything above the composer, not the status line below it.
+    const transcript = async () => {
+      const lines = (await tui!.captureFullScrollback()).split("\n");
+      const composer = lines.findLastIndex(isComposerLine);
+      return composer < 0 ? lines : lines.slice(0, composer);
+    };
+    await tui.waitForText("Sign in to fixture in your browser.", 10_000);
+    // A few words stand for the address, which only their link carries.
+    const shown = (await transcript()).join("\n");
+    expect(shown).toContain("Didn't open? Open the sign-in page.");
+    expect(shown).not.toContain("/authorize?");
+    const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
+    const link = /\x1b\]8;id=spark-mcp-sign-in;([^\x1b]+)\x1b\\/.exec(written);
+    expect(link).not.toBeNull();
+    const address = link![1];
+    expect(new URL(address).searchParams.get("state")).toBeTruthy();
+    expect(existsSync(root.openLog)).toBe(false);
+    // The user approves in some other browser, which then loads spark's loopback address.
+    const approved = await fetch(address, { redirect: "manual" });
+    const back = approved.headers.get("location")!;
+    expect(new URL(back).hostname).toBe("127.0.0.1");
+    await fetch(back);
+    await tui.waitForText("Signed in to fixture.", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+    // In the transcript, not only on the status line.
+    expect((await transcript()).join("\n")).toContain("Signed in to fixture.");
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("the /mcp menu's Log in signs in, and the server's tools follow", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const traceDir = join(root.home, "tmp");
+    mkdirSync(traceDir, { recursive: true });
+    // /trace writes a report to $TMPDIR; read the newest once it is complete.
+    const captureTrace = async (): Promise<TraceReport> => {
+      const before = new Set(traceReportNames(traceDir));
+      await tui!.sendText("/trace");
+      return waitForNewTraceReport(traceDir, before);
+    };
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), TMPDIR: traceDir, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // Started on its own, it wants a login; the status line says so, not the transcript.
+    await tui.waitForText("fixture needs login · /mcp", 15_000);
+    expect(await tui.captureFullScrollback()).not.toContain("needs login: /mcp login fixture");
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    // Opening it shows the login as the next step.
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Its tools show here once you log in.", 15_000);
+    await tui.waitForText("› Log in        /mcp login fixture", 5_000);
+
+    // /trace reports the MCP servers, and the one that waits for a login.
+    await tui.sendKeys("C-c");
+    await tui.waitForPane((pane) => !pane.includes("MCP servers") && !pane.includes("esc back"), 5_000);
+    const waiting = await captureTrace();
+    expect(waiting.problems("mcp_server").find((problem) => problem.name === "fixture")?.issue).toBe("needs_login");
+    expect(waiting.one("runtime_context").mcp_servers).toBe(1);
+    expect(waiting.one("mcp_server")).toMatchObject({ name: "fixture", transport: "http", tools: 0, signed_in: false, needs_login: true });
+
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    await tui.sendKeys("Enter");
+    // Signed in, the screen loads the tools it couldn't before.
+    await tui.waitForText("Echo text through the modern HTTP fixture", 15_000);
+    await tui.waitForText("› Log out       /mcp logout fixture", 5_000);
+    // Up and signed in, the failure that asked for the login is gone.
+    expect(await tui.capturePane()).not.toContain("it needs a login");
+    expect(auth.tokenExchanges).toBe(1);
+    await tui.sendKeys("C-c");
+    await tui.waitForPane((pane) => !pane.includes("esc back"), 5_000);
+    // The news waits on the status line for a few seconds, then goes. It was
+    // never printed in the transcript, and with nothing wrong the status line
+    // says nothing about MCP.
+    await tui.waitForText("Signed in to fixture.", 3_000);
+    await tui.waitForPane((pane) => !pane.includes("Signed in to fixture."), 10_000);
+    expect(await tui.capturePane()).not.toMatch(/mcp \d+\/\d+/);
+    const ready = await captureTrace();
+    const server = ready.one("mcp_server");
+    expect(server).toMatchObject({ name: "fixture", state: "ready", transport: "http", signed_in: true, needs_login: false });
+    expect(server.tools).toEqual(expect.any(Number));
+    expect(server.error).toBeUndefined();
+    expect(ready.problems("mcp_server")).toEqual([]);
+    expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("while a sign-in waits, the server's screen says so and links its address", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 100, height: 40,
+      env: { ...v2Env(root), SPARK_NO_OPEN_BROWSER: "1", SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    // No browser opens, so the sign-in waits, and the screen says what for in
+    // one line, like the transcript: its label links the address.
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 10_000);
+    const pane = await tui.capturePane();
+    expect(pane).not.toContain("/authorize?");
+    expect(pane).not.toContain("Its tools show here once you log in.");
+    expect(auth.tokenExchanges).toBe(0);
+  }, 60_000);
+
+  // Before, nothing changed on the screen until the address came, which a
+  // slow sign-in server makes seconds, and each Enter in the meantime closed
+  // the port the browser comes back to, so the sign-in could never finish.
+  // On the code before, this fails at "Signing in…".
+  test.skipIf(!tmuxAvailable())("Log in says \"Signing in…\" at once, more Enters keep that sign-in, and its address is one link that signs in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { discoveryDelayMs: 2_000 });
+    const root = createRoot(auth);
+    const tapePath = join(root.root, "sign-in.fxtape");
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 100, height: 40,
+      env: { ...v2Env(root), SPARK_NO_OPEN_BROWSER: "1", SPARK_RECORD: tapePath, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Signing in…", 1_500);
+    expect(await tui.capturePane()).not.toContain("Waiting for the browser");
+    // Pressed again while the sign-in server is slow, then once its address shows.
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 15_000);
+    await tui.sendKeys("Enter");
+    await Bun.sleep(500);
+
+    // The label is one link to the whole address, which the screen doesn't spell out.
+    expect(await tui.capturePane()).not.toContain("/authorize?");
+    const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
+    const link = /\x1b\]8;id=spark-mcp-sign-in;([^\x1b]+)\x1b\\Open the sign-in page/.exec(written);
+    expect(link).not.toBeNull();
+    const address = link![1];
+    expect(address).toContain("/authorize?");
+
+    // The browser's return reaches the sign-in those Enters kept.
+    const redirect = await fetch(address, { redirect: "manual" });
+    const back = await fetch(redirect.headers.get("location")!, { signal: AbortSignal.timeout(10_000) });
+    expect(back.status).toBe(200);
+    // Signed in, the screen offers Log out.
+    await tui.waitForText("Log out       /mcp logout fixture", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+    expect(auth.requests.filter((r) => r.path === "/.well-known/oauth-authorization-server").length).toBe(1);
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a config change during a sign-in keeps it going, unless it removes that server: then it ends and clears \"Signing in\"", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), SPARK_NO_OPEN_BROWSER: "1", SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // No browser opens, so the sign-in waits.
+    await tui.sendText("/mcp login fixture");
+    await tui.waitForText("Sign in to fixture in your browser.", 10_000);
+    await tui.waitForText("Signing in to fixture", 10_000);
+
+    // Another server's change leaves this sign-in waiting for its browser.
+    await tui.sendText("/mcp add web https://w.example/mcp");
+    await tui.waitForText("Added web to ~/.spark/mcp.json.", 10_000);
+    await Bun.sleep(1_000);
+    expect(await tui.capturePane()).toContain("Signing in to fixture");
+    expect(await tui.captureFullScrollback()).not.toContain("Couldn't sign in to fixture");
+
+    // Removing the server it signs in to ends it.
+    await tui.sendText("/mcp remove fixture");
+    await tui.waitForText("Couldn't sign in to fixture: the MCP config changed before the browser came back.", 10_000);
+    // The status line catches up within its 250 ms refresh.
+    const clearBy = Date.now() + 2_000;
+    while ((await tui.capturePane()).includes("Signing in to fixture") && Date.now() < clearBy) await Bun.sleep(50);
+    expect(await tui.capturePane()).not.toContain("Signing in to fixture");
+    expect(auth.tokenExchanges).toBe(0);
+  }, 60_000);
+
+  // A v1 login taken over would be refreshed by an older spark and this one
+  // apart, neither seeing the other's saves, so a server that takes each
+  // refresh token once signs both out. spark signs in on its own instead.
+  test("a v1 login isn't carried over: the server needs its own login, and v1's store stays as it is", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const v1Store = seedExpiredCredentials(root, auth, Date.now() + 3_600_000);
+    const v1Before = readFileSync(v1Store, "utf8");
+    const env = v2Env(root);
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(JSON.parse(show.stdout).status).toBe("needs_login");
+    expect(auth.requests.some((r) => (r.authorization ?? "").includes(ACCESS_INITIAL))).toBe(false);
+    expect(auth.refreshes).toBe(0);
+    expect(readFileSync(v1Store, "utf8")).toBe(v1Before);
+    expect(existsSync(join(root.home, ".spark", "mcp-credentials", "credentials-v3.json"))).toBe(false);
+  }, 60_000);
+
+  // Older builds keep their logins in credentials-v2.json. Those from before
+  // version 2 of it read a version-2 document as empty and write it back with
+  // only their own login, and every older spark still running refreshes the
+  // logins it holds apart from this one. So nothing there is carried over,
+  // the server signs in once, and an older spark's writes never reach it.
+  test("an older spark's credentials-v2.json is never read or written: the server signs in once, and that spark's rewrites never reach the login", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const directory = join(root.home, ".spark", "mcp-credentials");
+    const older = join(directory, "credentials-v2.json");
+    const own = join(directory, "credentials-v3.json");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const olderCredential = JSON.stringify({
+      access: "older-spark-access", refresh: "older-spark-refresh", expires_at_ms: null, skew_ms: 30_000,
+      token_endpoint: `${new URL(auth.url).origin}/token`, revocation_endpoint: null,
+      resource: new URL(auth.resource).href, client_id: "older-spark", client_secret: null, method: "none",
+    });
+    let olderText = JSON.stringify({ version: 2, servers: [{ name: "fixture", url: auth.url, credential: olderCredential }] });
+    writeFileSync(older, olderText, { mode: 0o600 });
+
+    // The older login isn't taken: the server needs one of its own.
+    const before = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(JSON.parse(before.stdout).status).toBe("needs_login");
+    expect(auth.requests.some((r) => (r.authorization ?? "").includes("older-spark-access"))).toBe(false);
+    expect(auth.refreshes).toBe(0);
+    expect(readFileSync(older, "utf8")).toBe(olderText);
+    expect(existsSync(own)).toBe(false);
+
+    // One sign-in, saved in this spark's own store.
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    expect(readFileSync(older, "utf8")).toBe(olderText);
+    const signedIn = readFileSync(own, "utf8");
+    expect(JSON.parse(signedIn).servers.map((s: { name: string }) => s.name)).toEqual(["fixture"]);
+
+    // An older spark reads its version-2 store as empty and writes it back.
+    olderText = JSON.stringify({ version: 1, imported_v1: true, servers: [] });
+    writeFileSync(older, olderText, { mode: 0o600 });
+    const after = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(after.stderr).toBe("");
+    expect(JSON.parse(after.stdout).status).toBe("ready");
+    expect(readFileSync(own, "utf8")).toBe(signedIn);
+    expect(readFileSync(older, "utf8")).toBe(olderText);
+    expect(auth.tokenExchanges).toBe(1);
+  }, 60_000);
+
+  test("a refresh refused with HTTP 200 and ok:false, as Slack refuses, needs a new login at once and isn't tried again", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 200, body: { ok: false, error: "invalid_refresh_token" } } });
+    const root = createRoot(auth);
+    seedV2Credential(root, auth, { expires_at_ms: 0 });
+    const env = v2Env(root);
+    const started = Date.now();
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(JSON.parse(show.stdout).status).toBe("needs_login");
+    expect(auth.refreshes).toBe(1);
+    // The dead refresh token is dropped, so the next run doesn't send it.
+    const again = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(JSON.parse(again.stdout).status).toBe("needs_login");
+    expect(auth.refreshes).toBe(1);
+  }, 60_000);
+
+  test("a refresh that fails for now (503) ends spark mcp show as retrying, keeps the login, and asks for no new one", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 503, body: { error: "temporarily_unavailable" } } });
+    const root = createRoot(auth);
+    const store = seedV2Credential(root, auth, { expires_at_ms: 0 });
+    const env = v2Env(root);
+    const started = Date.now();
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(Date.now() - started).toBeLessThan(10_000);
+    // A sign-in server that didn't answer says nothing about the login.
+    const status = JSON.parse(show.stdout);
+    expect(status.status).toBe("retrying");
+    expect(status.error).toContain("couldn't be renewed");
+    expect(auth.refreshes).toBe(1);
+    expect(readFileSync(store, "utf8")).toContain(REFRESH_INITIAL);
+  }, 60_000);
+
+  test("a refresh Slack answers with a temporary error at HTTP 200 keeps the login, and spark mcp show says it's retrying", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 200, body: { ok: false, error: "internal_error" } } });
+    const root = createRoot(auth);
+    const store = seedV2Credential(root, auth, { expires_at_ms: 0 });
+    const env = v2Env(root);
+    const started = Date.now();
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(Date.now() - started).toBeLessThan(10_000);
+    // Only a refusal ends the login; a temporary error leaves it for the next try.
+    const status = JSON.parse(show.stdout);
+    expect(status.status).toBe("retrying");
+    expect(status.error).toContain("couldn't be renewed");
+    expect(auth.refreshes).toBe(1);
+    expect(readFileSync(store, "utf8")).toContain(REFRESH_INITIAL);
+  }, 60_000);
+
+  // Slack refreshes a PKCE app's tokens without its secret only for a
+  // localhost redirect, so spark's Slack app signs in with one.
+  test("Slack signs in as spark's Slack app at Slack's own page, with a localhost redirect on its port and the app's scopes, and refreshes without a secret", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    // Slack's 401 names one of its own scopes; the login asks for it with
+    // the app's, so it adds nothing here.
+    auth = startAuthFixture(upstream.url, { slackBridgeClientId: SPARK_SLACK_CLIENT_ID, slackLocalhostRedirect: true, challengeScope: "chat:write" });
+    const root = createRoot(auth, true, "http", auth.url, true, SPARK_SLACK_CLIENT_ID);
+    // spark's Slack app with no scopes of the config's own, on a free port.
+    const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+    const port = probe.port;
+    probe.stop(true);
+    const profilePath = join(root.home, ".spark", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.oauth = { client_id: SPARK_SLACK_CLIENT_ID, callback_port: port };
+    writeFileSync(profilePath, JSON.stringify(profile));
+    const standIn = new URL(auth.url).origin;
+    const env = { ...v2Env(root), SPARK_TEST_SLACK_ORIGIN: standIn };
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.stderr).toBe("");
+    expectExit0(login);
+    expect(login.stdout).toContain("Signed in to fixture.");
+    // The browser goes to Slack's own page; nothing asks spark.sh.
+    const opened = new URL(readFileSync(root.openLog, "utf8").trim());
+    expect(opened.origin).toBe(standIn);
+    expect(opened.pathname).toBe("/authorize");
+    expect(opened.searchParams.get("client_id")).toBe(SPARK_SLACK_CLIENT_ID);
+    expect(opened.searchParams.get("redirect_uri")).toBe(`http://localhost:${port}/callback`);
+    // spark adds offline_access when the authorization server lists it, as
+    // the stand-in does; Slack doesn't list it.
+    expect(opened.searchParams.get("scope")!.split(" ").filter((x) => x !== "offline_access").sort()).toEqual([
+      "channels:history", "channels:read", "channels:write", "chat:write", "emoji:read", "files:write",
+      "groups:history", "groups:read", "im:history", "im:read", "mpim:history", "mpim:read",
+      "search:read.im", "search:read.mpim", "search:read.private", "search:read.public", "search:read.users", "users:read",
+    ]);
+    expect(auth.requests.some((r) => r.path.startsWith("/api/slack/"))).toBe(false);
+    expect(auth.tokenExchanges).toBe(1);
+    // Its token runs out: the refresh goes without a secret, and the server is ready.
+    const storePath = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    const store = JSON.parse(readFileSync(storePath, "utf8"));
+    const credential = JSON.parse(store.servers[0].credential);
+    expect(credential.client_secret).toBeNull();
+    store.servers[0].credential = JSON.stringify({ ...credential, expires_at_ms: 0 });
+    writeFileSync(storePath, JSON.stringify(store), { mode: 0o600 });
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.stderr).toBe("");
+    expect(JSON.parse(show.stdout).status).toBe("ready");
+    expect(auth.refreshes).toBe(1);
+    const refresh = auth.requests.find((r) => r.path === "/token" && new URLSearchParams(r.body).get("grant_type") === "refresh_token");
+    expect(new URLSearchParams(refresh!.body).get("client_secret")).toBeNull();
+  }, 60_000);
+
+  test("a sign-in whose fixed callback port is taken says so, and sends nothing", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const taken = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("taken") });
+    try {
+      const profilePath = join(root.home, ".spark", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.oauth.callback_port = taken.port;
+      writeFileSync(profilePath, JSON.stringify(profile));
+      const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+      expect(login.code).toBe(1);
+      expect(login.stderr).toBe(`Couldn't sign in to fixture: port ${taken.port} is in use, maybe by another app signing in. Try again once it's free.\n`);
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(auth.tokenExchanges).toBe(0);
+    } finally {
+      taken.stop(true);
+    }
+  }, 60_000);
+
+  test("a server that only names spark's Slack app signs in on its own, never as spark's Slack app", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    // A stand-in for Slack at another origin, which must never be asked.
+    const bridgeRequests: string[] = [];
+    const bridge = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        bridgeRequests.push(new URL(request.url).pathname);
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      const root = createRoot(auth, true, "http", auth.url, true, SPARK_SLACK_CLIENT_ID);
+      const env = { ...v2Env(root), SPARK_TEST_SLACK_ORIGIN: `http://127.0.0.1:${bridge.port}` };
+      const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      expect(bridgeRequests).toEqual([]);
+      // The browser goes to the server's own page, with spark's own loopback redirect.
+      const opened = new URL(readFileSync(root.openLog, "utf8").trim());
+      expect(opened.origin).toBe(new URL(auth.url).origin);
+      expect(opened.pathname).toBe("/authorize");
+      expect(opened.searchParams.get("redirect_uri")).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/callback$/);
+      // The code comes back to spark on 127.0.0.1 and is redeemed with that redirect.
+      const token = auth.requests.find(r => r.path === "/token");
+      expect(new URLSearchParams(token!.body).get("redirect_uri")).toBe(opened.searchParams.get("redirect_uri"));
+      expect(login.stderr).toBe("");
+      expectExit0(login);
+      expect(login.stdout).toContain("Signed in to fixture.");
+      expect(auth.tokenExchanges).toBe(1);
+    } finally {
+      bridge.stop(true);
+    }
+  }, 60_000);
+
+  test("a token with a CR LF in it fails the sign-in, is never saved, and never reaches a header", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { accessTokenSuffix: "\r\nX-Injected: 1" });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.signal).toBeNull();
+    expect(login.code).toBe(1);
+    expect(login.stderr).toBe("Couldn't sign in to fixture: it didn't accept the sign-in (its token has characters OAuth doesn't allow).\n");
+    expect(auth.tokenExchanges).toBe(1);
+    expect(await statusOf(root)).not.toBe("signed_in");
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(JSON.parse(show.stdout).status).toBe("needs_login");
+    expect(auth.requests.some(r => (r.authorization ?? "").includes(ACCESS_INITIAL))).toBe(false);
+  }, 60_000);
+
+  test("a saved login whose token has a CR LF doesn't crash spark; the server needs a login again", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    // The saved token gains a CR LF, as an older spark could have saved it.
+    const storePath = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    const store = JSON.parse(readFileSync(storePath, "utf8"));
+    const saved = JSON.parse(store.servers[0].credential);
+    saved.access += "\r\nX-Injected: 1";
+    store.servers[0].credential = JSON.stringify(saved);
+    writeFileSync(storePath, JSON.stringify(store));
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(show.code).toBe(1);
+    expect(JSON.parse(show.stdout).status).toBe("needs_login");
+    expect(auth.requests.some(r => (r.authorization ?? "").includes("X-Injected"))).toBe(false);
+  }, 60_000);
+
+  test("a login store a newer spark saved is never written over, and login and logout say why they can't", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    // A newer spark saves the same store as version 2.
+    const storePath = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
+    const before = readFileSync(storePath, "utf8");
+    const unreadable = "spark can't read the saved MCP sign-ins in ~/.spark/mcp-credentials/credentials-v3.json. A newer spark saved them, or they're damaged; fix or delete them, then try again.\n";
+
+    expect((await runFx(["mcp", "list", "--json"], { cwd: root.workspace, env })).code).toBe(0);
+    const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(logout.stderr).toBe(`Can't sign out of fixture: ${unreadable}`);
+    expect(logout.code).toBe(1);
+    const login = await runFx(["mcp", "login", "--no-browser", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.stderr).toBe(`Can't sign in to fixture: ${unreadable}`);
+    expect(login.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toBe(before);
+    expect(auth.tokenExchanges).toBe(1);
+  }, 60_000);
+
+  // Before, a store spark couldn't read, here one a newer spark saved, left the
+  // server asking for a sign-in, which couldn't be saved there either.
+  test("a server whose saved logins spark can't read is down for that reason, not asked to sign in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    const storePath = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
+    const why = "~/.spark/mcp-credentials/credentials-v3.json couldn't be read: a newer spark saved it, or it's damaged";
+
+    const shown = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(shown.stdout).toMatch(/status +failed/);
+    expect(shown.stdout).toContain(`error      ${why}`);
+    expect(shown.stdout).not.toContain("needs login");
+    expect(shown.stdout).not.toContain("login fixture");
+    expect(shown.code).toBe(1);
+    const json = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(JSON.parse(json.stdout)).toMatchObject({ name: "fixture", status: "failed", error: why, tools: [] });
+    expect(json.code).toBe(1);
+  }, 60_000);
+
+  // Before, a server a reload added read its login from a store spark could no
+  // longer read, found none, and asked for a sign-in that couldn't be saved.
+  test.skipIf(!tmuxAvailable())("a server a reload adds while spark can't read its saved logins is down for that reason, not asked to sign in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    seedV2Credential(root, auth);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // The host read the store when it started; a newer spark saves it now.
+    const storePath = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
+    await tui.sendText(`/mcp add --no-login web ${auth.url}`);
+    await tui.waitForText("Added web to ~/.spark/mcp.json.", 10_000);
+    await tui.waitForText("web failed · /mcp", 15_000);
+    expect(await tui.capturePane()).not.toContain("web needs login");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a login made by another spark process reaches a running shell", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 40, env });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +needs login/, 15_000);
+    // Another spark with the same profile signs in.
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    expect(auth.tokenExchanges).toBe(1);
+    await tui.waitForComposer(5_000);
+    await tui.sendText("/mcp list");
+    await tui.waitForText(/fixture +~\/\.spark\/mcp\.json +http +(connecting|ready)/, 15_000);
+    await tui.sendText("/mcp show fixture");
+    const pane = await tui.waitForText(/status +ready/, 15_000);
+    // The shell took that login and never signed in itself.
+    expect(pane).toContain("Signed in to fixture.");
+    expect(auth.tokenExchanges).toBe(1);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a login another spark process saved that the server can't use isn't announced, and the server still needs one", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 40, env });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +needs login/, 15_000);
+    // Another spark saves a login whose token would break its header.
+    seedV2Credential(root, auth, { access: "at\r\n1" });
+    await tui.waitForComposer(5_000);
+    await tui.sendText("/mcp show fixture");
+    const pane = await tui.waitForText(/status +needs login[\s\S]*status +needs login/, 15_000);
+    expect(pane).not.toContain("Signed in to fixture.");
+    expect(auth.tokenExchanges).toBe(0);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a login another spark process made before the shell first used the server is used at once", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 40, env });
+    await tui.waitForComposer(15_000);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +ready/, 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a saved login the server no longer takes is tried once, not again and again", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean } = {};
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    // The server stops taking that login, and its refresh.
+    auth.validTokens.clear();
+    options.rejectRefresh = true;
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 40, env });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +needs login/, 15_000);
+    const settled = auth.requests.length;
+    await Bun.sleep(2_000);
+    expect(auth.requests.length - settled).toBeLessThan(3);
+    // Asked again, the shell doesn't take that login a second time.
+    const before = auth.requests.length;
+    await tui.waitForComposer(5_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +needs login[\s\S]*status +needs login/, 15_000);
+    expect(auth.requests.length).toBe(before);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("the model's call after a login made by another spark process works without a restart", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean; rotateAuthorizationToken?: boolean } = {};
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "first" } }),
+      fakeGatewayFinalText("First call done."),
+      // A selected tool lasts for its turn, so each turn selects it again.
+      fakeGatewayToolCall("select2", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "second" } }),
+      fakeGatewayFinalText("It needs a login."),
+      fakeGatewayToolCall("select3", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "third" } }),
+      fakeGatewayFinalText("Third call done."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 40,
+      env: { ...env, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl, SPARK_MODEL: MODEL },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the fixture.");
+    await tui.waitForText("First call done.", 20_000);
+    // The server stops taking that login and its refresh, so the next call needs a login.
+    auth.validTokens.clear();
+    options.rejectRefresh = true;
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call it again.");
+    await tui.waitForText("It needs a login.", 20_000);
+    // Another spark with the same profile signs in, and gets a new token.
+    options.rotateAuthorizationToken = true;
+    auth.validTokens.add(ACCESS_REFRESHED);
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    // The model tries again, as the needs-login text tells it to.
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Try again.");
+    await tui.waitForText("Third call done.", 20_000);
+    const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\""));
+    expect(calls.at(-1)?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
+    expect(calls.at(-1)?.body).toContain("third");
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a login another spark process saved stays when the shell's own is refused, and the shell takes it", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean; rotateAuthorizationToken?: boolean } = {};
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "first" } }),
+      fakeGatewayFinalText("First call done."),
+      fakeGatewayToolCall("select2", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "second" } }),
+      fakeGatewayFinalText("Second call done."),
+      fakeGatewayToolCall("select3", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "third" } }),
+      fakeGatewayFinalText("Third call done."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 40,
+      env: { ...env, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl, SPARK_MODEL: MODEL },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the fixture.");
+    await tui.waitForText("First call done.", 20_000);
+    // Another spark signs in again and saves a new token; the server then takes
+    // only that one, and refuses the shell's refresh.
+    options.rotateAuthorizationToken = true;
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    auth.validTokens.clear();
+    auth.validTokens.add(ACCESS_REFRESHED);
+    options.rejectRefresh = true;
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call it again.");
+    await tui.waitForText("Second call done.", 20_000);
+    // The shell's own login was refused, and the other spark's stays saved.
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_REFRESHED);
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Try again.");
+    await tui.waitForText("Third call done.", 20_000);
+    const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\""));
+    expect(calls.at(-1)?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("the shell's own refreshed login, when refused, is removed by that shell", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean } = {};
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "first" } }),
+      fakeGatewayFinalText("First call done."),
+      fakeGatewayToolCall("select2", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "second" } }),
+      fakeGatewayFinalText("Second call done."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 40,
+      env: { ...env, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl, SPARK_MODEL: MODEL },
+    });
+    await tui.waitForComposer(15_000);
+    // The first token stops working, so the shell refreshes and saves the new one.
+    auth.validTokens.delete(ACCESS_INITIAL);
+    await tui.sendText("Call the fixture.");
+    await tui.waitForText("First call done.", 20_000);
+    expect(auth.refreshes).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_REFRESHED);
+    // Then that one stops too, and its refresh is refused.
+    auth.validTokens.clear();
+    options.rejectRefresh = true;
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call it again.");
+    await tui.waitForText("Second call done.", 20_000);
+    expect(JSON.parse(readFileSync(storePath, "utf8")).servers).toEqual([]);
+    // The trace says why the login went, and holds no token.
+    const trace = readFileSync(root.trace, "utf8");
+    expect(trace).toContain("MCP login dropped server=fixture reason=refresh refused status=400 error=invalid_grant");
+    expect(trace).toContain("MCP login dropped server=fixture saved=removed");
+    for (const token of [ACCESS_INITIAL, ACCESS_REFRESHED, REFRESH_INITIAL, REFRESH_ROTATED]) expect(trace).not.toContain(token);
+    // Its screen says it needs a login, not that it's signed in, and offers
+    // no sign-out of a login that's gone.
+    await tui.waitForComposer(5_000);
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    const screen = await tui.capturePane();
+    expect(screen).toMatch(/ status +needs login/);
+    expect(screen).not.toContain("signed in");
+    expect(screen).not.toContain("Log out");
+  }, 90_000);
+
+  // Every spark holding a login refreshes it from memory. Where a refresh
+  // token works once, the shell must take the login another spark refreshed, not
+  // send the token that spark's refresh retired.
+  for (const [rule, singleUseRefresh] of [
+    ["a retired one is refused", { graceMs: 0 }],
+    ["sending a retired one cancels the newest too", { graceMs: 0, revokeOnReplay: true }],
+  ] as const) test.skipIf(!tmuxAvailable())(`a shell takes the login another spark refreshed when refresh tokens work once (${rule})`, async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "first" } }),
+      fakeGatewayFinalText("First call done."),
+      fakeGatewayToolCall("select2", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "second" } }),
+      fakeGatewayFinalText("Second call done."),
+      fakeGatewayToolCall("select3", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "third" } }),
+      fakeGatewayFinalText("Third call done."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 40,
+      env: { ...env, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl, SPARK_MODEL: MODEL },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the fixture.");
+    await tui.waitForText("First call done.", 20_000);
+    // The access token runs out for every spark holding it, and another spark
+    // refreshes it first.
+    auth.validTokens.delete(ACCESS_INITIAL);
+    const other = await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expectExit0(other);
+    expect(auth.refreshes).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-1`);
+    // Then the shell needs a token too.
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call it again.");
+    await tui.waitForText("Second call done.", 20_000);
+    expect(auth.replays).toBe(0);
+    const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\""));
+    expect(calls.at(-1)?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}-1`);
+    // The login still works, for the shell and for the next spark.
+    expect(auth.validTokens.has(`${ACCESS_REFRESHED}-1`)).toBe(true);
+    expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-1`);
+    // The shell refreshes on its own next and lets the lock go, so another spark
+    // refreshing after it doesn't wait for it.
+    auth.validTokens.delete(`${ACCESS_REFRESHED}-1`);
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call a third time.");
+    await tui.waitForText("Third call done.", 20_000);
+    expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-2`);
+    auth.validTokens.delete(`${ACCESS_REFRESHED}-2`);
+    const startedAt = Date.now();
+    expectExit0(await runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-3`);
+    expect(auth.replays).toBe(0);
+  }, 90_000);
+
+  // One spark refreshes a login at a time. Another that needs it meanwhile
+  // waits for as long as the refresh is still going, here a token endpoint
+  // that takes 15 s to answer, and then takes the login it saved: refreshing
+  // with the token the first already sent would be refused. Both are
+  // connected before the token runs out, as spark windows in use are.
+  test("an spark waits for another's refresh that takes 15 s, and takes the login it saved", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh: { graceMs: 0 }, refreshDelayMs: 15_000 });
+    const activeAuth = auth;
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    const until = async (what: string, done: () => boolean) => {
+      const deadline = Date.now() + 30_000;
+      while (!done()) {
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+        await Bun.sleep(25);
+      }
+    };
+    const models = { models: [{ id: MODEL, type: "language" as const, tags: ["tool-use"] }] };
+    // The first spark calls once the second is connected, and finds the token
+    // withdrawn; the second calls once the first's refresh is out.
+    let second: ReturnType<typeof startFakeGateway> | null = null;
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_first", "toolbox", { open: TOOL_NAME }),
+      async () => {
+        await until("the second spark to connect", () => (second?.requests.length ?? 0) >= 2);
+        activeAuth.validTokens.delete(ACCESS_INITIAL);
+        return fakeGatewayToolCall("first", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } });
+      },
+      fakeGatewayFinalText("First call done."),
+    ], models);
+    const first = gateway;
+    second = startFakeGateway([
+      fakeGatewayToolCall("select_second", "toolbox", { open: TOOL_NAME }),
+      async () => {
+        await until("the first spark's refresh", () => activeAuth.refreshes >= 1);
+        return fakeGatewayToolCall("second", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } });
+      },
+      fakeGatewayFinalText("Second call done."),
+    ], models);
+    const other = second;
+    try {
+      const ask = (g: ReturnType<typeof startFakeGateway>) => runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
+        cwd: root.workspace,
+        env: { ...env, SPARK_GATEWAY_BASE_URL: g.baseUrl, SPARK_GATEWAY_CHAT_URL: g.chatUrl },
+        timeoutMs: 60_000,
+      });
+      const [a, b] = await Promise.all([ask(first), ask(other)]);
+      // Refreshing with the token the first sent is refused, and both lose the login.
+      expect(auth.replays).toBe(0);
+      expect(auth.refreshes).toBe(1);
+      expectExit0(a);
+      expectExit0(b);
+      expect(toolResultText(first.requests.at(-1)?.body ?? "", "first")).toContain("first");
+      expect(toolResultText(other.requests.at(-1)?.body ?? "", "second")).toContain("second");
+      // Both called the tool with the one refreshed login.
+      const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\"") && r.authorization === `Bearer ${ACCESS_REFRESHED}-1`);
+      expect(calls.length).toBe(2);
+      expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-1`);
+    } finally {
+      other.stop();
+    }
+  }, 90_000);
+
+  // A load balancer resets the token endpoint's keep-alive connection once it
+  // sits idle. spark keeps it for the next renewal, which must find it gone and
+  // go out on a new connection instead of failing every renewal until spark
+  // restarts.
+  test("a renewal after the token endpoint reset its idle connection still goes through", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh: { graceMs: 0 } });
+    tokenProxy = await startIdleDropProxy(auth.url, "reset");
+    const root = createRoot(auth);
+    seedV2Credential(root, auth, { token_endpoint: `${tokenProxy.origin}/token` });
+    const activeAuth = auth;
+    // Each call finds its access token withdrawn, so spark renews the login
+    // first. The second comes after the proxy reset the first one's
+    // connection.
+    const renewed = (withdrawn: string, id: string, waitMs: number) => async () => {
+      await Bun.sleep(waitMs);
+      activeAuth.validTokens.delete(withdrawn);
+      return fakeGatewayToolCall(id, "toolbox", { run: TOOL_NAME, arguments: { text: id } });
+    };
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "toolbox", { open: TOOL_NAME }),
+      renewed(ACCESS_INITIAL, "first", 0),
+      renewed(`${ACCESS_REFRESHED}-1`, "second", 600),
+      fakeGatewayFinalText("Renewed twice."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture twice."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 30_000,
+    });
+    expectExit0(result);
+    const last = gateway.requests.at(-1)?.body ?? "";
+    expect(toolResultText(last, "first")).toContain("first");
+    expect(toolResultText(last, "second")).toContain("second");
+    expect(auth.refreshes).toBe(2);
+    expect(auth.replays).toBe(0);
+    // Each renewal had its own connection: the reset one wasn't used again.
+    expect(tokenProxy.dropped).toBeGreaterThanOrEqual(1);
+    expect(tokenProxy.connections).toBe(2);
+  }, 40_000);
+
+  // A login that can't be saved works only where it was made, so spark says so.
+  test("a login that can't be saved says so, and spark mcp login fails", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const barrier = mkdtempSync(join(tmpdir(), "spark-mcp-code-barrier-"));
+    const started = join(barrier, "started");
+    const release = join(barrier, "release");
+    auth = startAuthFixture(upstream.url, { codeBarrierStartedPath: started, codeBarrierReleasePath: release });
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const login = runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    // Once the browser came back, another spark keeps the saved logins busy.
+    expect(await waitForFile(started, 10_000)).toBe(true);
+    const holder = await holdStoreLock(root, 6);
+    writeFileSync(release, "go");
+    const done = await login;
+    holder.kill();
+    expect(done.stderr).toBe("Signed in to fixture, but couldn't save the login: ~/.spark/mcp-credentials/credentials-v3.json couldn't be written: another spark kept it busy. Sign in again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(auth.tokenExchanges).toBe(1);
+    expect(existsSync(join(root.home, ".spark", "mcp-credentials", "credentials-v3.json"))).toBe(false);
+  }, 60_000);
+
+  // A logout that can't remove the saved login says so: every other spark, and
+  // the next one, would still sign in with it.
+  test("a logout that can't remove the saved login says so, and spark mcp logout fails", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    // Readable, but spark won't replace a file it isn't allowed to write.
+    chmodSync(storePath, 0o400);
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Signed out of fixture here, but couldn't remove its saved login: ~/.spark/mcp-credentials/credentials-v3.json couldn't be written: spark isn't allowed to write it. Sign out again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test("removing a server whose saved login can't be deleted says so, and spark mcp remove fails", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    chmodSync(storePath, 0o400);
+    const done = await runFx(["mcp", "remove", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Removed fixture from ~/.spark/mcp.json, but couldn't delete its saved login: ~/.spark/mcp-credentials/credentials-v3.json couldn't be written: spark isn't allowed to write it. Once that's fixed, add it back and run spark mcp logout fixture to delete it.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(join(root.home, ".spark", "mcp.json"), "utf8")).not.toContain("fixture");
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  // A server waiting for approval has no session, so a saved login that
+  // can't be removed means nothing changed.
+  test("a logout of a held server whose saved login can't be removed changes nothing and says so", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    moveAuthFixtureToWorkspace(root);
+    const storePath = seedV2Credential(root, auth);
+    const doc = JSON.parse(readFileSync(storePath, "utf8"));
+    doc.servers[0].workspace = root.workspace;
+    writeFileSync(storePath, JSON.stringify(doc));
+    chmodSync(storePath, 0o400);
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Couldn't sign out of fixture: ~/.spark/mcp-credentials/credentials-v3.json couldn't be written: spark isn't allowed to write it. Try again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  // A held server has no session to sign out of, so its logout removes the
+  // saved login without revoking it, and says that.
+  test("a logout of a held server says its login wasn't revoked at its server", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    moveAuthFixtureToWorkspace(root);
+    const storePath = seedV2Credential(root, auth);
+    const doc = JSON.parse(readFileSync(storePath, "utf8"));
+    doc.servers[0].workspace = root.workspace;
+    writeFileSync(storePath, JSON.stringify(doc));
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("Signed out of fixture here, but the login wasn't revoked at its server, so its tokens stay valid until they expire.\n");
+    expect(done.stderr).toBe("");
+    expect(done.code).toBe(0);
+    expect(auth.revocations).toBe(0);
+    expect(readFileSync(storePath, "utf8")).not.toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test("a logout while another spark keeps the saved logins busy changes nothing and says so", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    // Private, as spark makes it.
+    writeFileSync(join(root.home, ".spark", "mcp-credentials", "credentials-v3.lock"), "", { mode: 0o600 });
+    const holder = await holdStoreLock(root, 8);
+    const done = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    holder.kill();
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Couldn't sign out of fixture: ~/.spark/mcp-credentials/credentials-v3.json couldn't be written: another spark kept it busy. Try again once that's fixed.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("a refreshed login that can't be saved says so in the shell, and keeps working there", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    const options: { rejectRefresh?: boolean } = {};
+    auth = startAuthFixture(upstream.url, options);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const storePath = join(root.home, ".spark", "mcp-credentials", "credentials-v3.json");
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("first", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "first" } }),
+      fakeGatewayFinalText("First call done."),
+      fakeGatewayToolCall("select2", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("second", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "second" } }),
+      fakeGatewayFinalText("Second call done."),
+      fakeGatewayToolCall("select3", "toolbox", { open: "mcp_fixture_echo" }),
+      fakeGatewayToolCall("third", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "third" } }),
+      fakeGatewayFinalText("Third call done."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 120, height: 40,
+      env: { ...env, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl, SPARK_MODEL: MODEL },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the fixture.");
+    await tui.waitForText("First call done.", 20_000);
+    auth.validTokens.delete(ACCESS_INITIAL);
+    // Another spark keeps the saved logins busy past both waits for them.
+    const holder = await holdStoreLock(root, 6);
+    try {
+      await tui.waitForComposer(5_000);
+      await tui.sendText("Call it again.");
+      await tui.waitForText("Couldn't save fixture's new login", 20_000);
+      await tui.waitForText("Second call done.", 20_000);
+    } finally {
+      holder.kill();
+    }
+    // The refresh worked here, and the store still has the login before it.
+    expect(auth.refreshes).toBe(1);
+    const calls = auth.requests.filter((r) => r.body.includes("\"tools/call\""));
+    expect(calls.at(-1)?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+    // Then the server takes neither the refreshed login nor its refresh. The
+    // shell, refused, removes the saved login it had, which its refresh
+    // replaced, so nothing takes that one later.
+    auth.validTokens.clear();
+    options.rejectRefresh = true;
+    await tui.waitForComposer(5_000);
+    await tui.sendText("Call a third time.");
+    await tui.waitForText("Third call done.", 20_000);
+    expect(JSON.parse(readFileSync(storePath, "utf8")).servers).toEqual([]);
+  }, 90_000);
+
+  // Two shells share one login on the Keychain. Shell A starts while B is
+  // idle, and A's Keychain read hangs past the 10 s it may hold the store's
+  // lock; meanwhile B's token is refused, so B refreshes and saves. The
+  // auth server's refresh tokens work once, as WorkOS's do.
+  // Before, B waited 2 s for the lock, dropped its new login with "another
+  // spark kept it busy", and A, taking the saved login, replayed a refresh
+  // token B had already used. Now A's hung read is cut at its budget, B
+  // waits for that and saves, and A takes B's login without refreshing.
+  test.skipIf(process.platform !== "darwin" || !tmuxAvailable())("a refreshed login is saved while another spark hangs in the Keychain", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh: { graceMs: 0 } });
+    const root = createRoot(auth);
+    mkdirSync(join(root.home, "Library"), { recursive: true });
+    symlinkSync(join(homedir(), "Library", "Keychains"), join(root.home, "Library", "Keychains"), "dir");
+    const account = `${MCP_KEYCHAIN_ACCOUNT_PREFIX}${process.pid}-${randomUUID()}`;
+    const env = {
+      ...baseEnv(root), USER: account, SPARK_DISABLE_KEYCHAIN: undefined, DISPLAY: ":0", SSH_CONNECTION: undefined,
+      SPARK_NO_OPEN_BROWSER: undefined, SPARK_TRACE_SCOPES: "mcp,keychain",
+    };
+    const call = (id: string, done: string) => [
+      fakeGatewayToolCall(`select_${id}`, "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall(`call_${id}`, "toolbox", { run: TOOL_NAME, arguments: { text: id } }),
+      fakeGatewayFinalText(done),
+    ];
+    const models = [{ id: MODEL, type: "language", tags: ["tool-use"] }];
+    const gatewayA = startFakeGateway(call("a", "A call done."), { models });
+    let shellA: TmuxSession | null = null;
+    let paused: number | null = null;
+    let watcher: { pid: Promise<number | null>; stop: () => void } | null = null;
+    try {
+      expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+      expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+      gateway = startFakeGateway([...call("first", "First call done."), ...call("second", "Second call done.")], { models });
+      tui = await TmuxSession.create({
+        isolated: true, cwd: root.workspace, width: 220, height: 40,
+        env: { ...env, SPARK_TRACE_LOG: `${root.trace}.b`, SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Call the fixture.");
+      await tui.waitForText("First call done.", 20_000);
+      await tui.waitForComposer(10_000);
+      auth.validTokens.delete(ACCESS_INITIAL);
+
+      watcher = pauseNextKeychainRead(account);
+      const starting = TmuxSession.create({
+        isolated: true, cwd: root.workspace, width: 220, height: 40, startupWaitMs: 0,
+        env: { ...env, SPARK_TRACE_LOG: `${root.trace}.a`, SPARK_GATEWAY_BASE_URL: gatewayA.baseUrl, SPARK_GATEWAY_CHAT_URL: gatewayA.chatUrl },
+      });
+      paused = await watcher.pid;
+      shellA = await starting;
+      expect(paused).not.toBeNull();
+      const pausedAt = Date.now();
+
+      await tui.sendText("Call it again.");
+      await Bun.sleep(Math.max(0, pausedAt + 14_000 - Date.now()));
+      releaseProcess(paused);
+      paused = null;
+      await tui.waitForText("Second call done.", 45_000);
+      await shellA.waitForComposer(15_000);
+      await shellA.sendText("Call the fixture.");
+      await shellA.waitForText("A call done.", 30_000);
+
+      const screen = (await tui.capturePaneGrid()).join("\n").replace(/\n\s+/g, " ");
+      const saved = mcpKeychainItem("load", account, root.home);
+      if (screen.includes("another spark kept it busy") || !saved.includes(`${ACCESS_REFRESHED}-1`)) {
+        const trace = (who: string) => existsSync(`${root.trace}.${who}`) ? readFileSync(`${root.trace}.${who}`, "utf8").split("\n").filter((l) => /\[(keychain|mcp)\].*(lock|credential|saved login|refresh|load|store)/.test(l)).map((l) => `${who} ${l}`) : [];
+        console.log(`---- shell B ----\n${screen}\n---- traces ----\n${[...trace("a"), ...trace("b")].join("\n")}`);
+      }
+      expect(screen).not.toContain("another spark kept it busy");
+      // B's refreshed login is the saved one, A took it instead of
+      // refreshing, and no retired refresh token was sent.
+      expect(saved).toContain(`${ACCESS_REFRESHED}-1`);
+      expect(auth.refreshes).toBe(1);
+      expect(auth.replays).toBe(0);
+      const aCall = auth.requests.filter((r) => r.body.includes("\"tools/call\"")).at(-1);
+      expect(aCall?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}-1`);
+    } finally {
+      releaseProcess(paused);
+      watcher?.stop();
+      await shellA?.kill();
+      gatewayA.stop();
+      try { mcpKeychainItem("delete", account, root.home); } catch (err) { console.log(String(err)); }
+      // Only the link goes, never the Keychains it points at.
+      unlinkSync(join(root.home, "Library", "Keychains"));
+    }
+  }, 150_000);
+
+  // Before, a Keychain read that hung past its budget when spark started left
+  // the server asking for a sign-in, though its login was saved. Now the
+  // store is read again when the server asks for one.
+  test.skipIf(process.platform !== "darwin")("a saved login the Keychain didn't give at the start is read again when the server asks for one", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    mkdirSync(join(root.home, "Library"), { recursive: true });
+    symlinkSync(join(homedir(), "Library", "Keychains"), join(root.home, "Library", "Keychains"), "dir");
+    const account = `${MCP_KEYCHAIN_ACCOUNT_PREFIX}${process.pid}-${randomUUID()}`;
+    const env = {
+      ...baseEnv(root), USER: account, SPARK_DISABLE_KEYCHAIN: undefined, DISPLAY: ":0", SSH_CONNECTION: undefined,
+      SPARK_NO_OPEN_BROWSER: undefined, SPARK_TRACE_SCOPES: "mcp,keychain",
+    };
+    let paused: number | null = null;
+    let watcher: { pid: Promise<number | null>; stop: () => void } | null = null;
+    try {
+      expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+      expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+      // The next spark's first Keychain read hangs, and spark cuts it at its budget.
+      watcher = pauseNextKeychainRead(account);
+      const showing = runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 40_000 });
+      paused = await watcher.pid;
+      expect(paused).not.toBeNull();
+      const shown = await showing;
+      expect(shown.stdout).toMatch(/status +ready/);
+      expect(shown.stdout).not.toContain("needs login");
+      expect(shown.code).toBe(0);
+      expect(auth.tokenExchanges).toBe(1);
+    } finally {
+      releaseProcess(paused);
+      watcher?.stop();
+      try { mcpKeychainItem("delete", account, root.home); } catch (err) { console.log(String(err)); }
+      // Only the link goes, never the Keychains it points at.
+      unlinkSync(join(root.home, "Library", "Keychains"));
+    }
+  }, 60_000);
+
+  // The login read again after a slow first Keychain read can still be
+  // refused, or the server can ask for more scopes: either way the server
+  // waits for a sign-in, as it does when the store was read at once.
+  for (const [what, refuse] of [
+    ["the server refuses", (fixture: AuthFixture) => fixture.validTokens.clear()],
+    ["the server asks more scopes of", (fixture: AuthFixture) => fixture.askForMoreScopes("tools.call")],
+  ] as const) {
+    test.skipIf(process.platform !== "darwin")(`a login read again after a slow Keychain that ${what} leaves the server needing a login`, async () => {
+      upstream = startModernMcpHttpFixture("json");
+      auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 400, body: { error: "invalid_grant" } } });
+      const root = createRoot(auth);
+      mkdirSync(join(root.home, "Library"), { recursive: true });
+      symlinkSync(join(homedir(), "Library", "Keychains"), join(root.home, "Library", "Keychains"), "dir");
+      const account = `${MCP_KEYCHAIN_ACCOUNT_PREFIX}${process.pid}-${randomUUID()}`;
+      const env = {
+        ...baseEnv(root), USER: account, SPARK_DISABLE_KEYCHAIN: undefined, DISPLAY: ":0", SSH_CONNECTION: undefined,
+        SPARK_NO_OPEN_BROWSER: undefined, SPARK_TRACE_SCOPES: "mcp,keychain",
+      };
+      let paused: number | null = null;
+      let watcher: { pid: Promise<number | null>; stop: () => void } | null = null;
+      try {
+        expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
+        expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+        refuse(auth);
+        // The next spark's first Keychain read hangs, and spark cuts it at its budget.
+        watcher = pauseNextKeychainRead(account);
+        const showing = runFx(["mcp", "show", "fixture"], { cwd: root.workspace, env, timeoutMs: 40_000 });
+        paused = await watcher.pid;
+        expect(paused).not.toBeNull();
+        const shown = await showing;
+        expect(shown.stdout).toMatch(/status +needs login/);
+        expect(shown.stdout).not.toMatch(/status +(ready|failed)/);
+        expect(auth.tokenExchanges).toBe(1);
+        // A step-up keeps the login for what it already had.
+        if (what === "the server asks more scopes of") {
+          expect(mcpKeychainItem("load", account, root.home)).toContain(ACCESS_INITIAL);
+        }
+      } finally {
+        releaseProcess(paused);
+        watcher?.stop();
+        try { mcpKeychainItem("delete", account, root.home); } catch (err) { console.log(String(err)); }
+        // Only the link goes, never the Keychains it points at.
+        unlinkSync(join(root.home, "Library", "Keychains"));
+      }
+    }, 60_000);
+  }
+
+  test("a configured oauth.resource reaches the authorization server as written", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    // The fixture advertises its origin as the resource and checks it on
+    // /authorize and /token; spark's own address is .../mcp.
+    auth = startAuthFixture(upstream.url, { resourceAtOrigin: true });
+    const root = createRoot(auth);
+    const configPath = join(root.home, ".spark", "mcp.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    config.mcp.fixture.oauth.resource = `${new URL(auth.url).origin}/`;
+    writeFileSync(configPath, JSON.stringify(config));
+    // Freed memory reads as 0x55, so a resource spark failed to copy is garbled.
+    const env = { ...v2Env(root), MallocScribble: "1", MALLOC_PERTURB_: "85" };
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.signal).toBeNull();
+    expect(login.stderr).toBe("");
+    expectExit0(login);
+    expect(auth.tokenExchanges).toBe(1);
+    expect(await statusOf(root)).toBe("signed_in");
+  }, 60_000);
+
+  test("spark mcp login explains servers it can't sign in to", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    const unknown = await runFx(["mcp", "login", "nope"], { cwd: root.workspace, env });
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).toBe("No MCP server named nope. spark mcp list shows them.\n");
+    moveAuthFixtureToWorkspace(root);
+    const waiting = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env });
+    expect(waiting.code).toBe(1);
+    expect(waiting.stderr).toBe("fixture is waiting for approval: spark mcp approve fixture.\n");
+    expect(existsSync(root.openLog)).toBe(false);
+    expect(auth.authorizationRequests).toBe(0);
+  }, 30_000);
+
+  // A saved login is renewed before it's sent once it's expired, or within
+  // its renewal window (skew_ms before it expires), whatever the server's era.
+  for (const era of ["2026-07-28", "2025-11-25"] as const) {
+    test(`an expired saved login is renewed before spark first talks to a ${era} server`, async () => {
+      const target = era === "2026-07-28"
+        ? (upstream = startModernMcpHttpFixture("json"))
+        : (legacyStreamable = startLegacyStreamableHttpFixture(era));
+      auth = startAuthFixture(target.url);
+      const root = createRoot(auth);
+      seedV2Credential(root, auth, { expires_at_ms: 0 });
+      gateway = startToolGateway();
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
+        cwd: root.workspace,
+        env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(auth.refreshes).toBe(1);
+      // The expired token never reached the server.
+      const sent = auth.requests.filter((request) => request.path === "/mcp");
+      expect(sent.length).toBeGreaterThan(0);
+      for (const request of sent) expect(request.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
+      expect(auth.protectedToolCalls).toBe(1);
+      expect(toolResultText(gateway.requests[2]?.body ?? "", "call_mcp")).toContain("authenticated");
+    }, 30_000);
+  }
+
+  test("a login that comes within its renewal window while spark runs is renewed before the next call", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    // Renewed 6 s before it expires, 21 s from now: the first use is well
+    // before that window, even when spark starts slowly on a busy machine, and
+    // the call, held until 16 s from now, inside it.
+    const savedAt = Date.now();
+    seedV2Credential(root, auth, { expires_at_ms: savedAt + 21_000, skew_ms: 6_000 });
+    gateway = startDelayedToolGateway(savedAt + 16_000, "Renewed call complete.");
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 45_000,
+    });
+    expect(result.code).toBe(0);
+    expect(auth.refreshes).toBe(1);
+    const sent = auth.requests.filter((request) => request.path === "/mcp");
+    expect(sent[0]?.authorization).toBe(`Bearer ${ACCESS_INITIAL}`);
+    // The fixture takes both tokens, so the call carries the new one only
+    // because spark renewed it first.
+    const call = sent.find((request) => request.body.includes('"tools/call"'));
+    expect(call?.authorization).toBe(`Bearer ${ACCESS_REFRESHED}`);
+    expect(auth.protectedToolCalls).toBe(1);
+  }, 60_000);
+
+  // Before, a shell that started before another terminal signed in logged out
+  // without that login, which stayed valid at the server for every other spark.
+  test.skipIf(!tmuxAvailable())("a logout in a shell revokes the login another terminal saved after the shell started", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 110, height: 34,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // Another terminal signs in while the shell runs.
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 }));
+    expect(auth.revocations).toBe(0);
+    await tui.sendText("/mcp logout fixture");
+    await tui.waitForText("Signed out of fixture.", 15_000);
+    const revoked = auth.requests.filter((request) => request.path === "/revoke").map((request) => new URLSearchParams(request.body).get("token"));
+    expect(revoked).toEqual([REFRESH_INITIAL]);
+    expect(readFileSync(join(root.home, ".spark", "mcp-credentials", "credentials-v3.json"), "utf8")).not.toContain("\"name\":\"fixture\"");
+  }, 60_000);
+
+  // Before, a shell holding a login renewed it at its next use after another
+  // terminal logged out, and saved it again: at a server that doesn't end the
+  // login on revocation, as this fixture, the logout undid itself.
+  test.skipIf(!tmuxAvailable())("after another terminal logs out, a shell holding the login signs out at its next renewal instead of saving it back", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    // Due for renewal 10 s from now: the shell connects with it before, and
+    // calls a tool after.
+    const seeded = Date.now();
+    const store = seedV2Credential(root, auth, { expires_at_ms: seeded + 20_000, skew_ms: 10_000 });
+    gateway = startToolGateway();
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 110, height: 34,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    const connectedBy = Date.now() + 9_000;
+    while (!auth.requests.some((request) => request.path === "/mcp" && request.authorization === `Bearer ${ACCESS_INITIAL}`) && Date.now() < connectedBy) await Bun.sleep(50);
+    expect(auth.requests.some((request) => request.path === "/mcp" && request.authorization === `Bearer ${ACCESS_INITIAL}`)).toBe(true);
+    expect(auth.refreshes).toBe(0);
+
+    // Another terminal logs out.
+    expectExit0(await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 }));
+    expect(readFileSync(store, "utf8")).not.toContain("\"name\":\"fixture\"");
+
+    await Bun.sleep(Math.max(0, seeded + 10_500 - Date.now()));
+    await tui.sendText("Call the protected fixture.");
+    await tui.waitForText("Authenticated MCP call complete.", 20_000);
+    // The shell didn't renew the login, so nothing saved it again.
+    expect(auth.refreshes).toBe(0);
+    expect(auth.protectedToolCalls).toBe(0);
+    expect(readFileSync(store, "utf8")).not.toContain("\"name\":\"fixture\"");
+    expect(await statusOf(root)).not.toBe("signed_in");
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp logout with no saved login says so and leaves the running server alone", async () => {
+    upstream = startModernMcpHttpFixture("cache_auth_subscription");
+    auth = startAuthFixture(upstream.url);
+    // A server that needs no login, reached directly.
+    const root = createRoot(auth, false, "http", upstream.url);
+    const listens = () => upstream!.requests.filter((request) => request.message.method === "subscriptions/listen");
+    const calls = () => upstream!.requests.filter((request) => request.message.method === "tools/call");
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_first", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("call_first", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } }),
+      fakeGatewayFinalText("First call complete."),
+      fakeGatewayToolCall("select_second", "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall("call_second", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } }),
+      fakeGatewayFinalText("Second call complete."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 110,
+      height: 34,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Call the MCP fixture.");
+    await tui.waitForText("First call complete.", 20_000);
+    const deadline = Date.now() + 10_000;
+    while (listens().length < 1 && Date.now() < deadline) await Bun.sleep(25);
+    expect(listens()).toHaveLength(1);
+
+    await tui.sendText("/mcp logout fixture");
+    await tui.waitForText("fixture wasn't signed in.", 10_000);
+    expect(upstream.cancelledListens).toBe(0);
+    await tui.waitForComposer(10_000);
+    await tui.sendText("Call it again.");
+    await tui.waitForText("Second call complete.", 20_000);
+    // The same connection served both calls.
+    expect(calls()).toHaveLength(2);
+    expect(listens()).toHaveLength(1);
+    expect(upstream.cancelledListens).toBe(0);
+    expect(tui.paneStatus()).toEqual({ dead: false, status: null });
+    upstream.finishSubscription();
+  }, 60_000);
+
+  // RFC 8414 section 3.2: the metadata is an application/json response.
+  test("spark mcp login refuses sign-in metadata that isn't JSON before opening the browser", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { authorizationMetadataContentType: "text/plain" });
+    const root = createRoot(auth);
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(login.code).not.toBe(0);
+    expect(`${login.stdout}${login.stderr}`).toContain("text/plain");
+    expect(existsSync(root.openLog)).toBe(false);
+    expect(auth.authorizationRequests).toBe(0);
+    expect(auth.tokenExchanges).toBe(0);
+    expect(existsSync(join(root.home, ".spark", "mcp-credentials", "credentials-v3.json"))).toBe(false);
+  }, 30_000);
+
+  // MongoDB's deployed server answers server/discover with a session error
+  // where a 2025-11-25 server would answer with an unknown method.
+  for (const mode of ["legacy_session_required", "legacy_mongodb_session_required"] as const) {
+    test(`a signed-in server that refuses discovery as MongoDB's does (${mode}) falls back and lists its tools`, async () => {
+      upstream = startModernMcpHttpFixture(mode);
+      auth = startAuthFixture(upstream.url);
+      const root = createRoot(auth);
+      const env = v2Env(root);
+      const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      expectExit0(login);
+      expect(login.stdout).toContain("Signed in to fixture.");
+      const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      expectExit0(show);
+      expect(show.stderr).toBe("");
+      const status = JSON.parse(show.stdout);
+      expect(status.status).toBe("ready");
+      expect(status.version).toBe("2025-11-25");
+      expect(status.tools).toHaveLength(1);
+      for (const secret of [ACCESS_INITIAL, REFRESH_INITIAL]) {
+        expect(show.stdout).not.toContain(secret);
+        expect(show.stderr).not.toContain(secret);
+      }
+      const methods = upstream.requests.map((entry) => entry.message.method);
+      expect(methods.slice(0, 3)).toEqual(["server/discover", "initialize", "notifications/initialized"]);
+      expect(methods).toContain("tools/list");
+    }, 30_000);
+  }
+
+  // Esc stops only the call: the renewal runs on, so a server that swaps its
+  // refresh token on each renewal never sees an old one. A renewal gets 30 s;
+  // the call waiting when it runs out fails, and the next call renews afresh.
+  test.skipIf(!tmuxAvailable())("Esc while a login is being renewed cancels the call before it's sent, and a renewal that never answers ends after 30 s", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    // The first renewal never answers.
+    auth = startAuthFixture(upstream.url, { stallRefresh: true });
+    const root = createRoot(auth);
+    // Times from the moment the login is saved, below.
+    let savedAt = 0;
+    gateway = startRefreshRecoveryGateway(() => savedAt + 16_000);
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 110,
+      height: 34,
+      env: { ...v2Env(root), SPARK_GATEWAY_BASE_URL: gateway.baseUrl, SPARK_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // Renewed 6 s before it expires, 21 s from now: the tool is found well
+    // before that window, even on a slow machine, and called inside it, 16 s
+    // from now.
+    savedAt = Date.now();
+    const store = seedV2Credential(root, auth, { expires_at_ms: savedAt + 21_000, skew_ms: 6_000 });
+    await tui.sendText("Call the protected MCP fixture.");
+    const refreshDeadline = Date.now() + 40_000;
+    while (auth.refreshes === 0 && Date.now() < refreshDeadline) await Bun.sleep(25);
+    expect(auth.refreshes).toBe(1);
+
+    const renewalStarted = Date.now();
+
+    await tui.sendInterruptEscapePair(10_000);
+    await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+    expect(auth.protectedToolCalls).toBe(0);
+    expect(upstream.requests.some((entry) => entry.message.method === "tools/call")).toBe(false);
+    expect(readFileSync(store, "utf8")).toContain(ACCESS_INITIAL);
+    expect(readFileSync(store, "utf8")).not.toContain(ACCESS_REFRESHED);
+    await tui.waitForComposer(10_000);
+    // The renewal is still open.
+    expect(auth.refreshCancellations).toBe(0);
+
+    // The retry waits for that renewal, which spark drops after its 30 s.
+    await tui.sendText("Retry the protected MCP fixture.");
+    await tui.waitForText("Retry ended.", 45_000);
+    const waited = Date.now() - renewalStarted;
+    expect(waited).toBeGreaterThan(28_000);
+    expect(waited).toBeLessThan(40_000);
+    expect(auth.refreshes).toBe(1);
+    expect(auth.refreshCancellations).toBe(1);
+    expect(auth.protectedToolCalls).toBe(0);
+    const retried = gateway.requests.find((r) => r.body.includes('"toolCallId":"call_retry"'))?.body ?? "{}";
+    expect(toolResultText(retried, "call_retry", "error-text")).toContain("couldn't be renewed because the sign-in server didn't answer");
+    expect(readFileSync(store, "utf8")).toContain(ACCESS_INITIAL);
+    await tui.waitForComposer(10_000);
+
+    // The login was kept, so the next call renews it afresh.
+    await tui.sendText("Call the protected MCP fixture again.");
+    await tui.waitForText("Refresh recovery complete.", 20_000);
+    expect(auth.refreshes).toBe(2);
+    expect(auth.protectedToolCalls).toBe(1);
+    expect(readFileSync(store, "utf8")).toContain(ACCESS_REFRESHED);
+  }, 120_000);
+
+  test("a pinned callback port is bound again for each of several sign-ins in a row", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    // This test plays the browser itself.
+    const root = createRoot(auth, true, "http", auth.url, false);
+    const callbackPort = unusedCallbackPort();
+    const profilePath = join(root.home, ".spark", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.oauth.callback_port = callbackPort;
+    writeFileSync(profilePath, JSON.stringify(profile));
+    const env = v2Env(root);
+    const attempts = 8;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      rmSync(root.openLog, { force: true });
+      const login = runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      expect(await waitForFileText(root.openLog, "http", 10_000)).toBe(true);
+      const authorization = await fetch(readFileSync(root.openLog, "utf8").trim(), { redirect: "manual" });
+      const callback = authorization.headers.get("location");
+      expect(callback).not.toBeNull();
+      expect(new URL(callback!).port).toBe(String(callbackPort));
+      expect((await fetch(callback!)).status).toBe(200);
+      const done = await login;
+      expect({ attempt, code: done.code, stderr: done.stderr }).toEqual({ attempt, code: 0, stderr: "" });
+      expect(done.stdout).toContain("Signed in to fixture.");
+      const logout = await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+      expect({ attempt, code: logout.code, stderr: logout.stderr }).toEqual({ attempt, code: 0, stderr: "" });
+    }
+    expect(auth.authorizationRequests).toBe(attempts);
+    expect(auth.tokenExchanges).toBe(attempts);
+  }, 120_000);
+});
