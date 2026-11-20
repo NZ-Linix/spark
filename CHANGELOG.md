@@ -1,8 +1,23 @@
 # spark
 
-## 0.0.17
+## 26.11.20
 
 <!-- release:start -->
+
+**spark now runs on 32-bit x86 Linux, including the iSH app on iPhone and iPad.**
+
+### New Features
+
+- Install spark on 32-bit x86 Linux. The installer can use wget on systems without curl.
+- Run `spark uninstall` to remove the running binary and its default local profile after confirmation.
+
+### Bug Fixes
+
+- On iSH, spark loads saved prompt history at startup so you can recall previous prompts with the Up arrow.
+
+<!-- release:end -->
+
+## 0.0.17
 
 **Subagents now work alongside you: switch between agents and run several spark instances in one window. Vercel Token Pass is now first-class in spark. Tool definitions 48.0% smaller, and 82.0% of later input from the prompt cache, up from 61.3%.**
 
@@ -164,7 +179,6 @@
 - Esc during a retry ends the turn, and the separate Esc-to-pause is gone.
 - `spark ask --json` and ACP report recovery as `state`, `attempt`, `need`, and `message`.
 
-<!-- release:end -->
 
 ## 0.0.16
 
