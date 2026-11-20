@@ -3926,6 +3926,7 @@ comptime {
     if (!builtin.is_test and !host_target.is_wasm) {
         @export(&main, .{ .name = "main" });
     }
+    _ = @import("core/shared/i386_syscall_fallbacks.zig");
 }
 
 pub fn runWasmTerminal(init: std.process.Init) !void {
