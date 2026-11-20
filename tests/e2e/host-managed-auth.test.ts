@@ -164,7 +164,7 @@ describe("host-managed authentication", () => {
       const result = await runFx(command, { cwd: workspace, env: childEnv });
       expect(result.code).toBe(0);
       // `spark setup` is deprecated and says so even when the host manages authentication.
-      expect(result.stderr).toBe(command[0] === "setup" ? "spark setup is deprecated and stops working in spark 0.0.18; use spark login vercel --api-key\n" : "");
+      expect(result.stderr).toBe(command[0] === "setup" ? "spark setup is deprecated and stops working in spark 26.12.20; use spark login vercel --api-key\n" : "");
       expect(result.stdout).toBe("Authentication is managed by the host.\n");
     }
     expect(existsSync(join(home, ".spark", "auth.json"))).toBe(false);

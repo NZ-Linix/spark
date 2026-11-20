@@ -6147,7 +6147,7 @@ test "setup preserves the disabled secret-store failure" {
     try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
     try std.testing.expectEqualStrings(
-        "spark setup is deprecated and stops working in spark 0.0.18; use spark login vercel --api-key\n" ++
+        "spark setup is deprecated and stops working in spark 26.12.20; use spark login vercel --api-key\n" ++
             "spark setup: stored API keys are disabled by SPARK_DISABLE_KEYCHAIN\n",
         capture.stderr.written(),
     );

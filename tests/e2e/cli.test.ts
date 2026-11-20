@@ -2980,7 +2980,7 @@ describe("cli: setup", () => {
       expect(r.code).toBe(1);
       expect(r.stdout).toBe("");
       expect(r.stderr).toBe(
-        "spark setup is deprecated and stops working in spark 0.0.18; use spark login vercel --api-key\n" +
+        "spark setup is deprecated and stops working in spark 26.12.20; use spark login vercel --api-key\n" +
           "spark setup: stored API keys are disabled by SPARK_DISABLE_KEYCHAIN\n",
       );
     },
@@ -3046,7 +3046,7 @@ exit 99
         });
         expect(r.code).toBe(1);
         expect(r.stdout).toBe("");
-        expect(r.stderr).toContain("spark setup is deprecated and stops working in spark 0.0.18; use spark login vercel --api-key\n");
+        expect(r.stderr).toContain("spark setup is deprecated and stops working in spark 26.12.20; use spark login vercel --api-key\n");
         expect(r.stderr).toContain("interactive terminal is required");
         expect(existsSync(invocationLog)).toBe(false);
       } finally {

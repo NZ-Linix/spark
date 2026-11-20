@@ -70,7 +70,8 @@ pub const SlashKind = enum {
 /// The release that drops every old spelling spark still reads with a warning,
 /// such as `spark setup`, `--sessions-v2`, and `/allowlist user`. The CLI shape
 /// check fails once spark's version reaches it, so they come out on time.
-pub const old_spelling_removal = "0.0.18";
+/// The calendar-versioned fork first shipped these warnings in 26.11.19.
+pub const old_spelling_removal = "26.12.20";
 /// What every warning about an old spelling says.
 pub const deprecated_until = "is deprecated and stops working in spark " ++ old_spelling_removal;
 
@@ -2082,7 +2083,7 @@ test "a deprecated command warns with its replacement and a current one does not
     const alloc = std.testing.allocator;
     const warning = (try deprecationWarning(alloc, testTopLevelRegistry(), .setup)).?;
     defer alloc.free(warning);
-    try std.testing.expectEqualStrings("spark setup is deprecated and stops working in spark 0.0.18; use spark login vercel --api-key\n", warning);
+    try std.testing.expectEqualStrings("spark setup is deprecated and stops working in spark 26.12.20; use spark login vercel --api-key\n", warning);
     try std.testing.expect((try deprecationWarning(alloc, testTopLevelRegistry(), .login)) == null);
 }
 

@@ -51,7 +51,7 @@ pub fn formatOlderName(alloc: Allocator, twice: settings_keys.OlderName, display
 }
 
 /// `permission_mode yolo in ~/.spark/settings.json is deprecated and stops
-/// working in spark 0.0.18; use full-access`. Caller owns the result.
+/// working in spark 26.12.20; use full-access`. Caller owns the result.
 pub fn formatOldYolo(alloc: Allocator, workspace: ?[]const u8, display_path: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -130,10 +130,10 @@ test "an older setting name or a saved yolo names the release that drops it" {
     const alloc = std.testing.allocator;
     const older = try formatOlderName(alloc, .{ .older = "statusLine", .current = "status_line", .both = false }, "~/.spark/settings.json");
     defer alloc.free(older);
-    try std.testing.expectEqualStrings("statusLine in ~/.spark/settings.json is deprecated and stops working in spark 0.0.18; rename it to status_line", older);
+    try std.testing.expectEqualStrings("statusLine in ~/.spark/settings.json is deprecated and stops working in spark 26.12.20; rename it to status_line", older);
     const yolo = try formatOldYolo(alloc, "/w", "~/.spark/settings.json");
     defer alloc.free(yolo);
-    try std.testing.expectEqualStrings("permission_mode yolo in ~/.spark/settings.json for workspace /w is deprecated and stops working in spark 0.0.18; use full-access", yolo);
+    try std.testing.expectEqualStrings("permission_mode yolo in ~/.spark/settings.json for workspace /w is deprecated and stops working in spark 26.12.20; use full-access", yolo);
 }
 
 test "a mistyped key on the command line gets the closest known key" {

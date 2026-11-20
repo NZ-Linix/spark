@@ -65,6 +65,11 @@ pub const doctor_options = [_]command_specs.OptionDoc{
     .{ .flag = "--deep", .description = "Read every saved file of each session checked, with no time limit; slower" },
 };
 
+pub const convo_option: command_specs.OptionDoc = .{
+    .flag = "--convo <file>",
+    .description = "Keep the conversation in this one file and nowhere else, kept out of saved sessions and /resume; the same command reopens it, and the file can be shared",
+};
+
 pub const upgrade_options = [_]command_specs.OptionDoc{
     .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
     json_option,
@@ -642,8 +647,8 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Pick a saved session, or resume the latest or an exact ID",
     },
     .{
-        .usage = "--convo <file>",
-        .description = "Keep the conversation in this one file and nowhere else, kept out of saved sessions and /resume; the same command reopens it, and the file can be shared",
+        .usage = convo_option.flag,
+        .description = convo_option.description,
     },
     .{
         .usage = "-h, --help",
