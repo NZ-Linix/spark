@@ -13,7 +13,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
-const active = builtin.cpu.arch == .x86 and builtin.os.tag == .linux and builtin.link_libc;
+const active = builtin.target.cpu.arch == .x86 and builtin.target.os.tag == .linux and builtin.link_libc;
 
 comptime {
     if (active) {
@@ -22,6 +22,154 @@ comptime {
         @export(&clockNanosleep, .{ .name = "clock_nanosleep" });
         @export(&fchmodat, .{ .name = "fchmodat" });
     }
+}
+
+const Io = std.Io;
+const Dir = Io.Dir;
+const File = Io.File;
+
+var metadata_available: ?bool = null;
+var legacy_metadata_vtable: Io.VTable = undefined;
+var metadata_inner: ?*const Io.VTable = null;
+
+/// The App Store build of iSH returns ENOSYS from statx. Probe with an
+/// invalid descriptor so the check never touches the filesystem.
+pub fn wrapIo(inner: Io) Io {
+    if (comptime !active) return inner;
+    if (metadata_available == null) {
+        var result: linux.Statx = undefined;
+        metadata_available = linux.errno(linux.statx(-1, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &result)) != .NOSYS;
+    }
+    return if (metadata_available.?) inner else legacyMetadataIo(inner);
+}
+
+fn legacyMetadataIo(inner: Io) Io {
+    if (metadata_inner) |vtable| {
+        std.debug.assert(vtable == inner.vtable);
+    } else {
+        legacy_metadata_vtable = inner.vtable.*;
+        legacy_metadata_vtable.fileStat = fileStat;
+        legacy_metadata_vtable.fileLength = fileLength;
+        legacy_metadata_vtable.dirStat = dirStat;
+        legacy_metadata_vtable.dirStatFile = dirStatFile;
+        metadata_inner = inner.vtable;
+    }
+    return .{ .userdata = inner.userdata, .vtable = &legacy_metadata_vtable };
+}
+
+/// Linux i386's stat64 syscall layout. The kernel aligns the 64-bit fields
+/// to four-byte boundaries and writes 96 bytes.
+const Stat64 = extern struct {
+    device: u64 align(4),
+    device_padding: u32,
+    truncated_inode: u32,
+    mode: u32,
+    nlink: u32,
+    uid: u32,
+    gid: u32,
+    rdev: u64 align(4),
+    rdev_padding: u32,
+    size: i64 align(4),
+    block_size: u32,
+    blocks: u64 align(4),
+    atime_sec: i32,
+    atime_nsec: u32,
+    mtime_sec: i32,
+    mtime_nsec: u32,
+    ctime_sec: i32,
+    ctime_nsec: u32,
+    inode: u64 align(4),
+
+    fn toFileStat(s: Stat64) File.Stat {
+        return .{
+            .inode = s.inode,
+            .nlink = s.nlink,
+            .size = @intCast(@max(0, s.size)),
+            .permissions = .fromMode(s.mode),
+            .kind = Io.Threaded.statxKind(@truncate(s.mode)),
+            .atime = .{ .nanoseconds = timestamp(s.atime_sec, s.atime_nsec) },
+            .mtime = .{ .nanoseconds = timestamp(s.mtime_sec, s.mtime_nsec) },
+            .ctime = .{ .nanoseconds = timestamp(s.ctime_sec, s.ctime_nsec) },
+            .block_size = s.block_size,
+        };
+    }
+};
+
+fn timestamp(sec: i32, nsec: u32) i96 {
+    return @as(i96, sec) * std.time.ns_per_s + nsec;
+}
+
+fn fileStat(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
+    const io: Io = .{ .userdata = userdata, .vtable = metadata_inner.? };
+    var result: Stat64 = undefined;
+    while (true) {
+        try io.checkCancel();
+        switch (linux.errno(linux.syscall2(.fstat64, @bitCast(file.handle), @intFromPtr(&result)))) {
+            .SUCCESS => return result.toFileStat(),
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .NOMEM => return error.SystemResources,
+            .PERM => return error.PermissionDenied,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn fileLength(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
+    return (try fileStat(userdata, file)).size;
+}
+
+fn dirStat(userdata: ?*anyopaque, dir: Dir) Dir.StatError!Dir.Stat {
+    return fileStat(userdata, .{ .handle = dir.handle, .flags = .{ .nonblocking = false } });
+}
+
+fn dirStatFile(userdata: ?*anyopaque, dir: Dir, path: []const u8, options: Dir.StatFileOptions) Dir.StatFileError!File.Stat {
+    if (std.mem.findScalar(u8, path, 0) != null) return error.BadPathName;
+    const path_z = try std.posix.toPosixPath(path);
+    const flags: u32 = if (options.follow_symlinks) 0 else linux.AT.SYMLINK_NOFOLLOW;
+    const io: Io = .{ .userdata = userdata, .vtable = metadata_inner.? };
+    var result: Stat64 = undefined;
+    while (true) {
+        try io.checkCancel();
+        switch (linux.errno(linux.syscall4(.fstatat64, @bitCast(dir.handle), @intFromPtr(&path_z), @intFromPtr(&result), flags))) {
+            .SUCCESS => return result.toFileStat(),
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .LOOP => return error.SymLinkLoop,
+            .NAMETOOLONG => return error.NameTooLong,
+            .NOENT => return error.FileNotFound,
+            .NOTDIR => return error.NotDir,
+            .NOMEM => return error.SystemResources,
+            .PERM => return error.PermissionDenied,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+test "legacy i386 metadata keeps file size, mode, and no-follow semantics" {
+    if (!active) return error.SkipZigTest;
+    comptime {
+        std.debug.assert(@sizeOf(Stat64) == 96);
+        std.debug.assert(@offsetOf(Stat64, "size") == 44);
+        std.debug.assert(@offsetOf(Stat64, "inode") == 88);
+    }
+    const io = legacyMetadataIo(std.testing.io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "history.jsonl", .data = "saved\n" });
+    try tmp.dir.symLink(io, "history.jsonl", "history-link", .{});
+    var file = try tmp.dir.openFile(io, "history.jsonl", .{ .mode = .read_write });
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0o600));
+    const stat = try file.stat(io);
+    try std.testing.expectEqual(@as(u64, 6), stat.size);
+    try std.testing.expectEqual(@as(u64, 6), try file.length(io));
+    try std.testing.expectEqual(@as(u64, 1), stat.nlink);
+    try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(File.Kind.directory, (try tmp.dir.stat(io)).kind);
+    try std.testing.expectEqual(File.Kind.file, (try tmp.dir.statFile(io, "history-link", .{})).kind);
+    try std.testing.expectEqual(File.Kind.sym_link, (try tmp.dir.statFile(io, "history-link", .{ .follow_symlinks = false })).kind);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "missing", .{}));
 }
 
 /// Reads each buffer in turn and stops at the first short read, as one

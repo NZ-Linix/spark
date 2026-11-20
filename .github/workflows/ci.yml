@@ -219,6 +219,9 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=x86-linux-musl -Dcpu=i686
 
+      - name: Test i386 file metadata compatibility
+        run: zig test src/core/shared/i386_syscall_fallbacks.zig -OReleaseSafe -target x86-linux-musl -mcpu i686 -lc --test-filter 'legacy i386 metadata'
+
       - name: Check the binary is 32-bit x86
         run: file zig-out/bin/spark | grep -Eq "ELF 32-bit LSB.*Intel 80386.*statically linked"
 
