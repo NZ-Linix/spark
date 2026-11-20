@@ -62,112 +62,68 @@ jobs:
             echo "Tag ${TAG} missing, release needed"
           fi
 
-  build-linux-aarch64:
+  build-linux:
     needs: check-version
     if: needs.check-version.outputs.needed == 'true'
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/pgso-linux-arm64.yml
-    with:
-      # Keep release evidence long enough to serve as the main control for
-      # manual PGSO comparisons.
-      evidence-retention-days: 90
-
-  build-linux-x86_64:
-    needs: check-version
-    if: needs.check-version.outputs.needed == 'true'
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/pgso-linux-x86_64.yml
-    with:
-      evidence-retention-days: 90
-
-  package-linux:
-    needs: [check-version, build-linux-aarch64, build-linux-x86_64]
-    if: needs.check-version.outputs.needed == 'true'
-    name: Package ${{ matrix.name }}
+    name: Build and test ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
-    permissions:
-      actions: read
-      contents: read
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: linux-aarch64
-            runner: ubuntu-24.04-arm
-            arch: aarch64
-            artifact-id: ${{ needs.build-linux-aarch64.outputs.artifact-id }}
           - name: linux-x86_64
             runner: ubuntu-24.04
-            arch: x86_64
-            artifact-id: ${{ needs.build-linux-x86_64.outputs.artifact-id }}
-    env:
-      ARCH: ${{ matrix.arch }}
-      ARCHIVE: spark-${{ matrix.name }}.tar.gz
+            target: x86_64-linux-gnu.2.34
+            cpu: baseline
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-linux-gnu.2.34
+            cpu: baseline
+          - name: linux-x86
+            runner: ubuntu-24.04
+            target: x86-linux-musl
+            cpu: i686
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Require native host
-        run: test "$(uname -m)" = "$ARCH"
-
-      - name: Download eligible candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          artifact-ids: ${{ matrix.artifact-id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/spark-pgso
+          version: "0.17.1"
 
-      - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/spark-pgso/candidate/spark"
+      - name: Build
+        env:
+          SPARK_BUILD_TARGET: ${{ matrix.target }}
+          SPARK_BUILD_CPU: ${{ matrix.cpu }}
+        run: zig build -Doptimize=ReleaseSafe -Dtarget="$SPARK_BUILD_TARGET" -Dcpu="$SPARK_BUILD_CPU"
 
-      - name: Confirm release eligibility
-        run: python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/spark-pgso" >/dev/null
+      - name: Check the i686 binary
+        if: matrix.name == 'linux-x86'
+        run: file zig-out/bin/spark | grep -Eq "ELF 32-bit LSB.*Intel 80386.*statically linked"
 
-      - name: Confirm the candidate is the qualified binary
+      - name: Smoke test
         run: |
-          python3 - "$RUNNER_TEMP/spark-pgso" <<'EOF'
-          import hashlib, json, pathlib, sys
-          root = pathlib.Path(sys.argv[1])
-          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-          expected = manifest["evidence"]["artifacts"]["candidate"]["sha256"]
-          actual = hashlib.sha256((root / "candidate/spark").read_bytes()).hexdigest()
-          if actual != expected:
-              sys.exit(f"candidate SHA-256 {actual} is not the qualified {expected}")
-          EOF
+          ./zig-out/bin/spark --version
+          ./zig-out/bin/spark help >/dev/null
 
-      - name: Smoke-test the candidate
+      - name: Package the tested binary
+        env:
+          ARCHIVE: spark-${{ matrix.name }}.tar.gz
         run: |
-          "$RUNNER_TEMP/spark-pgso/candidate/spark" --version
-          "$RUNNER_TEMP/spark-pgso/candidate/spark" help >/dev/null
-
-      - name: Smoke test the signed arm64 candidate
-        run: |
-          binary="$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark"
-          codesign --verify --strict --check-notarization -R=notarized "$binary"
-          "$binary" --version
-          "$binary" help >/dev/null
-
-      - name: Package stable release candidate
-        run: |
-          python3 -c 'import pathlib, sys; n = pathlib.Path(sys.argv[1]).stat().st_size; print(f"linux PGSO executable: {n:,} bytes ({n / 1048576:.6f} MiB)")' "$RUNNER_TEMP/spark-pgso/candidate/spark" >> "$GITHUB_STEP_SUMMARY"
-          package_dir="$RUNNER_TEMP/spark-release-package"
+          set -euo pipefail
+          package_dir="$RUNNER_TEMP/package"
           mkdir -p "$package_dir"
-          cp "$RUNNER_TEMP/spark-pgso/candidate/spark" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf "$RUNNER_TEMP/$ARCHIVE" -C "$package_dir" spark LICENSE THIRD_PARTY_NOTICES.md
-          cd "$RUNNER_TEMP"
+          cp zig-out/bin/spark LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf "$ARCHIVE" -C "$package_dir" spark LICENSE THIRD_PARTY_NOTICES.md
           sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
 
-      - name: Upload stable release artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: spark-${{ matrix.name }}
           path: |
-            ${{ runner.temp }}/${{ env.ARCHIVE }}
-            ${{ runner.temp }}/${{ env.ARCHIVE }}.sha256
+            spark-${{ matrix.name }}.tar.gz
+            spark-${{ matrix.name }}.tar.gz.sha256
           if-no-files-found: error
 
   build-macos-x86_64:
@@ -176,6 +132,7 @@ jobs:
     name: Build macos-x86_64
     runs-on: macos-15-intel
     environment: apple-signing
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -223,22 +180,10 @@ jobs:
   build-macos-arm64:
     needs: check-version
     if: needs.check-version.outputs.needed == 'true'
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/pgso-macos-arm64.yml
-    with:
-      # Keep release evidence long enough to serve as the main control for
-      # manual PGSO comparisons.
-      evidence-retention-days: 90
-
-  sign-macos-arm64:
-    needs: [check-version, build-macos-arm64]
-    if: needs.check-version.outputs.needed == 'true'
-    name: Sign macos-arm64
+    name: Build and sign macos-arm64
     runs-on: macos-15
     environment: apple-signing
-    timeout-minutes: 20
+    timeout-minutes: 10
     permissions:
       actions: read
       contents: read
@@ -248,18 +193,13 @@ jobs:
       - name: Require native arm64 host
         run: test "$(uname -m)" = arm64
 
-      - name: Download eligible candidate
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          artifact-ids: ${{ needs.build-macos-arm64.outputs.artifact-id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/spark-pgso-aggregate
+          version: "0.17.1"
 
-      - name: Restore executable mode
-        run: chmod +x "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark"
-
-      - name: Confirm release eligibility
-        run: python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/spark-pgso-aggregate" >/dev/null
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
 
       - name: Sign and notarize stable release candidate
         env:
@@ -274,17 +214,17 @@ jobs:
           if [[ "$VALIDATE_ONLY" == true ]]; then
             control_dir="$RUNNER_TEMP/spark-signing-control"
             mkdir -p "$control_dir"
-            cp "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark" "$control_dir/spark"
+            cp "zig-out/bin/spark" "$control_dir/spark"
             scripts/sign-and-notarize-macos.sh "$control_dir/spark" 4096
-            scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark" 16384
+            scripts/sign-and-notarize-macos.sh "zig-out/bin/spark" 16384
           else
-            scripts/sign-and-notarize-macos.sh "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark"
+            scripts/sign-and-notarize-macos.sh "zig-out/bin/spark"
           fi
 
       - name: Verify notarized arm64 binaries
         if: github.event_name == 'workflow_dispatch' && inputs.validate_only
         run: |
-          for binary in "$RUNNER_TEMP/spark-signing-control/spark" "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark"; do
+          for binary in "$RUNNER_TEMP/spark-signing-control/spark" "zig-out/bin/spark"; do
             codesign --verify --strict --check-notarization -R=notarized "$binary"
             "$binary" --version
             "$binary" help
@@ -306,7 +246,7 @@ jobs:
           archive="$RUNNER_TEMP/spark-macos-aarch64.tar.gz"
           package_dir="$RUNNER_TEMP/spark-release-package"
           mkdir -p "$package_dir"
-          cp "$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          cp "zig-out/bin/spark" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
           tar -czf "$archive" -C "$package_dir" spark LICENSE THIRD_PARTY_NOTICES.md
           cd "$RUNNER_TEMP"
           shasum -a 256 spark-macos-aarch64.tar.gz > spark-macos-aarch64.tar.gz.sha256
@@ -320,50 +260,8 @@ jobs:
             ${{ runner.temp }}/spark-macos-aarch64.tar.gz.sha256
           if-no-files-found: error
 
-  build-linux-x86:
-    needs: check-version
-    if: needs.check-version.outputs.needed == 'true'
-    name: Build and test Linux i686
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: "0.17.1"
-
-      - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=x86-linux-musl -Dcpu=i686
-
-      - name: Smoke test the i686 build
-        run: |
-          file zig-out/bin/spark | grep -Eq "ELF 32-bit LSB.*Intel 80386.*statically linked"
-          ./zig-out/bin/spark --version
-          ./zig-out/bin/spark help >/dev/null
-
-      - name: Package
-        run: |
-          set -euo pipefail
-          archive="spark-linux-x86.tar.gz"
-          package_dir="$RUNNER_TEMP/package"
-          mkdir -p "$package_dir"
-          cp zig-out/bin/spark LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf "$archive" -C "$package_dir" spark LICENSE THIRD_PARTY_NOTICES.md
-          sha256sum "$archive" > "$archive.sha256"
-          ls -l "$archive"
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: spark-linux-x86
-          path: |
-            spark-linux-x86.tar.gz
-            spark-linux-x86.tar.gz.sha256
-          if-no-files-found: error
-
   release:
-    needs: [check-version, package-linux, build-macos-x86_64, sign-macos-arm64, build-linux-x86]
+    needs: [check-version, build-linux, build-macos-x86_64, build-macos-arm64]
     if: needs.check-version.outputs.publish == 'true'
     environment: release
     runs-on: ubuntu-latest
