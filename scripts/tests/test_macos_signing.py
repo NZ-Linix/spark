@@ -29,7 +29,7 @@ PGSO_LINUX_X86_64_WORKFLOW_PATH = (
 )
 DEV_RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "dev-release.yml"
 PGSO_SETUP_ACTION_PATH = REPO_ROOT / ".github" / "actions" / "setup-pgso" / "action.yml"
-SIGNING_IDENTITY = "Developer ID Application: Vercel, Inc (JW6Y669B67)"
+SIGNING_IDENTITY = "Developer ID Application: Example (EXAMPLE123)"
 TEST_CDHASH = "0123456789abcdef0123456789abcdef01234567"
 SECRET_NAMES = (
     "APPLE_DEVELOPER_ID_P12_BASE64",
@@ -112,7 +112,7 @@ if args and args[0] == "set-key-partition-list":
         print("error: The specified item could not be found in the keychain.", file=sys.stderr)
         raise SystemExit(1)
 if args and args[0] == "find-identity":
-    print('  1) HASH "{SIGNING_IDENTITY}"')
+    print('  1) 0123456789ABCDEF0123456789ABCDEF01234567 "{SIGNING_IDENTITY}"')
     print("     1 valid identities found")
 ''',
         )
@@ -134,8 +134,8 @@ if "--force" in args:
     binary = pathlib.Path(args[-1])
     binary.write_bytes(binary.read_bytes() + b"signed\\n")
 if "--display" in args:
-    identifier = os.environ.get("SPARK_SIGNING_TEST_IDENTIFIER", "com.vercel.spark")
-    team_id = os.environ.get("SPARK_SIGNING_TEST_TEAM_ID", "JW6Y669B67")
+    identifier = os.environ.get("SPARK_SIGNING_TEST_IDENTIFIER", "io.github.nz-linix.spark")
+    team_id = os.environ.get("SPARK_SIGNING_TEST_TEAM_ID", "EXAMPLE123")
     print(f"Identifier={{identifier}}", file=sys.stderr)
     print(f"TeamIdentifier={{team_id}}", file=sys.stderr)
     print("CDHash={TEST_CDHASH}", file=sys.stderr)
@@ -222,6 +222,7 @@ else:
                 "APPLE_NOTARY_KEY_P8_BASE64": base64.b64encode(
                     b"p8-private-material"
                 ).decode(),
+                "APPLE_SIGNING_TEAM_ID": "EXAMPLE123",
                 "APPLE_NOTARY_KEY_ID": "TESTKEY123",
                 "APPLE_NOTARY_ISSUER_ID": "00000000-0000-0000-0000-000000000000",
             }
@@ -308,7 +309,7 @@ else:
             self.assertIn("security import", events)
             self.assertIn("security delete-keychain", events)
             self.assertIn("codesign --force", events)
-            self.assertIn("--identifier com.vercel.spark", events)
+            self.assertIn("--identifier io.github.nz-linix.spark", events)
             self.assertIn("--options runtime", events)
             self.assertIn("--timestamp", events)
             self.assertIn("xcrun notarytool submit", events)
@@ -449,6 +450,17 @@ else:
             )
             self.assertNotIn("p12-password", output)
             self.assertNotIn("p8-private-material", output)
+            self.assertEqual([], list(runner_temp.iterdir()))
+
+    def test_rejects_an_imported_identity_from_the_wrong_apple_team(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="spark-macos-signing-test-") as tmp:
+            result, _, runner_temp, event_log = self.run_script(
+                pathlib.Path(tmp),
+                {"APPLE_SIGNING_TEAM_ID": "WRONGTEAM1"},
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("identity for the configured Apple team", result.stderr)
+            self.assertNotIn("codesign --force", event_log.read_text())
             self.assertEqual([], list(runner_temp.iterdir()))
 
     def test_rejects_a_signature_from_the_wrong_apple_team(self) -> None:
