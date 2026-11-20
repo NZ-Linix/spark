@@ -70,6 +70,10 @@ pub const upgrade_options = [_]command_specs.OptionDoc{
     json_option,
 };
 
+pub const uninstall_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--yes", .description = "Confirm permanent removal without prompting" },
+};
+
 pub const workspace_options = [_]command_specs.OptionDoc{json_option};
 
 const workspace_subcommands = [_]command_specs.SubcommandDoc{
@@ -419,6 +423,17 @@ pub const top_level_specs = [_]TopLevelSpec{
         .options = &upgrade_options,
     },
     .{
+        .kind = .uninstall,
+        .token = "uninstall",
+        .usage = "uninstall [--yes]",
+        .summary = "Remove spark and its local profile",
+        .options = &uninstall_options,
+        .details = &.{
+            "Permanently deletes the running spark binary and the default profile, including settings, credentials, and saved sessions.",
+            "Close other spark sessions first. With a custom SPARK_HOME, back up or remove that profile manually and unset SPARK_HOME before uninstalling.",
+        },
+    },
+    .{
         .kind = .replay,
         .token = "replay",
         .usage = "replay <tape> [--frames] [--json] [--golden <path>] [--frames-dir <path>]",
@@ -505,6 +520,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .workspace, .usage = "workspace" },
         .{ .kind = .config, .usage = "config" },
         .{ .kind = .upgrade, .usage = "upgrade|update", .summary = "Upgrade spark on the selected release channel" },
+        .{ .kind = .uninstall, .usage = "uninstall" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .completion, .usage = "completion <shell>" },
         .{ .kind = .help, .usage = "help" },

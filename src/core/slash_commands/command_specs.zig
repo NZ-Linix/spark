@@ -30,6 +30,7 @@ pub const TopLevelKind = enum {
     credits,
     usage,
     upgrade,
+    uninstall,
     replay,
     workspace,
     config,
