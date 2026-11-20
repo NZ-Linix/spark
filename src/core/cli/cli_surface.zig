@@ -102,6 +102,7 @@ pub const Command = union(enum) {
     credits: []const [:0]const u8,
     usage: []const [:0]const u8,
     upgrade: []const [:0]const u8,
+    uninstall: []const [:0]const u8,
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
     config: []const [:0]const u8,
@@ -809,6 +810,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         'u' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .usage)) return .{ .usage = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .upgrade)) return .{ .upgrade = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .uninstall)) return .{ .uninstall = args[1..] };
         },
         'w' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .workspace)) return .{ .workspace = args[1..] };
@@ -2065,6 +2067,32 @@ fn runNonInteractiveWithDeps(
             if (opts.format == .json) try writeStdout(deps, "\n");
             return if (result.snapshot.status == .failed) .handled_failure else .handled_success;
         },
+        .uninstall => |rest| {
+            const uninstall = @import("cli_uninstall.zig");
+            const assume_yes = uninstall.parse(rest) catch |err| {
+                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .uninstall, "uninstall", err, rest);
+                return usage_failure;
+            };
+            const outcome = uninstall.run(alloc, assume_yes) catch |err| {
+                const message = switch (err) {
+                    error.CustomSparkHome => "unset SPARK_HOME before uninstalling the default profile",
+                    error.UnsafeHome => "HOME must name a user directory",
+                    error.UnsafeExecutable => "the running executable must be named spark",
+                    else => @errorName(err),
+                };
+                try writeStderrLine(alloc, deps, "spark uninstall: {s}\n", message);
+                return .handled_failure;
+            };
+            switch (outcome) {
+                .confirmation_required => {
+                    try writeStderr(deps, "spark uninstall: use --yes to confirm permanent removal without a terminal\n");
+                    return usage_failure;
+                },
+                .declined => try writeStderr(deps, "Uninstall canceled.\n"),
+                .removed => try writeStdout(deps, "Removed spark and its local profile.\n"),
+            }
+            return .handled_success;
+        },
         .completion => |rest| {
             const shell = if (rest.len == 1) completion.parseShell(rest[0]) else null;
             if (shell == null) {
@@ -2771,6 +2799,7 @@ fn parsedOptions(kind: TopLevelKind) ?[]const command_specs.OptionDoc {
         .login => &builtin_commands.login_options,
         .usage => &builtin_commands.usage_options,
         .upgrade => &builtin_commands.upgrade_options,
+        .uninstall => &builtin_commands.uninstall_options,
         .workspace => &builtin_commands.workspace_options,
         .config => &builtin_commands.config_parse_options,
         .session => &builtin_commands.session_options,

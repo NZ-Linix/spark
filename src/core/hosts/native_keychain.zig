@@ -827,6 +827,15 @@ fn storeMcpValueMacControlled(
     }
 }
 
+/// Removes the current account's local spark items without contacting providers.
+pub fn deleteSparkCredentials(alloc: std.mem.Allocator) Error!void {
+    _ = try deleteServiceItem(alloc, service_name);
+    _ = try deleteOAuthSession(alloc);
+    _ = try deleteOAuthPendingRevocations(alloc);
+    _ = try deleteMcpHostCredentials(alloc);
+    _ = try deleteMcpPendingRevocations(alloc);
+}
+
 fn deleteMcpValueMac(
     alloc: std.mem.Allocator,
     service: []const u8,
@@ -874,6 +883,9 @@ fn deleteServiceItem(
             "-s",
             service,
         },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+        .timeout = keychain_process_timeout,
     }) catch |err| {
         debug_trace.logf("keychain", "delete failed step=spawn err={s}", .{@errorName(err)});
         return error.KeychainDeleteFailed;
