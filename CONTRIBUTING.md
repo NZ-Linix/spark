@@ -121,7 +121,7 @@ zig build fuzz -Dfuzz-target=sse_framing --fuzz=200K   # try 200,000 new inputs
 
 When the search finds a failure, Zig 0.17 prints `error: test '...'` but still exits with status 0, so read the output. Without a limit, `--fuzz` runs until you stop it and opens Zig's web interface.
 
-The Fuzz workflow fuzzes each target on `main` every night for about 20 minutes, and for two minutes on a pull request that changes the fuzzing setup. When the nightly run finds a failure, it uploads the failing input as an artifact and opens an issue titled `Nightly fuzz failure: <target>`, or comments on that issue if it is already open. To fix the failure, copy the input into `tests/fuzz/corpus/<target>/` and run `zig build fuzz -Dfuzz-target=<target>` to reproduce it. That build uses Debug by default, which adds allocation stack traces to leak reports. Keep the input file in the fix's pull request, so `zig build test` replays it on every pull request after that.
+Run `zig build fuzz -Dfuzz-target=<target>` to fuzz a target locally. Save failing inputs in `tests/fuzz/corpus/<target>/` so `zig build test` replays them.
 
 A saved input holds the values the test reads from its `std.testing.Smith`, in order. For example, a test that calls `smith.slice` reads a 4-byte little-endian length and then that many bytes. Inputs that the fuzzer saves are already in this form. Inline seeds go through `@import("fuzz_seed").slices`, which writes each one in this form for a test whose first read is `smith.slice`. A seed written as a plain string would lose its first four bytes to the length.
 
@@ -259,25 +259,13 @@ The `TLA+ subagent and session-write models` job takes a few minutes and runs it
 
 All four run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
 
-Other workflows and benchmark jobs also report on pull requests, such as the `Examples` workflow when `examples/` changes and the `Shell command overhead` benchmark. Only the five checks above are required to merge, but look into any check that fails. Two of the others need more explanation:
-
-- The binary size workflow builds each release target for the pull request and its base commit on native runners, reports the size change, and smoke-tests every target's binary. Growth of 52,429 bytes (0.05 MiB) or more on a platform adds a warning. Investigate growth you can't explain.
-- The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline itself changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. Stable releases always run it. [scripts/pgso/README.md](scripts/pgso/README.md) explains the pipeline and its acceptance gates.
-- The Linux arm64 PGSO workflow runs on the same pull request paths, with `.github/workflows/pgso-linux-arm64.yml` in place of the macOS workflow file. It qualifies a Linux candidate in one job, which takes several hours. The stable release always runs it and ships its candidate as the Linux arm64 binary. `.github/workflows/pgso-linux-x86_64.yml` qualifies a Linux x86_64 candidate the same way, and the stable release ships it as the Linux x86_64 binary.
-
 Other runs start only on request:
 
 | Run | Command |
 | --- | --- |
 | macOS checks | `gh workflow run macos.yml --ref your-branch`, or add the `ci:macos` label |
 | libfx durable-session and MCP model checks | `gh workflow run ci.yml --ref your-branch` |
-| PGSO qualification | `gh workflow run pgso-macos-arm64.yml --ref your-branch` |
-| Linux PGSO qualification | `gh workflow run pgso-linux-arm64.yml --ref your-branch` or `pgso-linux-x86_64.yml` |
 | Live ACP suite | `gh workflow run ci.yml --ref your-branch -f acp_live=true` |
-| Long-turn memory benchmark | `gh workflow run bench.yml --ref your-branch -f long_turn_memory=true` |
-| libfx runtime benchmark | `gh workflow run bench.yml --ref your-branch -f libfx_runtime=true` |
-| Fuzzing of one target | `gh workflow run fuzz.yml --ref your-branch -f target=<target>` |
-| Unit tests with ThreadSanitizer | `gh workflow run tsan.yml --ref your-branch` |
 
 Only maintainers can start these runs or add the `ci:macos` label. If you're an outside contributor and your change needs one of them, ask in the pull request and a maintainer will start it. If CI doesn't start at all on your first pull request, a maintainer may need to approve the workflow run.
 
@@ -324,9 +312,7 @@ For example:
 
 Maintainers prepare each release in a pull request that bumps `pub const version` in `src/main.zig` and adds the new entry to `CHANGELOG.md`. When that pull request merges, the release workflow finds no tag for the new version, builds the binaries for every platform, creates the tag, and publishes the GitHub Release along with the binaries that the install script and `spark upgrade` download. Never create a version tag by hand. The [Releasing](AGENTS.md#releasing) section of AGENTS.md describes the changelog format and release markers.
 
-To check release artifacts without publishing anything, run **Actions > Release** on `main` with `validate_only` enabled. The run builds every target, runs the PGSO qualification, and notarizes the macOS binaries. It creates no tag or GitHub Release, uploads nothing to the CDN, and changes no update channel.
-
-After CI passes on `main`, the dev release workflow publishes binaries for that commit. Run `spark upgrade --channel dev` to follow those builds, and `spark upgrade --channel stable` to go back to tagged releases.
+To check release artifacts without publishing anything, run **Actions > Release** on `main` with `validate_only` enabled. The run builds and smoke-tests every target and notarizes the macOS binaries. It creates no tag or GitHub Release, uploads nothing to the CDN, and changes no update channel.
 
 ## License
 

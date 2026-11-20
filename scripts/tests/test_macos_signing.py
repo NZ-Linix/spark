@@ -15,21 +15,7 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "sign-and-notarize-macos.sh"
 RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
-PUBLISH_LIBFX_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "publish-libfx.yml"
-)
-PGSO_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "pgso-macos-arm64.yml"
-)
-PGSO_LINUX_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "pgso-linux-arm64.yml"
-)
-PGSO_LINUX_X86_64_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "pgso-linux-x86_64.yml"
-)
-DEV_RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "dev-release.yml"
-PGSO_SETUP_ACTION_PATH = REPO_ROOT / ".github" / "actions" / "setup-pgso" / "action.yml"
-SIGNING_IDENTITY = "Developer ID Application: Vercel, Inc (JW6Y669B67)"
+SIGNING_IDENTITY = "Developer ID Application: Example (EXAMPLE123)"
 TEST_CDHASH = "0123456789abcdef0123456789abcdef01234567"
 SECRET_NAMES = (
     "APPLE_DEVELOPER_ID_P12_BASE64",
@@ -112,7 +98,7 @@ if args and args[0] == "set-key-partition-list":
         print("error: The specified item could not be found in the keychain.", file=sys.stderr)
         raise SystemExit(1)
 if args and args[0] == "find-identity":
-    print('  1) HASH "{SIGNING_IDENTITY}"')
+    print('  1) 0123456789ABCDEF0123456789ABCDEF01234567 "{SIGNING_IDENTITY}"')
     print("     1 valid identities found")
 ''',
         )
@@ -134,8 +120,8 @@ if "--force" in args:
     binary = pathlib.Path(args[-1])
     binary.write_bytes(binary.read_bytes() + b"signed\\n")
 if "--display" in args:
-    identifier = os.environ.get("SPARK_SIGNING_TEST_IDENTIFIER", "com.vercel.spark")
-    team_id = os.environ.get("SPARK_SIGNING_TEST_TEAM_ID", "JW6Y669B67")
+    identifier = os.environ.get("SPARK_SIGNING_TEST_IDENTIFIER", "io.github.nz-linix.spark")
+    team_id = os.environ.get("SPARK_SIGNING_TEST_TEAM_ID", "EXAMPLE123")
     print(f"Identifier={{identifier}}", file=sys.stderr)
     print(f"TeamIdentifier={{team_id}}", file=sys.stderr)
     print("CDHash={TEST_CDHASH}", file=sys.stderr)
@@ -222,6 +208,7 @@ else:
                 "APPLE_NOTARY_KEY_P8_BASE64": base64.b64encode(
                     b"p8-private-material"
                 ).decode(),
+                "APPLE_SIGNING_TEAM_ID": "EXAMPLE123",
                 "APPLE_NOTARY_KEY_ID": "TESTKEY123",
                 "APPLE_NOTARY_ISSUER_ID": "00000000-0000-0000-0000-000000000000",
             }
@@ -308,7 +295,7 @@ else:
             self.assertIn("security import", events)
             self.assertIn("security delete-keychain", events)
             self.assertIn("codesign --force", events)
-            self.assertIn("--identifier com.vercel.spark", events)
+            self.assertIn("--identifier io.github.nz-linix.spark", events)
             self.assertIn("--options runtime", events)
             self.assertIn("--timestamp", events)
             self.assertIn("xcrun notarytool submit", events)
@@ -451,6 +438,17 @@ else:
             self.assertNotIn("p8-private-material", output)
             self.assertEqual([], list(runner_temp.iterdir()))
 
+    def test_rejects_an_imported_identity_from_the_wrong_apple_team(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="spark-macos-signing-test-") as tmp:
+            result, _, runner_temp, event_log = self.run_script(
+                pathlib.Path(tmp),
+                {"APPLE_SIGNING_TEAM_ID": "WRONGTEAM1"},
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("identity for the configured Apple team", result.stderr)
+            self.assertNotIn("codesign --force", event_log.read_text())
+            self.assertEqual([], list(runner_temp.iterdir()))
+
     def test_rejects_a_signature_from_the_wrong_apple_team(self) -> None:
         self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
         with tempfile.TemporaryDirectory(prefix="spark-macos-signing-test-") as tmp:
@@ -523,7 +521,7 @@ class MacosSigningWorkflowTests(unittest.TestCase):
     def test_validation_builds_existing_versions_without_publishing(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
         check_job = release.split("  check-version:\n", 1)[1].split(
-            "\n  build-linux-aarch64:", 1
+            "\n  build-linux:", 1
         )[0]
         check_script = textwrap.dedent(check_job.split("        run: |\n", 1)[1])
         for validate, tag_exists, expected_needed, expected_publish in (
@@ -575,7 +573,7 @@ class MacosSigningWorkflowTests(unittest.TestCase):
                         "#!/bin/sh\nprintf '%s' \"${2-default}\" >> \"$1\"\n"
                     )
                     signer.chmod(0o755)
-                    candidate = root / "spark-pgso-aggregate/candidate/spark"
+                    candidate = root / "zig-out/bin/spark"
                     candidate.parent.mkdir(parents=True)
                     candidate.write_bytes(b"native:")
                     result = subprocess.run(
@@ -597,83 +595,51 @@ class MacosSigningWorkflowTests(unittest.TestCase):
 
     def test_every_privileged_publish_job_uses_an_environment_gate(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
-        publish_libfx = PUBLISH_LIBFX_WORKFLOW_PATH.read_text(encoding="utf-8")
 
         release_job = release.split("  release:\n", 1)[1]
-        npm_publish_job = publish_libfx.split("  publish:\n", 1)[1]
 
         self.assertIn("environment: release", release_job)
-        self.assertIn("environment: npm", npm_publish_job)
+        prerelease_job = release.split("  publish-prerelease:\n", 1)[1]
+        self.assertIn("environment: prerelease", prerelease_job)
 
     def test_stable_release_is_the_only_workflow_with_signing_secrets(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
-        pgso = PGSO_WORKFLOW_PATH.read_text(encoding="utf-8")
-        pgso_linux = PGSO_LINUX_WORKFLOW_PATH.read_text(
-            encoding="utf-8"
-        ) + PGSO_LINUX_X86_64_WORKFLOW_PATH.read_text(encoding="utf-8")
-        dev_release = DEV_RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
-
-        self.assertIn("build-macos-x86_64:", release)
-        self.assertIn("runs-on: macos-15-intel", release)
-        self.assertIn("sign-macos-arm64:", release)
         self.assertEqual(2, release.count("environment: apple-signing"))
-        self.assertIn("scripts/sign-and-notarize-macos.sh zig-out/bin/spark", release)
-        self.assertNotIn("sign-stable-release:", pgso)
-        self.assertNotIn("package_release", pgso)
-        self.assertNotIn("environment: apple-signing", pgso)
         self.assertIn(
-            "scripts/sign-and-notarize-macos.sh "
-            '"$RUNNER_TEMP/spark-pgso-aggregate/candidate/spark"',
+            "needs: [check-version, build-linux, build-macos-x86_64, build-macos-arm64]",
             release,
         )
-        arm64_caller = release.split("  build-macos-arm64:\n", 1)[1].split(
-            "\n  sign-macos-arm64:\n", 1
+        intel_job = release.split("  build-macos-x86_64:\n", 1)[1].split(
+            "\n  build-macos-arm64:", 1
         )[0]
-        self.assertNotIn("secrets:", arm64_caller)
-        self.assertNotIn("package_release", arm64_caller)
-        sign_release = release.split("  sign-macos-arm64:\n", 1)[1].split(
-            "\n  release:\n", 1
+        sign_release = release.split("  build-macos-arm64:\n", 1)[1].split(
+            "\n  release:", 1
         )[0]
-        self.assertIn("needs: [check-version, build-macos-arm64]", sign_release)
-        self.assertIn("environment: apple-signing", sign_release)
-        self.assertIn(
-            "needs: [check-version, package-linux, build-macos-x86_64, sign-macos-arm64]",
-            release,
-        )
-        workflow_call = pgso.split("  workflow_dispatch:\n", 1)[0]
-        aggregate = pgso.split("  aggregate:\n", 1)[1].split(
-            "\n  sign-macos-arm64:\n", 1
-        )[0]
-        self.assertIn(
-            "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
-            sign_release,
-        )
-        self.assertIn(
-            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
-            sign_release,
-        )
-        self.assertIn(
-            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
-            sign_release,
-        )
-        report_position = sign_release.index("python3 -m scripts.pgso report")
-        signing_position = sign_release.index("scripts/sign-and-notarize-macos.sh")
-        package_position = sign_release.index("tar -czf")
-        self.assertLess(report_position, signing_position)
-        self.assertLess(signing_position, package_position)
-        for secret_name in SECRET_NAMES:
-            secret_reference = f"${{{{ secrets.{secret_name} }}}}"
-            self.assertIn(secret_reference, release)
-            self.assertIn(secret_reference, sign_release)
-            self.assertNotIn(secret_name, workflow_call)
-            self.assertNotIn(secret_name, aggregate)
-            self.assertNotIn(secret_name, pgso)
-            self.assertNotIn(secret_name, pgso_linux)
-            self.assertNotIn(secret_name, dev_release)
-        self.assertNotIn("sign-and-notarize-macos", pgso)
-        self.assertNotIn("sign-and-notarize-macos", dev_release)
+        for job, runner in ((intel_job, "macos-15-intel"), (sign_release, "macos-15")):
+            self.assertIn(f"runs-on: {runner}", job)
+            self.assertIn("environment: apple-signing", job)
+            self.assertIn("needs: check-version", job)
+            build = job.index("zig build")
+            signing = job.index("scripts/sign-and-notarize-macos.sh")
+            notarization = job.index("codesign --verify --strict --check-notarization")
+            smoke = job.index("--version", notarization)
+            archive = job.index("tar -czf", smoke)
+            self.assertLess(build, signing)
+            self.assertLess(signing, notarization)
+            self.assertLess(notarization, smoke)
+            self.assertLess(smoke, archive)
+            for secret in SECRET_NAMES:
+                self.assertIn(f"${{{{ secrets.{secret} }}}}", job)
+        for workflow in RELEASE_WORKFLOW_PATH.parent.glob("*.yml"):
+            if workflow == RELEASE_WORKFLOW_PATH:
+                continue
+            contents = workflow.read_text(encoding="utf-8")
+            self.assertNotIn("environment: apple-signing", contents, workflow.name)
+            self.assertNotIn("sign-and-notarize-macos", contents, workflow.name)
+            for secret in SECRET_NAMES:
+                self.assertNotIn(secret, contents, workflow.name)
 
-    def test_pgso_release_chain_pins_every_external_action(self) -> None:
+    def test_release_pins_every_external_action(self) -> None:
         mutable_references: list[str] = []
         pending = [RELEASE_WORKFLOW_PATH]
         checked: set[pathlib.Path] = set()
@@ -697,13 +663,6 @@ class MacosSigningWorkflowTests(unittest.TestCase):
                         f"{path.relative_to(REPO_ROOT)}:{line_number}: {line.strip()}"
                     )
 
-        for path in (
-            PGSO_WORKFLOW_PATH,
-            PGSO_LINUX_WORKFLOW_PATH,
-            PGSO_LINUX_X86_64_WORKFLOW_PATH,
-            PGSO_SETUP_ACTION_PATH,
-        ):
-            self.assertIn(path, checked)
         self.assertEqual([], mutable_references)
 
 
@@ -714,111 +673,77 @@ class LinuxReleaseWorkflowTests(unittest.TestCase):
             r"\n  (?=\S)", release.split(f"\n  {name}:\n", 1)[1], maxsplit=1
         )[0]
 
-    def test_release_ships_the_qualified_pgso_candidate_for_each_linux_target(self) -> None:
+    def test_release_builds_smoke_tests_and_packages_all_linux_targets(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
-        self.assertNotIn("\n  build-linux:\n", release)
-        self.assertNotIn("zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}", release)
-
-        for job, workflow_path in (
-            ("build-linux-aarch64", PGSO_LINUX_WORKFLOW_PATH),
-            ("build-linux-x86_64", PGSO_LINUX_X86_64_WORKFLOW_PATH),
+        build = self.release_job("build-linux")
+        self.assertNotIn("./.github/workflows/pgso-", release)
+        self.assertIn("runs-on: ${{ matrix.runner }}", build)
+        self.assertIn("timeout-minutes: 10", build)
+        for name, runner, target, cpu in (
+            ("linux-x86_64", "ubuntu-24.04", "x86_64-linux-gnu.2.34", "baseline"),
+            ("linux-aarch64", "ubuntu-24.04-arm", "aarch64-linux-gnu.2.34", "baseline"),
+            ("linux-x86", "ubuntu-24.04", "x86-linux-musl", "i686"),
         ):
-            with self.subTest(job=job):
-                caller = self.release_job(job)
-                self.assertIn(f"uses: ./.github/workflows/{workflow_path.name}", caller)
-                self.assertIn("evidence-retention-days: 90", caller)
-                self.assertNotIn("secrets:", caller)
-                workflow = workflow_path.read_text(encoding="utf-8")
-                triggers = workflow.split("\njobs:\n", 1)[0]
-                self.assertIn("  workflow_call:\n", triggers)
-                self.assertIn("value: ${{ jobs.candidate.outputs.artifact-id }}", triggers)
-                self.assertIn("artifact-id: ${{ steps.upload.outputs.artifact-id }}", workflow)
-                self.assertIn(
-                    "retention-days: ${{ inputs.evidence-retention-days || 14 }}", workflow
-                )
-
-        package = self.release_job("package-linux")
-        self.assertIn("needs: [check-version, build-linux-aarch64, build-linux-x86_64]", package)
-        self.assertIn("runs-on: ${{ matrix.runner }}", package)
-        for name, runner, arch, build in (
-            ("linux-aarch64", "ubuntu-24.04-arm", "aarch64", "build-linux-aarch64"),
-            ("linux-x86_64", "ubuntu-24.04", "x86_64", "build-linux-x86_64"),
-        ):
-            with self.subTest(name=name):
-                self.assertIn(
-                    f"          - name: {name}\n"
-                    f"            runner: {runner}\n"
-                    f"            arch: {arch}\n"
-                    f"            artifact-id: ${{{{ needs.{build}.outputs.artifact-id }}}}\n",
-                    package,
-                )
-        self.assertIn('test "$(uname -m)" = "$ARCH"', package)
-        self.assertIn("artifact-ids: ${{ matrix.artifact-id }}", package)
-        self.assertNotIn("environment:", package)
-        report = package.index("python3 -m scripts.pgso report")
-        digest = package.index("- name: Confirm the candidate is the qualified binary")
-        smoke = package.index('candidate/spark" --version')
-        archive = package.index("tar -czf")
-        self.assertLess(report, digest)
-        self.assertLess(digest, smoke)
+            self.assertIn(
+                f"          - name: {name}\n"
+                f"            runner: {runner}\n"
+                f"            target: {target}\n"
+                f"            cpu: {cpu}",
+                build,
+            )
+        self.assertNotIn("environment:", build)
+        compile_step = build.index("zig build")
+        smoke = build.index("./zig-out/bin/spark --version")
+        archive = build.index("tar -czf")
+        self.assertLess(compile_step, smoke)
         self.assertLess(smoke, archive)
-        self.assertIn("ARCHIVE: spark-${{ matrix.name }}.tar.gz", package)
-        self.assertIn("          name: spark-${{ matrix.name }}\n", package)
+        self.assertIn('cp zig-out/bin/spark LICENSE THIRD_PARTY_NOTICES.md', build)
+        self.assertIn('sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"', build)
 
-    def test_the_evidence_artifact_keeps_the_candidate_at_its_root(self) -> None:
-        # upload-artifact roots an artifact at the deepest directory its paths
-        # share, and package-linux reads candidate/spark and manifest.json from
-        # that root, so every evidence path stays under spark-pgso/.
-        for workflow_path in (PGSO_LINUX_WORKFLOW_PATH, PGSO_LINUX_X86_64_WORKFLOW_PATH):
-            with self.subTest(workflow=workflow_path.name):
-                workflow = workflow_path.read_text(encoding="utf-8")
-                evidence = workflow.split("      - name: Upload evidence\n", 1)[1].split(
-                    "\n      - name:", 1
-                )[0]
-                block = evidence.split("          path: |\n", 1)[1].split(
-                    "\n          if-no-files-found:", 1
-                )[0]
-                paths = [line.strip() for line in block.splitlines()]
-                self.assertIn("${{ runner.temp }}/spark-pgso/candidate/spark", paths)
-                self.assertIn("${{ runner.temp }}/spark-pgso/manifest.json", paths)
-                self.assertEqual("${{ runner.temp }}/spark-pgso", os.path.commonpath(paths))
-                logs = workflow.split("      - name: Upload unit test logs\n", 1)[1].split(
-                    "\n      - name:", 1
-                )[0]
-                self.assertIn("if: always()", logs)
-                self.assertIn("path: ${{ runner.temp }}/spark-pgso-unit-tests/logs\n", logs)
-                self.assertNotIn("id: upload", logs)
+    def test_only_release_and_platform_ci_workflows_are_defined(self) -> None:
+        self.assertEqual(
+            {"ci.yml", "macos.yml", "release.yml"},
+            {path.name for path in RELEASE_WORKFLOW_PATH.parent.glob("*.yml")},
+        )
 
-    def test_release_rejects_a_candidate_that_is_not_the_qualified_binary(self) -> None:
-        package = self.release_job("package-linux")
-        step = package.split(
-            "      - name: Confirm the candidate is the qualified binary\n", 1
-        )[1].split("\n      - name:", 1)[0]
+    def test_release_rejects_missing_or_changed_archives(self) -> None:
+        release = self.release_job("release")
+        step = release.split(
+            "      - name: Verify and publish all release archives\n", 1
+        )[1]
         script = textwrap.dedent(step.split("        run: |\n", 1)[1])
-        qualified = hashlib.sha256(b"qualified").hexdigest()
-        for shipped, expected_exit in ((b"qualified", 0), (b"rebuilt", 1)):
-            with self.subTest(shipped=shipped):
-                with tempfile.TemporaryDirectory(prefix="spark-linux-release-") as tmp:
+        targets = ("linux-x86_64", "linux-aarch64", "linux-x86", "macos-x86_64", "macos-aarch64")
+        for failure in (None, "missing", "changed"):
+            with self.subTest(failure=failure):
+                with tempfile.TemporaryDirectory(prefix="spark-release-archives-") as tmp:
                     root = pathlib.Path(tmp)
-                    candidate = root / "spark-pgso/candidate/spark"
-                    candidate.parent.mkdir(parents=True)
-                    candidate.write_bytes(shipped)
-                    (root / "spark-pgso/manifest.json").write_text(
-                        json.dumps(
-                            {"evidence": {"artifacts": {"candidate": {"sha256": qualified}}}}
-                        ),
-                        encoding="utf-8",
-                    )
+                    dist = root / "dist"
+                    dist.mkdir()
+                    for target in targets:
+                        archive = dist / f"spark-{target}.tar.gz"
+                        payload = target.encode()
+                        archive.with_suffix(".gz.sha256").write_text(
+                            f"{hashlib.sha256(payload).hexdigest()}  {archive.name}\n"
+                        )
+                        if target == "linux-x86" and failure == "missing":
+                            continue
+                        archive.write_bytes(b"changed" if target == "linux-x86" and failure else payload)
+                    gh = root / "gh"
+                    gh.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > published\n')
+                    gh.chmod(0o755)
                     result = subprocess.run(
                         ["bash", "-euo", "pipefail", "-c", script],
                         cwd=root,
-                        env=dict(os.environ, RUNNER_TEMP=str(root)),
+                        env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", TAG="v26.11.20", GITHUB_SHA="0" * 40),
                         capture_output=True,
                         text=True,
                     )
-                    self.assertEqual(expected_exit, result.returncode, result.stderr)
-                    if expected_exit:
-                        self.assertIn("is not the qualified", result.stderr)
+                    if failure is None:
+                        self.assertEqual(0, result.returncode, result.stderr)
+                        self.assertIn("--latest", (root / "published").read_text())
+                    else:
+                        self.assertNotEqual(0, result.returncode)
+                        self.assertFalse((root / "published").exists())
 
 
 if __name__ == "__main__":
