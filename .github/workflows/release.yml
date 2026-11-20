@@ -1,46 +1,324 @@
 name: Release
 
-# Publishes a GitHub release when src/main.zig carries a stable version
-# (X.Y.Z, no suffix) that has no tag yet. A dev version such as 26.11.19-d
-# never releases.
-#
-# Every release carries what install.sh and `spark update` read:
-#   latest.txt                      the release's tag, such as v26.11.19
-#   spark-<os>-<arch>.tar.gz        spark, LICENSE, THIRD_PARTY_NOTICES.md
-#   spark-<os>-<arch>.tar.gz.sha256 its checksum
-#
-# Started by hand with a prerelease tag such as v26.11.20-rc1, it publishes
-# a pre-release from the chosen branch instead, for testing a build before
-# it merges. A pre-release is never marked latest, so `spark update` and the
-# installer's default never pick it; `install.sh --version <tag>` does.
-
 on:
   push:
     branches: [main]
   workflow_dispatch:
     inputs:
+      validate_only:
+        description: Build all platforms and compare arm64 signing pages without publishing
+        type: boolean
+        default: false
       prerelease_tag:
-        description: Publish a test pre-release with this tag, such as v26.11.20-rc1
-        required: false
+        description: Publish a test prerelease with a suffix, such as v26.11.20-rc3
+        type: string
         default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: stable-release
+  group: ${{ inputs.prerelease_tag && format('spark-prerelease-{0}', inputs.prerelease_tag) || 'stable-release' }}
   cancel-in-progress: false
-
-env:
-  ZIG_VERSION: "0.17.1"
 
 jobs:
   check-version:
+    if: github.ref == 'refs/heads/main' && !inputs.prerelease_tag
     runs-on: ubuntu-latest
     outputs:
       needed: ${{ steps.check.outputs.needed }}
+      publish: ${{ steps.check.outputs.publish }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if release needed
+        id: check
+        env:
+          VALIDATE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.validate_only }}
+        run: |
+          VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$VERSION is a dev version; nothing to release"
+            exit 0
+          fi
+          TAG="v${VERSION}"
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          if [[ "$VALIDATE_ONLY" == true ]]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Validating release artifacts without publishing"
+          elif git rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} exists, no release needed"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} missing, release needed"
+          fi
+
+  build-linux:
+    needs: check-version
+    if: needs.check-version.outputs.needed == 'true'
+    name: Build and test ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-linux-gnu.2.34
+            cpu: baseline
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-linux-gnu.2.34
+            cpu: baseline
+          - name: linux-x86
+            runner: ubuntu-24.04
+            target: x86-linux-musl
+            cpu: i686
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.17.1"
+
+      - name: Build
+        env:
+          SPARK_BUILD_TARGET: ${{ matrix.target }}
+          SPARK_BUILD_CPU: ${{ matrix.cpu }}
+        run: zig build -Doptimize=ReleaseSafe -Dtarget="$SPARK_BUILD_TARGET" -Dcpu="$SPARK_BUILD_CPU"
+
+      - name: Check the i686 binary
+        if: matrix.name == 'linux-x86'
+        run: file zig-out/bin/spark | grep -Eq "ELF 32-bit LSB.*Intel 80386.*statically linked"
+
+      - name: Smoke test
+        run: |
+          ./zig-out/bin/spark --version
+          ./zig-out/bin/spark help >/dev/null
+
+      - name: Package the tested binary
+        env:
+          ARCHIVE: spark-${{ matrix.name }}.tar.gz
+        run: |
+          set -euo pipefail
+          package_dir="$RUNNER_TEMP/package"
+          mkdir -p "$package_dir"
+          cp zig-out/bin/spark LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf "$ARCHIVE" -C "$package_dir" spark LICENSE THIRD_PARTY_NOTICES.md
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: spark-${{ matrix.name }}
+          path: |
+            spark-${{ matrix.name }}.tar.gz
+            spark-${{ matrix.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  build-macos-x86_64:
+    needs: check-version
+    if: needs.check-version.outputs.needed == 'true'
+    name: Build macos-x86_64
+    runs-on: macos-15-intel
+    environment: apple-signing
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.17.1"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos
+
+      - name: Sign and notarize
+        env:
+          APPLE_SIGNING_TEAM_ID: ${{ vars.APPLE_SIGNING_TEAM_ID }}
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: scripts/sign-and-notarize-macos.sh zig-out/bin/spark
+
+      - name: Verify notarized Intel binary
+        run: |
+          codesign --verify --strict --check-notarization -R=notarized ./zig-out/bin/spark
+          ./zig-out/bin/spark --version
+          ./zig-out/bin/spark help
+
+      - name: Package
+        run: |
+          python3 -c 'import pathlib; n = pathlib.Path("zig-out/bin/spark").stat().st_size; print(f"macOS Intel signed executable: {n:,} bytes ({n / 1048576:.6f} MiB)")' >> "$GITHUB_STEP_SUMMARY"
+          package_dir="$RUNNER_TEMP/spark-package-macos-x86_64"
+          mkdir -p "$package_dir"
+          cp zig-out/bin/spark LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf spark-macos-x86_64.tar.gz -C "$package_dir" spark LICENSE THIRD_PARTY_NOTICES.md
+          shasum -a 256 spark-macos-x86_64.tar.gz > spark-macos-x86_64.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: spark-macos-x86_64
+          path: |
+            spark-macos-x86_64.tar.gz
+            spark-macos-x86_64.tar.gz.sha256
+
+  build-macos-arm64:
+    needs: check-version
+    if: needs.check-version.outputs.needed == 'true'
+    name: Build and sign macos-arm64
+    runs-on: macos-15
+    environment: apple-signing
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Require native arm64 host
+        run: test "$(uname -m)" = arm64
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: "0.17.1"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+
+      - name: Sign and notarize stable release candidate
+        env:
+          VALIDATE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.validate_only }}
+          APPLE_SIGNING_TEAM_ID: ${{ vars.APPLE_SIGNING_TEAM_ID }}
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          if [[ "$VALIDATE_ONLY" == true ]]; then
+            control_dir="$RUNNER_TEMP/spark-signing-control"
+            mkdir -p "$control_dir"
+            cp "zig-out/bin/spark" "$control_dir/spark"
+            scripts/sign-and-notarize-macos.sh "$control_dir/spark" 4096
+            scripts/sign-and-notarize-macos.sh "zig-out/bin/spark" 16384
+          else
+            scripts/sign-and-notarize-macos.sh "zig-out/bin/spark"
+          fi
+
+      - name: Verify notarized arm64 binaries
+        if: github.event_name == 'workflow_dispatch' && inputs.validate_only
+        run: |
+          for binary in "$RUNNER_TEMP/spark-signing-control/spark" "zig-out/bin/spark"; do
+            codesign --verify --strict --check-notarization -R=notarized "$binary"
+            "$binary" --version
+            "$binary" help
+            python3 -c 'import pathlib, sys; n = pathlib.Path(sys.argv[1]).stat().st_size; print(f"{sys.argv[1]}: {n:,} bytes ({n / 1048576:.6f} MiB)")' "$binary" >> "$GITHUB_STEP_SUMMARY"
+            shasum -a 256 "$binary" >> "$GITHUB_STEP_SUMMARY"
+          done
+          tar -czf "$RUNNER_TEMP/spark-signing-control.tar.gz" -C "$RUNNER_TEMP/spark-signing-control" spark
+
+      - name: Upload arm64 signing control
+        if: github.event_name == 'workflow_dispatch' && inputs.validate_only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signing-control-macos-arm64
+          path: ${{ runner.temp }}/spark-signing-control.tar.gz
+          if-no-files-found: error
+
+      - name: Package stable release candidate
+        run: |
+          archive="$RUNNER_TEMP/spark-macos-aarch64.tar.gz"
+          package_dir="$RUNNER_TEMP/spark-release-package"
+          mkdir -p "$package_dir"
+          cp "zig-out/bin/spark" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf "$archive" -C "$package_dir" spark LICENSE THIRD_PARTY_NOTICES.md
+          cd "$RUNNER_TEMP"
+          shasum -a 256 spark-macos-aarch64.tar.gz > spark-macos-aarch64.tar.gz.sha256
+
+      - name: Upload stable release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: spark-macos-aarch64
+          path: |
+            ${{ runner.temp }}/spark-macos-aarch64.tar.gz
+            ${{ runner.temp }}/spark-macos-aarch64.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: [check-version, build-linux, build-macos-x86_64, build-macos-arm64]
+    if: needs.check-version.outputs.publish == 'true'
+    environment: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: spark-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write latest.txt and the release notes
+        env:
+          TAG: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAG" > dist/latest.txt
+          awk '/<!-- release:start -->/{found=1; next} /<!-- release:end -->/{found=0} found{print}' CHANGELOG.md > notes.md
+          if [ "$(grep -c . notes.md)" -lt 1 ]; then
+            printf 'spark %s\n' "$TAG" > notes.md
+          fi
+          cat >> notes.md <<EOF
+
+          ### Install
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh | sh
+          \`\`\`
+
+          Already installed? Run \`spark update\`, or \`/update\` inside spark.
+          EOF
+          ls -l dist
+
+      - name: Verify and publish all release archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for target in linux-x86 linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
+            (cd dist && sha256sum -c "spark-$target.tar.gz.sha256")
+          done
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "spark $TAG" \
+            --notes-file notes.md \
+            --latest \
+            dist/spark-*.tar.gz dist/spark-*.tar.gz.sha256 dist/latest.txt
+
+  check-prerelease:
+    if: github.event_name == 'workflow_dispatch' && inputs.prerelease_tag && !inputs.validate_only
+    runs-on: ubuntu-latest
+    outputs:
       tag: ${{ steps.check.outputs.tag }}
-      prerelease: ${{ steps.check.outputs.prerelease }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -63,32 +341,13 @@ jobs:
             fi
             {
               echo "tag=$PRERELEASE_TAG"
-              echo "prerelease=true"
-              echo "needed=true"
             } >> "$GITHUB_OUTPUT"
             echo "::notice::Publishing pre-release $PRERELEASE_TAG from $GITHUB_REF_NAME"
             exit 0
           fi
-          echo "prerelease=false" >> "$GITHUB_OUTPUT"
-          VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "needed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::$VERSION is a dev version; nothing to release"
-            exit 0
-          fi
-          TAG="v${VERSION}"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "needed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::$TAG is already released"
-          else
-            echo "needed=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Releasing $TAG"
-          fi
 
-  build:
-    needs: check-version
-    if: needs.check-version.outputs.needed == 'true'
+  build-prerelease:
+    needs: check-prerelease
     name: Build ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -118,12 +377,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: ${{ env.ZIG_VERSION }}
+          version: "0.17.1"
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }}
+        env:
+          SPARK_BUILD_TARGET: ${{ matrix.target }}
+          SPARK_BUILD_CPU: ${{ matrix.cpu }}
+        run: zig build -Doptimize=ReleaseSafe -Dtarget="$SPARK_BUILD_TARGET" -Dcpu="$SPARK_BUILD_CPU"
 
       - name: Package
         run: |
@@ -144,8 +406,8 @@ jobs:
             spark-${{ matrix.name }}.tar.gz.sha256
           if-no-files-found: error
 
-  smoke:
-    needs: build
+  smoke-prerelease:
+    needs: build-prerelease
     name: Run ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -159,6 +421,8 @@ jobs:
           # An x86_64 Linux kernel runs 32-bit static binaries.
           - name: linux-x86
             runner: ubuntu-latest
+          - name: macos-x86_64
+            runner: macos-15-intel
           - name: macos-aarch64
             runner: macos-latest
     steps:
@@ -175,8 +439,9 @@ jobs:
           ./spark --version
           ./spark help >/dev/null
 
-  publish:
-    needs: [check-version, build, smoke]
+  publish-prerelease:
+    needs: [check-prerelease, build-prerelease, smoke-prerelease]
+    environment: prerelease
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -188,33 +453,9 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Write latest.txt and the release notes
-        if: needs.check-version.outputs.prerelease != 'true'
-        env:
-          TAG: ${{ needs.check-version.outputs.tag }}
-        run: |
-          set -euo pipefail
-          printf '%s\n' "$TAG" > dist/latest.txt
-          awk '/<!-- release:start -->/{found=1; next} /<!-- release:end -->/{found=0} found{print}' CHANGELOG.md > notes.md
-          if [ "$(grep -c . notes.md)" -lt 1 ]; then
-            printf 'spark %s\n' "$TAG" > notes.md
-          fi
-          cat >> notes.md <<EOF
-
-          ### Install
-
-          \`\`\`sh
-          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh | sh
-          \`\`\`
-
-          Already installed? Run \`spark update\`, or \`/update\` inside spark.
-          EOF
-          ls -l dist
-
       - name: Write the pre-release notes
-        if: needs.check-version.outputs.prerelease == 'true'
         env:
-          TAG: ${{ needs.check-version.outputs.tag }}
+          TAG: ${{ needs.check-prerelease.outputs.tag }}
         run: |
           set -euo pipefail
           installer="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/install.sh"
@@ -235,26 +476,16 @@ jobs:
           EOF
           ls -l dist
 
-      - name: Create the release
+      - name: Publish the prerelease
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.check-version.outputs.tag }}
-          PRERELEASE: ${{ needs.check-version.outputs.prerelease }}
+          TAG: ${{ needs.check-prerelease.outputs.tag }}
         run: |
           set -euo pipefail
-          if [ "$PRERELEASE" = true ]; then
-            gh release create "$TAG" \
-              --target "$GITHUB_SHA" \
-              --title "spark $TAG" \
-              --notes-file notes.md \
-              --prerelease \
-              --latest=false \
-              dist/spark-*.tar.gz dist/spark-*.tar.gz.sha256
-            exit 0
-          fi
           gh release create "$TAG" \
             --target "$GITHUB_SHA" \
             --title "spark $TAG" \
             --notes-file notes.md \
-            --latest \
-            dist/spark-*.tar.gz dist/spark-*.tar.gz.sha256 dist/latest.txt
+            --prerelease \
+            --latest=false \
+            dist/spark-*.tar.gz dist/spark-*.tar.gz.sha256
