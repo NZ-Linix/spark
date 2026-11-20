@@ -29,7 +29,7 @@ const Dir = Io.Dir;
 const File = Io.File;
 
 var metadata_available: ?bool = null;
-var legacy_metadata_vtable: Io.VTable = undefined;
+var compatible_vtable: Io.VTable = undefined;
 var metadata_inner: ?*const Io.VTable = null;
 
 /// The App Store build of iSH returns ENOSYS from statx. Probe with an
@@ -40,21 +40,24 @@ pub fn wrapIo(inner: Io) Io {
         var result: linux.Statx = undefined;
         metadata_available = linux.errno(linux.statx(-1, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &result)) != .NOSYS;
     }
-    return if (metadata_available.?) inner else legacyMetadataIo(inner);
+    return compatibleIo(inner, !metadata_available.?);
 }
 
-fn legacyMetadataIo(inner: Io) Io {
+fn compatibleIo(inner: Io, use_legacy_metadata: bool) Io {
     if (metadata_inner) |vtable| {
         std.debug.assert(vtable == inner.vtable);
     } else {
-        legacy_metadata_vtable = inner.vtable.*;
-        legacy_metadata_vtable.fileStat = fileStat;
-        legacy_metadata_vtable.fileLength = fileLength;
-        legacy_metadata_vtable.dirStat = dirStat;
-        legacy_metadata_vtable.dirStatFile = dirStatFile;
+        compatible_vtable = inner.vtable.*;
+        compatible_vtable.dirDeleteFile = dirDeleteFile;
+        if (use_legacy_metadata) {
+            compatible_vtable.fileStat = fileStat;
+            compatible_vtable.fileLength = fileLength;
+            compatible_vtable.dirStat = dirStat;
+            compatible_vtable.dirStatFile = dirStatFile;
+        }
         metadata_inner = inner.vtable;
     }
-    return .{ .userdata = inner.userdata, .vtable = &legacy_metadata_vtable };
+    return .{ .userdata = inner.userdata, .vtable = &compatible_vtable };
 }
 
 /// Linux i386's stat64 syscall layout. The kernel aligns the 64-bit fields
@@ -146,14 +149,28 @@ fn dirStatFile(userdata: ?*anyopaque, dir: Dir, path: []const u8, options: Dir.S
     }
 }
 
-test "legacy i386 metadata keeps file size, mode, and no-follow semantics" {
+/// iSH returns EPERM when unlinking a directory. Zig's deleteTree first
+/// tries unlink and only descends after IsDir. Distinguish a directory
+/// from a genuine permission failure without following the final symlink.
+fn dirDeleteFile(userdata: ?*anyopaque, dir: Dir, path: []const u8) Dir.DeleteFileError!void {
+    return metadata_inner.?.dirDeleteFile(userdata, dir, path) catch |err| {
+        if (err != error.PermissionDenied) return err;
+        const stat = compatible_vtable.dirStatFile(userdata, dir, path, .{ .follow_symlinks = false }) catch |stat_err| {
+            if (stat_err == error.Canceled) return error.Canceled;
+            return err;
+        };
+        return if (stat.kind == .directory) error.IsDir else err;
+    };
+}
+
+test "legacy i386 metadata and deletion preserve no-follow semantics" {
     if (!active) return error.SkipZigTest;
     comptime {
         std.debug.assert(@sizeOf(Stat64) == 96);
         std.debug.assert(@offsetOf(Stat64, "size") == 44);
         std.debug.assert(@offsetOf(Stat64, "inode") == 88);
     }
-    const io = legacyMetadataIo(std.testing.io);
+    const io = compatibleIo(std.testing.io, true);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "history.jsonl", .data = "saved\n" });
@@ -170,6 +187,12 @@ test "legacy i386 metadata keeps file size, mode, and no-follow semantics" {
     try std.testing.expectEqual(File.Kind.file, (try tmp.dir.statFile(io, "history-link", .{})).kind);
     try std.testing.expectEqual(File.Kind.sym_link, (try tmp.dir.statFile(io, "history-link", .{ .follow_symlinks = false })).kind);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "missing", .{}));
+    try tmp.dir.createDir(io, "profile", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "profile/history.jsonl", .data = "saved\n" });
+    try tmp.dir.symLink(io, "../history.jsonl", "profile/outside", .{});
+    try tmp.dir.deleteTree(io, "profile");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "profile", .{}));
+    try std.testing.expectEqual(File.Kind.file, (try tmp.dir.statFile(io, "history.jsonl", .{})).kind);
 }
 
 /// Reads each buffer in turn and stops at the first short read, as one
