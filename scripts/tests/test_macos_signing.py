@@ -15,20 +15,6 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "sign-and-notarize-macos.sh"
 RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
-PUBLISH_LIBFX_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "publish-libfx.yml"
-)
-PGSO_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "pgso-macos-arm64.yml"
-)
-PGSO_LINUX_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "pgso-linux-arm64.yml"
-)
-PGSO_LINUX_X86_64_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "pgso-linux-x86_64.yml"
-)
-DEV_RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "dev-release.yml"
-PGSO_SETUP_ACTION_PATH = REPO_ROOT / ".github" / "actions" / "setup-pgso" / "action.yml"
 SIGNING_IDENTITY = "Developer ID Application: Example (EXAMPLE123)"
 TEST_CDHASH = "0123456789abcdef0123456789abcdef01234567"
 SECRET_NAMES = (
@@ -609,29 +595,20 @@ class MacosSigningWorkflowTests(unittest.TestCase):
 
     def test_every_privileged_publish_job_uses_an_environment_gate(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
-        publish_libfx = PUBLISH_LIBFX_WORKFLOW_PATH.read_text(encoding="utf-8")
 
         release_job = release.split("  release:\n", 1)[1]
-        npm_publish_job = publish_libfx.split("  publish:\n", 1)[1]
 
         self.assertIn("environment: release", release_job)
-        self.assertIn("environment: npm", npm_publish_job)
+        prerelease_job = release.split("  publish-prerelease:\n", 1)[1]
+        self.assertIn("environment: prerelease", prerelease_job)
 
     def test_stable_release_is_the_only_workflow_with_signing_secrets(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
-        pgso = PGSO_WORKFLOW_PATH.read_text(encoding="utf-8")
-        pgso_linux = PGSO_LINUX_WORKFLOW_PATH.read_text(
-            encoding="utf-8"
-        ) + PGSO_LINUX_X86_64_WORKFLOW_PATH.read_text(encoding="utf-8")
-        dev_release = DEV_RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
-
         self.assertEqual(2, release.count("environment: apple-signing"))
         self.assertIn(
             "needs: [check-version, build-linux, build-macos-x86_64, build-macos-arm64]",
             release,
         )
-        self.assertNotIn("environment: apple-signing", pgso)
-        self.assertNotIn("environment: apple-signing", pgso_linux)
         intel_job = release.split("  build-macos-x86_64:\n", 1)[1].split(
             "\n  build-macos-arm64:", 1
         )[0]
@@ -653,28 +630,18 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             self.assertLess(smoke, archive)
             for secret in SECRET_NAMES:
                 self.assertIn(f"${{{{ secrets.{secret} }}}}", job)
-        workflow_call = pgso.split("  workflow_dispatch:\n", 1)[0]
-        aggregate = pgso.split("  aggregate:\n", 1)[1]
-        for secret_name in SECRET_NAMES:
-            secret_reference = f"${{{{ secrets.{secret_name} }}}}"
-            self.assertIn(secret_reference, release)
-            self.assertIn(secret_reference, sign_release)
-            self.assertNotIn(secret_name, workflow_call)
-            self.assertNotIn(secret_name, aggregate)
-            self.assertNotIn(secret_name, pgso)
-            self.assertNotIn(secret_name, pgso_linux)
-            self.assertNotIn(secret_name, dev_release)
-        self.assertNotIn("sign-and-notarize-macos", pgso)
-        self.assertNotIn("sign-and-notarize-macos", dev_release)
+        for workflow in RELEASE_WORKFLOW_PATH.parent.glob("*.yml"):
+            if workflow == RELEASE_WORKFLOW_PATH:
+                continue
+            contents = workflow.read_text(encoding="utf-8")
+            self.assertNotIn("environment: apple-signing", contents, workflow.name)
+            self.assertNotIn("sign-and-notarize-macos", contents, workflow.name)
+            for secret in SECRET_NAMES:
+                self.assertNotIn(secret, contents, workflow.name)
 
-    def test_release_and_pgso_pin_every_external_action(self) -> None:
+    def test_release_pins_every_external_action(self) -> None:
         mutable_references: list[str] = []
-        pending = [
-            RELEASE_WORKFLOW_PATH,
-            PGSO_WORKFLOW_PATH,
-            PGSO_LINUX_WORKFLOW_PATH,
-            PGSO_LINUX_X86_64_WORKFLOW_PATH,
-        ]
+        pending = [RELEASE_WORKFLOW_PATH]
         checked: set[pathlib.Path] = set()
         while pending:
             path = pending.pop()
@@ -696,13 +663,6 @@ class MacosSigningWorkflowTests(unittest.TestCase):
                         f"{path.relative_to(REPO_ROOT)}:{line_number}: {line.strip()}"
                     )
 
-        for path in (
-            PGSO_WORKFLOW_PATH,
-            PGSO_LINUX_WORKFLOW_PATH,
-            PGSO_LINUX_X86_64_WORKFLOW_PATH,
-            PGSO_SETUP_ACTION_PATH,
-        ):
-            self.assertIn(path, checked)
         self.assertEqual([], mutable_references)
 
 
@@ -740,29 +700,11 @@ class LinuxReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('cp zig-out/bin/spark LICENSE THIRD_PARTY_NOTICES.md', build)
         self.assertIn('sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"', build)
 
-    def test_the_evidence_artifact_keeps_the_candidate_at_its_root(self) -> None:
-        # upload-artifact roots an artifact at the deepest directory its paths
-        # share, and package-linux reads candidate/spark and manifest.json from
-        # that root, so every evidence path stays under spark-pgso/.
-        for workflow_path in (PGSO_LINUX_WORKFLOW_PATH, PGSO_LINUX_X86_64_WORKFLOW_PATH):
-            with self.subTest(workflow=workflow_path.name):
-                workflow = workflow_path.read_text(encoding="utf-8")
-                evidence = workflow.split("      - name: Upload evidence\n", 1)[1].split(
-                    "\n      - name:", 1
-                )[0]
-                block = evidence.split("          path: |\n", 1)[1].split(
-                    "\n          if-no-files-found:", 1
-                )[0]
-                paths = [line.strip() for line in block.splitlines()]
-                self.assertIn("${{ runner.temp }}/spark-pgso/candidate/spark", paths)
-                self.assertIn("${{ runner.temp }}/spark-pgso/manifest.json", paths)
-                self.assertEqual("${{ runner.temp }}/spark-pgso", os.path.commonpath(paths))
-                logs = workflow.split("      - name: Upload unit test logs\n", 1)[1].split(
-                    "\n      - name:", 1
-                )[0]
-                self.assertIn("if: always()", logs)
-                self.assertIn("path: ${{ runner.temp }}/spark-pgso-unit-tests/logs\n", logs)
-                self.assertNotIn("id: upload", logs)
+    def test_only_release_and_platform_ci_workflows_are_defined(self) -> None:
+        self.assertEqual(
+            {"ci.yml", "macos.yml", "release.yml"},
+            {path.name for path in RELEASE_WORKFLOW_PATH.parent.glob("*.yml")},
+        )
 
     def test_release_rejects_missing_or_changed_archives(self) -> None:
         release = self.release_job("release")
