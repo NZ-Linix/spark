@@ -5529,7 +5529,7 @@ test "trace stays well formed with every ring full and a long transcript" {
     for (entries, 0..) |*entry, index| {
         entry.* = .{ .raw_bytes = .{
             .id = @intCast(index + 1),
-            .created_at_ms = @intCast(1_700_000_000_000 + index),
+            .created_at_ms = 1_700_000_000_000 + @as(i64, @intCast(index)),
             .bytes = hostile ++ "\x1b[31mred\x1b[0m line\n",
         } };
     }

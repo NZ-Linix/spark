@@ -1,4 +1,5 @@
 const std = @import("std");
+const atomic_value = @import("atomic_value.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("debug_trace.zig");
 const io_mod = @import("io.zig");
@@ -30,7 +31,7 @@ pub const HttpPool = struct {
     /// connections at noteActivity-stamped completions, so when
     /// now - last_activity > ttl every free connection is provably stale.
     ttl_ms: i64 = default_ttl_ms,
-    last_activity_ms: std.atomic.Value(i64) = .init(0),
+    last_activity_ms: atomic_value.Value(i64) = .init(0),
     warm_started: std.atomic.Value(bool) = .init(false),
     warm_done: std.atomic.Value(bool) = .init(false),
     /// Connection opens running on their own threads (src/gateway/client.zig

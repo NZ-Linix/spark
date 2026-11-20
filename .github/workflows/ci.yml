@@ -195,6 +195,42 @@ jobs:
           cache-key: ${{ steps.zig.outputs.cache-key }}
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
+  # Releases ship a 32-bit x86 Linux build, for old PCs and the iSH app.
+  # Zig rejects 64-bit atomics there, so build it on every change and run it
+  # on this x86_64 runner, which executes 32-bit static binaries.
+  build-x86:
+    name: Build spark (Linux x86, 32-bit)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        id: zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.1"
+          cache-key: ci-build-x86-linux-musl
+
+      # The same target and CPU as the linux-x86 release build.
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=x86-linux-musl -Dcpu=i686
+
+      - name: Check the binary is 32-bit x86
+        run: file zig-out/bin/spark | grep -Eq "ELF 32-bit LSB.*Intel 80386.*statically linked"
+
+      - name: Smoke test fresh binary
+        run: scripts/smoke-binary.sh zig-out/bin/spark
+
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
   # The durable-session model check in SDK (Bun + N-API/WASM) takes about 40
   # minutes, the two TLA+ MCP jobs about 20 each, and the TLA+ transcript
   # window and subagent models a few each. A pull request runs each only when

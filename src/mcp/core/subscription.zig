@@ -317,52 +317,52 @@ const World = struct {
         switch (event) {
             .opened => |o| if (!out.ignored) {
                 try testing.expect(!t.config.stdio or before.up); // NoSendWhileDown
-                w.owner[o.id] = o.sub;
+                w.owner[@intCast(o.id)] = o.sub;
             },
             .resent => |r| if (!out.ignored) {
                 try testing.expect(!t.config.stdio or before.up); // NoSendWhileDown
-                try testing.expect(!w.final[before.subs[r.sub].id]); // NoRelistenAfterFinal
-                w.owner[r.id] = r.sub;
+                try testing.expect(!w.final[@intCast(before.subs[r.sub].id)]); // NoRelistenAfterFinal
+                w.owner[@intCast(r.id)] = r.sub;
             },
             .acknowledged => |a| if (!out.ignored) {
-                w.ack_seen[a.id] = true;
-                w.allowed[a.id] = asks[w.owner[a.id]] & a.filter;
+                w.ack_seen[@intCast(a.id)] = true;
+                w.allowed[@intCast(a.id)] = asks[w.owner[@intCast(a.id)]] & a.filter;
             },
             // The world ends these listens whatever the client does.
-            .lost => |id| if (!before.config.stdio and w.owner[id] != 255) {
-                w.over[id] = true;
+            .lost => |id| if (!before.config.stdio and w.owner[@intCast(id)] != 255) {
+                w.over[@intCast(id)] = true;
             },
             .transport_down => if (before.config.stdio and before.up) for (before.subs) |b| {
-                if (b.phase == .pending or b.phase == .active) w.over[b.id] = true;
+                if (b.phase == .pending or b.phase == .active) w.over[@intCast(b.id)] = true;
             },
             else => {},
         }
         for (out.effects()) |effect| switch (effect) {
             .deliver => |d| {
                 const id = event.notified.id;
-                try testing.expectEqual(w.owner[id], d.sub); // SubDemux
-                try testing.expect(w.ack_seen[id]); // AckFirst
-                try testing.expect(w.allowed[id] & bit(d.kind) != 0); // FilterRespected
-                try testing.expect(!w.over[id]); // NothingAfterEnd
+                try testing.expectEqual(w.owner[@intCast(id)], d.sub); // SubDemux
+                try testing.expect(w.ack_seen[@intCast(id)]); // AckFirst
+                try testing.expect(w.allowed[@intCast(id)] & bit(d.kind) != 0); // FilterRespected
+                try testing.expect(!w.over[@intCast(id)]); // NothingAfterEnd
             },
             .ended => |e| {
                 const id = t.subs[e.sub].id;
-                w.told[id] += 1;
-                try testing.expect(w.told[id] <= 1); // OneEnd
-                w.over[id] = true;
-                if (e.end != .gave_up) w.final[id] = true;
+                w.told[@intCast(id)] += 1;
+                try testing.expect(w.told[@intCast(id)] <= 1); // OneEnd
+                w.over[@intCast(id)] = true;
+                if (e.end != .gave_up) w.final[@intCast(id)] = true;
             },
-            .cancel_listen => |id| w.over[id] = true,
+            .cancel_listen => |id| w.over[@intCast(id)] = true,
             // Only a subscription waiting to listen again does.
             .relisten => |sub| try testing.expectEqual(Phase.waiting, t.subs[sub].phase),
             .arm_retry, .acknowledged => {},
         };
         for (before.subs, t.subs) |b, s| {
             // A listen that stopped listening is over.
-            if ((b.phase == .pending or b.phase == .active) and s.phase != b.phase and s.phase != .active) w.over[b.id] = true;
+            if ((b.phase == .pending or b.phase == .active) and s.phase != b.phase and s.phase != .active) w.over[@intCast(b.id)] = true;
             // ActiveListensForSomething, EndTold, and the bound on tries.
             if (s.phase == .active) try testing.expect(s.acked != 0);
-            if (s.phase == .ended) try testing.expectEqual(@as(u8, 1), w.told[s.id]);
+            if (s.phase == .ended) try testing.expectEqual(@as(u8, 1), w.told[@intCast(s.id)]);
             try testing.expect(s.tries <= t.config.max_tries);
         }
         // Where the model has no choice, the core must act.

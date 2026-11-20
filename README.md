@@ -30,6 +30,12 @@ macOS and Linux:
 curl -fsSL https://raw.githubusercontent.com/NZ-Linix/spark/main/install.sh | sh
 ```
 
+The same installer covers 32-bit x86 Linux, including the iSH app on iPhone and iPad. Where curl is missing, as on Alpine and iSH, use wget:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/NZ-Linix/spark/main/install.sh | sh
+```
+
 Windows (PowerShell, installs into WSL):
 
 ```powershell

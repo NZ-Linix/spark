@@ -9,6 +9,7 @@
 //! `tests/tla/mcp_host/ElicitationRouting.tla`.
 
 const std = @import("std");
+const atomic_value = @import("../shared/atomic_value.zig");
 const observation = @import("../agent/runtime/observation.zig");
 const mcp = @import("../../mcp/mcp.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -453,7 +454,7 @@ pub const Runtime = struct {
     /// from `flags`, which a sign-in or sign-out resets, so a count never
     /// comes back to a value the catalog already saw. Replaced with
     /// `resolved`.
-    tools_epochs: []std.atomic.Value(u64),
+    tools_epochs: []atomic_value.Value(u64),
     /// Owner thread only: the last `drain` held a request while a server a
     /// reload dropped stops, so the owner looks again soon.
     holding: bool = false,
@@ -568,7 +569,7 @@ pub const Runtime = struct {
         r.ids = try gpa.alloc(u64, n);
         errdefer gpa.free(r.ids);
         for (r.ids) |*id| id.* = r.newId();
-        r.tools_epochs = try gpa.alloc(std.atomic.Value(u64), n);
+        r.tools_epochs = try gpa.alloc(atomic_value.Value(u64), n);
         errdefer gpa.free(r.tools_epochs);
         for (r.tools_epochs) |*e| e.* = .init(0);
         // The engine copies what it keeps, so the rest of the config goes.
@@ -1961,7 +1962,7 @@ pub const Runtime = struct {
         errdefer r.gpa.free(flags);
         const ids = try r.gpa.alloc(u64, n);
         errdefer r.gpa.free(ids);
-        const epochs = try r.gpa.alloc(std.atomic.Value(u64), n);
+        const epochs = try r.gpa.alloc(atomic_value.Value(u64), n);
         errdefer r.gpa.free(epochs);
         for (from, flags, ids, epochs) |f, *flag, *id, *epoch| {
             flag.* = if (f) |i| r.flags[i] else .{};

@@ -1,4 +1,5 @@
 const std = @import("std");
+const atomic_value = @import("../shared/atomic_value.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -20,7 +21,7 @@ const ellipsis = "\u{2026}";
 /// thread or, in the interactive app, on the main thread; the parent reads
 /// it from any thread.
 pub const LiveMetrics = struct {
-    input_tokens: std.atomic.Value(u64) = .init(0),
+    input_tokens: atomic_value.Value(u64) = .init(0),
     call_mutex: std.Io.Mutex = .init,
     call: Call = .{},
 

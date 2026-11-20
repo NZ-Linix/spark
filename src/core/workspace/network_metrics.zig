@@ -725,8 +725,9 @@ fn stepsAscendPerThread(calls: []const NetworkCall) bool {
     var last: [9]?u64 = @splat(null);
     for (calls) |call| {
         if (call.subagent_id >= last.len) return false;
-        if (last[call.subagent_id]) |previous| if (call.step_id <= previous) return false;
-        last[call.subagent_id] = call.step_id;
+        const slot: usize = @intCast(call.subagent_id);
+        if (last[slot]) |previous| if (call.step_id <= previous) return false;
+        last[slot] = call.step_id;
     }
     return true;
 }

@@ -66,12 +66,22 @@ jobs:
         include:
           - name: linux-x86_64
             target: x86_64-linux-gnu.2.34
+            cpu: baseline
           - name: linux-aarch64
             target: aarch64-linux-gnu.2.34
+            cpu: baseline
+          # 32-bit x86 runs on old PCs and in the iSH app on iPhone and iPad,
+          # which runs Alpine (musl, no glibc) on an emulated i686 without
+          # SSE. A static musl build for the plain i686 CPU runs on both.
+          - name: linux-x86
+            target: x86-linux-musl
+            cpu: i686
           - name: macos-x86_64
             target: x86_64-macos
+            cpu: baseline
           - name: macos-aarch64
             target: aarch64-macos
+            cpu: baseline
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -81,7 +91,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dcpu=baseline
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dcpu=${{ matrix.cpu }}
 
       - name: Package
         run: |
@@ -114,6 +124,9 @@ jobs:
             runner: ubuntu-latest
           - name: linux-aarch64
             runner: ubuntu-24.04-arm
+          # An x86_64 Linux kernel runs 32-bit static binaries.
+          - name: linux-x86
+            runner: ubuntu-latest
           - name: macos-aarch64
             runner: macos-latest
     steps:

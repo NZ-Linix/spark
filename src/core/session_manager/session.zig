@@ -3708,7 +3708,7 @@ const session_tests = struct {
             // The children offered are exactly those spawned by the fork point.
             const parent_lines = try copyLines(&t, parent);
             defer gpa.free(parent_lines);
-            const point_ms = parent_lines[point_seq - 1].ts;
+            const point_ms = parent_lines[@intCast(point_seq - 1)].ts;
             var page = try session_mod.readPage(&t.env, gpa, parent, .start, .forward, 1 << 20);
             defer page.deinit();
             for (kids.items) |kid| {
