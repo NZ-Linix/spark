@@ -637,7 +637,7 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         self.assertIn("needs: [check-version, build-macos-arm64]", sign_release)
         self.assertIn("environment: apple-signing", sign_release)
         self.assertIn(
-            "needs: [check-version, package-linux, build-macos-x86_64, sign-macos-arm64]",
+            "needs: [check-version, package-linux, build-macos-x86_64, sign-macos-arm64, build-linux-x86]",
             release,
         )
         workflow_call = pgso.split("  workflow_dispatch:\n", 1)[0]
