@@ -2,10 +2,11 @@
 //! lacks. iSH emulates i386 Linux on iPhone and iPad, and its App Store
 //! build kills a program with SIGSYS ("Bad system call") when it makes a
 //! call iSH does not implement, so musl's fallbacks after ENOSYS never run.
-//! spark's static musl build reaches three such calls through std.Io:
-//! `preadv` and `pwritev` for positional file I/O, and `clock_nanosleep`
-//! (and its time64 form) for sleeping. The versions here use `pread`,
-//! `pwrite`, and `nanosleep` instead, which every Linux, iSH included, has.
+//! spark's static musl build reaches four such calls through std.Io:
+//! `preadv` and `pwritev` for positional file I/O, `clock_nanosleep` (and
+//! its time64 form) for sleeping, and `fchmodat2` for `fchmodat` with flags.
+//! The versions here use `pread`, `pwrite`, `nanosleep`, and `fchmodat`
+//! instead, which every Linux, iSH included, has.
 //! A strong definition here wins over musl's, so std.Io calls these.
 
 const std = @import("std");
@@ -19,6 +20,7 @@ comptime {
         @export(&preadv, .{ .name = "preadv" });
         @export(&pwritev, .{ .name = "pwritev" });
         @export(&clockNanosleep, .{ .name = "clock_nanosleep" });
+        @export(&fchmodat, .{ .name = "fchmodat" });
     }
 }
 
@@ -87,6 +89,30 @@ fn clockNanosleep(clk: std.c.clockid_t, flags: c_int, req: *const std.c.timespec
     return @intCast(@backingInt(err));
 }
 
+/// `fchmodat` without `fchmodat2`. The only flag is AT_SYMLINK_NOFOLLOW,
+/// and Linux cannot change a symlink's own mode, so a symlink fails with
+/// EOPNOTSUPP as in musl, and anything else changes through the plain call.
+/// Unlike musl's fallback, which pins the file through an O_PATH descriptor,
+/// a symlink swapped in between the check and the change is followed: iSH
+/// may lack O_PATH, and spark only changes modes of files it just wrote.
+fn fchmodat(fd: c_int, path: [*:0]const u8, mode: std.c.mode_t, flags: c_int) callconv(.c) c_int {
+    if (flags != 0) {
+        if (flags != linux.AT.SYMLINK_NOFOLLOW) return fail(.INVAL);
+        var st: linux.Statx = undefined;
+        const found = linux.errno(linux.statx(fd, path, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st));
+        if (found != .SUCCESS) return fail(found);
+        if (st.mode & linux.S.IFMT == linux.S.IFLNK) return fail(.OPNOTSUPP);
+    }
+    const rc = linux.syscall3(.fchmodat, @bitCast(@as(isize, fd)), @intFromPtr(path), mode);
+    const err = linux.errno(rc);
+    return if (err == .SUCCESS) 0 else fail(err);
+}
+
+fn fail(err: std.c.E) c_int {
+    std.c._errno().* = @backingInt(err);
+    return -1;
+}
+
 test "positional reads and writes match one preadv or pwritev" {
     if (!active) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
@@ -128,4 +154,24 @@ test "clock_nanosleep sleeps for a duration and until a deadline" {
     try std.testing.expect(elapsed_ns >= 60 * std.time.ns_per_ms);
     // A deadline already past returns at once.
     try std.testing.expectEqual(@as(c_int, 0), clockNanosleep(.MONOTONIC, 1, &before, null));
+}
+
+test "fchmodat changes a file's mode and refuses a symlink with NOFOLLOW" {
+    if (!active) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const file = try tmp.dir.createFile(io, "script", .{});
+    file.close(io);
+    try tmp.dir.symLink(io, "script", "link", .{});
+    const dir_fd = tmp.dir.handle;
+    try std.testing.expectEqual(@as(c_int, 0), fchmodat(dir_fd, "script", 0o700, linux.AT.SYMLINK_NOFOLLOW));
+    var st: linux.Statx = undefined;
+    try std.testing.expectEqual(@as(usize, 0), linux.statx(dir_fd, "script", 0, .{ .MODE = true }, &st));
+    try std.testing.expectEqual(@as(u16, 0o700), st.mode & 0o777);
+    try std.testing.expectEqual(@as(c_int, 0), fchmodat(dir_fd, "script", 0o600, 0));
+    try std.testing.expectEqual(@as(c_int, -1), fchmodat(dir_fd, "link", 0o700, linux.AT.SYMLINK_NOFOLLOW));
+    try std.testing.expectEqual(@backingInt(std.c.E.OPNOTSUPP), std.c._errno().*);
+    try std.testing.expectEqual(@as(c_int, -1), fchmodat(dir_fd, "script", 0o700, 0x100000));
+    try std.testing.expectEqual(@backingInt(std.c.E.INVAL), std.c._errno().*);
 }
