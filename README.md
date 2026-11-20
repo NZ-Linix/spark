@@ -9,8 +9,6 @@
 
 **A fast, native coding agent for your terminal.**
 
-One Zig binary · any OpenAI-compatible model · output that stays in your scrollback
-
 > [!WARNING]
 > spark is experimental. It runs with full access: every tool call, file edit, and shell command runs without asking first. Use it in projects you can restore.
 
@@ -30,7 +28,7 @@ macOS and Linux:
 curl -fsSL https://raw.githubusercontent.com/NZ-Linix/spark/main/install.sh | sh
 ```
 
-The same installer covers 32-bit x86 Linux, including the iSH app on iPhone and iPad. Where curl is missing, as on Alpine and iSH, use wget:
+Alternatively:
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/NZ-Linix/spark/main/install.sh | sh
