@@ -8,11 +8,21 @@ name: Release
 #   latest.txt                      the release's tag, such as v26.11.19
 #   spark-<os>-<arch>.tar.gz        spark, LICENSE, THIRD_PARTY_NOTICES.md
 #   spark-<os>-<arch>.tar.gz.sha256 its checksum
+#
+# Started by hand with a prerelease tag such as v26.11.20-rc1, it publishes
+# a pre-release from the chosen branch instead, for testing a build before
+# it merges. A pre-release is never marked latest, so `spark update` and the
+# installer's default never pick it; `install.sh --version <tag>` does.
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      prerelease_tag:
+        description: Publish a test pre-release with this tag, such as v26.11.20-rc1
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -30,6 +40,7 @@ jobs:
     outputs:
       needed: ${{ steps.check.outputs.needed }}
       tag: ${{ steps.check.outputs.tag }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -37,7 +48,28 @@ jobs:
 
       - name: Check whether this version needs a release
         id: check
+        env:
+          PRERELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease_tag || '' }}
         run: |
+          if [ -n "$PRERELEASE_TAG" ]; then
+            # A suffix is required, so a pre-release can never take a stable tag.
+            if ! [[ "$PRERELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9A-Za-z.]+$ ]]; then
+              echo "::error::$PRERELEASE_TAG is not a pre-release tag such as v26.11.20-rc1"
+              exit 1
+            fi
+            if git rev-parse -q --verify "refs/tags/$PRERELEASE_TAG" >/dev/null; then
+              echo "::error::$PRERELEASE_TAG already exists"
+              exit 1
+            fi
+            {
+              echo "tag=$PRERELEASE_TAG"
+              echo "prerelease=true"
+              echo "needed=true"
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice::Publishing pre-release $PRERELEASE_TAG from $GITHUB_REF_NAME"
+            exit 0
+          fi
+          echo "prerelease=false" >> "$GITHUB_OUTPUT"
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
           if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "needed=false" >> "$GITHUB_OUTPUT"
@@ -157,6 +189,7 @@ jobs:
           merge-multiple: true
 
       - name: Write latest.txt and the release notes
+        if: needs.check-version.outputs.prerelease != 'true'
         env:
           TAG: ${{ needs.check-version.outputs.tag }}
         run: |
@@ -178,12 +211,47 @@ jobs:
           EOF
           ls -l dist
 
+      - name: Write the pre-release notes
+        if: needs.check-version.outputs.prerelease == 'true'
+        env:
+          TAG: ${{ needs.check-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          installer="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/install.sh"
+          cat > notes.md <<EOF
+          Test pre-release built from \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}. It is not the latest release, and \`spark update\` never installs it.
+
+          ### Install
+
+          \`\`\`sh
+          curl -fsSL ${installer} | sh -s -- --version ${TAG}
+          \`\`\`
+
+          Without curl, as on Alpine and in the iSH app:
+
+          \`\`\`sh
+          wget -qO- ${installer} | sh -s -- --version ${TAG}
+          \`\`\`
+          EOF
+          ls -l dist
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.check-version.outputs.tag }}
+          PRERELEASE: ${{ needs.check-version.outputs.prerelease }}
         run: |
           set -euo pipefail
+          if [ "$PRERELEASE" = true ]; then
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "spark $TAG" \
+              --notes-file notes.md \
+              --prerelease \
+              --latest=false \
+              dist/spark-*.tar.gz dist/spark-*.tar.gz.sha256
+            exit 0
+          fi
           gh release create "$TAG" \
             --target "$GITHUB_SHA" \
             --title "spark $TAG" \
