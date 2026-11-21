@@ -983,6 +983,10 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "full_transcript");
                     return .done;
                 }
+                // Esc in the `/provider` form leaves the field or list it is on.
+                if (comptime @hasDecl(App, "saveConnection")) {
+                    if (try app_provider_menu_runtime.Runtime(App).routeAction(app, agents.screenAgentOf(app), resolved)) return .done;
+                }
                 const now = io_mod.milliTimestamp();
                 expireEscClearArm(app, now);
                 try resolveEscape(app, agents.screenAgentOf(app), was_cancel_pending, now);

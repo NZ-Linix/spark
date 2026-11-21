@@ -1,6 +1,7 @@
-//! `/provider`: routes keys to the connection form, saves the finished
-//! connection under `providers` in the profile settings, reloads the
-//! connection list, and switches to the new connection.
+//! `/provider`: routes keys to the connection form and saves under
+//! `providers` in the profile settings. An edit to a saved connection saves
+//! as soon as its field is committed and keeps the form open; a new
+//! connection saves on "Create connection" and becomes the one in use.
 
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
@@ -44,19 +45,21 @@ pub fn Runtime(comptime App: type) type {
             const form = &app.input_runtime.provider_menu;
             if (!form.active) return false;
             switch (action) {
-                .escape, .paste_start, .paste_end, .remapped_byte => return false,
+                .paste_start, .paste_end, .remapped_byte => return false,
+                // Esc leaves a field or a list; on the connection list it
+                // closes the form.
+                .escape => if (!try form.back(app.alloc)) return false,
                 .word_left => form.moveLeft(),
-                .cursor_right, .word_right => form.moveRight(),
+                .cursor_right => if (form.field.isList()) try submit(app, agent) else form.moveRight(),
+                .word_right => form.moveRight(),
                 .home => form.moveHome(),
                 .end => form.moveEnd(),
                 .delete_next => form.deleteNext(),
                 .delete_to_line_start, .clear_line => form.clearLine(),
-                .cursor_up, .history_up => if (form.field.isList()) form.move(-1) else {
-                    _ = try form.back(app.alloc);
-                },
-                .cursor_down, .history_down => if (form.field.isList()) form.move(1) else try submit(app, agent),
+                .cursor_up, .history_up => if (form.field.isList()) form.move(-1),
+                .cursor_down, .history_down => if (form.field.isList()) form.move(1),
                 .cursor_left => if (form.field.isList()) {
-                    _ = try form.back(app.alloc);
+                    if (!try form.back(app.alloc)) form.close(app.alloc);
                 } else form.moveLeft(),
                 else => {},
             }
@@ -68,7 +71,9 @@ pub fn Runtime(comptime App: type) type {
             const form = &app.input_runtime.provider_menu;
             switch (try form.submit(app.alloc)) {
                 .next, .invalid => {},
-                .finished => try saveConnection(app, agent),
+                .close => form.close(app.alloc),
+                .create => try saveConnection(app, agent),
+                .save => try saveEdit(app, agent),
                 .edit => {
                     const name = form.editing orelse return;
                     const definition = app.provider_selection.definitions.get(name) orelse {
@@ -85,8 +90,14 @@ pub fn Runtime(comptime App: type) type {
         pub fn open(app: *App) !void {
             var names: std.ArrayList([]const u8) = .empty;
             defer names.deinit(app.alloc);
-            for (app.provider_selection.definitions.definitions) |definition| try names.append(app.alloc, definition.id);
+            var labels: std.ArrayList(?[]const u8) = .empty;
+            defer labels.deinit(app.alloc);
+            for (app.provider_selection.definitions.definitions) |definition| {
+                try names.append(app.alloc, definition.id);
+                try labels.append(app.alloc, definition.display_name);
+            }
             try app.input_runtime.provider_menu.open(app.alloc, names.items);
+            try app.input_runtime.provider_menu.setLabels(app.alloc, labels.items);
         }
 
         /// Closes the form without saving. Returns whether it was open.
@@ -152,6 +163,66 @@ pub fn Runtime(comptime App: type) type {
             }
             const next = model_provider.parse(definitions[0].id) orelse return;
             try app_auth_runtime.Runtime(App).switchToConnection(app, agent, next.bind(app.provider_selection.definitions) catch next);
+        }
+
+        /// Saves a field changed on a saved connection and keeps the form
+        /// open on its list.
+        fn saveEdit(app: *App, agent: *AppAgent) !void {
+            const form = &app.input_runtime.provider_menu;
+            const previous_name = form.editing orelse return;
+            if (agent.stream.active) {
+                form.problem = "wait for the current turn to finish; the change is not saved yet";
+                return;
+            }
+            var arena: std.heap.ArenaAllocator = .init(app.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const previous = try a.dupe(u8, previous_name);
+            const base = config_runtime.loadConnectionJson(a, previous) catch null;
+            const value = try form.toJson(a, base);
+            const name = try a.dupe(u8, form.name.items);
+
+            var check: std.json.ObjectMap = .empty;
+            try check.put(a, name, value);
+            var checked = configured_provider.Registry.parse(app.alloc, .{ .object = check }) catch |err| {
+                form.problem = configured_provider.failure_advice(err) orelse "the connection could not be saved";
+                return;
+            };
+            checked.deinit(app.alloc);
+
+            const was_active = std.mem.eql(u8, provider_runtime.providerOf(app, agent).label(), previous);
+            const renamed = !std.mem.eql(u8, name, previous);
+            // Keep the saved model when the connection still has it.
+            const current_model = provider_runtime.modelOf(app, agent);
+            var model: ?[]const u8 = null;
+            if (was_active) {
+                model = form.models.items[0].id;
+                for (form.models.items) |entry| if (std.mem.eql(u8, entry.id, current_model)) {
+                    model = entry.id;
+                };
+            }
+            const target = model_provider.parse(name) orelse {
+                form.problem = "that ID can't be used";
+                return;
+            };
+            var outcome = config_runtime.setUserPreferences(app.alloc, .{
+                .connection = .{ .id = name, .value = value, .previous_id = previous },
+                .model_preference = if (model) |m| .{ .provider = target, .model = try a.dupe(u8, m) } else null,
+            }) catch |err| return writeError(form, err);
+            outcome.deinit(app.alloc);
+            try form.markSaved(app.alloc);
+            if (!try reloadConnections(app)) return;
+            var labels: std.ArrayList(?[]const u8) = .empty;
+            defer labels.deinit(app.alloc);
+            for (form.connections.items) |entry| {
+                const definition = app.provider_selection.definitions.get(entry);
+                try labels.append(app.alloc, if (definition) |d| d.display_name else null);
+            }
+            try form.setLabels(app.alloc, labels.items);
+            if (was_active and renamed) {
+                const bound = target.bind(app.provider_selection.definitions) catch target;
+                try app_auth_runtime.Runtime(App).switchToConnection(app, agent, bound);
+            }
         }
 
         pub fn saveConnection(app: *App, agent: *AppAgent) !void {

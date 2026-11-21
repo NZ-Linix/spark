@@ -368,6 +368,18 @@ pub fn loadConnectionJson(arena: Allocator, id: []const u8) !?std.json.Value {
     return providers.object.get(id);
 }
 
+/// The whole profile settings object, so a one-field edit can read the
+/// connection and its saved model together. Allocated in `arena`; null when
+/// the file is absent or isn't an object.
+pub fn loadUserSettingsJson(arena: Allocator) !?std.json.Value {
+    var paths = try discoverPaths(arena, ".");
+    defer paths.deinit(arena);
+    const bytes = (try readOptionalUserSettingsFile(arena, paths)) orelse return null;
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{ .duplicate_field_behavior = .@"error" });
+    if (parsed != .object) return null;
+    return parsed;
+}
+
 /// Reads only profile-global connection definitions. Caller owns the registry.
 pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
     var paths = try discoverPaths(alloc, ".");

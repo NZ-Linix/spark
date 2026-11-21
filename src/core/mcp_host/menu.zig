@@ -320,7 +320,8 @@ pub const Effect = union(enum) {
 /// Opens the form on the open server, its fields filled in by the app.
 pub fn startEdit(s: *State, http: bool, project: bool) void {
     s.screen = .add;
-    s.add_step = .name;
+    // An edit opens on Save with every field in view: ↑ picks the one to change.
+    s.add_step = .review;
     s.add_http = http;
     s.add_project = project;
     s.add_login = false;
@@ -332,7 +333,17 @@ pub fn addGoTo(s: *State, step: AddStep) void {
     s.add_step = step;
 }
 
+/// After a field is entered: the next step, or Save when editing, so an
+/// edit changes one field without walking the others.
 pub fn addAdvance(s: *State) void {
+    if (s.add_editing) {
+        s.add_step = .review;
+        return;
+    }
+    addNext(s);
+}
+
+fn addNext(s: *State) void {
     s.add_step = switch (s.add_step) {
         .name => .kind,
         .kind => .target,
@@ -346,7 +357,8 @@ pub fn addAdvance(s: *State) void {
 fn addBack(s: *State) void {
     s.add_step = switch (s.add_step) {
         .name => {
-            s.screen = if (s.add_editing) .server else .list;
+            if (s.add_editing) return;
+            s.screen = .list;
             return;
         },
         .kind => .name,
@@ -514,6 +526,11 @@ pub fn press(s: *State, view: View, key: Key) Effect {
         },
         .add => switch (key) {
             .escape => {
+                // Esc leaves an edit for the server's screen at once.
+                if (s.add_editing) {
+                    s.screen = .server;
+                    return .none;
+                }
                 addBack(s);
                 return if (s.screen == .list) .back else .none;
             },
@@ -531,7 +548,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
             // ↓ moves on without checking; the app keeps what was typed and
             // checks every field on save. The last step never saves by surprise.
             .down => {
-                if (s.add_step != .review) addAdvance(s);
+                if (s.add_step != .review) addNext(s);
                 return .none;
             },
             .left, .right => {

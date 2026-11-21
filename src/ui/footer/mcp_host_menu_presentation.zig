@@ -189,7 +189,7 @@ fn addRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width: 
     const s = p.state;
     const step = s.add_step;
     const http = s.add_http;
-    if (index == 0) return title(alloc, if (s.add_editing) "Edit MCP server" else "Add MCP server", try arena.print("step {d} of 6", .{@backingInt(step) + 1}), width);
+    if (index == 0) return title(alloc, if (s.add_editing) "Edit MCP server" else "Add MCP server", if (s.add_editing) "↑↓ choose a field, type to change it" else try arena.print("step {d} of 6", .{@backingInt(step) + 1}), width);
     const Field = struct { at: menu.AddStep, label: []const u8, value: []const u8 };
     const pairs_text = if (p.add_pairs.len == 0) "none" else blk: {
         var keys: std.ArrayList(u8) = .empty;
@@ -210,7 +210,8 @@ fn addRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width: 
     if (index <= fields.len) {
         const f = fields[index - 1];
         const current = f.at == step;
-        const done = @backingInt(f.at) < @backingInt(step);
+        // An edit has every field filled in already.
+        const done = s.add_editing or @backingInt(f.at) < @backingInt(step);
         const shown = if (done or !f.at.typed() or f.at == .pairs) f.value else "";
         var row: Row = .empty;
         errdefer row.deinit(alloc);

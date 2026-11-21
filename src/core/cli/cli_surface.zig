@@ -12,6 +12,7 @@ const completion = @import("completion.zig");
 const agent_run_flags = @import("agent_run_flags.zig");
 const flag_placement = @import("flag_placement.zig");
 const cli_config = @import("cli_config.zig");
+const cli_provider_edit = @import("cli_provider_edit.zig");
 const settings_messages = @import("settings_messages.zig");
 const settings_entries = @import("../config/settings_entries.zig");
 const settings_keys = @import("../config/settings_keys.zig");
@@ -1124,8 +1125,26 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .provider => |rest| {
+            if (cli_provider_edit.handles(rest)) {
+                const result = try cli_provider_edit.run(alloc, rest);
+                defer alloc.free(result.text);
+                switch (result.status) {
+                    .ok => {
+                        try writeStdout(deps, result.text);
+                        return .handled_success;
+                    },
+                    .failed => {
+                        try writeStderr(deps, result.text);
+                        return .handled_failure;
+                    },
+                    .usage => {
+                        try writeStderr(deps, result.text);
+                        return usage_failure;
+                    },
+                }
+            }
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: spark provider <name>\n");
+                try writeStderr(deps, cli_provider_edit.usage);
                 return usage_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {

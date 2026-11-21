@@ -45,6 +45,7 @@ pub const ParseError = Allocator.Error || error{
     ReservedHeader,
     InvalidTimeout,
     InvalidConnectionOption,
+    InvalidDisplayName,
 };
 
 pub const Protocol = enum {
@@ -146,6 +147,8 @@ pub const ModelMetadata = struct {
 /// requests; destroying the registry invalidates every definition and lookup.
 pub const Definition = struct {
     id: []const u8,
+    /// The name menus show in place of `id`, such as "OpenCode Go" for `oc-go`.
+    display_name: ?[]const u8 = null,
     protocol: Protocol,
     base_url: []const u8,
     auth: Auth,
@@ -309,6 +312,7 @@ pub fn failure_advice(err: anyerror) ?[]const u8 {
         error.ReservedProviderId => "gateway, codex, and grok are reserved names; give the provider another name",
         error.InvalidToolChoiceMode => "tool_choice_mode is omit or send",
         error.InvalidConnectionOption => "this is true or false",
+        error.InvalidDisplayName => "a display name is text of 1 to 80 bytes",
         error.InvalidModelId => "a model id is text with no control characters and no spaces at either end",
         error.InvalidModelMetadata => "spark can't use this value; spark.sh/docs/configure-spark/custom-model-connections lists each field",
         error.InvalidRequestFields => "request fields are a JSON object with non-empty keys, nested at most 16 deep",
@@ -412,7 +416,7 @@ pub const Registry = struct {
 /// `owned` is the registry's arena: a failure frees nothing here.
 fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at: ?*FailurePath) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata" }, at);
+    try check_fields(value, &.{ "display_name", "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata" }, at);
     enter(at, "protocol");
     const protocol_name = try required(value, "protocol");
     if (protocol_name != .string) return error.InvalidProtocol;
@@ -452,8 +456,16 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         leave(at);
     }
     const model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(owned, protocol, metadata, at) else &.{};
+    var display_name: ?[]const u8 = null;
+    if (value.object.get("display_name")) |name| {
+        enter(at, "display_name");
+        if (name != .string or name.string.len == 0 or name.string.len > 80) return error.InvalidDisplayName;
+        display_name = try owned.dupe(u8, name.string);
+        leave(at);
+    }
     return .{
         .id = try owned.dupe(u8, id),
+        .display_name = display_name,
         .protocol = protocol,
         .base_url = try owned.dupe(u8, normalized),
         .auth = switch (auth) {

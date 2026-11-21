@@ -292,8 +292,8 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .provider,
         .token = "provider",
-        .usage = "provider <name>",
-        .summary = "Choose a configured provider for spark",
+        .usage = "provider <name> | show <name> | set <name> [<model>] <field> <value> | unset <name> [<model>] <field> | remove-model <name> <model> | rename <name> <new-name>",
+        .summary = "Choose a configured provider, or change one of its fields",
     },
     .{
         .kind = .doctor,

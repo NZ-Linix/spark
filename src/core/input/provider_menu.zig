@@ -1,9 +1,11 @@
 //! State of the `/provider` form. It opens on a list of saved connections
-//! with "Add connection" at the end; a connection opens Edit or Delete. The
-//! form then takes one OpenAI-compatible connection a field at a time: its
-//! name, base URL, API key, and models, each with an optional display name,
-//! context window, and reasoning levels. The focused field's text lives here,
-//! not in the composer, so the API key never reaches composer history.
+//! with "Add connection" at the end. A connection opens on its fields, one
+//! row each: display name, ID, base URL, API key, each model, and "Add
+//! model". Enter on a row edits only that field, and Enter again saves it
+//! and returns to the list; a model opens on its own fields the same way.
+//! A new connection takes its ID first, then the same list with "Create
+//! connection". The focused field's text lives here, not in the composer, so
+//! the API key never reaches composer history.
 
 const std = @import("std");
 const configured_provider = @import("../config/configured_provider.zig");
@@ -13,12 +15,16 @@ const Allocator = std.mem.Allocator;
 pub const max_models = 32;
 pub const max_connections = 32;
 const max_field_bytes = 2048;
+const max_display_name_bytes = 80;
 
 pub const Field = enum {
     /// The list of connections.
     pick,
-    /// Edit, Delete, or Back for the picked connection.
-    action,
+    /// The fields of one connection.
+    overview,
+    /// The fields of one model.
+    model,
+    display_name,
     name,
     base_url,
     api_key,
@@ -30,8 +36,10 @@ pub const Field = enum {
     pub fn label(self: Field) []const u8 {
         return switch (self) {
             .pick => "Connections",
-            .action => "Connection",
-            .name => "Name",
+            .overview => "Connection",
+            .model => "Model",
+            .display_name => "Display name",
+            .name => "ID",
             .base_url => "Base URL",
             .api_key => "API key",
             .model_id => "Model ID",
@@ -42,11 +50,29 @@ pub const Field = enum {
     }
 
     pub fn isList(self: Field) bool {
-        return self == .pick or self == .action;
+        return self == .pick or self == .overview or self == .model;
     }
 };
 
-pub const actions = [_][]const u8{ "Edit", "Delete", "Back" };
+/// A row of the connection's field list.
+pub const OverviewRow = union(enum) {
+    field: Field,
+    model: usize,
+    add_model,
+    create,
+    delete,
+    back,
+};
+
+/// A row of a model's field list.
+pub const ModelRow = union(enum) {
+    field: Field,
+    delete,
+    back,
+};
+
+const connection_fields = [_]Field{ .display_name, .name, .base_url, .api_key };
+const model_fields = [_]Field{ .model_id, .model_name, .model_context, .model_efforts };
 
 pub const Model = struct {
     id: []u8,
@@ -60,7 +86,19 @@ pub const Model = struct {
 };
 
 /// What Enter did.
-pub const Advance = enum { next, invalid, finished, edit, delete };
+pub const Advance = enum {
+    next,
+    invalid,
+    /// A saved connection changed: save it and stay in the form.
+    save,
+    /// "Create connection" on a new one: save it, close, and switch to it.
+    create,
+    /// A saved connection was picked: load its fields.
+    edit,
+    delete,
+    /// The form has nothing left to go back to.
+    close,
+};
 
 /// Call `close` with the allocator passed to `open`.
 pub const State = struct {
@@ -69,6 +107,7 @@ pub const State = struct {
     input: std.ArrayList(u8) = .empty,
     /// Byte offset of the cursor in `input`, on a UTF-8 boundary.
     cursor: usize = 0,
+    display_name: std.ArrayList(u8) = .empty,
     name: std.ArrayList(u8) = .empty,
     base_url: std.ArrayList(u8) = .empty,
     api_key: std.ArrayList(u8) = .empty,
@@ -76,16 +115,21 @@ pub const State = struct {
     /// kept while the key field stays empty.
     key_env: ?[]u8 = null,
     models: std.ArrayList(Model) = .empty,
-    /// An edited connection's models not walked through yet, in order.
-    pending: std.ArrayList(Model) = .empty,
+    /// The model `.model` and the model fields describe; `models.len` while
+    /// a new model's ID is typed.
+    model_index: usize = 0,
     /// Saved connection names for the list.
     connections: std.ArrayList([]u8) = .empty,
-    /// The highlighted row of `pick` or `action`.
+    /// Each connection's display name, in `connections` order, or null.
+    labels: std.ArrayList(?[]u8) = .empty,
+    /// The highlighted row of a list.
     selected: usize = 0,
-    /// The name of the connection being edited, before any rename.
+    /// The saved name of the connection being edited, or null for a new one.
     editing: ?[]u8 = null,
     /// Why the last Enter was refused; static text.
     problem: ?[]const u8 = null,
+    /// Set after a field was saved; cleared by the next key.
+    saved: bool = false,
 
     /// Opens on the list when `names` has connections, else on a new one.
     pub fn open(self: *State, alloc: Allocator, names: []const []const u8) Allocator.Error!void {
@@ -99,31 +143,71 @@ pub const State = struct {
         self.field = if (self.connections.items.len > 0) .pick else .name;
     }
 
+    /// Sets the display names shown beside the connections `open` listed.
+    pub fn setLabels(self: *State, alloc: Allocator, labels: []const ?[]const u8) Allocator.Error!void {
+        for (self.labels.items) |label| if (label) |text| alloc.free(text);
+        self.labels.clearRetainingCapacity();
+        for (labels[0..@min(labels.len, self.connections.items.len)]) |label| {
+            const copy: ?[]u8 = if (label) |text| try alloc.dupe(u8, text) else null;
+            errdefer if (copy) |text| alloc.free(text);
+            try self.labels.append(alloc, copy);
+        }
+    }
+
+    /// The text a list row shows for connection `index`.
+    pub fn connectionLabel(self: *const State, index: usize) ?[]const u8 {
+        return if (index < self.labels.items.len) self.labels.items[index] else null;
+    }
+
     pub fn close(self: *State, alloc: Allocator) void {
         self.input.deinit(alloc);
+        self.display_name.deinit(alloc);
         self.name.deinit(alloc);
         std.crypto.secureZero(u8, self.api_key.items);
         self.api_key.deinit(alloc);
         self.base_url.deinit(alloc);
         if (self.key_env) |env| alloc.free(env);
-        for (self.models.items) |model| freeModel(alloc, model);
+        self.clearModels(alloc);
         self.models.deinit(alloc);
-        for (self.pending.items) |model| freeModel(alloc, model);
-        self.pending.deinit(alloc);
         for (self.connections.items) |name| alloc.free(name);
         self.connections.deinit(alloc);
+        for (self.labels.items) |label| if (label) |text| alloc.free(text);
+        self.labels.deinit(alloc);
         if (self.editing) |name| alloc.free(name);
         self.* = .{};
     }
 
-    /// Rows of the current list: the connections and "Add connection", or
-    /// the actions.
+    fn clearModels(self: *State, alloc: Allocator) void {
+        for (self.models.items) |model| freeModel(alloc, model);
+        self.models.clearRetainingCapacity();
+    }
+
+    /// Rows of the current list.
     pub fn listLen(self: *const State) usize {
         return switch (self.field) {
             .pick => self.connections.items.len + 1,
-            .action => actions.len,
+            // Fields, models, Add model, Create or Delete, Back.
+            .overview => connection_fields.len + self.models.items.len + 3,
+            .model => model_fields.len + 2,
             else => 0,
         };
+    }
+
+    pub fn overviewRow(self: *const State, index: usize) OverviewRow {
+        if (index < connection_fields.len) return .{ .field = connection_fields[index] };
+        const at = index - connection_fields.len;
+        const count = self.models.items.len;
+        if (at < count) return .{ .model = at };
+        return switch (at - count) {
+            0 => .add_model,
+            1 => if (self.editing == null) .create else .delete,
+            else => .back,
+        };
+    }
+
+    pub fn modelRow(index: usize) ModelRow {
+        if (index < model_fields.len) return .{ .field = model_fields[index] };
+        return if (index == model_fields.len) .delete else .back;
     }
 
     pub fn move(self: *State, delta: i32) void {
@@ -132,23 +216,29 @@ pub const State = struct {
         const count: i64 = @intCast(len);
         self.selected = @intCast(@mod(@as(i64, @intCast(self.selected)) + delta, count));
         self.problem = null;
+        self.saved = false;
     }
 
     /// The connection picked in the list.
     pub fn pickedName(self: *const State) ?[]const u8 {
-        if (self.editing) |name| return name;
-        return null;
+        return self.editing;
     }
 
-    /// Fills the form from a saved connection for editing.
+    /// Fills the form from a saved connection and shows its fields.
     pub fn beginEdit(self: *State, alloc: Allocator, definition: *const configured_provider.Definition) Allocator.Error!void {
         try replace(alloc, &self.name, definition.id);
+        try replace(alloc, &self.display_name, definition.display_name orelse "");
         try replace(alloc, &self.base_url, definition.base_url);
+        std.crypto.secureZero(u8, self.api_key.items);
+        self.api_key.clearRetainingCapacity();
+        if (self.key_env) |env| alloc.free(env);
+        self.key_env = null;
         switch (definition.auth) {
             .none => {},
             .key => |key| try replace(alloc, &self.api_key, key),
             .bearer => |env| self.key_env = try alloc.dupe(u8, env),
         }
+        self.clearModels(alloc);
         for (definition.model_metadata) |metadata| {
             var model: Model = .{ .id = try alloc.dupe(u8, metadata.id) };
             errdefer freeModel(alloc, model);
@@ -164,10 +254,31 @@ pub const State = struct {
                 model.efforts = try alloc.dupe(u8, text.items);
                 model.original_efforts = try alloc.dupe(u8, text.items);
             }
-            try self.pending.append(alloc, model);
+            try self.models.append(alloc, model);
         }
-        self.field = .name;
-        try self.load(alloc, self.name.items);
+        self.field = .overview;
+        self.selected = 0;
+        self.clearInput();
+        self.problem = null;
+    }
+
+    /// Records that the connection was saved under its current name.
+    pub fn markSaved(self: *State, alloc: Allocator) Allocator.Error!void {
+        const name = try alloc.dupe(u8, self.name.items);
+        if (self.editing) |old| {
+            for (self.connections.items) |*entry| if (std.mem.eql(u8, entry.*, old)) {
+                const copy = try alloc.dupe(u8, name);
+                alloc.free(entry.*);
+                entry.* = copy;
+            };
+            alloc.free(old);
+        }
+        self.editing = name;
+        for (self.models.items) |*model| {
+            if (model.original_efforts) |was| alloc.free(was);
+            model.original_efforts = if (model.efforts) |now| try alloc.dupe(u8, now) else null;
+        }
+        self.saved = true;
     }
 
     /// Inserts at the cursor.
@@ -217,99 +328,173 @@ pub const State = struct {
         self.problem = null;
     }
 
-    /// Goes back one step and loads what was entered there. Returns false
-    /// when there is nowhere to go back to.
+    /// Leaves the field or list without saving. Returns false when there is
+    /// nowhere to go back to.
     pub fn back(self: *State, alloc: Allocator) Allocator.Error!bool {
-        var buf: [16]u8 = undefined;
-        const previous: []const u8 = switch (self.field) {
+        _ = alloc;
+        self.problem = null;
+        self.saved = false;
+        switch (self.field) {
             .pick => return false,
-            .action => {
+            .overview => {
+                if (self.connections.items.len == 0) return false;
                 self.field = .pick;
-                self.selected = 0;
-                return true;
+                self.selected = self.connectionIndex() orelse 0;
             },
-            .name => return false,
-            .base_url => blk: {
-                self.field = .name;
-                break :blk self.name.items;
+            .model => {
+                self.field = .overview;
+                self.selected = connection_fields.len + self.model_index;
             },
-            .api_key => blk: {
-                self.field = .base_url;
-                break :blk self.base_url.items;
+            .name => {
+                // A new connection's first step.
+                if (self.editing == null and self.models.items.len == 0 and self.base_url.items.len == 0) {
+                    if (self.connections.items.len == 0) return false;
+                    self.field = .pick;
+                    self.selected = self.connections.items.len;
+                } else self.returnToOverview(.name);
             },
-            .model_id => blk: {
-                if (self.models.items.len == 0) {
-                    self.field = .api_key;
-                    break :blk self.api_key.items;
-                }
-                self.field = .model_efforts;
-                break :blk self.lastModel().efforts orelse "";
-            },
-            .model_name => {
-                // The model goes back to the front of the walk, details kept.
-                const model = self.models.pop().?;
-                self.pending.insert(alloc, 0, model) catch |err| {
-                    freeModel(alloc, model);
-                    return err;
-                };
-                self.field = .model_id;
-                try self.load(alloc, model.id);
-                return true;
-            },
-            .model_context => blk: {
-                self.field = .model_name;
-                break :blk self.lastModel().name orelse "";
-            },
-            .model_efforts => blk: {
-                self.field = .model_context;
-                const tokens = self.lastModel().context orelse break :blk "";
-                break :blk std.mem.print(&buf, "{d}", .{tokens}) catch "";
-            },
-        };
-        try self.load(alloc, previous);
+            .display_name, .base_url, .api_key => self.returnToOverview(self.field),
+            .model_id => if (self.model_index >= self.models.items.len) {
+                self.field = .overview;
+                self.selected = connection_fields.len + self.models.items.len;
+            } else self.returnToModel(.model_id),
+            .model_name, .model_context, .model_efforts => self.returnToModel(self.field),
+        }
+        self.clearInput();
         return true;
     }
 
-    /// Commits the focused field and moves to the next one.
+    fn connectionIndex(self: *const State) ?usize {
+        const name = self.editing orelse return null;
+        for (self.connections.items, 0..) |entry, index| if (std.mem.eql(u8, entry, name)) return index;
+        return null;
+    }
+
+    fn returnToOverview(self: *State, from: Field) void {
+        self.field = .overview;
+        self.selected = for (connection_fields, 0..) |field, index| {
+            if (field == from) break index;
+        } else 0;
+    }
+
+    fn returnToModel(self: *State, from: Field) void {
+        self.field = .model;
+        self.selected = for (model_fields, 0..) |field, index| {
+            if (field == from) break index;
+        } else 0;
+    }
+
+    /// Opens a field for typing with its current value.
+    fn focus(self: *State, alloc: Allocator, field: Field) Allocator.Error!void {
+        self.field = field;
+        self.problem = null;
+        self.saved = false;
+        var buf: [16]u8 = undefined;
+        const model: ?*Model = if (self.model_index < self.models.items.len) &self.models.items[self.model_index] else null;
+        const value: []const u8 = switch (field) {
+            .display_name => self.display_name.items,
+            .name => self.name.items,
+            .base_url => self.base_url.items,
+            .api_key => self.api_key.items,
+            .model_id => if (model) |m| m.id else "",
+            .model_name => if (model) |m| m.name orelse "" else "",
+            .model_context => if (model) |m| (if (m.context) |tokens| std.mem.print(&buf, "{d}", .{tokens}) catch "" else "") else "",
+            .model_efforts => if (model) |m| m.efforts orelse "" else "",
+            else => "",
+        };
+        try self.load(alloc, value);
+    }
+
+    /// After a field is committed: a saved connection saves at once, a new
+    /// one waits for "Create connection".
+    fn committed(self: *const State) Advance {
+        return if (self.editing != null) .save else .next;
+    }
+
+    /// Enter: opens the highlighted row, or commits the field being typed.
     pub fn submit(self: *State, alloc: Allocator) Allocator.Error!Advance {
         const text = std.mem.trim(u8, self.input.items, " \t");
+        self.saved = false;
         switch (self.field) {
             .pick => {
                 if (self.selected >= self.connections.items.len) {
-                    self.field = .name;
-                    self.selected = 0;
-                    try self.load(alloc, "");
+                    self.clearModels(alloc);
+                    self.display_name.clearRetainingCapacity();
+                    self.base_url.clearRetainingCapacity();
+                    self.api_key.clearRetainingCapacity();
+                    if (self.key_env) |env| alloc.free(env);
+                    self.key_env = null;
+                    if (self.editing) |old| alloc.free(old);
+                    self.editing = null;
+                    try self.focus(alloc, .name);
+                    self.input.clearRetainingCapacity();
+                    self.cursor = 0;
                     return .next;
                 }
                 if (self.editing) |old| alloc.free(old);
                 self.editing = try alloc.dupe(u8, self.connections.items[self.selected]);
-                self.field = .action;
-                self.selected = 0;
-                return .next;
+                return .edit;
             },
-            .action => {
-                const choice = self.selected;
-                self.selected = 0;
-                return switch (choice) {
-                    0 => .edit,
-                    1 => .delete,
-                    else => blk: {
-                        self.field = .pick;
-                        break :blk .next;
-                    },
-                };
+            .overview => switch (self.overviewRow(self.selected)) {
+                .field => |field| {
+                    try self.focus(alloc, field);
+                    return .next;
+                },
+                .model => |index| {
+                    self.model_index = index;
+                    self.field = .model;
+                    self.selected = 0;
+                    return .next;
+                },
+                .add_model => {
+                    if (self.models.items.len >= max_models) return self.refuse("that's as many models as one connection holds");
+                    self.model_index = self.models.items.len;
+                    try self.focus(alloc, .model_id);
+                    return .next;
+                },
+                .create => {
+                    if (self.base_url.items.len == 0) return self.refuse("set the base URL first");
+                    if (self.models.items.len == 0) return self.refuse("add at least one model first");
+                    return .create;
+                },
+                .delete => return .delete,
+                .back => return if (try self.back(alloc)) .next else .close,
+            },
+            .model => switch (modelRow(self.selected)) {
+                .field => |field| {
+                    try self.focus(alloc, field);
+                    return .next;
+                },
+                .delete => {
+                    if (self.models.items.len <= 1 and self.editing != null) return self.refuse("a connection needs at least one model");
+                    freeModel(alloc, self.models.orderedRemove(self.model_index));
+                    self.field = .overview;
+                    self.selected = connection_fields.len + @min(self.model_index, self.models.items.len);
+                    return self.committed();
+                },
+                .back => {
+                    _ = try self.back(alloc);
+                    return .next;
+                },
+            },
+            .display_name => {
+                if (text.len > max_display_name_bytes) return self.refuse("a display name is at most 80 bytes");
+                try replace(alloc, &self.display_name, text);
+                self.returnToOverview(.display_name);
             },
             .name => {
                 configured_provider.validate_id(text) catch |err| return self.refuse(switch (err) {
-                    error.ReservedProviderId => "that name is reserved",
-                    else => "a name starts with a letter and uses letters, digits, - and _",
+                    error.ReservedProviderId => "that ID is reserved",
+                    else => "an ID starts with a letter and uses letters, digits, - and _",
                 });
-                const renamed_onto_other = for (self.connections.items) |existing| {
+                const taken = for (self.connections.items) |existing| {
                     if (std.mem.eql(u8, existing, text) and !(self.editing != null and std.mem.eql(u8, self.editing.?, text))) break true;
                 } else false;
-                if (renamed_onto_other) return self.refuse("another connection has that name");
+                if (taken) return self.refuse("another connection has that ID");
                 try replace(alloc, &self.name, text);
-                self.field = .base_url;
+                self.returnToOverview(.name);
+                // A new connection goes on to its endpoint.
+                if (self.editing == null and self.base_url.items.len == 0) self.selected = 2;
             },
             .base_url => {
                 const normalized = configured_provider.validate_url(text) catch |err| return self.refuse(switch (err) {
@@ -317,7 +502,7 @@ pub const State = struct {
                     else => "enter an http or https URL with no query",
                 });
                 try replace(alloc, &self.base_url, normalized);
-                self.field = .api_key;
+                self.returnToOverview(.base_url);
             },
             .api_key => {
                 for (text) |byte| if (byte <= 0x20 or byte >= 0x7f) return self.refuse("the key has a character a header can't carry");
@@ -326,50 +511,44 @@ pub const State = struct {
                     alloc.free(env);
                     self.key_env = null;
                 };
-                self.field = .model_id;
+                self.returnToOverview(.api_key);
             },
             .model_id => {
-                const walking = self.pending.items.len > 0;
-                if (text.len == 0) {
-                    if (walking) {
-                        // An emptied ID deletes the model being walked.
-                        freeModel(alloc, self.pending.orderedRemove(0));
-                        try self.load(alloc, if (self.pending.items.len > 0) self.pending.items[0].id else "");
-                        return .next;
-                    }
-                    if (self.models.items.len == 0) return self.refuse("add at least one model");
-                    self.clearInput();
-                    return .finished;
-                }
+                if (text.len == 0) return self.refuse("enter the id the server expects");
                 configured_provider.validate_model_id(text) catch return self.refuse("a model id has no control characters");
-                for (self.models.items) |model| {
-                    if (std.mem.eql(u8, model.id, text)) return self.refuse("that model is already added");
+                for (self.models.items, 0..) |model, index| {
+                    if (index != self.model_index and std.mem.eql(u8, model.id, text)) return self.refuse("that model is already added");
                 }
-                if (self.models.items.len >= max_models) return self.refuse("that's as many models as one connection holds");
                 const id = try alloc.dupe(u8, text);
-                errdefer alloc.free(id);
-                var model: Model = if (walking) self.pending.orderedRemove(0) else .{ .id = undefined };
-                if (walking) alloc.free(model.id);
-                model.id = id;
-                self.models.append(alloc, model) catch |err| {
-                    if (walking) freeModelDetails(alloc, model);
-                    return err;
-                };
-                self.field = .model_name;
+                if (self.model_index < self.models.items.len) {
+                    const model = &self.models.items[self.model_index];
+                    alloc.free(model.id);
+                    model.id = id;
+                    self.returnToModel(.model_id);
+                } else {
+                    self.models.append(alloc, .{ .id = id }) catch |err| {
+                        alloc.free(id);
+                        return err;
+                    };
+                    self.model_index = self.models.items.len - 1;
+                    self.field = .model;
+                    self.selected = 1;
+                }
             },
             .model_name => {
-                const model = self.lastModel();
+                if (text.len > max_display_name_bytes) return self.refuse("a display name is at most 80 bytes");
+                const model = &self.models.items[self.model_index];
                 const name: ?[]u8 = if (text.len > 0) try alloc.dupe(u8, text) else null;
                 if (model.name) |old| alloc.free(old);
                 model.name = name;
-                self.field = .model_context;
+                self.returnToModel(.model_name);
             },
             .model_context => {
+                const model = &self.models.items[self.model_index];
                 if (text.len > 0) {
-                    const tokens = parseTokens(text) orelse return self.refuse("enter a number of tokens, like 128000 or 128k");
-                    self.lastModel().context = tokens;
-                } else self.lastModel().context = null;
-                self.field = .model_efforts;
+                    model.context = parseTokens(text) orelse return self.refuse("enter a number of tokens, like 128000 or 128k");
+                } else model.context = null;
+                self.returnToModel(.model_context);
             },
             .model_efforts => {
                 var names = std.mem.tokenizeAny(u8, text, ", ");
@@ -378,30 +557,15 @@ pub const State = struct {
                     configured_provider.validate_effort_name(level) catch return self.refuse("levels use letters, digits, - _ and ., like low, medium, high");
                 }
                 if (count > configured_provider.max_effort_levels) return self.refuse("that's more levels than a model can offer");
-                const model = self.lastModel();
+                const model = &self.models.items[self.model_index];
                 const efforts: ?[]u8 = if (count > 0) try alloc.dupe(u8, text) else null;
                 if (model.efforts) |old| alloc.free(old);
                 model.efforts = efforts;
-                self.field = .model_id;
+                self.returnToModel(.model_efforts);
             },
         }
-        // Moving forward shows what was already entered in the next field.
-        var buf: [16]u8 = undefined;
-        const kept: []const u8 = switch (self.field) {
-            .base_url => self.base_url.items,
-            .api_key => self.api_key.items,
-            .model_id => if (self.pending.items.len > 0) self.pending.items[0].id else "",
-            .model_name => self.lastModel().name orelse "",
-            .model_context => if (self.lastModel().context) |tokens| std.mem.print(&buf, "{d}", .{tokens}) catch "" else "",
-            .model_efforts => self.lastModel().efforts orelse "",
-            else => "",
-        };
-        try self.load(alloc, kept);
-        return .next;
-    }
-
-    pub fn lastModel(self: *State) *Model {
-        return &self.models.items[self.models.items.len - 1];
+        self.clearInput();
+        return self.committed();
     }
 
     /// The connection as a `providers.<name>` settings value, allocated in
@@ -410,6 +574,10 @@ pub const State = struct {
     pub fn toJson(self: *const State, arena: Allocator, base: ?std.json.Value) Allocator.Error!std.json.Value {
         var root: std.json.ObjectMap = if (base) |value| (if (value == .object) try value.object.clone(arena) else .empty) else .empty;
         if (!root.contains("protocol")) try root.put(arena, "protocol", .{ .string = "openai-chat-completions" });
+        if (self.display_name.items.len > 0)
+            try root.put(arena, "display_name", .{ .string = try arena.dupe(u8, self.display_name.items) })
+        else
+            _ = root.orderedRemove("display_name");
         try root.put(arena, "base_url", .{ .string = try arena.dupe(u8, self.base_url.items) });
         var auth: std.json.ObjectMap = .empty;
         if (self.api_key.items.len > 0) {
@@ -462,11 +630,12 @@ pub const State = struct {
     /// The field's hint, shown as a placeholder while it is empty.
     pub fn hint(self: *const State) []const u8 {
         return switch (self.field) {
-            .pick, .action => "",
+            .pick, .overview, .model => "",
+            .display_name => "optional, e.g. OpenCode Go",
             .name => "letters, digits, - and _, e.g. openrouter",
             .base_url => "e.g. https://openrouter.ai/api/v1",
             .api_key => if (self.key_env != null) "empty keeps the environment variable" else "leave empty for none",
-            .model_id => if (self.pending.items.len > 0) "empty deletes this model" else "the id the server expects; empty to save",
+            .model_id => "the id the server expects",
             .model_name => "optional",
             .model_context => "optional, e.g. 128k",
             .model_efforts => "optional, e.g. low, medium, high",
@@ -553,4 +722,61 @@ fn typeAndSubmit(state: *State, alloc: Allocator, text: []const u8) !Advance {
     state.clearLine();
     for (text) |byte| try state.appendByte(alloc, byte);
     return state.submit(alloc);
+}
+
+test "a new connection takes its ID, then each field from the list" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.close(alloc);
+    try state.open(alloc, &.{});
+    try std.testing.expectEqual(Field.name, state.field);
+    try std.testing.expectEqual(Advance.next, try typeAndSubmit(&state, alloc, "oc-go"));
+    try std.testing.expectEqual(Field.overview, state.field);
+    // Create is refused until the connection has an endpoint and a model.
+    state.selected = state.listLen() - 2;
+    try std.testing.expectEqual(OverviewRow.create, state.overviewRow(state.selected));
+    try std.testing.expectEqual(Advance.invalid, try state.submit(alloc));
+    state.selected = 2;
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Field.base_url, state.field);
+    try std.testing.expectEqual(Advance.next, try typeAndSubmit(&state, alloc, "https://example.com/v1"));
+    try std.testing.expectEqual(Field.overview, state.field);
+    state.selected = 4;
+    try std.testing.expectEqual(OverviewRow.add_model, state.overviewRow(state.selected));
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Advance.next, try typeAndSubmit(&state, alloc, "m1"));
+    try std.testing.expectEqual(Field.model, state.field);
+    try std.testing.expect(try state.back(alloc));
+    state.selected = state.listLen() - 2;
+    try std.testing.expectEqual(Advance.create, try state.submit(alloc));
+}
+
+test "editing a saved connection changes one field and saves" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.close(alloc);
+    try state.open(alloc, &.{"oc"});
+    try std.testing.expectEqual(Advance.edit, try state.submit(alloc));
+    const definition: configured_provider.Definition = .{
+        .id = "oc",
+        .protocol = .@"openai-chat-completions",
+        .base_url = "https://example.com/v1",
+        .auth = .none,
+        .model_metadata = &.{.{ .id = "m1" }},
+    };
+    try state.beginEdit(alloc, &definition);
+    try std.testing.expectEqual(Field.overview, state.field);
+    state.selected = 0;
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Field.display_name, state.field);
+    try std.testing.expectEqual(Advance.save, try typeAndSubmit(&state, alloc, "OpenCode Go"));
+    try std.testing.expectEqual(Field.overview, state.field);
+    try std.testing.expectEqualStrings("OpenCode Go", state.display_name.items);
+    // The only model can't be deleted from a saved connection.
+    state.selected = 4;
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Field.model, state.field);
+    state.selected = 4;
+    try std.testing.expectEqual(ModelRow.delete, State.modelRow(state.selected));
+    try std.testing.expectEqual(Advance.invalid, try state.submit(alloc));
 }
