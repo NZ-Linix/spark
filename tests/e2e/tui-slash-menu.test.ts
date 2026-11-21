@@ -88,7 +88,7 @@ function captureViewportEscapes(session: TmuxSession): string {
 
 function runningBinaryTitle(workspace: string): string {
   const version = execFileSync(SPARK_BIN, ["--version"], { encoding: "utf8" }).trim();
-  expect(version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
+  expect(version).toMatch(/^\d+\.\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?$/);
   return `spark v${version} | ${basename(workspace)}`;
 }
 

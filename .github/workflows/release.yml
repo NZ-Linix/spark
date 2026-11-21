@@ -40,7 +40,7 @@ jobs:
           VALIDATE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.validate_only }}
         run: |
           VERSION=$(grep 'pub const version' src/main.zig | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?$ ]]; then
             echo "needed=false" >> "$GITHUB_OUTPUT"
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "::notice::$VERSION is a dev version; nothing to release"
@@ -331,7 +331,7 @@ jobs:
         run: |
           if [ -n "$PRERELEASE_TAG" ]; then
             # A suffix is required, so a pre-release can never take a stable tag.
-            if ! [[ "$PRERELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9A-Za-z.]+$ ]]; then
+            if ! [[ "$PRERELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?-[0-9A-Za-z.]+$ ]]; then
               echo "::error::$PRERELEASE_TAG is not a pre-release tag such as v26.11.20-rc1"
               exit 1
             fi

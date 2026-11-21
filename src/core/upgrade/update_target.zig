@@ -156,22 +156,23 @@ pub fn normalizeVersion(raw: []const u8) []const u8 {
 pub fn compareVersions(a: []const u8, b: []const u8) std.math.Order {
     const av = parseVersionParts(a);
     const bv = parseVersionParts(b);
-    if (av[0] != bv[0]) return std.math.order(av[0], bv[0]);
-    if (av[1] != bv[1]) return std.math.order(av[1], bv[1]);
-    return std.math.order(av[2], bv[2]);
+    for (av, bv) |x, y| if (x != y) return std.math.order(x, y);
+    return .eq;
 }
 
+/// A stable version: major, minor, and patch, plus an optional fourth part
+/// for a second release on the same day, such as `26.11.21.1`.
 pub fn isValidVersion(raw: []const u8) bool {
     if (raw.len == 0 or raw.len > max_version_bytes) return false;
     var count: usize = 0;
     var parts = std.mem.splitScalar(u8, raw, '.');
     while (parts.next()) |part| {
-        if (count == 3 or part.len == 0) return false;
+        if (count == 4 or part.len == 0) return false;
         for (part) |byte| if (!std.ascii.isDigit(byte)) return false;
         _ = std.fmt.parseUnsigned(u32, part, 10) catch return false;
         count += 1;
     }
-    return count == 3;
+    return count >= 3;
 }
 
 pub fn isValidRevision(raw: []const u8) bool {
@@ -180,10 +181,11 @@ pub fn isValidRevision(raw: []const u8) bool {
     return true;
 }
 
-/// Major, minor, and patch. A suffix such as `-d` or `+build` is ignored, so
-/// a local `26.11.19-d` build counts as release 26.11.19.
-fn parseVersionParts(raw: []const u8) [3]u32 {
-    var values = [_]u32{ 0, 0, 0 };
+/// Major, minor, patch, and the optional fourth part, which is 0 when absent.
+/// A suffix such as `-d` or `+build` is ignored, so a local `26.11.19-d`
+/// build counts as release 26.11.19.
+fn parseVersionParts(raw: []const u8) [4]u32 {
+    var values = [_]u32{ 0, 0, 0, 0 };
     const normalized = normalizeVersion(raw);
     const core = normalized[0 .. std.mem.findAny(u8, normalized, "-+") orelse normalized.len];
     var parts = std.mem.splitScalar(u8, core, '.');
@@ -203,6 +205,18 @@ pub fn revisionsEqual(full: []const u8, current: []const u8) bool {
 
 fn shortRevision(revision: []const u8) []const u8 {
     return revision[0..@min(revision.len, 12)];
+}
+
+test "a fourth version part orders a second release after the first" {
+    try std.testing.expect(isValidVersion("26.11.21"));
+    try std.testing.expect(isValidVersion("26.11.21.1"));
+    try std.testing.expect(!isValidVersion("26.11"));
+    try std.testing.expect(!isValidVersion("26.11.21.1.2"));
+    try std.testing.expect(!isValidVersion("26.11.21."));
+    try std.testing.expectEqual(std.math.Order.gt, compareVersions("26.11.21.1", "26.11.21"));
+    try std.testing.expectEqual(std.math.Order.gt, compareVersions("v26.11.21.2", "26.11.21.1-d"));
+    try std.testing.expectEqual(std.math.Order.lt, compareVersions("26.11.21.1", "26.11.22"));
+    try std.testing.expectEqual(std.math.Order.eq, compareVersions("26.11.21.0", "26.11.21"));
 }
 
 test "channel parsing accepts only stable and dev" {
