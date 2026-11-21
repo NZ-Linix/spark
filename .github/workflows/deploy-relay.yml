@@ -1,0 +1,65 @@
+name: Deploy relay
+
+# Builds the relay and spark for the relay server (Linux arm64) on every push to
+# main and installs them there. The server runs mobile/bridge/deploy/update.sh
+# for the deploy key, which swaps the binaries and rolls back if the relay stops
+# answering. Secrets: RELAY_SSH_KEY (private deploy key), RELAY_HOST
+# (user@host), RELAY_KNOWN_HOSTS (the host's known_hosts line).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "build.zig"
+      - "build.zig.zon"
+      - "mobile/bridge/**"
+      - ".github/workflows/deploy-relay.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-relay
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.1"
+          cache-key: deploy-relay-aarch64
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Build spark for Linux arm64
+        run: zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseSafe --prefix out/zig
+
+      - name: Build the relay for Linux arm64
+        working-directory: mobile/bridge
+        run: |
+          bun install --frozen-lockfile
+          bun build relay.ts --compile --minify --target=bun-linux-arm64 --outfile ../../out/relay
+
+      - name: Install on the relay server
+        env:
+          KEY: ${{ secrets.RELAY_SSH_KEY }}
+          HOST: ${{ secrets.RELAY_HOST }}
+          KNOWN_HOSTS: ${{ secrets.RELAY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/relay_key
+          chmod 600 ~/.ssh/relay_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cp out/zig/bin/spark out/spark
+          tar -c -C out relay spark | ssh -i ~/.ssh/relay_key -o IdentitiesOnly=yes -o BatchMode=yes "$HOST"
