@@ -66,14 +66,19 @@ final class Link {
 
   // MARK: Setup
 
-  /** Joins a relay: this iPhone gets its own token there, and with it the relay's cloud, if it has one. */
-  func join(_ address: String) async throws {
+  /**
+   * Joins a relay: this iPhone gets its own token there, and with it the relay's cloud, if it has one.
+   * A relay that only takes paired phones asks for the code from `spark pair`.
+   */
+  func join(_ address: String, code: String? = nil) async throws {
     let url = try Self.normalize(address)
     struct Joined: Decodable { var token: String; var hosts: [HostEntry] }
     var req = URLRequest(url: url.appending(path: "api/devices"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    req.httpBody = try JSONEncoder().encode(["name": UIDevice.current.name])
+    var payload = ["name": UIDevice.current.name]
+    if let code { payload["code"] = code }
+    req.httpBody = try JSONEncoder().encode(payload)
     req.timeoutInterval = 15
     let joined: Joined = try await Self.fetch(req)
     disconnect()
@@ -104,11 +109,11 @@ final class Link {
   /** Pairs a Mac by the code `spark pair` shows. Joins the built-in relay first if this iPhone hasn't. */
   func pair(_ code: String) async throws -> HostEntry {
     // the Keychain outlives the app, so a token can be left from an install whose relay forgot it
-    if token == nil || relay == nil { try await join(Self.defaultRelay.absoluteString) }
+    if token == nil || relay == nil { try await join(Self.defaultRelay.absoluteString, code: code) }
     do {
       return try await claim(code)
     } catch let e as LinkError where e.status == 401 {
-      try await join((relay ?? Self.defaultRelay).absoluteString)
+      try await join((relay ?? Self.defaultRelay).absoluteString, code: code)
       return try await claim(code)
     }
   }

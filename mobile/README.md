@@ -48,8 +48,11 @@ Before it saves, the relay has spark check the new settings and shows spark's re
 
 ```bash
 cd bridge && bun install
-SPARK_DEFAULT_RELAY=https://relay.example.com bun build.ts ../../zig-out/bin/spark-bridge
+SPARK_DEFAULT_RELAY=https://relay.example.com SPARK_RELAY_ENROLL="$(cat ~/.spark/relay-enroll)" \
+  bun build.ts ../../zig-out/bin/spark-bridge
 ```
+
+`SPARK_RELAY_ENROLL` is the secret the relay asks of new Macs. The build carries it, so keep that `spark-bridge` to yourself.
 
 ## Run the relay
 
@@ -61,7 +64,7 @@ docker run -d -p 8787:8787 -v spark-data:/data \
   -v ~/.spark/settings.json:/config/settings.json:ro spark-relay
 ```
 
-Leave out `SPARK_CLOUD_ROOT` for a relay without cloud sessions. For development, run `cd bridge && PORT=8799 bun relay.ts` on the Mac.
+Set `SPARK_RELAY_ENROLL` to a long random secret, the same one `spark-bridge` is built with, and `HOST=127.0.0.1` when TLS runs in front of the relay on the same server. Leave out `SPARK_CLOUD_ROOT` for a relay without cloud sessions. For development, run `cd bridge && PORT=8799 bun relay.ts` on the Mac.
 
 ## Build the app
 
@@ -84,6 +87,6 @@ xcodebuild test -project Spark.xcodeproj -scheme Spark -destination 'platform=iO
 
 ## Security
 
-The relay authenticates every phone and Mac with a random token and keeps only its hash. A paired phone can run anything spark can run on that Mac, so host the relay behind TLS and unpair phones you no longer use. Messages are not end-to-end encrypted: whoever runs the relay can read them.
+The relay authenticates every phone and Mac with a random token and keeps only its hash. Only a Mac whose `spark-bridge` carries the relay's enrollment secret can register, and a phone can register only with a pairing code from one of those Macs, so phones need no setup and strangers can't use the relay or its cloud. `SPARK_RELAY_OPEN=1` drops the pairing code requirement and lets any phone start on the cloud. A paired phone can run anything spark can run on that Mac, so host the relay behind TLS and unpair phones you no longer use. Messages are not end-to-end encrypted: whoever runs the relay can read them.
 
 That includes API keys. Copying or adding a cloud provider sends its key through the relay, and the server stores it in that phone's cloud profile (`settings.json`, mode 0600). Only use a relay you trust with those keys.

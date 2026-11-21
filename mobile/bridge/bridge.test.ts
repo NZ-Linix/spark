@@ -182,3 +182,42 @@ describe.skipIf(!existsSync(SPARK))("provider put (cloud)", () => {
     expect(cloud.env()).toEqual({});
   });
 });
+
+describe("relay registration", () => {
+  test("takes Macs with the enrollment secret and phones with a pairing code", async () => {
+    const port = 20000 + Math.floor(Math.random() * 20000);
+    const relay = Bun.spawn(["bun", resolve(import.meta.dir, "relay.ts")], {
+      env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", SPARK_RELAY_DATA: dir, SPARK_RELAY_ENROLL: "enroll-secret", SPARK_CLOUD_ROOT: join(dir, "cloud") },
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    try {
+      const base = `http://127.0.0.1:${port}`;
+      const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
+        fetch(base + path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+      for (let i = 0; i < 50; i++) {
+        if (await fetch(base + "/api/info").then((r) => r.ok, () => false)) break;
+        await Bun.sleep(100);
+      }
+      // a phone can't start on the cloud by itself
+      expect(await (await fetch(base + "/api/info")).json()).toMatchObject({ cloud: false });
+
+      expect((await post("/api/hosts", { name: "Mac" })).status).toBe(403);
+      expect((await post("/api/hosts", { name: "Mac" }, { "x-spark-enroll": "wrong" })).status).toBe(403);
+      const host = await (await post("/api/hosts", { name: "Mac" }, { "x-spark-enroll": "enroll-secret" })).json();
+      expect(host.token).toBeString();
+
+      expect((await post("/api/devices", { name: "iPhone" })).status).toBe(403);
+      expect((await post("/api/devices", { name: "iPhone", code: "000000" })).status).toBe(403);
+      const { code } = await (await post("/api/hosts/code", {}, { authorization: `Bearer ${host.token}` })).json();
+      const device = await (await post("/api/devices", { name: "iPhone", code })).json();
+      expect(device.token).toBeString();
+      const paired = await post("/api/pair", { code }, { authorization: `Bearer ${device.token}` });
+      expect(paired.status).toBe(200);
+      // the code is used up
+      expect((await post("/api/devices", { name: "Other", code })).status).toBe(403);
+    } finally {
+      relay.kill();
+    }
+  });
+});

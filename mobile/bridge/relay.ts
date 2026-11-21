@@ -25,6 +25,15 @@ const CLOUD = process.env.SPARK_CLOUD_ROOT;
 const CLOUD_SETTINGS = process.env.SPARK_CLOUD_SETTINGS;
 const SPARK = process.env.SPARK_BIN ?? "spark";
 const CODE_MS = 10 * 60 * 1000;
+/** the address to listen on; 127.0.0.1 behind a TLS proxy keeps the port itself private */
+const HOSTNAME = process.env.HOST ?? "0.0.0.0";
+/**
+ * Macs need this secret to register, so only spark-bridge builds that carry it can use the relay.
+ * Without it, only the first Mac can register. Phones register only with a pairing code from a Mac,
+ * unless SPARK_RELAY_OPEN=1 lets any phone in, with its own cloud.
+ */
+const ENROLL = process.env.SPARK_RELAY_ENROLL ?? "";
+const OPEN = process.env.SPARK_RELAY_OPEN === "1";
 
 type DeviceRecord = { name: string; hash: string; created: string };
 type HostRecord = { name: string; hash: string; devices: string[]; created: string };
@@ -126,16 +135,31 @@ async function body(req: globalThis.Request): Promise<any> {
 
 const name = (v: unknown, fallback: string) => (typeof v === "string" && v.trim() ? v.trim().slice(0, 60) : fallback);
 
+/** an unexpired pairing code; joining checks it, pairing uses it up */
+function liveCode(v: unknown): boolean {
+  const entry = codes.get(String(v ?? "").replace(/\D/g, ""));
+  return Boolean(entry && entry.expires >= Date.now());
+}
+
+function enrolled(req: globalThis.Request): boolean {
+  if (!ENROLL) return Object.keys(state.hosts).length === 0;
+  const given = createHash("sha256").update(req.headers.get("x-spark-enroll") ?? "").digest();
+  return timingSafeEqual(given, createHash("sha256").update(ENROLL).digest());
+}
+
 Bun.serve<{ kind: "device" | "host"; id: string }, {}>({
   port: PORT,
+  hostname: HOSTNAME,
   async fetch(req, server) {
     const url = new URL(req.url);
     const path = url.pathname;
 
-    if (path === "/api/info") return json({ name: NAME, cloud: Boolean(CLOUD) });
+    // a phone without a Mac can only start on the cloud when anyone may join
+    if (path === "/api/info") return json({ name: NAME, cloud: Boolean(CLOUD) && OPEN });
 
     if (path === "/api/devices" && req.method === "POST") {
       const b = await body(req);
+      if (!OPEN && !liveCode(b.code)) return json({ error: "That code didn't work. Check it on your Mac, or make a new one." }, 403);
       const key = id();
       const s = secret();
       state.devices[key] = { name: name(b.name, "iPhone"), hash: hash(s), created: new Date().toISOString() };
@@ -144,6 +168,7 @@ Bun.serve<{ kind: "device" | "host"; id: string }, {}>({
     }
 
     if (path === "/api/hosts" && req.method === "POST") {
+      if (!enrolled(req)) return json({ error: "This relay doesn't accept new Macs. Build spark-bridge with its SPARK_RELAY_ENROLL." }, 403);
       const b = await body(req);
       const key = id();
       const s = secret();

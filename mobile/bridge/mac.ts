@@ -68,10 +68,13 @@ function store(c: Config) {
 const http = (relay: string) => relay.replace(/\/+$/, "");
 const ws = (relay: string) => http(relay).replace(/^http/, "ws");
 
+/** lets this Mac register on a relay that only takes Macs it knows; build.ts sets it */
+const ENROLL = process.env.SPARK_RELAY_ENROLL ?? "";
+
 async function post(url: string, body: unknown, token?: string) {
   const r = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}), ...(ENROLL ? { "x-spark-enroll": ENROLL } : {}) },
     body: JSON.stringify(body),
   });
   const j: any = await r.json().catch(() => ({}));
