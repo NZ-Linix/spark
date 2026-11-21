@@ -66,6 +66,8 @@ pub const TerminalState = struct {
     stdin_fd: std.posix.fd_t = std.posix.STDIN_FILENO,
     original_termios: std.posix.termios = undefined,
     raw_enabled: bool = false,
+    /// Clear the visible screen when spark leaves it, as `/quit` asks.
+    clear_screen_on_exit: bool = false,
     alternate_screen_owner: AlternateScreenOwner = .none,
     alternate_frame_layout: frame_layout.CommittedLayoutSnapshot = .{},
     alternate_mouse_tracking_active: bool = false,

@@ -1022,6 +1022,8 @@ pub fn shutdownInteractiveShell(
     terminal_title.clear();
     record_tape.shutdown();
     finishLeavingInteractiveMode(terminal, shell, metrics);
+    // `/quit` leaves a clean screen: what spark drew stays in scrollback.
+    if (terminal.clear_screen_on_exit) _ = writeLifecycleTerminalBytes(shell, metrics, "\x1b[H\x1b[2J") catch {};
 }
 
 /// Stage timing for interactive shutdown. Each mark logs the delta since the

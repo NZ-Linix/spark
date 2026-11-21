@@ -605,6 +605,7 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandQuit(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasField(App, "terminal")) app.terminal.clear_screen_on_exit = true;
             requestResumeExit(app);
         }
 
