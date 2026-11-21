@@ -221,3 +221,28 @@ describe("relay registration", () => {
     }
   });
 });
+
+test("ten wrong codes cancel every open code", async () => {
+  const port = 20000 + Math.floor(Math.random() * 20000);
+  const relay = Bun.spawn(["bun", resolve(import.meta.dir, "relay.ts")], {
+    env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", SPARK_RELAY_DATA: dir, SPARK_RELAY_ENROLL: "e" },
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  try {
+    const base = `http://127.0.0.1:${port}`;
+    const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
+      fetch(base + path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+    for (let i = 0; i < 50; i++) {
+      if (await fetch(base + "/api/info").then((r) => r.ok, () => false)) break;
+      await Bun.sleep(100);
+    }
+    const host = await (await post("/api/hosts", {}, { "x-spark-enroll": "e" })).json();
+    const { code } = await (await post("/api/hosts/code", {}, { authorization: `Bearer ${host.token}` })).json();
+    const wrong = code === "000000" ? "000001" : "000000";
+    for (let i = 0; i < 10; i++) expect((await post("/api/devices", { code: wrong })).status).toBe(403);
+    expect((await post("/api/devices", { code })).status).toBe(403);
+  } finally {
+    relay.kill();
+  }
+});

@@ -135,10 +135,19 @@ async function body(req: globalThis.Request): Promise<any> {
 
 const name = (v: unknown, fallback: string) => (typeof v === "string" && v.trim() ? v.trim().slice(0, 60) : fallback);
 
+/** wrong codes allowed before every open code is cancelled, so a code can't be guessed */
+const MAX_WRONG_CODES = 10;
+let wrongCodes = 0;
+
 /** an unexpired pairing code; joining checks it, pairing uses it up */
 function liveCode(v: unknown): boolean {
   const entry = codes.get(String(v ?? "").replace(/\D/g, ""));
-  return Boolean(entry && entry.expires >= Date.now());
+  if (entry && entry.expires >= Date.now()) return true;
+  if (++wrongCodes >= MAX_WRONG_CODES) {
+    codes.clear();
+    wrongCodes = 0;
+  }
+  return false;
 }
 
 function enrolled(req: globalThis.Request): boolean {
@@ -185,6 +194,7 @@ Bun.serve<{ kind: "device" | "host"; id: string }, {}>({
       do code = String(randomInt(0, 1_000_000)).padStart(6, "0");
       while (codes.has(code));
       codes.set(code, { host: auth[0], expires: Date.now() + CODE_MS });
+      wrongCodes = 0;
       return json({ code, expires: Date.now() + CODE_MS });
     }
 
@@ -193,8 +203,8 @@ Bun.serve<{ kind: "device" | "host"; id: string }, {}>({
       if (!auth) return json({ error: "This iPhone isn't known to the relay." }, 401);
       const b = await body(req);
       const code = String(b.code ?? "").replace(/\D/g, "");
-      const entry = codes.get(code);
-      if (!entry || entry.expires < Date.now()) return json({ error: "That code didn't work. Check it on your Mac, or make a new one." }, 404);
+      const entry = liveCode(code) ? codes.get(code) : undefined;
+      if (!entry) return json({ error: "That code didn't work. Check it on your Mac, or make a new one." }, 404);
       codes.delete(code);
       const h = state.hosts[entry.host];
       if (!h) return json({ error: "That Mac is gone." }, 404);
