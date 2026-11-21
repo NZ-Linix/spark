@@ -299,7 +299,7 @@ describe("spark mcp", () => {
     expect(profile.code).toBe(1);
     // The older --profile still names the profile file, with a warning.
     expect(profile.stderr).toBe(
-      "spark mcp remove: --profile is deprecated and stops working in spark 0.0.18; use --global\nNo MCP server named twin in ~/.spark/mcp.json.\n",
+      "spark mcp remove: --profile is deprecated and stops working in spark 26.12.20; use --global\nNo MCP server named twin in ~/.spark/mcp.json.\n",
     );
   });
 

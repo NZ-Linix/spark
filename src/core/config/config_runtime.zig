@@ -1934,7 +1934,6 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.notification_attention_required) |value| target.notification_attention_required = value;
     if (incoming.notification_max) |value| target.notification_max = value;
     if (incoming.experimental_workspace_capture) |value| target.experimental_workspace_capture = value;
-
 }
 
 fn freeStringSlice(alloc: Allocator, values: [][]u8) void {

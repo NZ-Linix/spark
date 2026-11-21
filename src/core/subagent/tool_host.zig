@@ -3530,7 +3530,6 @@ fn waitForBlockedOnUser(worker: *worker_runtime.WorkerRuntime) !void {
     return error.Timeout;
 }
 
-
 fn askQuestionThread(worker: *worker_runtime.WorkerRuntime, returned: *std.Io.Event) void {
     defer returned.set(io_mod.getIo());
     const alloc = std.testing.allocator;

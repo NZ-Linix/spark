@@ -36,7 +36,6 @@ const ResolvedPermissionCallTarget = struct {
     path: []const u8,
 };
 
-
 pub const PermissionTargetKind = enum {
     none,
     path_existing,

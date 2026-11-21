@@ -1272,7 +1272,6 @@ fn expectActiveInputSurvivesResize(
     try input.edit_state.input.appendSlice(alloc, input_text);
     input.edit_state.cursor = input.edit_state.input.items.len;
 
-
     try h.shell.initViewport(&h.metrics, 15);
     // Tiny targets require the committed frame to own the full terminal.
     h.shell.owned_top_row = 1;

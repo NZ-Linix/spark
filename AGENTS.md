@@ -247,7 +247,7 @@ spark does not use declarations that Zig 0.17 deprecates. They still compile, so
 
 * In test blocks, use `std.testing.io` for the `Io` parameter. `io_mod.getIo()` automatically returns `std.testing.io` in test builds.
 
-* A new `std.testing.fuzz` test needs an entry in `tests/fuzz/targets.json` and its saved inputs passed as its corpus, as **Fuzz a parser** in `CONTRIBUTING.md` describes. The nightly Fuzz workflow fuzzes every entry.
+* A new `std.testing.fuzz` test needs an entry in `tests/fuzz/targets.json` and its saved inputs passed as its corpus, as **Fuzz a parser** in `CONTRIBUTING.md` describes. Run the fuzz target locally to check new inputs.
 
 * Use `io_mod.dirRealpathAlloc(alloc, dir, sub_path)` to resolve paths within `std.testing.tmpDir()`.
 
@@ -316,10 +316,8 @@ Do not run the complete deterministic test suite locally as the default developm
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most spark behavior is identical on every platform:
 
 * `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery, the empty-reply nudge, and the malformed tool call feedback, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
-* `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
-* `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
-Linux jobs install Zig through `.github/actions/setup-zig`, which restores the Zig cache that runs on `main` save with `.github/actions/save-zig-cache`. Pull requests never save a Zig cache through these actions, so they cannot push `main`'s entries out of the repository's cache quota. The PGSO workflow keeps its own cache through `.github/actions/setup-pgso`.
+Linux jobs install Zig through `.github/actions/setup-zig`, which restores the Zig cache that runs on `main` save with `.github/actions/save-zig-cache`. Pull requests never save a Zig cache through these actions, so they cannot push `main`'s entries out of the repository's cache quota.
 
 macOS runs only when `scripts/detect-macos-need.sh` finds a change that can behave differently there, such as a Zig file with a macOS, BSD, or Linux code path, `build.zig`, the macOS signing script, the native SDK addon, or a platform E2E file. If the detector cannot read the change, the `macOS arm64` check fails instead of passing. When the change does not need macOS, the check passes without starting a macOS runner. To request macOS for any other change, add the `ci:macos` label or run `gh workflow run macos.yml --ref <branch>`. The label needs triage access and the dispatch needs write access, so an outside contributor asks in the PR and a maintainer starts the run. Every E2E file that branches on `process.platform` or `platform()` being `darwin` or `linux` must appear in `tests/e2e/macos-platform-tests.json`, and `tests/e2e/ci-shards.test.ts` enforces that.
 
@@ -331,13 +329,7 @@ The `TLA+ transcript window model` job takes about 4 minutes, so a pull request 
 
 The `TLA+ subagent and session-write models` job takes a few minutes, so a pull request runs it only when the same detector finds a change to `src/core/subagent/`, `src/core/session/`, `src/core/agent/worker_runtime.zig`, `src/core/agent/runtime/parallel_execution.zig`, the models in `tests/tla/subagent/` and the session-write and live sessions models in `tests/tla/session/`, their drivers in `tests/tla/drivers/subagent/`, `tests/tla/drivers/session/write.test.ts`, and `tests/tla/drivers/session/live.test.ts`, the shared code in `tests/tla/lib/` and `tests/tla/drivers/lib/`, the helpers those drivers load (`tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. It checks the models' design configs and drives a built spark along them, and leaves out the planted bugs and spark's old defects; run `tests/tla/subagent/check.sh` and `tests/tla/session/check.sh` with no arguments before you change that code.
 
-The `spark mcp call` model check, `.github/workflows/tla-mcp-call.yml`, runs `tests/tla/mcp_call/check.sh`: TLC on the bridge model, the core's tests, both drivers against the real core, and every planted bug. Every push to `main` runs it. A pull request runs it only with the `ci:tla-mcp-call` label, and `gh workflow run tla-mcp-call.yml --ref <branch>` runs it on any branch. Like `ci:macos`, the label needs triage access.
 
-The custom model connection model check, `.github/workflows/tla-configured-provider.yml`, runs `tests/tla/configured_provider/check.sh` and `bun tests/tla/drivers/configured_provider/driver.ts --self-check`: TLC on every config and planted mutation, the built spark against local fake servers along the models, and the deadline module through its lab. It runs only on request, never on a push: on a pull request with the `ci:tla-configured-provider` label, or with `gh workflow run tla-configured-provider.yml --ref <branch>`. Run it when you change `src/core/config/configured_provider.zig` or the custom connection adapters in `src/gateway/`.
-
-The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. To qualify any other change, run `gh workflow run pgso-macos-arm64.yml --ref <branch>`. The stable release always runs it.
-
-The Linux arm64 PGSO workflow, `.github/workflows/pgso-linux-arm64.yml`, builds and qualifies a Linux candidate in one job on a GitHub-hosted arm64 runner, which takes several hours. It runs on the same pull request paths, with its own workflow file in place of the macOS one, and `gh workflow run pgso-linux-arm64.yml --ref <branch>` runs it for any other change. The stable release always runs it and ships its candidate as the Linux arm64 binary. `.github/workflows/pgso-linux-x86_64.yml` does the same on a GitHub-hosted x86_64 runner, on the same pull request paths with its own workflow file, and the stable release ships its candidate as the Linux x86_64 binary.
 
 Live model evals and the live ACP suite need credentials and are not deterministic, so they run only on request. Run the live ACP suite with `gh workflow run ci.yml --ref <branch> -f acp_live=true`.
 
@@ -388,16 +380,13 @@ When a tmux or tape-based scenario exposes a bug, reproduce it as a Zig unit tes
 
 ## Benchmarks
 
-Startup latency benchmarks live in `benchmarks/` and run in CI via `.github/workflows/bench.yml`.
+Startup latency benchmarks live in `benchmarks/`.
 
 ```bash
 ./benchmarks/startup.sh            # full run (100 iterations, builds ReleaseSafe, needs hyperfine)
 ./benchmarks/startup.sh --quick    # quick run (20 iterations)
 ```
 
-The `Startup Latency` job builds a ReleaseSafe binary, measures five CLI paths with hyperfine, and enforces per-command latency budgets. The same job runs `tests/e2e/tui-performance.test.ts` as the interactive terminal performance gate. A PR that exceeds either fails the check.
-
-The long-turn memory and libfx runtime benchmarks run only on request. Start them with `gh workflow run bench.yml --ref <branch> -f long_turn_memory=true` or `-f libfx_runtime=true`.
 
 The startup benchmark uses `SPARK_BENCH=1`, an environment variable that runs through arg parsing and CLI dispatch, then exits before TTY initialization. This lives in `src/core/app/app_entry_runtime.zig`.
 
@@ -406,23 +395,6 @@ To measure the interactive launch up to the first frame, use `benchmarks/first_f
 The budget is 2ms of raw wall-clock time for every command on the Linux CI runner, which is the authoritative product budget. Local macOS runs report raw means only, because process and dynamic-loader overhead there can exceed 2ms independently of spark. The process baseline is diagnostic only and is never subtracted.
 
 When adding features, consider their impact on startup latency. The `spark help` path is the baseline cold-start benchmark.
-
-## Binary Size Observability
-
-Every pull request runs `.github/workflows/binary-size.yml`, which builds each
-release target and its base commit on native runners, reports the size change,
-and smoke-tests the pull request binary with `scripts/smoke-binary.sh`. Each
-push to `main` builds and caches that commit's binaries, so a pull request
-based on it restores its base binary instead of building it. Pull requests
-never save that cache.
-
-Each platform check is informational. An increase of at least 52,429 bytes
-(0.050000 MiB) emits a warning and retains that platform's binaries for
-investigation, but does not reject the pull request. Investigate notable
-unexplained growth before changing the threshold. The full macOS arm64, Linux
-arm64, and Linux x86_64 PGSO release qualifications remain authoritative for the
-production ceilings (6.750 MiB for macOS arm64, 7.000 MiB for Linux arm64, and
-8.750 MiB for Linux x86_64) and performance gates.
 
 ## Documentation
 
@@ -457,7 +429,7 @@ To prepare a release:
 3. Write the changelog entry in `CHANGELOG.md` at the top, under a new `## <version>` heading, wrapped in `<!-- release:start -->` and `<!-- release:end -->` markers. Remove the markers from the previous release entry so only the new release has them.
 4. Open a PR and merge to `main`
 
-When the PR merges, CI compares the version tag to what exists in git. If the tag is missing, it builds all platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached. The release body is extracted from the content between the `<!-- release:start -->` and `<!-- release:end -->` markers in `CHANGELOG.md`.
+When the PR merges, CI checks for the version tag. For a new version, the release workflow builds the five standard targets in parallel, smoke-tests each executable, and signs and notarizes both macOS binaries. It then creates a tag and publishes the archives on GitHub Releases. The release body is extracted from the content between the `<!-- release:start -->` and `<!-- release:end -->` markers in `CHANGELOG.md`.
 
 ### Writing the changelog
 

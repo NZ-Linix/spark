@@ -32,6 +32,7 @@
 //! coming.
 
 const std = @import("std");
+const atomic_value = @import("../../shared/atomic_value.zig");
 const builtin = @import("builtin");
 const recovery = @import("../../recovery/recovery.zig");
 const types = @import("../../shared/types.zig");
@@ -141,7 +142,7 @@ pub const RequestRecovery = struct {
     next_beat_ms: u64 = 0,
     /// Tests run on this virtual boot clock, so a 30-second wait takes no
     /// real time.
-    virtual_now_ms: std.atomic.Value(u64) = .init(test_epoch_ms),
+    virtual_now_ms: atomic_value.Value(u64) = .init(test_epoch_ms),
 
     pub fn init(
         deps: *const runtime_deps.AgentRuntimeDeps,

@@ -3181,8 +3181,6 @@ const FakeApprovalCancelWorker = struct {
         self.record(.request_cancel);
     }
 
-
-
     pub fn submitQuestionBatchAnswer(_: *FakeApprovalCancelWorker, _: std.mem.Allocator, _: ?[]const []const u8, _: ?worker_runtime.QuestionResumeObserver) !void {}
 };
 
@@ -3486,8 +3484,6 @@ const RoutingWorker = struct {
     pub fn interactiveAdmissionSnapshot(self: *RoutingWorker) worker_runtime.InteractiveAdmissionSnapshot {
         return self.admission_snapshot;
     }
-
-
 
     pub fn submitQuestionBatchAnswer(self: *RoutingWorker, _: std.mem.Allocator, answers: ?[]const []const u8, on_resume: ?worker_runtime.QuestionResumeObserver) !void {
         if (self.question_submission_fails) return error.OutOfMemory;

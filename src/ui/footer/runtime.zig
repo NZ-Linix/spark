@@ -4,8 +4,6 @@ const footer_paint_plan = @import("paint_plan.zig");
 const render_input = @import("render_input.zig");
 const surface_frame = @import("surface_frame.zig");
 
-
-
 pub const composeQuestionResolutions = question_ui.composeQuestionResolutions;
 pub const RenderContext = render_input.RenderContext;
 pub const FooterTranscriptState = footer_paint_plan.FooterTranscriptState;

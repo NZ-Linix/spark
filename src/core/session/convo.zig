@@ -5,13 +5,14 @@
 //! same command opens the conversation again, on any machine.
 
 const std = @import("std");
+const commands = @import("../../builtins/commands.zig");
+const cli_flags = @import("../cli/cli_flags.zig");
 const io_mod = @import("../shared/io.zig");
 const json_decode = @import("../shared/json_decode.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const flag = "--convo";
 const format_version = 1;
 const max_file_bytes = 256 * 1024 * 1024;
 const index_name = "index.jsonl";
@@ -47,21 +48,17 @@ pub fn takeFlag(args: []const [:0]const u8, rest: [][:0]const u8, rest_len: *usi
     var file: ?[]const u8 = null;
     var n: usize = 0;
     var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, flag)) {
-            if (i + 1 >= args.len) return error.MissingConvoFile;
-            file = args[i + 1];
-            i += 1;
-            continue;
-        }
-        if (std.mem.startsWith(u8, arg, flag ++ "=")) {
-            file = arg[flag.len + 1 ..];
+    while (i < args.len) {
+        var parser = cli_flags.Parser.initPrefix(&.{commands.convo_option}, args[i..]);
+        if (parser.next() catch return error.MissingConvoFile) |item| {
+            file = item.option.value.?;
+            i += parser.index;
             continue;
         }
         if (n >= rest.len) return error.TooManyArgs;
-        rest[n] = arg;
+        rest[n] = args[i];
         n += 1;
+        i += 1;
     }
     rest_len.* = n;
     return file;

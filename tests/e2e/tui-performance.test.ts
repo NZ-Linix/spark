@@ -46,8 +46,8 @@ const LOCAL_MENU_ACTIONS = [
   { name: "resumeOpen", command: "/resume", marker: "Sessions " },
   { name: "mcpOpen", command: "/mcp", marker: "MCP servers" },
   { name: "usageOpen", command: "/usage", marker: "usage: API key" },
-  { name: "statuslineOpen", command: "/statusline", marker: "Status line" },
-  { name: "workspaceOpen", command: "/workspace", marker: "enter use" },
+  { name: "connectOpen", command: "/connect", marker: "Add model connection" },
+  { name: "forkOpen", command: "/fork", marker: "enter fork" },
 ] as const;
 
 const MEASURED_ACTION_NAMES = [
@@ -58,7 +58,6 @@ const MEASURED_ACTION_NAMES = [
   "dollarQuery",
   "fileQuery",
   "questionNavigate",
-  "approvalNavigate",
   "fullOpen",
   "fullScroll",
   "fullScrollCacheMiss",
@@ -508,7 +507,9 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Submit without an optional home directory.");
       const pane = await active.waitForText("MISSING_HOME_PROMPT_OK", 5_000);
-      expect(pane).not.toContain("HomeNotSet");
+      expect(pane.match(/[^\n]*HomeNotSet[^\n]*/g)).toEqual([
+        "✗ full-access-acknowledgment: active for this process but not saved to global settings (HomeNotSet)",
+      ]);
       expect(noHomeGateway.requestCount()).toBe(1);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
     } finally {
@@ -655,15 +656,15 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         }],
       }),
       fakeGatewayFinalText("PERF_QUESTION_DONE"),
-      fakeGatewayToolCall("performance-approval", "shell", {
+      fakeGatewayToolCall("performance-shell", "shell", {
         request: {
           action: "run",
-          command: "touch performance-approval.txt",
+          command: "touch performance-shell.txt",
           profile: "clean",
           timeout_ms: 600_000,
         },
       }),
-      fakeGatewayFinalText("PERF_APPROVAL_DONE"),
+      fakeGatewayFinalText("PERF_SHELL_DONE"),
       fakeGatewayToolCall("performance-terminal", "shell", {
         request: {
           action: "run",
@@ -705,7 +706,6 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           SPARK_GATEWAY_BASE_URL: gateway.baseUrl,
           SPARK_GATEWAY_CHAT_URL: gateway.chatUrl,
           SPARK_MODEL: FAKE_GATEWAY_MODEL,
-          SPARK_PERMISSION_MODE: "ask",
           SPARK_AUTO_UPGRADE: "0",
           SPARK_SOUND: "0",
           SPARK_RECORD: fixture.tapePath,
@@ -938,31 +938,18 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       await session.waitForText("PERF_QUESTION_DONE", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
 
-      await session.sendText("Open the performance approval.");
-      await session.waitForText("touch performance-approval.txt", TIMEOUT);
-      for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
-        const before = await session.capturePaneEscapes();
-        const key = cycle % 2 === 0 ? "Down" : "Up";
-        const navigation = await measureAction(
-          fixture.tapePath,
-          () => session!.sendKeysImmediate([key]),
-          () => waitForEscapedPaneChange(session!, before, `approvalNavigate.${cycle}`),
-        );
-        if (cycle >= WARMUPS) appendMeasured(samples.approvalNavigate, navigation);
-      }
-      session.sendKeysImmediate(["3"]);
-      await session.waitForText("PERF_APPROVAL_DONE", TIMEOUT);
+      await session.sendText("Run the performance shell command.");
+      await session.waitForText("PERF_SHELL_DONE", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
+      expect(readFileSync(join(fixture.workspace, "performance-shell.txt"), "utf8")).toBe("");
 
       await session.sendText("Start the performance terminal.");
-      await session.waitForText("PERF_TERMINAL_READY", TIMEOUT);
-      session.sendKeysImmediate(["1"]);
+      await session.waitForText("Still running", TIMEOUT);
       await session.waitForText("PERF_TERMINAL_AGENT_READY", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Close the performance terminal.");
-      await session.waitForText("shell stop", TIMEOUT);
-      session.sendKeysImmediate(["1"]);
-      await session.waitForText("PERF_TERMINAL_CLOSED", TIMEOUT);
+      const closedTerminalPane = await session.waitForText("PERF_TERMINAL_CLOSED", TIMEOUT);
+      expect(closedTerminalPane).toContain("● Stopped ");
       await session.waitForComposer(TIMEOUT);
       const resourcesBefore = await waitForResourceStability(pid);
       expect(resourcesBefore.threads - preFeatureResources.threads).toBeLessThanOrEqual(2);

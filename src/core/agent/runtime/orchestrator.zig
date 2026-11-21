@@ -4634,7 +4634,6 @@ fn processQueuedPromptInner(
     var overlay_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer mem_utils.deinit_arena(overlay_arena_state);
 
-
     var completed_tool_names: std.ArrayList([]u8) = .empty;
     defer completed_tool_names.deinit(arena);
     var interrupted_persisted = false;

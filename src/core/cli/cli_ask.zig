@@ -2873,7 +2873,6 @@ fn reachWorkspace(raw_ctx: *anyopaque, dir: []const u8, tool_name: []const u8) v
     ctx.turn_capture.reach(context, dir, tool_name, &ctx.session_write_mutex);
 }
 
-
 fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);

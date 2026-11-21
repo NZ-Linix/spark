@@ -19,7 +19,7 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 
 | Surface | Name |
 |---|---|
-| Setting | `permission_mode`: `ask`, `auto`, or `full-access` (legacy `yolo` is read until spark 0.0.18, never written) |
+| Setting | `permission_mode`: `ask`, `auto`, or `full-access` (legacy `yolo` is read until spark 26.12.20, never written) |
 | Flag | `--permission-mode <mode>`, with aliases `--ask`, `--auto`, `--full-access`, `--yolo` |
 | Env var | `SPARK_PERMISSION_MODE` |
 | Slash command | `/permissions [ask\|auto\|full-access\|reset]` |
@@ -33,7 +33,7 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 | `--workspace` | This folder's entry in the profile |
 | `--project` | A committed file in the repo, only for commands that write one (`spark mcp` and `.mcp.json`) |
 
-`spark mcp --profile` still works as `--global`, and `/allowlist` still takes `user` (the profile's top level) and `local` (this folder's entry) for `global` and `workspace`; each warns and stops working in spark 0.0.18, and spark always shows the new words.
+`spark mcp --profile` still works as `--global`, and `/allowlist` still takes `user` (the profile's top level) and `local` (this folder's entry) for `global` and `workspace`; each warns and stops working in spark 26.12.20, and spark always shows the new words.
 
 ## Settings and their surfaces
 
@@ -41,8 +41,8 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 |---|---|
 | Settings command | `spark config list\|get\|set\|unset\|schema`; `--global`, `--workspace` (list and get), `--show-origin` |
 | Generic per-run override | `spark ask --config key=value`, with the keys `spark config set` takes |
-| Sound | `sound.turn_end`, `sound.attention_required`, `sound.max` (the older `notifications.*` is read until spark 0.0.18); `/sound on\|off\|max` and `SPARK_SOUND` are presets for the group |
-| Status line | `status_line.*` (the older `statusLine` is read until spark 0.0.18) |
+| Sound | `sound.turn_end`, `sound.attention_required`, `sound.max` (the older `notifications.*` is read until spark 26.12.20); `/sound on\|off\|max` and `SPARK_SOUND` are presets for the group |
+| Status line | `status_line.*` (the older `statusLine` is read until spark 26.12.20) |
 | Experiments | `experimental.<name>`; none today |
 | Home | `SPARK_HOME` (default `~/.spark`) |
 | Test hooks | `SPARK_TEST_*` |
@@ -55,7 +55,7 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 | Concept | Name |
 |---|---|
 | Sign in, including pasting an AI Gateway key | `spark login [vercel\|codex\|grok]` |
-| Paste an AI Gateway API key | `spark login vercel --api-key`; in a session, `/login` offers sign-in or an API key. `spark setup` and `/setup` warn, stop working in spark 0.0.18, and are hidden from help |
+| Paste an AI Gateway API key | `spark login vercel --api-key`; in a session, `/login` offers sign-in or an API key. `spark setup` and `/setup` warn, stop working in spark 26.12.20, and are hidden from help |
 | Choose the active provider | `spark provider <name>`, `/provider` |
 
 ## Other

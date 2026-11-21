@@ -2628,7 +2628,6 @@ const CoordinatorTestWorker = struct {
     pub fn cancellationStopsTurn(self: *const @This()) bool {
         return self.cancel_requested and !self.cancel_continues_turn;
     }
-
 };
 
 const CoordinatorTestUpgrader = struct {

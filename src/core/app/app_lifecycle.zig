@@ -338,7 +338,6 @@ pub const StartupState = struct {
         }
         if (self.ultrafast_mode) self.fast_mode = false;
     }
-
 };
 
 /// Where `spark status` found the selected model.

@@ -51,7 +51,7 @@ pub fn formatOlderName(alloc: Allocator, twice: settings_keys.OlderName, display
 }
 
 /// `permission_mode yolo in ~/.spark/settings.json is deprecated and stops
-/// working in spark 0.0.18; use full-access`. Caller owns the result.
+/// working in spark 26.12.20; use full-access`. Caller owns the result.
 pub fn formatOldYolo(alloc: Allocator, workspace: ?[]const u8, display_path: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();

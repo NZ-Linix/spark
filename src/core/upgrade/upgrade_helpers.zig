@@ -1,4 +1,5 @@
 const std = @import("std");
+const atomic_value = @import("../shared/atomic_value.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const testing_listener = @import("../shared/testing_listener.zig");
@@ -66,7 +67,7 @@ fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
 }
 
 pub const platform = platformFromTarget() orelse
-    @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
+    @compileError("unsupported platform for auto-upgrade (requires macOS or Linux on x86_64 or aarch64, or Linux on x86)");
 
 fn platformFromTarget() ?[]const u8 {
     const os: ?[]const u8 = switch (builtin.target.os.tag) {
@@ -77,6 +78,7 @@ fn platformFromTarget() ?[]const u8 {
     const arch: ?[]const u8 = switch (builtin.target.cpu.arch) {
         .x86_64 => "x86_64",
         .aarch64 => "aarch64",
+        .x86 => "x86",
         else => null,
     };
     if (os) |o| {
@@ -202,7 +204,7 @@ const InterruptedReadServer = struct {
     /// Set once the thread has published its connection to `slot`, just
     /// before it reads.
     published: std.atomic.Value(bool) = .init(false),
-    woke_ms: std.atomic.Value(i64) = .init(0),
+    woke_ms: atomic_value.Value(i64) = .init(0),
 
     /// Listens on a free loopback port and starts the thread. The server
     /// must not move until `deinit` returns.

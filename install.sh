@@ -3,6 +3,10 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/NZ-Linix/spark/main/install.sh | sh
 #
+# Without curl, as on Alpine and in the iSH app:
+#
+#   wget -qO- https://raw.githubusercontent.com/NZ-Linix/spark/main/install.sh | sh
+#
 # Pass options after `sh -s --` when piping:
 #
 #   curl -fsSL .../install.sh | sh -s -- --version v26.11.19
@@ -297,8 +301,17 @@ need() {
 }
 
 # http_get URL OUT [ACCEPT]: the token, when there is one, goes to curl on
-# stdin so it never shows in the process list.
+# stdin so it never shows in the process list. Without curl, wget fetches
+# public URLs, as on Alpine and in the iSH app, which ship only wget.
 http_get() {
+	if ! need curl; then
+		if [ -n "${3:-}" ]; then
+			wget -q -T 15 --header "Accept: $3" -O "$2" "$1"
+		else
+			wget -q -T 15 -O "$2" "$1"
+		fi
+		return
+	fi
 	if [ -n "$TOKEN" ]; then
 		{
 			printf 'header = "Authorization: Bearer %s"\n' "$TOKEN"
@@ -359,12 +372,17 @@ detect_platform() {
 	case $arch in
 	x86_64 | amd64) ARCH=x86_64 ;;
 	arm64 | aarch64) ARCH=aarch64 ;;
+	i386 | i486 | i586 | i686 | x86) ARCH=x86 ;;
 	*) fail "spark has no build for $arch processors." "Try building from source with --from-source." ;;
 	esac
 	# An Intel shell under Rosetta still gets the native Apple silicon build.
 	if [ "$OS" = macos ] && [ "$ARCH" = x86_64 ] &&
 		[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 1 ]; then
 		ARCH=aarch64
+	fi
+	# A 32-bit userland on a 64-bit Linux kernel runs 32-bit programs best.
+	if [ "$OS" = linux ] && [ "$ARCH" = x86_64 ] && [ "$(getconf LONG_BIT 2>/dev/null || echo 64)" = 32 ]; then
+		ARCH=x86
 	fi
 	ASSET="spark-$OS-$ARCH.tar.gz"
 	case $ARCH in aarch64) ARCH_NAME=arm64 ;; *) ARCH_NAME=$ARCH ;; esac
@@ -533,7 +551,7 @@ setup_path() {
 # ── main ──────────────────────────────────────────────────────────────────
 
 main() {
-	need curl || [ -n "$ARCHIVE" ] || [ "$UNINSTALL" = 1 ] || die_early "curl is required"
+	need curl || need wget || [ -n "$ARCHIVE" ] || [ "$UNINSTALL" = 1 ] || die_early "curl or wget is required"
 	TMP=$(mktemp -d 2>/dev/null || mktemp -d -t spark-install)
 
 	header
@@ -569,9 +587,12 @@ main() {
 	else
 		# A private repository answers 404 without a token; a signed-in gh
 		# has one.
-		if [ -z "$TOKEN" ] && need gh &&
+		if [ -z "$TOKEN" ] && need gh && need curl &&
 			! curl -fsS -o /dev/null --connect-timeout 10 "https://api.github.com/repos/$REPO" 2>/dev/null; then
 			TOKEN=$(gh auth token 2>/dev/null || true)
+		fi
+		if [ -n "$TOKEN" ] && ! need curl; then
+			fail "Installing from a private repository needs curl." "Install curl and try again."
 		fi
 		run_step "Finding the release" step_find_release
 		TAG=$(cat "$TMP/tag")

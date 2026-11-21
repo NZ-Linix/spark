@@ -24,6 +24,7 @@ pub const TopLevelKind = enum {
     @"resume",
     upgrade,
     pair,
+    uninstall,
     replay,
     workspace,
     config,
@@ -59,7 +60,8 @@ pub const SlashKind = enum {
 /// The release that drops every old spelling spark still reads with a warning,
 /// such as `spark setup` and `--sessions-v2`. The CLI shape
 /// check fails once spark's version reaches it, so they come out on time.
-pub const old_spelling_removal = "0.0.18";
+/// The calendar-versioned fork first shipped these warnings in 26.11.19.
+pub const old_spelling_removal = "26.12.20";
 /// What every warning about an old spelling says.
 pub const deprecated_until = "is deprecated and stops working in spark " ++ old_spelling_removal;
 

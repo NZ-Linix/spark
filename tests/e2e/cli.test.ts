@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdtempSync,
@@ -584,6 +585,50 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
     },
     TIMEOUT,
   );
+});
+
+describe("cli: uninstall", () => {
+  test("requires confirmation and removes only the disposable installation and default profile", () => {
+    const home = createIsolatedTestHome();
+    try {
+      const install = join(home, "bin");
+      const profile = join(home, ".spark");
+      const workspace = join(home, "workspace");
+      const executable = join(install, "spark");
+      mkdirSync(install);
+      mkdirSync(join(profile, "sessions"), { recursive: true });
+      mkdirSync(workspace);
+      copyFileSync(SPARK_BIN, executable);
+      chmodSync(executable, 0o755);
+      writeFileSync(join(profile, "sessions", "saved"), "session");
+      writeFileSync(join(workspace, "keep"), "project");
+      symlinkSync(workspace, join(profile, "workspace-link"));
+
+      const env = { ...envWithoutFxHome(), HOME: home, SPARK_DISABLE_KEYCHAIN: "1", SPARK_SOUND: "0" };
+      const refused = spawnSync(executable, ["uninstall"], { env, encoding: "utf8", timeout: TIMEOUT });
+      expect(refused.status).toBe(2);
+      expect(refused.stderr).toContain("--yes");
+      expect(existsSync(executable)).toBe(true);
+      expect(existsSync(profile)).toBe(true);
+
+      const custom = spawnSync(executable, ["uninstall", "--yes"], {
+        env: { ...env, SPARK_HOME: workspace },
+        encoding: "utf8",
+        timeout: TIMEOUT,
+      });
+      expect(custom.status).toBe(1);
+      expect(custom.stderr).toContain("unset SPARK_HOME");
+
+      const removed = spawnSync(executable, ["uninstall", "--yes"], { env, encoding: "utf8", timeout: TIMEOUT });
+      expect(removed.status).toBe(0);
+      expect(removed.stderr).toBe("");
+      expect(existsSync(executable)).toBe(false);
+      expect(existsSync(profile)).toBe(false);
+      expect(readFileSync(join(workspace, "keep"), "utf8")).toBe("project");
+    } finally {
+      cleanupIsolatedTestHome(home);
+    }
+  });
 });
 
 describe("cli: launch flags", () => {
@@ -2935,7 +2980,7 @@ describe("cli: setup", () => {
       expect(r.code).toBe(1);
       expect(r.stdout).toBe("");
       expect(r.stderr).toBe(
-        "spark setup is deprecated and stops working in spark 0.0.18; use spark login vercel --api-key\n" +
+        "spark setup is deprecated and stops working in spark 26.12.20; use spark login vercel --api-key\n" +
           "spark setup: stored API keys are disabled by SPARK_DISABLE_KEYCHAIN\n",
       );
     },
@@ -3001,7 +3046,7 @@ exit 99
         });
         expect(r.code).toBe(1);
         expect(r.stdout).toBe("");
-        expect(r.stderr).toContain("spark setup is deprecated and stops working in spark 0.0.18; use spark login vercel --api-key\n");
+        expect(r.stderr).toContain("spark setup is deprecated and stops working in spark 26.12.20; use spark login vercel --api-key\n");
         expect(r.stderr).toContain("interactive terminal is required");
         expect(existsSync(invocationLog)).toBe(false);
       } finally {

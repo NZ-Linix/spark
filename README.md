@@ -9,8 +9,6 @@
 
 **A fast, native coding agent for your terminal.**
 
-One Zig binary · any OpenAI-compatible model · output that stays in your scrollback
-
 > [!WARNING]
 > spark is experimental. It runs with full access: every tool call, file edit, and shell command runs without asking first. Use it in projects you can restore.
 
@@ -30,6 +28,12 @@ macOS and Linux:
 curl -fsSL https://raw.githubusercontent.com/NZ-Linix/spark/main/install.sh | sh
 ```
 
+Alternatively:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/NZ-Linix/spark/main/install.sh | sh
+```
+
 Windows (PowerShell, installs into WSL):
 
 ```powershell
@@ -45,6 +49,12 @@ spark update
 ```
 
 Inside spark, `/update` installs the newest release and restarts into the same session. spark also checks for updates in the background and shows `ctrl+g to reload` when one is ready.
+
+### Uninstall
+
+Close other spark sessions, then run `spark uninstall`. Confirm to delete the running binary, the default profile at `~/.spark`, and spark's local Keychain credentials on macOS. This permanently removes saved sessions and settings. Use `spark uninstall --yes` from a script.
+
+If you set `SPARK_HOME`, back up or remove that profile separately and unset the variable before running the command. To remove only the installed binary, pass `--uninstall` to the installer script.
 
 ### Build from source
 

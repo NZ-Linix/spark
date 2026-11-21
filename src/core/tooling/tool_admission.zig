@@ -80,7 +80,6 @@ pub const FileMutationPreflightRequest = struct {
     access_scope: ?workspace_access.AccessScope = null,
 };
 
-
 pub const FileMutationPreparationRequest = struct {
     tool_registry: tool_dispatch.Registry,
     workspace_root: []const u8,
@@ -362,7 +361,6 @@ pub fn preflightPreparedFileMutation(
     } };
 }
 
-
 pub fn preflightFileMutation(
     arena: Allocator,
     call: ToolCall,
@@ -471,7 +469,6 @@ pub fn revalidateLiveActionPermissionOutcome(
     };
 }
 
-
 fn commandAuthorityFingerprint(
     authority: command_admission.CommandExecutionAuthority,
 ) command_admission.AdmissionFingerprint {
@@ -557,7 +554,6 @@ fn fileMutationOutcome(preflight: FileMutationPreflight) command_admission.Permi
         },
     };
 }
-
 
 fn ordinaryPermissionOutcome(decision: ToolPermissionDecision) command_admission.PermissionOutcome {
     return .{

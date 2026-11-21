@@ -35,6 +35,7 @@
 //! - `tests/tla/session_manager/rollout/pr-1116/PR1116Terminal.tla`: hosted terminal state
 
 const std = @import("std");
+const atomic_value = @import("../shared/atomic_value.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const sm = @import("session_manager");
@@ -93,7 +94,7 @@ const max_workspace_capture_bytes = max_inline_piece_bytes;
 /// The next capture turn token, shared by every Session of the process so a
 /// token from one never matches another's turn (D98). Starts at 1: 0 means
 /// no turn.
-var capture_turns: std.atomic.Value(u64) = .init(1);
+var capture_turns: atomic_value.Value(u64) = .init(1);
 /// Lines per page when replaying history.
 const replay_page_lines: usize = 256;
 
@@ -5918,7 +5919,7 @@ fn summaryOf(alloc: Allocator, scratch: Allocator, item: sm.Summary) !session_st
         .created_at_ms = std.math.cast(i64, item.created_ms) orelse 0,
         .updated_at_ms = std.math.cast(i64, item.updated_ms) orelse 0,
         .conversation_language = if (item.language) |raw| try decodeLanguage(scratch, raw) else types.ConversationLanguage.default(),
-        .history_len = @max(item.turns, 1),
+        .history_len = std.math.cast(usize, @max(item.turns, 1)) orelse std.math.maxInt(usize),
     };
 }
 

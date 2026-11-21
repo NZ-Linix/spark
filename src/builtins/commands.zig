@@ -50,9 +50,18 @@ pub const doctor_options = [_]command_specs.OptionDoc{
     .{ .flag = "--deep", .description = "Read every saved file of each session checked, with no time limit; slower" },
 };
 
+pub const convo_option: command_specs.OptionDoc = .{
+    .flag = "--convo <file>",
+    .description = "Keep the conversation in this one file and nowhere else, kept out of saved sessions and /resume; the same command reopens it, and the file can be shared",
+};
+
 pub const upgrade_options = [_]command_specs.OptionDoc{
     .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
     json_option,
+};
+
+pub const uninstall_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--yes", .description = "Confirm permanent removal without prompting" },
 };
 
 pub const workspace_options = [_]command_specs.OptionDoc{json_option};
@@ -349,6 +358,17 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
+        .kind = .uninstall,
+        .token = "uninstall",
+        .usage = "uninstall [--yes]",
+        .summary = "Remove spark and its local profile",
+        .options = &uninstall_options,
+        .details = &.{
+            "Permanently deletes the running spark binary and the default profile, including settings, credentials, and saved sessions.",
+            "Close other spark sessions first. With a custom SPARK_HOME, back up or remove that profile manually and unset SPARK_HOME before uninstalling.",
+        },
+    },
+    .{
         .kind = .replay,
         .token = "replay",
         .usage = "replay <tape> [--frames] [--json] [--golden <path>] [--frames-dir <path>]",
@@ -432,6 +452,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .config, .usage = "config" },
         .{ .kind = .upgrade, .usage = "upgrade|update", .summary = "Upgrade spark on the selected release channel" },
         .{ .kind = .pair, .usage = "pair", .summary = "Pair an iPhone" },
+        .{ .kind = .uninstall, .usage = "uninstall" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .completion, .usage = "completion <shell>" },
         .{ .kind = .help, .usage = "help" },
@@ -540,8 +561,8 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Pick a saved session, or resume the latest or an exact ID",
     },
     .{
-        .usage = "--convo <file>",
-        .description = "Keep the conversation in this one file and nowhere else, kept out of saved sessions and /resume; the same command reopens it, and the file can be shared",
+        .usage = convo_option.flag,
+        .description = convo_option.description,
     },
     .{
         .usage = "-h, --help",

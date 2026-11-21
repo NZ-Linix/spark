@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const atomic_value = @import("../shared/atomic_value.zig");
 
 pub const Agent = @import("agent.zig").Agent;
 pub const Role = @import("agent.zig").Role;
@@ -38,7 +39,7 @@ pub fn storeTotal(total: *u64, value: u64) void {
         total.* = value;
         return;
     }
-    @atomicStore(u64, total, value, .monotonic);
+    atomic_value.store(u64, total, value, .monotonic);
 }
 
 /// Adds to a total, saturating as `+|=` does.
@@ -47,13 +48,13 @@ pub fn addTotal(total: *u64, value: u64) void {
         total.* +|= value;
         return;
     }
-    var current = @atomicLoad(u64, total, .monotonic);
-    while (@cmpxchgWeak(u64, total, current, current +| value, .monotonic, .monotonic)) |seen| current = seen;
+    var current = atomic_value.load(u64, total, .monotonic);
+    while (atomic_value.cmpxchgWeak(u64, total, current, current +| value, .monotonic, .monotonic)) |seen| current = seen;
 }
 
 pub fn loadTotal(total: *const u64) u64 {
     if (comptime builtin.single_threaded) return total.*;
-    return @atomicLoad(u64, total, .monotonic);
+    return atomic_value.load(u64, total, .monotonic);
 }
 
 /// Asserts, in debug and test builds, that the main loop's own thread is

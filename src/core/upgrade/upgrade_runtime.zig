@@ -1,4 +1,5 @@
 const std = @import("std");
+const atomic_value = @import("../shared/atomic_value.zig");
 const io_mod = @import("../shared/io.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const helpers = @import("upgrade_helpers.zig");
@@ -276,8 +277,8 @@ const ProgressSnapshot = struct {
 
 const ProgressState = struct {
     phase: std.atomic.Value(u8) = .init(@backingInt(ProgressPhase.checking)),
-    downloaded: std.atomic.Value(u64) = .init(0),
-    total: std.atomic.Value(u64) = .init(0),
+    downloaded: atomic_value.Value(u64) = .init(0),
+    total: atomic_value.Value(u64) = .init(0),
 
     fn markUpdateFound(self: *ProgressState) void {
         self.phase.store(@backingInt(ProgressPhase.found), .release);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const atomic_value = @import("atomic_value.zig");
 const io_mod = @import("io.zig");
 const profile_paths = @import("profile_paths.zig");
 
@@ -29,9 +30,9 @@ pub const TraceContext = struct {
 
 var state_mutex: std.Io.Mutex = .init;
 var state: State = .{};
-var next_turn_id = std.atomic.Value(u64).init(1);
-var next_step_id = std.atomic.Value(u64).init(1);
-var next_subagent_id = std.atomic.Value(u64).init(1);
+var next_turn_id = atomic_value.Value(u64).init(1);
+var next_step_id = atomic_value.Value(u64).init(1);
+var next_subagent_id = atomic_value.Value(u64).init(1);
 
 pub fn configureFromEnv(alloc: Allocator, workspace_root: []const u8) void {
     const options = loadOptionsFromEnv(alloc, workspace_root) catch return;

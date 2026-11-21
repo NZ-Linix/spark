@@ -280,7 +280,6 @@ pub const ActiveSessionState = struct {
     /// an open turn's tool images can take a session past one window and one
     /// prompt, and what a running session held must reopen.
     staging_needed: StagedTotals = .{},
-
 };
 
 const ActivePrompt = struct {

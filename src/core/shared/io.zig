@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const i386_syscall_fallbacks = @import("i386_syscall_fallbacks.zig");
 const net_connect = @import("net_connect.zig");
 const profile_paths = @import("profile_paths.zig");
 
@@ -25,9 +26,9 @@ pub fn setIo(zio: std.Io) void {
     real_io = processIo(zio);
 }
 
-/// `zio` with spark's process spawn on Darwin and spark's TCP connect.
+/// Applies spark's platform-specific process, filesystem, and socket adapters.
 fn processIo(zio: std.Io) std.Io {
-    return net_connect.wrap(process_io_for(builtin.target.os.tag, zio));
+    return net_connect.wrap(i386_syscall_fallbacks.wrapIo(process_io_for(builtin.target.os.tag, zio)));
 }
 
 /// Tests only: `getIo` returns `zio`, as given, until `restoreIoForTest`

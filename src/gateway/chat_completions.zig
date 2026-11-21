@@ -271,4 +271,3 @@ fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider
         null;
     return .{ .loaded = .{ .ids = ids, .provenance = provenance, .notice = notice } };
 }
-

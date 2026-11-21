@@ -1875,7 +1875,6 @@ const FakeWorker = struct {
         _ = max_history_turns;
         self.propagated_history_turns += 1;
     }
-
 };
 
 const FakeQuestionPrompt = struct {

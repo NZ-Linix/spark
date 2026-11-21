@@ -39,8 +39,9 @@ pub const Fault = struct {
     writers: std.ArrayList(std.posix.fd_t) = .empty,
     /// Mutating storage calls made so far (writes, syncs, creates, renames,
     /// links, cuts, deletes). Atomic: threads appending to one session can
-    /// write and sync at once, and each call gets its own step.
-    steps: std.atomic.Value(u64) = .init(0),
+    /// write and sync at once, and each call gets its own step. `usize`
+    /// because 32-bit x86 has no 64-bit atomics.
+    steps: std.atomic.Value(usize) = .init(0),
     /// A real `kill -9`: the process sends itself SIGKILL just before this
     /// mutating call (counting from 1). The driver's crash matrix sets it.
     kill_at_step: ?u64 = null,
@@ -147,7 +148,7 @@ pub const Fault = struct {
     /// Counts one mutating call. Dies for real at `kill_at_step`; at
     /// `power_at_step` loses power and returns true: the call must fail.
     pub fn mutate(f: *Fault) bool {
-        const step = f.steps.fetchAdd(1, .monotonic) + 1;
+        const step: u64 = f.steps.fetchAdd(1, .monotonic) + 1;
         if (f.kill_at_step) |n| if (step == n) {
             std.posix.kill(std.c.getpid(), .KILL) catch {};
         };

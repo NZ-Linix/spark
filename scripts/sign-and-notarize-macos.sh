@@ -4,9 +4,12 @@ set -euo pipefail
 
 umask 077
 
-signing_identity="Developer ID Application: Vercel, Inc (JW6Y669B67)"
-signing_identifier="com.vercel.spark"
-signing_team_id="JW6Y669B67"
+signing_identifier="io.github.nz-linix.spark"
+signing_team_id="${APPLE_SIGNING_TEAM_ID:-}"
+if [[ ! "${signing_team_id}" =~ ^[A-Z0-9]{10}$ ]]; then
+    echo "APPLE_SIGNING_TEAM_ID must be a 10-character Apple team ID" >&2
+    exit 1
+fi
 
 openssl_bin="${SPARK_SIGNING_OPENSSL_BIN:-/usr/bin/openssl}"
 security_bin="${SPARK_SIGNING_SECURITY_BIN:-/usr/bin/security}"
@@ -91,8 +94,15 @@ if ! signing_identities="$(
 )"; then
     fail_stage "signing identity lookup"
 fi
-if [[ "${signing_identities}" != *"${signing_identity}"* ]]; then
-    echo "Developer ID signing identity is unavailable" >&2
+signing_identity="$(
+    printf '%s\n' "${signing_identities}" | /usr/bin/awk -v ending=" (${signing_team_id})" '
+        /"Developer ID Application:/ && substr($0, length($0) - length(ending)) == ending "\"" {
+            print $2
+        }
+    '
+)"
+if [[ ! "${signing_identity}" =~ ^[[:xdigit:]]{40}$ ]]; then
+    echo "Expected exactly one Developer ID Application identity for the configured Apple team" >&2
     exit 1
 fi
 
