@@ -45,10 +45,6 @@
       "job": "internal",
       "stability": "internal"
     },
-    "SPARK_GATEWAY_CHAT_URL": {
-      "job": "internal",
-      "stability": "internal"
-    },
     "SPARK_HERDR": {
       "job": "integration",
       "stability": "stable"
@@ -77,23 +73,11 @@
       "job": "integration",
       "stability": "stable"
     },
-    "SPARK_OAUTH_CLIENT_ID": {
-      "job": "internal",
-      "stability": "internal"
-    },
     "SPARK_PERMISSION_MODE": {
       "job": "setting-override",
       "stability": "stable"
     },
     "SPARK_PROVIDER": {
-      "job": "setting-override",
-      "stability": "stable"
-    },
-    "SPARK_PROVIDER_ORDER": {
-      "job": "setting-override",
-      "stability": "stable"
-    },
-    "SPARK_PROVIDER_STRICT": {
       "job": "setting-override",
       "stability": "stable"
     },
@@ -103,10 +87,6 @@
     },
     "SPARK_RECORD_INPUT": {
       "job": "diagnostics",
-      "stability": "stable"
-    },
-    "SPARK_REVIEW_MODEL": {
-      "job": "setting-override",
       "stability": "stable"
     },
     "SPARK_SKILL_SYMLINK_AUTHORITIES": {
@@ -121,6 +101,10 @@
       "job": "diagnostics",
       "stability": "stable"
     },
+    "SPARK_SYSTEM_PROMPT_FILE": {
+      "job": "internal",
+      "stability": "internal"
+    },
     "SPARK_TEST_ACP_PROMPT_REAP_READY": {
       "job": "test",
       "stability": "internal"
@@ -133,39 +117,11 @@
       "job": "test",
       "stability": "internal"
     },
-    "SPARK_TEST_AUTH_LOCK_CONTENTION": {
-      "job": "test",
-      "stability": "internal"
-    },
     "SPARK_TEST_C04_STREAM_ANSI_OSC8_FIXTURE": {
       "job": "test",
       "stability": "internal"
     },
     "SPARK_TEST_CACHE_WARMING_TTL_MS": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_CHATGPT_ISSUER_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_CHATGPT_ORIGIN": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_CHATGPT_REVOKE_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_CHATGPT_TOKEN_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_CODEX_CLIENT_VERSION": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_CODEX_VERSION_URL": {
       "job": "test",
       "stability": "internal"
     },
@@ -201,51 +157,11 @@
       "job": "test",
       "stability": "internal"
     },
-    "SPARK_TEST_GROK_CLIENT_VERSION": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_GROK_ISSUER_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_GROK_ORIGIN": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_GROK_REVOKE_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_GROK_TOKEN_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_GROK_USERINFO_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_GROK_VERSION_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
     "SPARK_TEST_INPUT_LOOP_NETWORK_GUARD": {
       "job": "test",
       "stability": "internal"
     },
     "SPARK_TEST_INSTANCES": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_OAUTH_ISSUER_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_OPENAI_CODEX_MODELS_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_OPENAI_CODEX_RESPONSES_URL": {
       "job": "test",
       "stability": "internal"
     },
@@ -353,22 +269,6 @@
       "job": "test",
       "stability": "internal"
     },
-    "SPARK_TEST_USAGE_CLOCK_FILE": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_XAI_GROK_MODALITIES_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_XAI_GROK_MODELS_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
-    "SPARK_TEST_XAI_GROK_RESPONSES_URL": {
-      "job": "test",
-      "stability": "internal"
-    },
     "SPARK_THEME": {
       "job": "setting-override",
       "stability": "stable"
@@ -396,10 +296,6 @@
     "SPARK_ULTRAFAST": {
       "job": "setting-override",
       "stability": "stable"
-    },
-    "SPARK_WEB_SEARCH_BACKEND": {
-      "job": "internal",
-      "stability": "internal"
     }
   },
   "not_env": {
@@ -412,7 +308,6 @@
     "SPARK_TEST_AI_GATEWAY_API_KEY": "Keychain service name used by keychain tests, not an env var"
   },
   "external_env": [
-    "AI_GATEWAY_API_KEY",
     "CMUX_WORKSPACE_ID",
     "COLORFGBG",
     "COLORTERM",
@@ -435,8 +330,6 @@
     "TMPDIR",
     "TMUX",
     "TMUX_PANE",
-    "TYPESAFE_API_KEY",
-    "TYPESAFE_BASE_URL",
     "USER",
     "USERPROFILE",
     "WAYLAND_DISPLAY",

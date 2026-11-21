@@ -1654,12 +1654,6 @@ fn parseProfileOnlyFields(
         settings.permission_mode = parsePermissionMode(value.string) orelse return error.InvalidPermissionMode;
     }
 
-    if (root.object.get("credential_source")) |credential_source_value| {
-        if (credential_source_value != .string) return error.InvalidCredentialSourceType;
-        settings.credential_source = types.parseCredentialSource(credential_source_value.string) orelse
-            return error.InvalidCredentialSource;
-    }
-
     if (root.object.get("yolo_acknowledged")) |acknowledged_value| {
         if (acknowledged_value != .bool) return error.InvalidYoloAcknowledgedType;
         settings.yolo_acknowledged = acknowledged_value.bool;

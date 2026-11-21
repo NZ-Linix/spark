@@ -2544,6 +2544,8 @@ pub const ConnectionWatch = struct {
 
     pub fn start(self: *ConnectionWatch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
         self.done.store(false, .seq_cst);
+        // A single-threaded build, such as the wasm terminal, has no watcher.
+        if (comptime builtin.single_threaded) return;
         self.thread = try spawn_gateway_cancel_watcher(&self.done, cancel, deadline, &self.state, connection);
     }
 
@@ -2606,6 +2608,8 @@ const SilentBodyServer = struct {
     fn start(self: *SilentBodyServer) !void {
         var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
         self.server = try address.listen(self.io_backend.io(), .{ .reuse_address = true });
+        // A single-threaded build, such as the wasm terminal, has no watcher.
+        if (comptime builtin.single_threaded) return;
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -5137,6 +5141,8 @@ const LoopbackGatewayFixture = struct {
 
     fn start(self: *@This()) !void {
         std.debug.assert(self.thread == null);
+        // A single-threaded build, such as the wasm terminal, has no watcher.
+        if (comptime builtin.single_threaded) return;
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 

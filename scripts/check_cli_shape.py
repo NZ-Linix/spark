@@ -67,7 +67,7 @@ KEY_READ = re.compile(r'\.(?:get|getPtr|contains)\("([^"]+)"\)')
 # An ACP config option as sessions.zig writes it: {\"id\":\"model\",\"name\":...
 ACP_CONFIG_ID = re.compile(r'\\"id\\":\\"([a-z_]+)\\",\\"name\\"')
 # spark's version, and the release that drops the old spellings.
-VERSION = re.compile(r'^pub const version = "(\d+)\.(\d+)\.(\d+)";', re.M)
+VERSION = re.compile(r'^pub const version = "(\d+)\.(\d+)\.(\d+)(?:\.\d+)?";', re.M)
 OLD_SPELLING_REMOVAL = re.compile(r'^pub const old_spelling_removal = "(\d+)\.(\d+)\.(\d+)";', re.M)
 # A config option ID that session/set_config_option accepts.
 ACP_SET_ID = re.compile(r'std\.mem\.eql\(u8, config_id, "([a-z_]+)"\)')

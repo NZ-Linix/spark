@@ -76,8 +76,8 @@ class RegistryTests(unittest.TestCase):
         names = matrix_names(targets)
 
         self.assertEqual(len(names), len(set(names)))
-        self.assertIn("sse_framing", names)
-        self.assertEqual(["sse_framing"], matrix_names(targets, "sse_framing"))
+        self.assertIn("mcp_wire", names)
+        self.assertEqual(["mcp_wire"], matrix_names(targets, "mcp_wire"))
 
     def test_unknown_target_is_an_error(self) -> None:
         with self.assertRaises(fuzz_nightly.FuzzNightlyError):

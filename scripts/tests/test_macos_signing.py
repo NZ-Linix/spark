@@ -702,7 +702,7 @@ class LinuxReleaseWorkflowTests(unittest.TestCase):
 
     def test_only_release_and_platform_ci_workflows_are_defined(self) -> None:
         self.assertEqual(
-            {"ci.yml", "macos.yml", "release.yml"},
+            {"ci.yml", "deploy-relay.yml", "macos.yml", "release.yml"},
             {path.name for path in RELEASE_WORKFLOW_PATH.parent.glob("*.yml")},
         )
 
