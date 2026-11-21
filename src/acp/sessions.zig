@@ -619,6 +619,58 @@ pub fn handleRemoveWasmSession(state: *server.ServerState, alloc: Allocator, msg
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
+/// The string param `key`, or null after writing the error.
+fn stringParam(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message, parsed: *const std.json.Parsed(std.json.Value), key: []const u8) !?[]const u8 {
+    const value = if (parsed.value == .object) parsed.value.object.get(key) else null;
+    if (value) |v| if (v == .string and v.string.len > 0) return v.string;
+    var buf: [64]u8 = undefined;
+    try state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = std.mem.print(&buf, "Missing {s}", .{key}) catch "Missing param" });
+    return null;
+}
+
+/// `session/remove`: deletes a saved session for good. The session this
+/// server has loaded is closed first; one another spark process has open is
+/// refused.
+pub fn handleRemoveSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
+    defer parsed.deinit();
+    const session_id = (try stringParam(state, alloc, msg, &parsed, "sessionId")) orelse return;
+    const store = server.sessionsStore(state) orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "Sessions are unavailable" });
+    if (state.active_session) |*active| {
+        if (sameSessionId(active.session_id, session_id)) try server.releaseActiveSession(state);
+    }
+    store.manager.delete(session_id) catch |err| return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = switch (err) {
+            error.NotFound, error.InvalidArgument => "That session is gone.",
+            error.Busy => "That session is open in another spark process.",
+            else => "The session could not be removed.",
+        },
+    });
+    try state.writer.writeResponse(alloc, msg.id, "null");
+}
+
+/// `_spark/session/rename`: gives the loaded session a title the user
+/// chose, as `/rename` does.
+pub fn handleRenameSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
+    defer parsed.deinit();
+    const session_id = (try stringParam(state, alloc, msg, &parsed, "sessionId")) orelse return;
+    const raw_title = (try stringParam(state, alloc, msg, &parsed, "title")) orelse return;
+    const title = std.mem.trim(u8, raw_title, " \t\r\n");
+    if (title.len == 0 or title.len > 200 or std.mem.findAny(u8, title, "\r\n") != null)
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "A title is one line of 1 to 200 bytes." });
+    const active = if (state.active_session) |*a| (if (sameSessionId(a.session_id, session_id)) a else null) else null;
+    const session = (if (active) |a| a.v2 else null) orelse
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Load the session first." });
+    session.rename(title) catch return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "The title could not be saved." });
+    try state.writer.writeResponse(alloc, msg.id, "null");
+}
+
 const RestoreKind = enum {
     load,
     reconnect,

@@ -1585,6 +1585,7 @@ fn buildAgentConfig(
 ) agent_runtime.Config {
     return .{
         .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
+        .exclusive_system_prompt = state.cfg.prompt_policy.exclusive,
         .host_instructions = sections.host_instructions,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(session.model),
         .skill_catalog = sections.skill_catalog,

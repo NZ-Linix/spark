@@ -12,6 +12,7 @@ const completion = @import("completion.zig");
 const agent_run_flags = @import("agent_run_flags.zig");
 const flag_placement = @import("flag_placement.zig");
 const cli_config = @import("cli_config.zig");
+const prompts = @import("../prompts/prompts.zig");
 const cli_provider_edit = @import("cli_provider_edit.zig");
 const settings_messages = @import("settings_messages.zig");
 const settings_entries = @import("../config/settings_entries.zig");
@@ -1087,6 +1088,17 @@ fn runNonInteractiveWithDeps(
                 },
             };
             defer acp_opts.deinit(alloc);
+            // SPARK_SYSTEM_PROMPT_FILE names a prompt the iPhone chose: like
+            // /prompt, spark sends it alone in place of its own.
+            var acp_policy = cfg.prompt_policy;
+            const custom_prompt = try readSystemPromptFile(alloc);
+            defer if (custom_prompt) |text| alloc.free(text);
+            if (custom_prompt) |text| {
+                acp_policy.system_prompt = text;
+                acp_policy.embedded_system_prompt = null;
+                acp_policy.model_prompt_overlay_fn = null;
+                acp_policy.exclusive = true;
+            }
             try cfg.acp_runner.run(alloc, .{
                 .auth_mode = cfg.auth_mode,
                 .default_model = cfg.default_model,
@@ -1097,7 +1109,7 @@ fn runNonInteractiveWithDeps(
                 .provider_set = cfg.provider_set,
                 .process_provider = cfg.process_provider,
                 .secret_store = cfg.secret_store,
-                .prompt_policy = cfg.prompt_policy,
+                .prompt_policy = acp_policy,
                 .ignored_list_entries = cfg.ignored_list_entries,
                 .max_list_entries = cfg.max_list_entries,
                 .max_read_file_bytes = cfg.max_read_file_bytes,
@@ -1988,6 +2000,22 @@ fn runGithubWorkflow(
 /// wrote before a tool call never becomes the title or body.
 fn draftFromRun(alloc: Allocator, run_result: cli_ask.PromptRunResult) !github_publish.Draft {
     return github_publish.parseDraft(alloc, run_result.final_source);
+}
+
+/// The prompt in `SPARK_SYSTEM_PROMPT_FILE`, or null when the variable is
+/// unset or the file is empty. Caller owns the result.
+fn readSystemPromptFile(alloc: Allocator) !?[]u8 {
+    const path = io_mod.getenv("SPARK_SYSTEM_PROMPT_FILE") orelse return null;
+    if (path.len == 0) return null;
+    const text = prompts.read(alloc, path) catch |err| {
+        debug_trace.logf("acp", "system prompt file unreadable err={s}", .{@errorName(err)});
+        return err;
+    };
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+        alloc.free(text);
+        return null;
+    }
+    return text;
 }
 
 fn writeStdout(deps: RunDeps, text: []const u8) !void {

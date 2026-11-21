@@ -9340,6 +9340,51 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "_spark/session/rename retitles the loaded session and session/remove deletes it",
+    async () => {
+      const fixture = createConfiguredProviderFixture();
+      const acp = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+      try {
+        await acp.request("initialize", { protocolVersion: 1, clientCapabilities: {} }, 1);
+        const ids: string[] = [];
+        for (const text of ["Keep this one", "Rename this one"]) {
+          const created = await acp.request("session/new", { cwd: fixture.workspace, mcpServers: [] }) as any;
+          if (created.error) throw new Error(JSON.stringify(created));
+          ids.push(created.result.sessionId);
+          const turn = await acp.request("session/prompt", { sessionId: created.result.sessionId, prompt: [{ type: "text", text }] }) as any;
+          expect(turn.result?.stopReason).toBe("end_turn");
+        }
+        const [kept, target] = ids;
+
+        const blank = await acp.request("_spark/session/rename", { sessionId: target, title: "  " }) as any;
+        expect(blank.error?.message).toContain("one line of 1 to 200 bytes");
+        const other = await acp.request("_spark/session/rename", { sessionId: kept, title: "Not loaded" }) as any;
+        expect(other.error?.message).toContain("Load the session first.");
+        const renamed = await acp.request("_spark/session/rename", { sessionId: target, title: "  Renamed from the phone " }) as any;
+        expect(renamed.error).toBeUndefined();
+
+        const listed = await acp.request("session/list", {}) as any;
+        expect(listed.result?.sessions).toContainEqual(
+          expect.objectContaining({ sessionId: target, title: "Renamed from the phone" }),
+        );
+
+        const removed = await acp.request("session/remove", { sessionId: target }) as any;
+        expect(removed.error).toBeUndefined();
+        const after = await acp.request("session/list", {}) as any;
+        expect(after.result?.sessions.map((s: any) => s.sessionId)).toEqual([kept]);
+
+        const again = await acp.request("session/remove", { sessionId: target }) as any;
+        expect(again.error?.message).toContain("That session is gone.");
+        expect(acp.stderr).toBe("");
+      } finally {
+        await acp.close();
+        fixture.close();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/list exposes bounded titled pages",
     async () => {
       const root = createIsolatedRoot("spark-acp-paged-session-list-");

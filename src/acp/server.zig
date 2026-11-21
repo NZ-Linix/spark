@@ -76,6 +76,8 @@ const AcpMethod = enum {
     session_close,
     session_list,
     session_remove,
+    /// `_spark/session/rename`: a title the user chose for the loaded session.
+    session_rename,
     session_prompt,
     session_set_config_option,
     session_set_mode,
@@ -102,6 +104,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "session/close")) return .session_close;
         if (std.mem.eql(u8, method, "session/list")) return .session_list;
         if (std.mem.eql(u8, method, "session/remove")) return .session_remove;
+        if (std.mem.eql(u8, method, "_spark/session/rename")) return .session_rename;
         if (std.mem.eql(u8, method, "session/prompt")) return .session_prompt;
         if (std.mem.eql(u8, method, "session/set_config_option")) return .session_set_config_option;
         if (std.mem.eql(u8, method, "session/set_mode")) return .session_set_mode;
@@ -129,6 +132,8 @@ const AcpMethod = enum {
             .session_load,
             .session_resume,
             .session_close,
+            // a title can change while a turn runs: Session.rename takes the session's lock
+            .session_rename,
             .libfx_new,
             .libfx_steer,
             .libfx_withdraw,
@@ -1435,6 +1440,8 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .session_resume => sessions.handleResumeSession(state, alloc, msg),
         .session_close => handleCloseSession(state, alloc, msg),
         .session_list => sessions.handleListSessions(state, alloc, msg),
+        .session_remove => sessions.handleRemoveSession(state, alloc, msg),
+        .session_rename => sessions.handleRenameSession(state, alloc, msg),
         .session_prompt => startPrompt(state, alloc, msg),
         .session_set_config_option => handleSetConfigOption(state, alloc, msg),
         .session_set_mode => handleSetMode(state, alloc, msg),
@@ -1451,7 +1458,6 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .initialize,
         .request_cancel,
         .session_cancel,
-        .session_remove,
         .mcp_message,
         .unknown,
         => state.writer.writeError(alloc, msg.id, .{
