@@ -1,0 +1,76 @@
+name: Spark
+options:
+  bundleIdPrefix: com.example.spark
+  deploymentTarget:
+    iOS: '26.0'
+  createIntermediateGroups: true
+configFiles:
+  # your signing team: copy Local.example.xcconfig to Local.xcconfig (it stays out of git)
+  Debug: Local.xcconfig
+  Release: Local.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: '6.0'
+    MARKETING_VERSION: '1.0'
+    CURRENT_PROJECT_VERSION: '1'
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    SWIFT_APPROACHABLE_CONCURRENCY: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    ENABLE_PREVIEWS: YES
+targets:
+  Spark:
+    type: application
+    platform: iOS
+    sources: [Spark]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(SPARK_BUNDLE_ID)
+        TARGETED_DEVICE_FAMILY: '1'
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Spark
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_UIUserInterfaceStyle: Dark
+        ASSETCATALOG_COMPILER_APPICON_NAME: Spark
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    info:
+      path: Spark/Info.plist
+      properties:
+        ITSAppUsesNonExemptEncryption: false
+        # the relay the app and spark-bridge share (SPARK_RELAY_URL in Local.xcconfig)
+        SparkRelay: $(SPARK_RELAY_URL)
+        UIAppFonts:
+          - Geist-Regular.ttf
+          - Geist-Italic.ttf
+          - Geist-Medium.ttf
+          - Geist-SemiBold.ttf
+          - Geist-Bold.ttf
+          - GeistMono-Regular.ttf
+          - GeistMono-Medium.ttf
+        # a relay on the local network, for development
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: spark connects to a relay on your local network when you run one there.
+  # drives the app against a local relay: see mobile/README.md
+  SparkUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [SparkUITests]
+    dependencies:
+      - target: Spark
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(SPARK_BUNDLE_ID).uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Spark
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+schemes:
+  Spark:
+    build:
+      targets:
+        Spark: all
+        SparkUITests: [test]
+    test:
+      targets: [SparkUITests]
