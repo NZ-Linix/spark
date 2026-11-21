@@ -1,8 +1,24 @@
 # spark
 
-## 26.11.20
+## 26.11.21
 
 <!-- release:start -->
+
+**Pair your iPhone with spark, and spark now always runs with full access.**
+
+### Breaking Changes
+
+- spark no longer asks before running tools. Every session runs with full access, and the `ask` and `auto` permission modes load as full access.
+- ChatGPT and Grok subscription sign-in, Vercel Token Pass, and the usage menu are removed. Use an API key or a custom provider instead.
+
+### New Features
+
+- Run `spark pair` to link the spark iPhone app to this computer with a six-digit code. The app lists the chats you start from the phone and the spark sessions running on the computer, and can start new ones in any folder.
+- The iPhone app can also run chats in the cloud, which keep working while the computer is asleep. Copy a provider from the computer to the cloud, or add one in the app.
+
+<!-- release:end -->
+
+## 26.11.20
 
 **spark now runs on 32-bit x86 Linux, including the iSH app on iPhone and iPad.**
 
@@ -15,7 +31,6 @@
 
 - On iSH, spark loads saved prompt history at startup so you can recall previous prompts with the Up arrow.
 
-<!-- release:end -->
 
 ## 0.0.17
 
