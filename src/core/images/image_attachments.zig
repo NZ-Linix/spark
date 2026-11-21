@@ -16,11 +16,6 @@ const pathing = @import("../workspace/pathing.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 pub const max_image_bytes: usize = 20 * 1024 * 1024;
-/// The most images, and image bytes together, one libfx prompt holds: the
-/// limits `sdk/spark-sdk.js` takes a prompt within (`maxPromptImages` and
-/// `maxPromptImagesBytes`), which the core holds a prompt to as well.
-pub const max_libfx_prompt_images: usize = 8;
-pub const max_libfx_prompt_images_bytes: usize = 6 * 1024 * 1024;
 const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
 pub const image_too_large_notice = "image exceeds the 20 MiB limit";
 pub const image_preparation_failed_notice = "Unable to prepare this image for upload. Use a smaller image.";
@@ -613,47 +608,6 @@ pub fn captureInlineImageBytes(
     attachment.path = durable_path;
     return attachment;
 }
-
-/// Captures caller-supplied image bytes for sessions without a filesystem
-/// snapshot backend (libfx kernel sessions on native and wasm). Applies the
-/// same size, media-type, and digest validation as the filesystem capture,
-/// but retains the decoded bytes on the attachment itself so request building
-/// and checkpoint serialization never touch a filesystem.
-/// The caller owns the returned attachment and must release it with
-/// `types.freeImageAttachment` or `discardImageAttachment`.
-pub fn captureInlineImageBytesInMemory(
-    alloc: std.mem.Allocator,
-    image_id: usize,
-    declared_media_type: []const u8,
-    bytes: []const u8,
-) !types.ImageAttachment {
-    if (image_id == 0) return error.InvalidImageId;
-    if (bytes.len == 0 or declared_media_type.len == 0) return error.UnsupportedImageType;
-    if (bytes.len > max_image_bytes) return error.ImageTooLarge;
-    const detected = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
-    if (!std.mem.eql(u8, detected, declared_media_type)) return error.ImageSnapshotMediaTypeMismatch;
-
-    if (!image_data.fitsEncodedImageLimit(bytes.len)) return error.ImageTooLarge;
-    const owned_bytes = try alloc.dupe(u8, bytes);
-    errdefer alloc.free(owned_bytes);
-    const owned_path = try alloc.print(inline_image_path_prefix ++ "{d}", .{image_id});
-    errdefer alloc.free(owned_path);
-    const owned_media_type = try alloc.dupe(u8, declared_media_type);
-    errdefer alloc.free(owned_media_type);
-    var digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(owned_bytes, &digest, .{});
-    const digest_hex = try alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
-    errdefer alloc.free(digest_hex);
-    return .{
-        .id = image_id,
-        .path = owned_path,
-        .media_type = owned_media_type,
-        .snapshot_sha256 = digest_hex,
-        .inline_data = owned_bytes,
-    };
-}
-
-pub const inline_image_path_prefix = "inline://image-";
 
 fn captureImageSnapshotFromOpenFileWithBudget(
     alloc: std.mem.Allocator,

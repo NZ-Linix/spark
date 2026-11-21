@@ -136,14 +136,14 @@ fn sendBudgetMs(_: Source) i64 {
 }
 
 fn processId() i64 {
-    if (comptime host_target.is_wasm or builtin.target.os.tag == .windows) return 0;
+    if (comptime builtin.target.os.tag == .windows) return 0;
     return std.c.getpid();
 }
 
 /// A zombie, an spark that exited before its parent reaped it, counts as gone.
 /// A check that fails counts as alive, so the lease still ends at its time.
 fn processAlive(alloc: Allocator, pid: i64) bool {
-    if (comptime host_target.is_wasm or builtin.target.os.tag == .windows) return false;
+    if (comptime builtin.target.os.tag == .windows) return false;
     if (pid <= 0 or pid > std.math.maxInt(std.posix.pid_t)) return false;
     return process_tree.processIsAlive(alloc, @intCast(pid)) catch true;
 }
@@ -434,7 +434,6 @@ pub const Place = struct {
 
     /// The profile folder, or null when there is none and `open` is `.existing`.
     fn openProfile(self: Place, open: Open) !?io_mod.VerifiedDir {
-        if (comptime host_target.is_wasm) return null;
         var opened: ?std.Io.Dir = null;
         defer if (opened) |dir| dir.close(io_mod.getIo());
         const parent = self.parent orelse blk: {
@@ -586,7 +585,6 @@ const Mutation = struct {
 /// the profile folder under `home`, or in the Keychain when `keychain` says
 /// the store is there (`mcp_host/credentials.zig`). `home` is borrowed.
 pub fn mcpPlace(home: []const u8, keychain: bool) Place {
-    if (comptime host_target.is_wasm) return .{ .source = .mcp, .home = home };
     return .{ .source = .mcp, .home = home, .keychain = if (keychain) mcp_keychain_backend else null };
 }
 

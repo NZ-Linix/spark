@@ -1,6 +1,5 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
-const runtime_profile = @import("../hosts/runtime_profile.zig");
 const edit_contract = @import("../input/editor_state.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const file_completion_state = @import("../input/file_completion_state.zig");
@@ -121,9 +120,6 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (comptime agents.hasAgentField(App, "question_prompt")) {
                 if (agent.question_prompt.isActive()) return false;
             }
-            if (comptime false) {
-                if (false) return false;
-            }
             if (hasFileQuery(app)) return false;
             return slashCompletionQueryActive(app, agent);
         }
@@ -143,9 +139,6 @@ pub fn CompletionRuntime(comptime App: type) type {
         fn visibleInlinePickerKind(app: *App, agent: *AppAgent) ?picker_state.InlinePickerKind {
             if (comptime agents.hasAgentField(App, "question_prompt")) {
                 if (agent.question_prompt.isActive()) return null;
-            }
-            if (comptime false) {
-                if (false) return null;
             }
             if (comptime agents.hasAgentField(App, "stream")) {
                 if (agent.stream.active) {
@@ -412,10 +405,8 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (try routeModelMenuMove(app, agent, delta)) return true;
             if (try routeEffortMenuMove(app, agent, delta)) return true;
             if (try routeSkillsMenuMove(app, agent, delta)) return true;
-            if (comptime runtime_profile.allows(App, .durable_sessions)) {
-                if (try routeSessionPickerMove(app, agent, delta)) return true;
-                if (try routeForkMenuMove(app, agent, delta)) return true;
-            }
+            if (try routeSessionPickerMove(app, agent, delta)) return true;
+            if (try routeForkMenuMove(app, agent, delta)) return true;
             if (hasFileQuery(app)) {
                 navigateFilePicker(app, agent, delta);
                 return true;
@@ -642,7 +633,6 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn hasFileQuery(app: *App) bool {
-            if (comptime !runtime_profile.allows(App, .file_index)) return false;
             return app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null;
         }
 
@@ -755,9 +745,6 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (comptime agents.hasAgentField(App, "question_prompt")) {
                 if (agent.question_prompt.isActive()) return false;
             }
-            if (comptime false) {
-                if (false) return false;
-            }
             if (catalogMenuOwnsSurface(app, agent)) return false;
             return true;
         }
@@ -787,9 +774,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn filePickerEligible(app: *App, agent: *AppAgent) bool {
-            if (comptime !runtime_profile.allows(App, .file_index)) return false;
             if (comptime agents.hasAgentField(App, "question_prompt")) if (agent.question_prompt.isActive()) return false;
-            if (comptime false) if (false) return false;
             if (comptime @hasField(App, "auth")) {
                 if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) if (app.auth.pickerView().active) return false;
             }
@@ -800,7 +785,6 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn reconcileFilePicker(app: *App, agent: *AppAgent) void {
-            if (comptime !runtime_profile.allows(App, .file_index)) return;
             const picker = &app.input_runtime.picker;
             const query = picker.activeFilePickerQuery(&app.input_runtime.edit_state);
             var decoded_storage: [file_index.max_path_len]u8 = undefined;
@@ -823,7 +807,6 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn collectFilePickerFacts(app: *App, agent: *AppAgent) void {
-            if (comptime !runtime_profile.allows(App, .file_index)) return;
             reconcileFilePicker(app, agent);
             app.harvestDirectoryCompletion(filePickerEligible(app, agent));
         }
@@ -831,7 +814,6 @@ pub fn CompletionRuntime(comptime App: type) type {
         /// Returns true while the frame for a keystroke that started a folder
         /// listing should wait for its rows, so they paint together.
         pub fn holdFrameForFileListing(app: *App, agent: *AppAgent, now_ms: i64) bool {
-            if (comptime !runtime_profile.allows(App, .file_index)) return false;
             app.harvestDirectoryCompletion(filePickerEligible(app, agent));
             const picker = &app.input_runtime.picker;
             const state = &picker.file_completion;
@@ -853,14 +835,12 @@ pub fn CompletionRuntime(comptime App: type) type {
         /// finishes in that time is seen at once, which also turns waiting
         /// back on after a slow folder.
         pub fn fileListingHoldPending(app: *const App, now_ms: i64) bool {
-            if (comptime !runtime_profile.allows(App, .file_index)) return false;
             return app.input_runtime.picker.file_listing_wait.measuring(now_ms);
         }
 
         /// The sole acquisition boundary. Called after input batching, never by
         /// painters, navigation or acceptance. Directory work is scheduled, not run.
         pub fn prepareFilePicker(app: *App, agent: *AppAgent) void {
-            if (comptime !runtime_profile.allows(App, .file_index)) return;
             reconcileFilePicker(app, agent);
             const picker = &app.input_runtime.picker;
             const state = &picker.file_completion;
@@ -934,20 +914,18 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn filePickerView(app: *App) file_completion_state.View {
-            if (comptime !runtime_profile.allows(App, .file_index)) return .{};
             const picker = &app.input_runtime.picker;
             return picker.file_completion.view(picker.file_completion_index, picker.file_completion_window_start);
         }
 
         pub fn acknowledgeFilePicker(app: *App, agent: *AppAgent, receipt: FilePickerReceipt) void {
-            if (comptime !runtime_profile.allows(App, .file_index)) return;
             if (!filePickerEligible(app, agent)) return;
             const picker = &app.input_runtime.picker;
             picker.file_completion.acknowledge(app.alloc, receipt, &picker.file_completion_index, &picker.file_completion_window_start);
         }
 
         pub fn distrustFilePicker(app: *App) void {
-            if (comptime runtime_profile.allows(App, .file_index)) app.input_runtime.picker.file_completion.distrust();
+            app.input_runtime.picker.file_completion.distrust();
         }
 
         fn navigateFilePicker(app: *App, agent: *AppAgent, delta: i32) void {
@@ -958,7 +936,6 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn autocompleteFilePickerSelection(app: *App, agent: *AppAgent, max_input_len: usize) !edit_contract.InsertResult {
-            if (comptime !runtime_profile.allows(App, .file_index)) return .inactive;
             reconcileFilePicker(app, agent);
             if (!filePickerEligible(app, agent)) return .inactive;
             const selection = resolveFilePickerSelection(app) orelse {
@@ -1047,7 +1024,6 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn submitFilePickerOnEnter(app: *App, agent: *AppAgent, max_input_len: usize) !?edit_contract.InsertResult {
-            if (comptime !runtime_profile.allows(App, .file_index)) return null;
             reconcileFilePicker(app, agent);
             if (!filePickerOwnsSurface(app, agent)) return null;
             const selection = resolveFilePickerSelection(app) orelse {

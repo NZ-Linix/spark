@@ -289,7 +289,7 @@ pub fn Runtime(comptime App: type) type {
         /// when it lands. Prompts already wait for a current catalog. Returns
         /// false when the host loads skills inline.
         fn beginStartupSkillsLoad(app: *App) !bool {
-            if (comptime host_target.is_wasm or !@hasDecl(App, "requestSkillsRefresh")) return false;
+            if (comptime !@hasDecl(App, "requestSkillsRefresh")) return false;
             const dir = (try app_runtime_setup.resolveManagedSkillsDir(std.heap.c_allocator)) orelse return false;
             // An empty catalog records the managed directory the refresh scans.
             app.skills.replaceLoaded(std.heap.c_allocator, dir, &.{}, &.{}) catch |err| {

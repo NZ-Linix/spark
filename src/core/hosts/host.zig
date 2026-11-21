@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const wasm = @import("wasm.zig");
 
 pub const TerminalSupport = enum {
     unsupported,
@@ -237,22 +236,7 @@ pub const Clipboard = struct {
 };
 
 pub fn current() Capabilities {
-    return capabilitiesForTarget(builtin.target.cpu.arch, builtin.target.os.tag);
-}
-
-fn capabilitiesForTarget(
-    arch: std.Target.Cpu.Arch,
-    os_tag: std.Target.Os.Tag,
-) Capabilities {
-    if (wasm.isTarget(arch)) {
-        return .{
-            .process_control = wasm.process_control,
-            .url_open = false,
-            .native_url_open = false,
-            .terminal = terminalSupportForOs(os_tag),
-        };
-    }
-    return nativeForOs(os_tag);
+    return nativeForOs(builtin.target.os.tag);
 }
 
 pub fn terminalSupportForOs(os_tag: std.Target.Os.Tag) TerminalSupport {
@@ -274,9 +258,6 @@ pub fn nativeForOs(os_tag: std.Target.Os.Tag) Capabilities {
 /// Returns an owned description of the current operating system. The caller
 /// owns the returned slice and must free it with `alloc`.
 pub fn operatingSystemText(alloc: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
-    if (comptime wasm.isTarget(builtin.target.cpu.arch)) {
-        return wasm.operatingSystemText(alloc, builtin.target.os.tag);
-    }
     if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return alloc.dupe(u8, @tagName(builtin.target.os.tag));
     }

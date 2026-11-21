@@ -19,7 +19,6 @@ const core_input_runtime = @import("../input/runtime.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const turn_capture = @import("../workspace/turn_capture.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
-const runtime_profile = @import("../hosts/runtime_profile.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
@@ -161,10 +160,6 @@ pub fn Bindings(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
-                .cooperative_transport_pulse = if (comptime @hasDecl(App, "cooperativeTransportPulse")) .{
-                    .ctx = @ptrCast(agent),
-                    .run = cooperativeTransportPulse,
-                } else null,
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry(agent) else .{},
                 .context_registry = if (comptime @hasDecl(App, "contextRegistry")) app.contextRegistry() else null,
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else false,
@@ -403,10 +398,7 @@ pub fn Bindings(comptime App: type) type {
                     if (parsed.value == .object) {
                         if (parsed.value.object.get("command")) |command_value| {
                             if (command_value == .string) {
-                                const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
-                                    if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
-                                else
-                                    app.workspace_root;
+                                const workspace_root = app.workspace_root;
                                 const display = tool_presentation.formatRunCommandDetailBounded(
                                     alloc,
                                     command_value.string,
@@ -469,10 +461,7 @@ pub fn Bindings(comptime App: type) type {
                             // the live terminal width like any other command.
                             if (app.toolRegistry(agent).lookup(started.tool_name)) |spec| {
                                 if (spec.executor_kind == .terminal) {
-                                    const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
-                                        if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root
-                                    else
-                                        app.workspace_root;
+                                    const workspace_root = app.workspace_root;
                                     const session_call: ToolCall = .{
                                         .id = started.id.call_id,
                                         .name = started.tool_name,
@@ -658,12 +647,6 @@ pub fn Bindings(comptime App: type) type {
             try app.appendRuntimeContextMessage(agent, arena, messages);
         }
 
-        fn cooperativeTransportPulse(ctx: *anyopaque) !void {
-            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            const app = appOf(agent);
-            try app.cooperativeTransportPulse(agent);
-        }
-
         fn agentFinalizeTurn(ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentationOutcome, _: ?types.ProviderCompletionDisposition) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             try agent.worker.pushTurnFinished(std.heap.c_allocator, .{
@@ -741,19 +724,6 @@ pub fn Bindings(comptime App: type) type {
         fn agentResolveModelCapabilities(ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
-            if (comptime runtime_profile.allows(App, .cooperative_agent)) {
-                const settings = agent.worker.effectiveAgentTurnSettings();
-                if (settings.fast_mode or settings.ultrafast_mode) {
-                    if (agent.worker.isCancelRequested()) return error.Cancelled;
-                    app.ensureModelCache();
-                    // A host abort can settle the fetch before queued input reaches the worker.
-                    app.cooperativeTransportPulse(agent) catch |err| {
-                        debug_trace.logf("gateway", "model catalog transport pulse failed err={s}", .{@errorName(err)});
-                        return error.Cancelled;
-                    };
-                    if (agent.worker.isCancelRequested()) return error.Cancelled;
-                }
-            }
             if (comptime @hasDecl(App, "resolveModelCapabilitiesForRequest")) {
                 return app.resolveModelCapabilitiesForRequest(agent, model);
             }
@@ -1049,17 +1019,6 @@ pub fn Bindings(comptime App: type) type {
             retained_from: ?types.ContextHistoryCut,
         ) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
-            if (comptime runtime_profile.allows(App, .cooperative_agent)) {
-                // The bridge's context is the agent, as for every other
-                // worker bridge callback.
-                try agent.worker.publishContextCompaction(std.heap.c_allocator, .{
-                    .summary = summary,
-                    .active_prefix = active_prefix,
-                    .retained_from = retained_from,
-                    .max_history_turns = agent.session.max_history_turns,
-                }, @ptrCast(agent), workerBridgeContextCompaction);
-                return;
-            }
             try app_worker_runtime.Runtime(App).commitContextCompaction(
                 agent,
                 summary,

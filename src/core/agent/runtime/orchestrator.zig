@@ -8794,25 +8794,14 @@ fn processQueuedPromptLoop(
                         .{ .ctx = &completion_publisher, .notify = ParallelSubagentCompletionPublisher.notify }
                     else
                         null;
-                    if (comptime host_target.is_wasm) {
-                        parallel_run = try runtime_parallel_execution.runSequentialCalls(arena, executable_calls.items, .{
-                            .exec_ctx = &parallel_exec_ctx,
-                            .execute = runtime_parallel_execution.parallelHookExecute,
-                            .format_ctx = &parallel_exec_ctx,
-                            .format_error = runtime_parallel_execution.parallelHookFormatError,
-                            .cancel_flag = config.cancel_flag,
-                            .attempt_observer = attempt_observer,
-                        });
-                    } else {
-                        parallel_run = try runtime_parallel_execution.runParallelCalls(arena, executable_calls.items, .{
-                            .exec_ctx = &parallel_exec_ctx,
-                            .execute = runtime_parallel_execution.parallelHookExecute,
-                            .format_ctx = &parallel_exec_ctx,
-                            .format_error = runtime_parallel_execution.parallelHookFormatError,
-                            .cancel_flag = config.cancel_flag,
-                            .attempt_observer = attempt_observer,
-                        });
-                    }
+                    parallel_run = try runtime_parallel_execution.runParallelCalls(arena, executable_calls.items, .{
+                        .exec_ctx = &parallel_exec_ctx,
+                        .execute = runtime_parallel_execution.parallelHookExecute,
+                        .format_ctx = &parallel_exec_ctx,
+                        .format_error = runtime_parallel_execution.parallelHookFormatError,
+                        .cancel_flag = config.cancel_flag,
+                        .attempt_observer = attempt_observer,
+                    });
                 }
                 defer if (parallel_run) |*run| run.deinit(arena);
 

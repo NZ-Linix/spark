@@ -970,7 +970,6 @@ pub const SessionRuntime = struct {
     /// The conversation's cache warmer, created on first use. Null on
     /// WebAssembly, which has no threads, or when it cannot be created.
     pub fn cacheWarmer(self: *SessionRuntime) ?*cache_warmer.Warmer {
-        if (comptime host_target.is_wasm) return null;
         if (self.cache_warmer == null) {
             self.cache_warmer = cache_warmer.Warmer.create() catch |err| {
                 debug_trace.logf("cache_warming", "event=unavailable err={s}", .{@errorName(err)});
@@ -983,14 +982,12 @@ pub const SessionRuntime = struct {
     /// Stops the warmer and its pings. The warmer is created again if the
     /// conversation is used after this.
     pub fn closeCacheWarmer(self: *SessionRuntime) void {
-        if (comptime host_target.is_wasm) return;
         const warmer = self.cache_warmer orelse return;
         self.cache_warmer = null;
         warmer.destroy();
     }
 
     fn disarmCacheWarming(self: *SessionRuntime, why: []const u8) void {
-        if (comptime host_target.is_wasm) return;
         if (self.cache_warmer) |warmer| warmer.disarm(why);
     }
 

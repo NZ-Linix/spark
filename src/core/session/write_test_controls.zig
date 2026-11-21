@@ -8,10 +8,9 @@
 //! (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a compaction commit while
 //! a subagent finishes lists each record once";
 //! `tests/tla/drivers/session/write.test.ts`). Only those tests set the
-//! controls, so the libfx artifacts leave them out.
+//! controls.
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
@@ -25,7 +24,6 @@ pub var test_hold: if (builtin.is_test) ?*const fn (count: usize) void else void
 
 /// Called by a write that took `count` due records, before it appends them.
 pub fn holdDueRecords(count: usize) void {
-    if (comptime build_options.libfx) return;
     if (builtin.is_test) {
         if (test_hold) |hold| hold(count);
         return;

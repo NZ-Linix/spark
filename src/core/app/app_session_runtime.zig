@@ -15,7 +15,6 @@ const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
 const runtime_execution_memory = @import("../agent/runtime/execution_memory.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
-const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host_capability = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const diff = @import("../output/diff.zig");
@@ -32,7 +31,6 @@ const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
-const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_event = @import("../session/session_event.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const result_store = @import("../session/result_store.zig");
@@ -85,7 +83,6 @@ pub const SessionPicker = session_persistence.SessionPicker;
 const SessionPickerCatalogCache = session_persistence.SessionPickerCatalogCache;
 const SessionPickerLoad = session_persistence.SessionPickerLoad;
 const TitleGenerationLoad = session_persistence.TitleGenerationLoad;
-const JsHostSessionStore = session_persistence.JsHostSessionStore;
 const PendingCancelledCommand = session_persistence.PendingCancelledCommand;
 pub const Persistence = session_persistence.Persistence;
 pub const TranscriptArchiveBoundaries = session_persistence.TranscriptArchiveBoundaries;
@@ -451,7 +448,6 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             required: bool,
         ) !void {
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             const opened = session_adapter.Store.openFromEnv(app.alloc) catch |err| {
                 if (required) return err;
                 return;
@@ -461,7 +457,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn enableSessionStores(app: *App, agent: *AppAgent) void {
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             const v2 = agent.session_persistence.v2 orelse return;
             if (comptime @hasDecl(@TypeOf(agent.session), "configureWebFetchArtifactBlobs")) {
                 // A v2 session's downloads are its blobs (D44, D49).
@@ -494,22 +489,14 @@ pub fn Runtime(comptime App: type) type {
             agent.total_input_tokens = 0;
             agent.total_output_tokens = 0;
             agent.total_web_search_requests = 0;
-            if (comptime runtime_profile.allows(App, .js_host_sessions)) {
-                try beginFreshJsHostSession(app, agent, carried);
-            }
             defer syncTranscriptWindowSaveMode(app, agent);
             defer syncTranscriptArchiveAvailable(app, agent);
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             if (agent.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, agent, v2_store, start, carried);
         }
 
         /// The preferences `agent`'s open session has saved, or null when it
         /// has no session or they can't be read. Caller owns.
         fn savedPreferences(app: *App, agent: *AppAgent) ?session_codec.DurableSessionPreferences {
-            if (comptime runtime_profile.allows(App, .js_host_sessions)) {
-                if (jsHostSavedPreferences(app, agent)) |preferences| return preferences;
-            }
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) return null;
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = agent.session_persistence.v2 orelse return null;
@@ -581,36 +568,6 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.degraded_warning_emitted = false;
         }
 
-        /// The preferences `agent`'s JS-host session has saved, or null when
-        /// it has none or they can't be copied. Caller owns.
-        fn jsHostSavedPreferences(app: *App, agent: *AppAgent) ?session_codec.DurableSessionPreferences {
-            const owner = if (agent.session_persistence.js_host_session) |*value| value else return null;
-            return owner.state.preferences.dupe(app.alloc) catch |err| {
-                debug_trace.logf("session", "saved preferences unavailable session={s} err={s}; the new session starts from the workspace's", .{ owner.state.id, @errorName(err) });
-                return null;
-            };
-        }
-
-        /// `carried`, when given, is what the new session starts with in
-        /// place of the workspace's preferences, as in `beginFresh`.
-        fn beginFreshJsHostSession(app: *App, agent: *AppAgent, carried: ?session_codec.DurableSessionPreferences) !void {
-            const preferences = carried orelse agent.session_persistence.workspace_preferences orelse
-                return error.SessionPreferencesUnavailable;
-            try replacePreferences(
-                app.alloc,
-                &agent.session_persistence.session_preferences,
-                preferences,
-            );
-            var state = try freshState(app, agent, preferences);
-            errdefer state.deinit(app.alloc);
-            if (agent.session_persistence.js_host_session) |*owner| owner.deinit(app.alloc);
-            agent.session_persistence.js_host_session = .{
-                .state = state,
-                .revision = null,
-            };
-            state = undefined;
-        }
-
         pub fn clearSession(app: *App, agent: *AppAgent) !void {
             try resetSessionWithBackgroundPolicy(app, agent, .carry_forward);
         }
@@ -638,7 +595,7 @@ pub fn Runtime(comptime App: type) type {
             const previous_policy = agent.session_persistence.pending_live_session_policy;
             const processing = agent.worker.isProcessing();
             const decision = decideLiveSessionTransition(
-                runtime_profile.allows(App, .cooperative_agent),
+                false,
                 processing,
                 previous_policy,
                 .{ .request = background_policy },
@@ -689,7 +646,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = app.admitPendingResizeSignal("session_handoff");
             }
             if (!shell_runtime.resizeLifecycleIdle(&app.shell)) return false;
-            if (comptime !host_target.is_wasm and @hasField(App, "terminal")) {
+            if (comptime @hasField(App, "terminal")) {
                 const actual = app.terminal.queryLayout(app.shell.layout.rows -| app.shell.layout.content_bottom) catch return false;
                 if (actual.cols != app.shell.layout.cols or actual.rows != app.shell.layout.rows) return false;
             }
@@ -788,7 +745,7 @@ pub fn Runtime(comptime App: type) type {
                 releaseLiveSessionTransitionHold(app, agent);
             }
             const decision = decideLiveSessionTransition(
-                runtime_profile.allows(App, .cooperative_agent),
+                false,
                 processing,
                 agent.session_persistence.pending_live_session_policy,
                 .settle,
@@ -1079,7 +1036,6 @@ pub fn Runtime(comptime App: type) type {
         /// its own transcript. The first instance's startup alone sets the
         /// terminal's replay anchor and the remembered session.
         pub fn resumeSessionById(app: *App, agent: *AppAgent, session_id: []const u8) !void {
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) return error.SessionPersistenceUnavailable;
             const v2_store = agent.session_persistence.v2_store orelse return error.SessionPersistenceUnavailable;
             const v2 = try session_adapter.Session.resumeSession(app.alloc, v2_store, .{ .id = session_id }, app.workspace_root, .app);
             try installResumedV2Session(app, agent, v2, .session);
@@ -1090,11 +1046,6 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             notice: ResumeNotice,
         ) !void {
-            if (comptime runtime_profile.allows(App, .js_host_sessions) and
-                !runtime_profile.allows(App, .durable_sessions))
-            {
-                return resumeRequestedJsHostSessionWithNotice(app, agent, notice);
-            }
             var target = app.requested_resume orelse return;
             app.requested_resume = null;
             defer target.deinit(app.alloc);
@@ -1123,144 +1074,6 @@ pub fn Runtime(comptime App: type) type {
         fn requestUpgradeRelaunchRedraw(app: *App) !void {
             debug_trace.logf("session", "event=upgrade_relaunch_redraw dropped=terminal_screen_and_scrollback reason=relaunched_build_redraws_conversation", .{});
             try app.shell.requestTerminalReset(&app.metrics);
-        }
-
-        fn resumeRequestedJsHostSession(app: *App, agent: *AppAgent) !void {
-            return resumeRequestedJsHostSessionWithNotice(app, agent, .session);
-        }
-
-        fn resumeRequestedJsHostSessionWithNotice(
-            app: *App,
-            agent: *AppAgent,
-            notice: ResumeNotice,
-        ) !void {
-            var target = app.requested_resume orelse return;
-            app.requested_resume = null;
-            defer target.deinit(app.alloc);
-
-            if (target == .pick) {
-                debug_trace.logf(
-                    "session",
-                    "event=js_host_session_restore outcome=dropped reason=picker_unsupported",
-                    .{},
-                );
-                try continueWithFreshJsHostSession(app, agent);
-                try app.writeDomainNotice(.{
-                    .topic = "session",
-                    .tone = .neutral,
-                    .body = "session picker is unavailable in this host; use --resume last or a session ID",
-                }, true);
-                return;
-            }
-
-            var listed: ?[]js_host_session_store.Metadata = null;
-            defer if (listed) |entries| {
-                for (entries) |*entry| entry.deinit(app.alloc);
-                app.alloc.free(entries);
-            };
-            const session_id = switch (target) {
-                .pick => unreachable,
-                .id => |id| id,
-                .remembered, .last => latest: {
-                    const entries = agent.session_persistence.js_host_store.list(app.alloc) catch |err| {
-                        traceJsHostRestoreFailure("list", null, err);
-                        try continueWithFreshJsHostSession(app, agent);
-                        return;
-                    };
-                    listed = entries;
-                    if (entries.len == 0) {
-                        debug_trace.logf(
-                            "session",
-                            "event=js_host_session_restore outcome=dropped reason=missing_record target=last",
-                            .{},
-                        );
-                        try continueWithFreshJsHostSession(app, agent);
-                        return;
-                    }
-                    var latest_index: usize = 0;
-                    for (entries[1..], 1..) |entry, index| {
-                        if (entry.updated_at_ms > entries[latest_index].updated_at_ms) {
-                            latest_index = index;
-                        }
-                    }
-                    break :latest entries[latest_index].id;
-                },
-            };
-
-            var loaded = (agent.session_persistence.js_host_store.load(app.alloc, session_id) catch |err| {
-                traceJsHostRestoreFailure(jsHostLoadFailureStage(err), session_id, err);
-                try continueWithFreshJsHostSession(app, agent);
-                return;
-            }) orelse {
-                debug_trace.logf(
-                    "session",
-                    "event=js_host_session_restore outcome=dropped reason=missing_record id={s}",
-                    .{session_id},
-                );
-                try continueWithFreshJsHostSession(app, agent);
-                return;
-            };
-            var loaded_owned = true;
-            defer if (loaded_owned) loaded.deinit(app.alloc);
-
-            var display = session_display_metadata.deriveFromHistory(
-                app.alloc,
-                loaded.state.history,
-            ) catch |err| {
-                traceJsHostRestoreFailure("display", session_id, err);
-                try continueWithFreshJsHostSession(app, agent);
-                return;
-            };
-            defer display.deinit(app.alloc);
-            hydrateResumedSession(app, agent, loaded.state, &display, notice) catch |err| {
-                traceJsHostRestoreFailure("hydrate", session_id, err);
-                try continueWithFreshJsHostSession(app, agent);
-                return;
-            };
-
-            if (agent.session_persistence.js_host_session) |*owner| owner.deinit(app.alloc);
-            agent.session_persistence.js_host_session = .{
-                .state = loaded.state,
-                .revision = loaded.revision,
-            };
-            loaded_owned = false;
-            loaded = undefined;
-            try app.commitStartupResumeReplayAnchor();
-        }
-
-        fn continueWithFreshJsHostSession(app: *App, agent: *AppAgent) !void {
-            agent.session.reset(app.alloc);
-            app.shell.clearTranscript(app.alloc);
-            clearCachedSessionTitle(app, agent);
-            try beginFreshJsHostSession(app, agent, null);
-            try finishLiveSessionTransition(app);
-        }
-
-        fn jsHostLoadFailureStage(err: anyerror) []const u8 {
-            return switch (err) {
-                error.InvalidDurableField,
-                error.InvalidDurableBytes,
-                error.InvalidSessionFormat,
-                error.InvalidSessionId,
-                => "decode",
-                else => "load",
-            };
-        }
-
-        fn traceJsHostRestoreFailure(stage: []const u8, id: ?[]const u8, err: anyerror) void {
-            if (id) |session_id| {
-                debug_trace.logf(
-                    "session",
-                    "event=js_host_session_restore outcome=dropped stage={s} id={s} err={s}",
-                    .{ stage, session_id, @errorName(err) },
-                );
-            } else {
-                debug_trace.logf(
-                    "session",
-                    "event=js_host_session_restore outcome=dropped stage={s} err={s}",
-                    .{ stage, @errorName(err) },
-                );
-            }
         }
 
         pub fn startResumedSessionWarmup(app: *App) void {
@@ -2195,7 +2008,6 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
                 ensureCachedSessionTitle(app, agent) catch {};
-                commitJsHostSnapshot(app, agent, "history_turn");
                 return .committed;
             }
             // The turn's end capture was taken on its worker as the turn
@@ -2224,7 +2036,6 @@ pub fn Runtime(comptime App: type) type {
             }
             if (snapshot_file_ownership) |ownership| ownership.transfer();
             ensureCachedSessionTitle(app, agent) catch {};
-            commitJsHostSnapshot(app, agent, "history_turn");
             return .committed;
         }
 
@@ -2396,10 +2207,6 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
 
-            if (result.session_error == null) {
-                commitJsHostSnapshot(app, agent, "preferences");
-            }
-
             agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             if (agent.session_persistence.v2) |v2| {
@@ -2446,7 +2253,6 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn activeSessionId(agent: *AppAgent) ?[]const u8 {
             if (agent.session_persistence.v2) |v2| return v2.id();
-            if (agent.session_persistence.js_host_session) |*owner| return owner.state.id;
             return null;
         }
 
@@ -2560,7 +2366,6 @@ pub fn Runtime(comptime App: type) type {
         /// no-op because the locally derived title remains in place. The
         /// generated title is applied by `pollSessionTitleGeneration`.
         pub fn maybeStartSessionTitleGeneration(app: *App, agent: *AppAgent, prompt: []const u8) void {
-            if (comptime host_target.is_wasm) return;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return;
             if (comptime !@hasField(App, "session_title_generation")) return;
             if (comptime !agents.hasAgentField(App, "session_title")) return;
@@ -2620,7 +2425,6 @@ pub fn Runtime(comptime App: type) type {
         /// Applies a finished background title generation on the main loop.
         /// Returns true when the session title changed.
         pub fn pollSessionTitleGeneration(app: *App, agent: *AppAgent) !bool {
-            if (comptime host_target.is_wasm) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             if (comptime !agents.hasAgentField(App, "session_title")) return false;
             if (comptime !agents.hasAgentField(App, "session")) return false;
@@ -3752,24 +3556,22 @@ pub fn Runtime(comptime App: type) type {
             context_history: []const types.HistoryTurn,
             labels: *HistoricalSessionLabels,
         ) !bool {
-            if (comptime runtime_profile.allows(App, .durable_sessions)) {
-                // The screen holds the newest compaction cycle; Ctrl+O reads
-                // the older ones from the log.
-                if (agent.session_persistence.v2) |v2| {
-                    const Visitor = struct {
-                        app: *App,
-                        agent: *AppAgent,
-                        sink: @TypeOf(sink),
-                        labels: *HistoricalSessionLabels,
-                        has_prior_turns: bool = false,
+            // The screen holds the newest compaction cycle; Ctrl+O reads
+            // the older ones from the log.
+            if (agent.session_persistence.v2) |v2| {
+                const Visitor = struct {
+                    app: *App,
+                    agent: *AppAgent,
+                    sink: @TypeOf(sink),
+                    labels: *HistoricalSessionLabels,
+                    has_prior_turns: bool = false,
 
-                        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                            return replayHistoryToSinkIncremental(self.app, self.agent, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
-                        }
-                    };
-                    var visitor = Visitor{ .app = app, .agent = agent, .sink = sink, .labels = labels };
-                    return v2.visitHistorySinceCompaction(app.alloc, &visitor);
-                }
+                    pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+                        return replayHistoryToSinkIncremental(self.app, self.agent, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
+                    }
+                };
+                var visitor = Visitor{ .app = app, .agent = agent, .sink = sink, .labels = labels };
+                return v2.visitHistorySinceCompaction(app.alloc, &visitor);
             }
             try replayHistoryToSink(app, agent, sink, context_history, labels);
             return false;
@@ -5059,20 +4861,6 @@ pub fn Runtime(comptime App: type) type {
                 defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
                 if (agent.session_persistence.v2) |v2| {
                     try v2.commitCompaction(summary, active_prefix != null, retained_from);
-                } else if (agent.session_persistence.js_host_session) |*owner| {
-                    var next = try snapshotCurrentState(app, agent, owner.state, io_mod.milliTimestamp());
-                    var next_owned = true;
-                    defer if (next_owned) next.deinit(app.alloc);
-                    const history = try session_runtime.snapshotOwnedContextHistory(app.alloc, prepared, 0, 0);
-                    types.freeHistoryTurnSlice(app.alloc, next.history);
-                    next.history = history;
-                    next.context_history_start = 0;
-                    const revision = try agent.session_persistence.js_host_store.commit(app.alloc, next, owner.revision);
-                    if (owner.revision) |old| app.alloc.free(old);
-                    owner.state.deinit(app.alloc);
-                    owner.state = next;
-                    owner.revision = revision;
-                    next_owned = false;
                 }
             }
             agent.session.commitCompactedHistory(app.alloc, prepared);
@@ -5083,59 +4871,6 @@ pub fn Runtime(comptime App: type) type {
                     syncTranscriptArchiveAvailable(app, agent);
                 }
             }
-        }
-
-        fn commitJsHostSnapshot(app: *App, agent: *AppAgent, boundary: []const u8) void {
-            if (comptime !agents.hasAgentField(App, "session_persistence")) return;
-            if (comptime !runtime_profile.allows(App, .js_host_sessions)) return;
-            commitJsHostSnapshotEnabled(app, agent, boundary);
-        }
-
-        fn commitJsHostSnapshotEnabled(app: *App, agent: *AppAgent, boundary: []const u8) void {
-            agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const owner = if (agent.session_persistence.js_host_session) |*value|
-                value
-            else
-                return;
-            var next = snapshotCurrentState(
-                app,
-                agent,
-                owner.state,
-                io_mod.milliTimestamp(),
-            ) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event=js_host_session_commit outcome=dropped boundary={s} id={s} err={s}",
-                    .{ boundary, owner.state.id, @errorName(err) },
-                );
-                return;
-            };
-            var next_owned = true;
-            defer if (next_owned) next.deinit(app.alloc);
-            const revision = agent.session_persistence.js_host_store.commit(
-                app.alloc,
-                next,
-                owner.revision,
-            ) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "event=js_host_session_commit outcome=dropped boundary={s} id={s} expected_revision={s} err={s}",
-                    .{
-                        boundary,
-                        owner.state.id,
-                        owner.revision orelse "",
-                        @errorName(err),
-                    },
-                );
-                return;
-            };
-
-            if (owner.revision) |old_revision| app.alloc.free(old_revision);
-            owner.state.deinit(app.alloc);
-            owner.state = next;
-            owner.revision = revision;
-            next_owned = false;
         }
 
         fn snapshotCurrentState(
@@ -5887,118 +5622,6 @@ const TestApp = struct {
         return &self.main_agent;
     }
 };
-
-const FakeJsHostSessionStore = struct {
-    state: ?session_codec.DurableSessionState = null,
-    revision: []const u8 = "revision-1",
-    updated_at_ms: i64 = 1,
-    list_error: ?anyerror = null,
-    load_error: ?anyerror = null,
-    commit_error: ?anyerror = null,
-    load_missing: bool = false,
-    commit_count: usize = 0,
-    committed_state: ?session_codec.DurableSessionState = null,
-    expected_revision: ?[]u8 = null,
-
-    fn deinit(self: *FakeJsHostSessionStore, alloc: Allocator) void {
-        if (self.state) |*state| state.deinit(alloc);
-        if (self.committed_state) |*state| state.deinit(alloc);
-        if (self.expected_revision) |revision| alloc.free(revision);
-        self.* = .{};
-    }
-
-    fn store(self: *FakeJsHostSessionStore) JsHostSessionStore {
-        return .{
-            .ctx = self,
-            .load_fn = load,
-            .commit_fn = commit,
-            .list_fn = list,
-        };
-    }
-
-    fn load(raw: ?*anyopaque, alloc: Allocator, id: []const u8) !?js_host_session_store.Loaded {
-        const self: *FakeJsHostSessionStore = @ptrCast(@alignCast(raw.?));
-        if (self.load_error) |err| return err;
-        if (self.load_missing) return null;
-        const state = self.state orelse return null;
-        if (!std.mem.eql(u8, state.id, id)) return null;
-        var owned_state = try state.dupe(alloc);
-        errdefer owned_state.deinit(alloc);
-        return .{
-            .state = owned_state,
-            .revision = try alloc.dupe(u8, self.revision),
-        };
-    }
-
-    fn commit(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        state: session_codec.DurableSessionState,
-        expected_revision: ?[]const u8,
-    ) ![]u8 {
-        const self: *FakeJsHostSessionStore = @ptrCast(@alignCast(raw.?));
-        self.commit_count += 1;
-        if (self.commit_error) |err| return err;
-        if (self.expected_revision) |revision| alloc.free(revision);
-        self.expected_revision = if (expected_revision) |revision|
-            try alloc.dupe(u8, revision)
-        else
-            null;
-        if (self.committed_state) |*committed| committed.deinit(alloc);
-        self.committed_state = try state.dupe(alloc);
-        return alloc.dupe(u8, "revision-next");
-    }
-
-    fn list(raw: ?*anyopaque, alloc: Allocator) ![]js_host_session_store.Metadata {
-        const self: *FakeJsHostSessionStore = @ptrCast(@alignCast(raw.?));
-        if (self.list_error) |err| return err;
-        const state = self.state orelse return alloc.alloc(js_host_session_store.Metadata, 0);
-        const entries = try alloc.alloc(js_host_session_store.Metadata, 1);
-        errdefer alloc.free(entries);
-        entries[0] = .{
-            .id = try alloc.dupe(u8, state.id),
-            .updated_at_ms = self.updated_at_ms,
-        };
-        return entries;
-    }
-};
-
-fn makeJsHostTestState(
-    alloc: Allocator,
-    id: []const u8,
-    user: []const u8,
-    assistant: []const u8,
-) !session_codec.DurableSessionState {
-    const history = try alloc.alloc(types.HistoryTurn, 1);
-    errdefer alloc.free(history);
-    history[0] = try session_runtime.makeAssistantTurn(alloc, user, assistant);
-    errdefer session_runtime.freeHistoryTurn(alloc, history[0]);
-    const owned_id = try alloc.dupe(u8, id);
-    errdefer alloc.free(owned_id);
-    const origin = try alloc.dupe(u8, "/origin");
-    errdefer alloc.free(origin);
-    const workspace = try alloc.dupe(u8, "/workspace");
-    errdefer alloc.free(workspace);
-    const model = try alloc.dupe(u8, "restored/model");
-    errdefer alloc.free(model);
-    return .{
-        .id = owned_id,
-        .origin_workspace_root = origin,
-        .workspace_root = workspace,
-        .created_at_ms = 10,
-        .updated_at_ms = 20,
-        .conversation_language = session_runtime.ConversationLanguage.literal("en"),
-        .preferences = .{
-            .model = model,
-            .effort = types.ReasoningEffort.literal("high"),
-            .fast_mode = true,
-        },
-        .history = history,
-        .context_history_start = 0,
-        .total_input_tokens = 17,
-        .total_output_tokens = 23,
-    };
-}
 
 fn testPaths(alloc: Allocator, tmp: *std.testing.TmpDir) !struct { home: []u8, workspace: []u8 } {
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.spark");

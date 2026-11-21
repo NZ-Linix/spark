@@ -14,7 +14,6 @@ const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const host = @import("../hosts/host.zig");
-const runtime_profile = @import("../hosts/runtime_profile.zig");
 const composer_insertion = @import("../input/composer_insertion.zig");
 const composer_stash = @import("../input/composer_stash.zig");
 const gesture_state = @import("../input/gesture_state.zig");
@@ -1190,7 +1189,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .open_all_sessions => {
                     if (comptime agents.hasAgentField(App, "session_persistence") and
-                        runtime_profile.allows(App, .durable_sessions))
+                        true)
                     {
                         if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app)) return .done;
                         if (try refuseSessionActionWithDraft(app, agents.screenAgentOf(app), "submit or clear the draft before switching sessions")) return .done;
@@ -1488,10 +1487,8 @@ pub fn Runtime(comptime App: type) type {
                     if (try submitModelMenuSelection(app, agent)) return;
                     if (try submitSkillsMenuSelection(app, max_input_len)) return;
                     if (try submitSlashPickerSelection(app, agent)) return;
-                    if (comptime runtime_profile.allows(App, .durable_sessions)) {
-                        if (try submitSessionPickerSelection(app, agent)) return;
-                        if (try submitForkMenuSelection(app, agent, null, max_input_len)) return;
-                    }
+                    if (try submitSessionPickerSelection(app, agent)) return;
+                    if (try submitForkMenuSelection(app, agent, null, max_input_len)) return;
                     if (try completion_rt.submitFilePickerOnEnter(app, agent, max_input_len)) |result| {
                         if (result == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
@@ -1984,7 +1981,6 @@ pub fn Runtime(comptime App: type) type {
         /// bytes are dropped with a trace line, so a stray key never forks;
         /// control bytes pass, so Ctrl+C still works.
         fn routeForkQuestionByte(app: *App, agent: *AppAgent, byte: u8) !bool {
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             if (!agent.session_persistence.fork_menu.asking()) return false;
             const bring: ?bool = switch (byte) {
@@ -2003,7 +1999,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn answerForkQuestionOnEscape(app: *App, agent: *AppAgent) !bool {
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             if (!agent.session_persistence.fork_menu.asking()) return false;
             return submitForkMenuSelection(app, agent, false, forkPromptLimit());
@@ -2296,7 +2291,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn toggleSessionPickerScopeIfActive(app: *App, agent: *AppAgent) !bool {
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) return false;
             if (comptime !agents.hasAgentField(App, "session_persistence")) return false;
             if (!agent.session_persistence.session_picker.active) return false;
             return try app_session_runtime.Runtime(App).toggleSessionPickerScope(app, agent);
@@ -2796,10 +2790,6 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !agents.hasAgentField(App, "session_persistence")) return;
             const picker = &agent.session_persistence.session_picker;
             if (!picker.active) return;
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
-                picker.setQuery(app.input_runtime.edit_state.input.items);
-                return;
-            }
             app_session_runtime.Runtime(App).searchSessionPicker(app, agent) catch |err| {
                 debug_trace.logf(
                     "session",
@@ -3034,10 +3024,6 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            if (false) {
-                _ = disarmEscapeClear(app);
-                return;
-            }
             if (cancelConnectMenu(app) or cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app, agent) or cancelForkMenu(app, agent) or cancelEffortMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);

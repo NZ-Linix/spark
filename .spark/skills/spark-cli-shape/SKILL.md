@@ -12,7 +12,7 @@ spark follows git and Unix conventions for how people and scripts control it. Ea
 Every rule below comes from these values. When a case isn't covered, decide by them, then ask a maintainer.
 
 - **Guessable.** Someone who knows git and the Unix command line should predict what a control is called, where its options go, and which source wins. Follow open standards first, such as `AGENTS.md`, the Agent Skills folders, MCP's `mcp.json`, and `NO_COLOR`; then git; then what other coding agents agree on. When copying a reference would make a command harder to type, the shorter form wins.
-- **One concept, one name.** A setting is spelled the same in settings files, flags, env vars, slash commands, JSON, ACP, and libfx. Only each surface's case changes.
+- **One concept, one name.** A setting is spelled the same in settings files, flags, env vars, slash commands, JSON, and ACP. Only each surface's case changes.
 - **One job per mechanism.** Subcommands act, arguments name what they act on, flags shape one run, settings persist, env vars carry context from the surroundings, and slash commands act inside a session.
 - **Scripts are first-class.** Data goes to stdout and diagnostics to stderr, JSON fields stay stable, exit codes mean something, and spark never prompts without a terminal.
 - **Untrusted input stays limited.** A committed project file or a repository's content never gets the power of the user's own profile.

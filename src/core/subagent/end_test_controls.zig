@@ -8,7 +8,7 @@
 //! every time (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a message right
 //! after a stop starts the subagent's next turn";
 //! `tests/tla/drivers/subagent/stop-message.test.ts`). Only those tests set
-//! the controls, so the libfx artifacts leave them out.
+//! the controls.
 //!
 //! Every hold reads two paths from the environment and uses them only when
 //! both are absolute (`holdFiles`): the file calls take no other kind, and a
@@ -26,7 +26,6 @@
 //! work ends with nothing to report still returns").
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
@@ -41,7 +40,6 @@ pub var test_hold: if (builtin.is_test) ?*const fn (child_id: []const u8) void e
 /// Whether a stopped work's end may be held, so the slot reads who stopped
 /// it only when a test asked.
 pub fn armed() bool {
-    if (comptime build_options.libfx) return false;
     if (builtin.is_test) return test_hold != null;
     return holdFiles("SPARK_TEST_SUBAGENT_END_HELD", "SPARK_TEST_SUBAGENT_END_RELEASE") != null;
 }
@@ -49,7 +47,6 @@ pub fn armed() bool {
 /// Called by the slot of `child_id` once a work that `by` stopped has ended,
 /// before the slot finishes it. `by` is "parent" or "user".
 pub fn holdStoppedEnd(child_id: []const u8, by: []const u8) void {
-    if (comptime build_options.libfx) return;
     if (builtin.is_test) {
         if (test_hold) |hold| hold(child_id);
         return;
@@ -67,7 +64,6 @@ pub var test_settle_hold: if (builtin.is_test) ?*const fn (child_id: []const u8)
 /// Whether the host may be held before it settles an ended work, so it
 /// reads the controls only when a test asked.
 pub fn settleArmed() bool {
-    if (comptime build_options.libfx) return false;
     if (builtin.is_test) return test_settle_hold != null;
     return holdFiles("SPARK_TEST_SUBAGENT_SETTLE_HELD", "SPARK_TEST_SUBAGENT_SETTLE_RELEASE") != null;
 }
@@ -75,7 +71,6 @@ pub fn settleArmed() bool {
 /// Called by the host for `child_id` once it has told the owner of a work's
 /// end, before it clears the child's busy flag.
 pub fn holdBeforeSettle(child_id: []const u8) void {
-    if (comptime build_options.libfx) return;
     if (builtin.is_test) {
         if (test_settle_hold) |hold| hold(child_id);
         return;
@@ -94,14 +89,12 @@ pub var test_hold_run: if (builtin.is_test) ?*const fn (child_id: []const u8, re
 
 /// Whether an inline test holds the slot there.
 pub fn runArmed() bool {
-    if (comptime build_options.libfx) return false;
     if (builtin.is_test) return test_hold_run != null;
     return false;
 }
 
 /// Called by the slot of `child_id` at the two points `test_hold_run` names.
 pub fn holdAfterRun(child_id: []const u8, recorded: bool) void {
-    if (comptime build_options.libfx) return;
     if (builtin.is_test) {
         if (test_hold_run) |hold| hold(child_id, recorded);
     }

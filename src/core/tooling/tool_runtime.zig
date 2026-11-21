@@ -75,11 +75,6 @@ const test_builtin_tools = if (builtin.is_test)
     @import("../../builtins/tools.zig")
 else
     struct {};
-const test_browser_workspace_tools = if (builtin.is_test)
-    @import("../../builtins/browser_workspace_tools.zig")
-else
-    struct {};
-const js_host_workspace = @import("../hosts/js_host_workspace.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -234,7 +229,6 @@ pub const Context = struct {
     on_web_search_progress: ?tool_dispatch.WebSearchProgressFn = null,
     web_fetch_progress_ctx: ?*anyopaque = null,
     on_web_fetch_progress: ?tool_dispatch.WebFetchProgressFn = null,
-    workspace_executor: ?js_host_workspace.Executor = null,
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?subagent_tool_host.ModelOverrideResolver = null,
@@ -547,34 +541,6 @@ test "returned tool results retain diagnostic outcome identity" {
         diagnostics.ToolCallOutcome.runtime_failed,
         classifyToolExecutionError(error.Unexpected),
     );
-}
-
-pub fn executeHostToolCallAuthorized(
-    ctx: Context,
-    request: tool_contracts.ToolExecutionRequest,
-) !ToolExecutionResult {
-    const spec = ctx.tool_registry.lookup(request.call.name) orelse
-        return error.InvalidToolArguments;
-    if (spec.executor_kind != .host) return error.InvalidToolArguments;
-
-    var execution_ctx = ctx;
-    execution_ctx.observer = request.observer orelse ctx.observer;
-    if (request.permission_mode) |permission_mode| {
-        execution_ctx.permission_mode = permission_mode;
-    }
-    execution_ctx.max_tool_result_bytes = request.max_tool_result_bytes;
-    var dispatch_ctx = typedDispatchContextForCall(
-        execution_ctx,
-        request.result_allocator,
-        request.call,
-    );
-    dispatch_ctx.execution_authority = request.authority;
-    const dispatched = try tool_dispatch.dispatchAuthorizedToolCall(
-        dispatch_ctx,
-        execution_ctx.tool_registry,
-        request.call,
-    );
-    return toolExecutionResultFromDispatch(dispatched, .{});
 }
 
 fn rebindMcpAuthorityGeneration(
@@ -1936,20 +1902,6 @@ fn toolRunCommand(
         if (ctx.command_replay_capture) |capture| capture.policy() else null,
     );
 
-    if (comptime builtin.target.os.tag == .wasi or builtin.is_test) {
-        if (ctx.workspace_executor) |executor| {
-            return executeWorkspaceRunCommand(
-                arena,
-                request,
-                command_ctx,
-                authority,
-                executor,
-                timeout.timeout_ms,
-            );
-        }
-    }
-    if (comptime builtin.target.os.tag == .wasi) return error.WorkspaceUnavailable;
-
     try execution_router.validateConfigContext(.{
         .max_command_output_bytes = ctx.max_command_output_bytes,
     }, command_ctx);
@@ -2148,81 +2100,6 @@ fn toolRunCommand(
         .{
             .model_output = result.output,
             .command_result_json = if (result.command_result) |command_result| try command_result.toJson(arena) else null,
-        },
-    );
-}
-
-fn executeWorkspaceRunCommand(
-    arena: Allocator,
-    request: tool_dispatch.RunCommandRequest,
-    command_ctx: command_admission.CommandContext,
-    authority: command_admission.CommandExecutionAuthority,
-    executor: js_host_workspace.Executor,
-    configured_timeout_ms: ?usize,
-) !ToolExecutionResult {
-    if (std.meta.activeTag(request.environment) != .workspace_clean) return error.InvalidWorkspaceInput;
-    var route = try execution_router.prepareAuthorizedRoute(
-        arena,
-        command_ctx,
-        authority,
-    );
-    defer route.deinit(arena);
-
-    const timeout_ms: u32 = @intCast(@min(
-        @max(configured_timeout_ms orelse js_host_workspace.max_timeout_ms, js_host_workspace.min_timeout_ms),
-        js_host_workspace.max_timeout_ms,
-    ));
-    const started_ms = io_mod.milliTimestamp();
-    const result = executor.execute(
-        arena,
-        request.command,
-        request.resolved_cwd,
-        timeout_ms,
-    ) catch |err| {
-        if (err == error.WorkspaceDeadline) {
-            return command_result_mapping.Command.timeoutFailure(
-                arena,
-                request.command,
-                request.resolved_cwd,
-                timeout_ms,
-                started_ms,
-            );
-        }
-        return err;
-    };
-    var replay_transferred = false;
-    if (try command_result_mapping.Command.cancelledFailure(arena, result)) |cancelled| {
-        return finishCommandToolResult(
-            arena,
-            null,
-            false,
-            &replay_transferred,
-            result,
-            cancelled,
-        );
-    }
-    if (try command_result_mapping.Command.nonZeroFailure(arena, result)) |failure| {
-        return finishCommandToolResult(
-            arena,
-            null,
-            false,
-            &replay_transferred,
-            result,
-            failure,
-        );
-    }
-    return finishCommandToolResult(
-        arena,
-        null,
-        false,
-        &replay_transferred,
-        result,
-        .{
-            .model_output = result.output,
-            .command_result_json = if (result.command_result) |command_result|
-                try command_result.toJson(arena)
-            else
-                null,
         },
     );
 }

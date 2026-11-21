@@ -9,14 +9,13 @@
 //! (`tests/e2e/gateway-stream-lifecycle.test.ts`, "a stop right after a
 //! subagent's turn ended finds it not working" and "a close right after a
 //! subagent's turn ended closes it as an idle one"). Only those tests set the
-//! controls, so the libfx artifacts leave them out. A build that sets neither
+//! controls. A build that sets neither
 //! control reads one environment variable per end and does nothing more.
 //!
 //! An inline test sets `test_hold` in place of the file controls; a test
 //! build without it does nothing at all.
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
@@ -30,7 +29,6 @@ pub var test_hold: if (builtin.is_test) ?*const fn (child_id: []const u8) void e
 /// Called by the slot of `child_id` once the host's end hook has returned,
 /// before the slot goes on to its next work or publishes its completion.
 pub fn holdPublish(child_id: []const u8) void {
-    if (comptime build_options.libfx) return;
     if (builtin.is_test) {
         if (test_hold) |hold| hold(child_id);
         return;

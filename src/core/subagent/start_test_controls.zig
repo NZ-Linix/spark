@@ -11,10 +11,9 @@
 //! `tests/tla/drivers/subagent/stop-message.test.ts`).
 //! `SPARK_TEST_SUBAGENT_START_WAIT_MS` shortens how long a message waits for such
 //! a start before it goes to the subagent's next turn. Only those tests set
-//! the controls, so the libfx artifacts leave them out.
+//! the controls.
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const io_mod = @import("../shared/io.zig");
 const end_test_controls = @import("end_test_controls.zig");
 
@@ -38,7 +37,6 @@ pub var test_wait_limit_ms: if (builtin.is_test) ?u64 else void = if (builtin.is
 /// Whether a work's start may be held, so the slot checks only when a test
 /// asked.
 pub fn armed() bool {
-    if (comptime build_options.libfx) return false;
     if (builtin.is_test) return test_hold != null;
     return end_test_controls.holdFiles("SPARK_TEST_SUBAGENT_START_HELD", "SPARK_TEST_SUBAGENT_START_RELEASE") != null;
 }
@@ -46,7 +44,6 @@ pub fn armed() bool {
 /// Called by the slot of `child_id` once the work's turn is built, before its
 /// worker attaches. `cancel` is the work's cancel flag.
 pub fn holdStart(child_id: []const u8, cancel: *const std.atomic.Value(bool)) void {
-    if (comptime build_options.libfx) return;
     if (builtin.is_test) {
         if (test_hold) |hold| hold(child_id);
         return;
@@ -68,7 +65,6 @@ pub fn holdStart(child_id: []const u8, cancel: *const std.atomic.Value(bool)) vo
 
 /// How long a message waits for a starting work's turn to begin.
 pub fn waitLimitMs() u64 {
-    if (comptime build_options.libfx) return default_wait_limit_ms;
     if (builtin.is_test) return test_wait_limit_ms orelse default_wait_limit_ms;
     const raw = io_mod.getenv("SPARK_TEST_SUBAGENT_START_WAIT_MS") orelse return default_wait_limit_ms;
     return std.fmt.parseInt(u64, raw, 10) catch default_wait_limit_ms;

@@ -218,9 +218,6 @@ pub fn Runtime(comptime App: type) type {
             if (comptime agents.hasAgentField(App, "question_prompt")) {
                 if (agent.question_prompt.isActive()) return "upgrade is unavailable while a question is open";
             }
-            if (comptime false) {
-                if (false) return "upgrade is unavailable while an approval is open";
-            }
             if (comptime @hasField(App, "auth") and
                 @hasDecl(@TypeOf(app.auth), "apiKeyEntryActive"))
             {

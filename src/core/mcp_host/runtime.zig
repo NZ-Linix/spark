@@ -56,7 +56,6 @@ const refresh_retry_ms: u32 = 20;
 /// servers than without. Hosts, their threads, and their memory are left to
 /// the exiting process, and a logout already waited for its revocation.
 pub fn signalServersForExit() void {
-    if (comptime host_target.is_wasm) return;
     mcp.stdio.signalAllForExit(io_mod.getIo());
 }
 

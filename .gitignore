@@ -10,7 +10,6 @@ bun.lock
 zig-cache/
 zig-out/
 zig-pkg/
-sdk/dist/
 
 # Python bytecode written when the scripts run
 __pycache__/

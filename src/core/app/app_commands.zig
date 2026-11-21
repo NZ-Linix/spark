@@ -1,7 +1,6 @@
 const std = @import("std");
 const profile_paths = @import("../shared/profile_paths.zig");
 const agents = @import("../agents/agents.zig");
-const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
@@ -651,27 +650,11 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandResumeSession(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
-                try app.writeDomainNotice(.{
-                    .topic = "session",
-                    .tone = .warning,
-                    .body = "Session resume is owned by the embedding SDK for this host.",
-                }, true);
-                return;
-            }
             try app_session_runtime.Runtime(App).openSessionPicker(app, agents.screenAgentOf(app));
         }
 
         fn commandForkSession(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
-                try app.writeDomainNotice(.{
-                    .topic = "session",
-                    .tone = .warning,
-                    .body = "Session forking is owned by the embedding SDK for this host.",
-                }, true);
-                return;
-            }
             try app_session_runtime.Runtime(App).openForkMenu(app, agents.screenAgentOf(app));
         }
 
@@ -845,14 +828,6 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             if (comptime !@hasDecl(App, "runMcpVerbs")) return;
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime !runtime_profile.allows(App, .mcp)) {
-                try app.writeDomainNotice(.{
-                    .topic = "mcp",
-                    .tone = .warning,
-                    .body = "MCP servers are unavailable in this host; the embedding app provides MCP tools.",
-                }, true);
-                return;
-            }
             const command = std.mem.trim(u8, rest, " \t");
             // `/mcp` alone opens the menu, and `/mcp VERB` runs the verbs
             // `spark mcp` has.
@@ -864,14 +839,6 @@ pub fn Handlers(comptime App: type) type {
 
         noinline fn commandHandleSkills(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime !runtime_profile.allows(App, .skills)) {
-                try app.writeDomainNotice(.{
-                    .topic = "skills",
-                    .tone = .warning,
-                    .body = "Skills are unavailable in this host because filesystem access is not provided.",
-                }, true);
-                return;
-            }
             const provider = app.skillsCommandProvider();
             const command = provider.parseCommand(rest);
 

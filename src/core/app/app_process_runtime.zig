@@ -28,11 +28,6 @@ fn settleCompactionWorkFailure(worker: *worker_runtime.WorkerRuntime, work: work
     }
 }
 
-/// Whether `App` runs its agent on the main loop, without worker threads.
-pub fn cooperativeHost(comptime App: type) bool {
-    return @hasDecl(App, "host_profile") and App.host_profile.cooperative_agent;
-}
-
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -58,57 +53,8 @@ pub fn Runtime(comptime App: type) type {
         /// for that agent's conversation. A cooperative host runs no agent
         /// threads, so it hosts only its first agent.
         pub fn startAgentWorkerThread(app: *App, agent: *agents.Agent) !void {
-            if (comptime cooperativeHost(App)) return error.AgentThreadsUnavailable;
             enableCommitGate(agent);
             agent.worker_thread = try std.Thread.spawn(.{}, agentWorkerThreadMain, .{ app, agent });
-        }
-
-        /// Starts one queued prompt on a single-threaded host. Prompt admission
-        /// is presented before agent work can suspend on host transport.
-        pub fn processNextCooperativePrompt(
-            app: *App,
-            agent: *AppAgent,
-            event_handlers: app_worker_runtime.WorkerEventHandlers,
-            flush_frame: *const fn (*App) anyerror!void,
-        ) !void {
-            const work = (try agent.worker.tryTakeNextWork(std.heap.c_allocator)) orelse return;
-            defer worker_runtime.freeWorkItem(std.heap.c_allocator, work);
-            defer agent.worker.finishProcessing();
-            processCooperativeWork(app, agent, event_handlers, flush_frame, work) catch |err| {
-                settleCompactionWorkFailure(&agent.worker, work, err);
-                return err;
-            };
-        }
-
-        fn processCooperativeWork(
-            app: *App,
-            agent: *AppAgent,
-            event_handlers: app_worker_runtime.WorkerEventHandlers,
-            flush_frame: *const fn (*App) anyerror!void,
-            work: worker_runtime.WorkItem,
-        ) !void {
-            try app_worker_runtime.Runtime(App).tick(
-                app,
-                agent,
-                event_handlers,
-            );
-            try flush_frame(app);
-
-            var failure_provenance: ?compaction_activity.ErrorProvenance = null;
-            app.processQueuedWork(agent, work, &failure_provenance) catch |err| {
-                settleCompactionWorkFailure(&agent.worker, work, err);
-                if (compactionErrorHandled(work, failure_provenance, err)) {
-                    compactor.traceLog(true, "interactive error retained err={s}", .{@errorName(err)});
-                } else if (err != error.RouteRecoveryStopped) {
-                    const body = try formatErrorBody(std.heap.c_allocator, "request failed", err);
-                    defer std.heap.c_allocator.free(body);
-                    try agent.worker.pushEvent(std.heap.c_allocator, .{ .error_text = .{
-                        .topic = "system",
-                        .tone = .@"error",
-                        .body = body,
-                    } });
-                }
-            };
         }
 
         pub fn formatToolExecutionError(alloc: std.mem.Allocator, tool_name: []const u8, err: anyerror) ![]u8 {

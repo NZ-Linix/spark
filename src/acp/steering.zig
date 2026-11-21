@@ -1,5 +1,5 @@
-//! When a libfx steer interrupts, waits, joins, or hands off a turn. TLA+
-//! model: `tests/tla/sdk/DurableSteer.tla`.
+//! The steering queue of a running ACP turn: `session/prompt` requests
+//! with `_meta.spark.steer` that join the turn at its next boundary.
 
 const std = @import("std");
 const debug_trace = @import("../core/shared/debug_trace.zig");

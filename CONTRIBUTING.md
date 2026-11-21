@@ -153,7 +153,7 @@ python3 benchmarks/first_frame.py --binary /tmp/spark-before --binary ./zig-out/
 
 ### Check a TLA+ model
 
-`tests/tla/` holds TLA+ models of spark, such as the session manager, the MCP engine and host, ACP, `/usage`, the shell tool, the workspace indexer, and libfx. Most come with Bun drivers that run the real binary and have TLC check what it did. CI runs the libfx and MCP models on `main` and on pull requests that change the code they cover; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` lists every model and covers setup.
+`tests/tla/` holds TLA+ models of spark, such as the session manager, the MCP engine and host, ACP, `/usage`, the shell tool, the workspace indexer. Most come with Bun drivers that run the real binary and have TLC check what it did. CI runs the MCP, transcript window, and subagent models on `main` and on pull requests that change the code they cover; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` lists every model and covers setup.
 
 ```bash
 tests/tla/session_manager/check.sh SessionLog
@@ -213,7 +213,7 @@ These five checks must pass before a pull request merges:
 
 | Check | What it runs |
 | --- | --- |
-| `Build & Test` | Formatting, the PGSO corpus, the public-surface, compactor-boundary, and indexer-boundary checks, the ReleaseSafe unit tests, and the SDK package jobs, including the libfx durable-session model check when the change needs it |
+| `Build & Test` | Formatting, the PGSO corpus, the public-surface, compactor-boundary, and indexer-boundary checks, the ReleaseSafe unit tests, and the model checks the change needs |
 | `E2E (deterministic)` | Every end-to-end file, split across four weighted shards, plus the MCP conformance baseline |
 | `Shellcheck` | `bash -n` and `shellcheck` on the scripts listed in the job, such as `benchmarks/startup.sh` and `scripts/detect-macos-need.sh` |
 | `Startup Latency` | The benchmarked CLI commands on a ReleaseSafe build, each held to 2 ms, plus the interactive performance test in `tests/e2e/tui-performance.test.ts` |
@@ -226,20 +226,12 @@ CI retries a failed end-to-end file once. A file that passes only on the retry g
 - A Zig file with a macOS, BSD, or Linux code path
 - `build.zig`
 - The macOS signing script
-- The native SDK addon
 - An end-to-end file listed in `tests/e2e/macos-platform-tests.json`
 - A shared end-to-end helper that reads the platform
 
 When the detector can't read the change, the `macOS arm64` check fails instead of passing.
 
-`scripts/detect-ci-need.sh` decides whether a pull request runs CI's four model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
-
-- `sdk/`
-- The SDK models in `tests/tla/sdk/` or their drivers in `tests/tla/drivers/*.mjs`
-- The Node-API or WebAssembly core entry point
-- `src/acp/`, `src/core/hosts/`, or `src/core/session_manager/`
-
-The `TLA+ MCP engine models and driver` and `TLA+ MCP host models and drivers` jobs run in parallel, take about 20 minutes each, and run their checks when the change touches:
+`scripts/detect-ci-need.sh` decides whether a pull request runs CI's three long model checks. The `TLA+ MCP engine models and driver` and `TLA+ MCP host models and drivers` jobs run in parallel, take about 20 minutes each, and run their checks when the change touches:
 
 - `src/mcp/`, `src/core/mcp_host/`, or `src/core/mcp/`
 - The models in `tests/tla/mcp/` or `tests/tla/mcp_host/`, or their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, or `tests/tla/drivers/lib/`
@@ -257,14 +249,14 @@ The `TLA+ subagent and session-write models` job takes a few minutes and runs it
 - The models in `tests/tla/subagent/`, the session-write and live sessions models in `tests/tla/session/`, or their drivers in `tests/tla/drivers/subagent/`, `tests/tla/drivers/session/write.test.ts`, and `tests/tla/drivers/session/live.test.ts`
 - The shared code in `tests/tla/lib/` and `tests/tla/drivers/lib/`, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts` and `tests/evals/eval-helpers.ts`
 
-All four run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
+All three run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
 
 Other runs start only on request:
 
 | Run | Command |
 | --- | --- |
 | macOS checks | `gh workflow run macos.yml --ref your-branch`, or add the `ci:macos` label |
-| libfx durable-session and MCP model checks | `gh workflow run ci.yml --ref your-branch` |
+| MCP, transcript window, and subagent model checks | `gh workflow run ci.yml --ref your-branch` |
 | Live ACP suite | `gh workflow run ci.yml --ref your-branch -f acp_live=true` |
 
 Only maintainers can start these runs or add the `ci:macos` label. If you're an outside contributor and your change needs one of them, ask in the pull request and a maintainer will start it. If CI doesn't start at all on your first pull request, a maintainer may need to approve the workflow run.
@@ -285,7 +277,6 @@ If CI fails, push the smallest fix to the same pull request and wait for a passi
 Update the documentation in the same pull request as the behavior it describes:
 
 - The `--help` output comes from the command specs in `src/builtins/commands.zig`.
-- `sdk/README.md` documents libfx. Update it when libfx's public behavior or setup changes, as [sdk/AGENTS.md](sdk/AGENTS.md) describes.
 - Update this file when build steps, development setup, or collaboration rules change.
 
 Change `README.md` only when one of its statements becomes false, or when a change adds a capability as broad as the ones in its feature list. A new option, command, or environment variable belongs in `--help` and the manual.

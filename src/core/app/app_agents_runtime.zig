@@ -2717,8 +2717,6 @@ pub fn Runtime(comptime App: type) type {
         /// open, and attaches it to the child's agent in context, which saves
         /// every later turn through it as main does.
         fn attachSession(app: *App, agent: *AppAgent, child: *ChildAgent) !void {
-            // A cooperative host starts no subagents (`startAgentWorkerThread`).
-            if (comptime app_process_runtime.cooperativeHost(App)) return error.SubagentHostUnavailable;
             const host = hostOf(app, child) orelse return error.SubagentHostUnavailable;
             const session = try host.openChildSession(child.id);
             try app_session_runtime.Runtime(App).attachChildV2Session(app, agent, session);

@@ -10,7 +10,6 @@ const shared_theme = @import("../shared/theme.zig");
 const code_highlight = @import("../agent/presentation/code_highlight.zig");
 const code_highlight_languages = @import("../agent/presentation/code_highlight_languages.zig");
 const app_callbacks = @import("app_callbacks.zig");
-const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host = @import("../hosts/host.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
@@ -60,7 +59,6 @@ const web_search_runtime = @import("../tooling/web_search_runtime.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
-const js_host_workspace = @import("../hosts/js_host_workspace.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -82,25 +80,14 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
-        fn appHostWorkspaceInfo(app: *const App) ?*const js_host_workspace.Info {
-            if (comptime @hasDecl(App, "workspaceHostInfo")) {
-                return app.workspaceHostInfo();
-            }
-            return null;
-        }
-
         const TurnWorkspace = struct {
             root: []const u8,
             access_scope: ?workspace_access.AccessScope,
         };
 
-        /// A host workspace owns the root that tools, turns, and project
-        /// context use; otherwise the app's local workspace does.
+        /// The app's local workspace owns the root that tools, turns, and
+        /// project context use.
         fn turnWorkspace(app: *const App) TurnWorkspace {
-            if (appHostWorkspaceInfo(app)) |info| return .{
-                .root = info.root(),
-                .access_scope = workspace_access.AccessScope.primaryOnly(info.root()),
-            };
             return .{ .root = app.workspace_root, .access_scope = appAccessScope(app) };
         }
 
@@ -312,7 +299,6 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
             authority: ?ToolAuthorityView,
         ) tool_runtime.Context {
-            const host_workspace = appHostWorkspaceInfo(app);
             const workspace = turnWorkspace(app);
             const agent_settings = agent.worker.effectiveAgentTurnSettings();
             const permission_snapshot = if (authority) |snapshot|
@@ -395,19 +381,14 @@ pub fn Runtime(comptime App: type) type {
                 .context_registry = app.contextRegistry(),
                 .output_chunk_ctx = @ptrCast(agent),
                 .on_output_chunk = app_callbacks.Bindings(App).onCommandOutputChunk,
-                .workspace_executor = if (comptime @hasDecl(App, "workspaceExecutor")) app.workspaceExecutor() else null,
-                .host_sandbox_default = if (host_workspace) |info| switch (info.permission) {
-                    .allow_sandboxed => .allow_sandboxed,
-                    .prompt => .prompt,
-                } else .none,
                 .tracker = &agent.change_tracker,
                 .mcp_ctx = @ptrCast(app),
-                .mcp_has_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpHasTool else null,
-                .mcp_validate_tool = if (comptime runtime_profile.allows(App, .mcp)) validateMcpTool else null,
-                .mcp_call_tool = if (comptime runtime_profile.allows(App, .mcp)) callMcpTool else null,
-                .mcp_search_tools = if (comptime runtime_profile.allows(App, .mcp)) searchMcpTools else null,
-                .mcp_tool_schema = if (comptime runtime_profile.allows(App, .mcp)) mcpToolSchemaJson else null,
-                .mcp_snapshot_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpSnapshotTool else null,
+                .mcp_has_tool = mcpHasTool,
+                .mcp_validate_tool = validateMcpTool,
+                .mcp_call_tool = callMcpTool,
+                .mcp_search_tools = searchMcpTools,
+                .mcp_tool_schema = mcpToolSchemaJson,
+                .mcp_snapshot_tool = mcpSnapshotTool,
                 .mcp_progress_ctx = @ptrCast(agent),
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
                 .tool_progress_ctx = @ptrCast(agent),
@@ -433,8 +414,7 @@ pub fn Runtime(comptime App: type) type {
                 ctx.web_search_progress_ctx = @ptrCast(agent);
                 ctx.on_web_search_progress = app_callbacks.Bindings(App).onWebSearchProgress;
             }
-            if (comptime runtime_profile.allows(App, .mcp) and
-                @hasDecl(@TypeOf(agent.worker), "requestMcpElicitationAnswerBlocking") and
+            if (comptime @hasDecl(@TypeOf(agent.worker), "requestMcpElicitationAnswerBlocking") and
                 @hasDecl(App, "urlOpener"))
             {
                 ctx.mcp_input_responder = .{
@@ -978,7 +958,6 @@ pub fn Runtime(comptime App: type) type {
             _ = gateway_retry_count;
             _ = gateway_chat_url;
             const permission_snapshot = worker_runtime.PermissionSnapshot{ .mode = .yolo };
-            const host_workspace = appHostWorkspaceInfo(app);
             const workspace = turnWorkspace(app);
             // The agent's own subagents, as its turn started with them.
             const subagents: ?[]const u8 = if (comptime agents.hasAgentField(App, "session_persistence"))
@@ -987,11 +966,6 @@ pub fn Runtime(comptime App: type) type {
                 null;
             try app.contextRegistry().appendDefaultTransient(.{
                 .workspace_root = workspace.root,
-                .host_workspace = if (host_workspace) |info| .{
-                    .root = info.root(),
-                    .cwd = info.cwd(),
-                    .home = info.home(),
-                } else null,
                 .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
@@ -1205,7 +1179,6 @@ pub fn Runtime(comptime App: type) type {
             const provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, settings.effort, settings.fast_mode);
             var summary_model: agent_runtime.CompactorCaller = .{
                 .stream_provider = deps.agent_stream_provider,
-                .cooperative_transport_pulse = deps.cooperative_transport_pulse,
                 .provider = job.provider,
                 .model = job.model,
                 .api_key = job.api_key,
@@ -1845,14 +1818,9 @@ const RefreshContextApp = struct {
     context_notices: std.ArrayList(u8) = .empty,
     context_notice_tone: ?types.NoticeTone = null,
     context_notice_visibility: ?types.NoticeVisibility = null,
-    host_info: ?js_host_workspace.Info = null,
 
     fn contextRegistry(self: *const RefreshContextApp) context_contract.Registry {
         return self.context_registry;
-    }
-
-    pub fn workspaceHostInfo(self: *const RefreshContextApp) ?*const js_host_workspace.Info {
-        return if (self.host_info) |*info| info else null;
     }
 
     fn deinit(self: *RefreshContextApp) void {
@@ -2200,19 +2168,6 @@ test "app model id loading uses the injected catalog provider" {
     try std.testing.expectEqualStrings("provider/first", ids.items[0]);
     try std.testing.expectEqualStrings("provider/second", ids.items[1]);
 }
-
-const TestHostWorkspace = struct {
-    pub fn workspaceAvailable() i32 {
-        return 1;
-    }
-
-    pub fn workspaceInfo(out_ptr: [*]u8, out_cap: usize) i32 {
-        const json = "{\"version\":1,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"allow-sandboxed\"}";
-        if (json.len > out_cap) return -3;
-        @memcpy(out_ptr[0..json.len], json);
-        return json.len;
-    }
-};
 
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
     return .{

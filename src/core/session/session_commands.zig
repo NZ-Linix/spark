@@ -23,7 +23,6 @@ const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const render_request = @import("../../ui/render_request.zig");
-const runtime_profile = @import("../hosts/runtime_profile.zig");
 const info_panel = @import("../input/info_panel.zig");
 
 const freeStringList = collections.freeStringList;
@@ -345,7 +344,7 @@ pub fn Commands(comptime App: type) type {
         /// before quitting. Saved means a resume opens it
         /// (`tests/tla/session/ShellSession.tla` StatusSavedIsOnDisk).
         fn shellSession(agent: *AppAgent) ?output_contracts.StatusSnapshot.ShellSession {
-            if (comptime !runtime_profile.allows(App, .durable_sessions) or !agents.hasAgentField(App, "session_persistence")) return null;
+            if (comptime !agents.hasAgentField(App, "session_persistence")) return null;
             const v2 = agent.session_persistence.v2 orelse return .unavailable;
             return .{ .open = .{ .id = v2.id(), .saved = v2.saved() } };
         }
@@ -1035,7 +1034,6 @@ pub fn Commands(comptime App: type) type {
             }
             const selected = provider_runtime.modelOf(app, agent);
             try agent.worker.syncQueuedPromptModel(std.heap.c_allocator, selected);
-            if (comptime @hasDecl(App, "persistAcceptedModel")) try app.persistAcceptedModel(selected);
             app_session_runtime.Runtime(App).syncTerminalTitle(app, agent);
         }
 

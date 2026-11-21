@@ -982,8 +982,7 @@ pub fn Runtime(comptime App: type) type {
             if (!compaction_active and !agent.stream.active and !app.pacer.hasCompletedAssistantPresentationTail()) {
                 return advanceSubagentWaitBlink(app, agent, now_ms);
             }
-            if (false or
-                agent.question_prompt.isActive() or
+            if (agent.question_prompt.isActive() or
                 !app.shell.shimmer_active)
             {
                 return false;
@@ -1006,7 +1005,7 @@ pub fn Runtime(comptime App: type) type {
         fn advanceSubagentWaitBlink(app: *App, agent: *AppAgent, now_ms: i64) bool {
             if (comptime !@hasDecl(App, "subagentWaitCount")) return false;
             if (offScreen(app, agent)) return false;
-            if (false or agent.question_prompt.isActive() or !app.shell.shimmer_active) return false;
+            if (agent.question_prompt.isActive() or !app.shell.shimmer_active) return false;
             // A worker status, such as a failed request, shows in its place.
             switch (app.shell.activityProjection()) {
                 .turn_thinking => |thinking| if (thinking.tone != .thinking) return false,
