@@ -1753,9 +1753,29 @@ pub fn hasInterruptedTurn(store: *Store, alloc: Allocator, workspace: []const u8
     var peeked = store.manager.peek(alloc, id) catch return false;
     defer peeked.deinit(alloc);
     const state = peeked.state;
-    if (state.open_turn != null) return true;
-    const last = state.last_interrupted orelse return false;
-    return last.turn == state.last_turn and (last.reason == .crash or last.reason == .closed);
+    const turn = if (state.open_turn) |open| open else blk: {
+        const last = state.last_interrupted orelse return false;
+        if (last.turn != state.last_turn or !(last.reason == .crash or last.reason == .closed)) return false;
+        break :blk last.turn;
+    };
+    return firstHint(store, alloc, id, turn);
+}
+
+/// Whether this is the first launch to point at turn `turn` of session `id`.
+/// The hint names one interrupted turn once: launches after it that send
+/// nothing don't repeat it. The last turn hinted is kept in
+/// `~/.spark/sessions/v2/interrupted-hint`.
+fn firstHint(store: *Store, alloc: Allocator, id: []const u8, turn: u64) bool {
+    const path = profile_paths.rootPath(alloc, store.home, &.{ profile_paths.sessions_dir_name, session_layout.sessions_v2_dir, "interrupted-hint" }) catch return true;
+    defer alloc.free(path);
+    var key_buf: [96]u8 = undefined;
+    const key = std.mem.print(&key_buf, "{s}:{d}", .{ id, turn }) catch return true;
+    if (std.Io.Dir.cwd().readFileAlloc(io_mod.getIo(), path, alloc, .limited(128))) |seen| {
+        defer alloc.free(seen);
+        if (std.mem.eql(u8, std.mem.trim(u8, seen, " \n"), key)) return false;
+    } else |_| {}
+    io_mod.writeFileAtomic(alloc, path, key) catch {};
+    return true;
 }
 
 pub const Session = struct {
