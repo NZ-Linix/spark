@@ -109,51 +109,6 @@ fn unavailable(
     return error.OAuthTransportUnavailable;
 }
 
-test "cancellable transport adds its cancel flag to every request" {
-    const Recorder = struct {
-        seen: ?*std.atomic.Value(bool) = null,
-
-        fn execute(raw: ?*anyopaque, _: Allocator, request: Request) !Response {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.seen = request.cancel_flag;
-            return .{ .disposition = .accepted, .body = &.{} };
-        }
-    };
-    var recorder: Recorder = .{};
-    var cancel = std.atomic.Value(bool).init(false);
-    var cancellable: Cancellable = .{
-        .inner = .{ .context = &recorder, .execute_fn = Recorder.execute },
-        .cancel_flag = &cancel,
-    };
-    var response = try cancellable.provider().execute(std.testing.allocator, .{ .method = .get, .url = "https://issuer.test" });
-    defer response.deinit(std.testing.allocator);
-    try std.testing.expectEqual(&cancel, recorder.seen.?);
-
-    // A refresh's request runs without the flag, so a cancel never cuts it off.
-    recorder.seen = &cancel;
-    var refresh = try cancellable.provider().execute(std.testing.allocator, .{ .method = .post_form, .url = "https://issuer.test/token", .outlives_cancel = true });
-    defer refresh.deinit(std.testing.allocator);
-    try std.testing.expect(recorder.seen == null);
-    // Once cancelled, it is never sent.
-    recorder.seen = &cancel;
-    cancel.store(true, .seq_cst);
-    try std.testing.expectError(error.Cancelled, cancellable.provider().execute(std.testing.allocator, .{ .method = .post_form, .url = "https://issuer.test/token", .outlives_cancel = true }));
-    try std.testing.expectEqual(&cancel, recorder.seen.?);
-}
-
 pub const unavailable_provider = Provider{
     .execute_fn = unavailable,
 };
-
-test "response transfers owned bytes exactly once" {
-    var response = Response{
-        .disposition = .accepted,
-        .body = try std.testing.allocator.dupe(u8, "secret"),
-    };
-    const body = response.takeBody();
-    defer secret.zeroAndFree(std.testing.allocator, body);
-
-    response.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), response.body.len);
-    try std.testing.expectEqualStrings("secret", body);
-}

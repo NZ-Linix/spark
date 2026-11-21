@@ -252,7 +252,7 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
     if ((keycode == 'd' or keycode == 'D') and (meta_prefixed or (mods & 0x02) != 0)) return .delete_word_right;
     if (keycode == 'o' or keycode == 'O') return ctrlOKeyAction(meta_prefixed, mods);
     if ((keycode == 'r' or keycode == 'R') and (mods & 0x08) != 0) return .open_all_sessions;
-    if (keycode == 9 and (mods & 0x01) != 0) return .toggle_permission_mode;
+    if (keycode == 9 and (mods & 0x01) != 0) return .back_tab;
     if ((mods & 0x04) != 0) {
         if (keycode == '_') return .{ .remapped_byte = 31 };
         if (keycode >= 'a' and keycode <= 'z') return .{ .remapped_byte = @intCast(keycode - 96) };
@@ -569,7 +569,7 @@ pub fn consumeInputEscapeByteWithMouse(
                 else
                     plainNavigationAction(byte),
                 'H', 'F' => plainNavigationAction(byte),
-                'Z' => .toggle_permission_mode,
+                'Z' => .back_tab,
                 '<' => {
                     mouse.reset();
                     setBaseEscapeStage(stage, sgr_mouse_stage);
@@ -725,7 +725,7 @@ pub fn consumeInputEscapeByteWithMouse(
             const modifiers = if (param.* > 0) param.* - 1 else 0;
             if (byte == 'Z' and modifiers != 0) {
                 resetMouseEscapeDecode(stage, param, param2, mouse);
-                return .toggle_permission_mode;
+                return .back_tab;
             }
             if (modifiedArrowAction(byte, modifiers, meta_prefixed)) |action| {
                 resetMouseEscapeDecode(stage, param, param2, mouse);

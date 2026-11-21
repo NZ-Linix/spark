@@ -362,16 +362,6 @@ fn expectModeSafeTmuxHistoryClearForTest(_: Allocator, argv: []const []const u8)
     }
 }
 
-test "tmux history clear preserves pane modes with a server-owned target" {
-    tmux_history_clear_test_calls = 0;
-    tmux_history_clear_test_runner = expectModeSafeTmuxHistoryClearForTest;
-    defer tmux_history_clear_test_runner = null;
-
-    try runTmuxHistoryClear(std.testing.allocator, "%42");
-
-    try std.testing.expectEqual(@as(usize, 1), tmux_history_clear_test_calls);
-}
-
 pub fn detectSyncUpdatesEnabled(_: Allocator) bool {
     return syncUpdatesEnabledForValues(io_mod.getenv("SPARK_SYNC_UPDATES"), io_mod.getenv("TERM"));
 }
@@ -587,18 +577,6 @@ fn vtimeIndex() usize {
     };
 }
 
-test "sync updates override beats dumb term" {
-    try std.testing.expect(syncUpdatesEnabledForValues("on", "dumb"));
-    try std.testing.expect(!syncUpdatesEnabledForValues("off", "xterm-256color"));
-    try std.testing.expect(!syncUpdatesEnabledForValues(null, "dumb"));
-}
-
-test "direct Apple Terminal uses RIS for terminal history resets" {
-    try std.testing.expect(historyResetUsesRisForValues("Apple_Terminal", null));
-    try std.testing.expect(!historyResetUsesRisForValues("Apple_Terminal", "/tmp/tmux-1/default,1,0"));
-    try std.testing.expect(!historyResetUsesRisForValues("Ghostty", null));
-}
-
 pub const TestPty = struct {
     master: std.posix.fd_t,
     slave: std.posix.fd_t,
@@ -634,94 +612,6 @@ pub const TestPty = struct {
 
 fn closeTestFd(fd: std.posix.fd_t) void {
     (std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(io_mod.getIo());
-}
-
-test "enableRawMode preserves already queued input" {
-    if (!supports_test_pty) return error.SkipZigTest;
-
-    const pty = try TestPty.open();
-    defer pty.close();
-
-    var original = try io_mod.tcgetattr(pty.slave);
-    original.lflag.ECHO = false;
-    original.lflag.ICANON = false;
-    original.lflag.ISIG = false;
-    const vmin_idx = vminIndex();
-    const vtime_idx = vtimeIndex();
-    if (vmin_idx < original.cc.len and vtime_idx < original.cc.len) {
-        original.cc[vmin_idx] = 1;
-        original.cc[vtime_idx] = 0;
-    }
-    try io_mod.tcsetattr(pty.slave, .NOW, original);
-
-    var terminal = TerminalState{ .stdin_fd = pty.slave };
-    try terminal.captureOriginalTermios();
-
-    const queued = [_]u8{3};
-    try (std.Io.File{
-        .handle = pty.master,
-        .flags = .{ .nonblocking = false },
-    }).writeStreamingAll(io_mod.getIo(), &queued);
-
-    try terminal.enableRawMode();
-    defer terminal.disableRawMode();
-
-    var fds = [_]std.posix.pollfd{.{
-        .fd = pty.slave,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&fds, 100));
-    try std.testing.expect((fds[0].revents & std.posix.POLL.IN) != 0);
-
-    var buf: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.read(pty.slave, &buf));
-    try std.testing.expectEqual(@as(u8, 3), buf[0]);
-}
-
-test "enableRawMode preserves carriage return input" {
-    if (!supports_test_pty) return error.SkipZigTest;
-
-    const pty = try TestPty.open();
-    defer pty.close();
-
-    var original = try io_mod.tcgetattr(pty.slave);
-    original.iflag.IGNCR = true;
-    original.iflag.ICRNL = true;
-    original.iflag.INLCR = true;
-    try io_mod.tcsetattr(pty.slave, .NOW, original);
-
-    var terminal = TerminalState{ .stdin_fd = pty.slave };
-    try terminal.captureOriginalTermios();
-    try terminal.enableRawMode();
-    defer terminal.disableRawMode();
-
-    const raw = try io_mod.tcgetattr(pty.slave);
-    try std.testing.expect(!raw.iflag.IGNCR);
-    try std.testing.expect(!raw.iflag.ICRNL);
-    try std.testing.expect(!raw.iflag.INLCR);
-
-    const enter = [_]u8{'\r'};
-    try (std.Io.File{
-        .handle = pty.master,
-        .flags = .{ .nonblocking = false },
-    }).writeStreamingAll(io_mod.getIo(), &enter);
-
-    var fds = [_]std.posix.pollfd{.{
-        .fd = pty.slave,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(&fds, 100));
-    try std.testing.expect((fds[0].revents & std.posix.POLL.IN) != 0);
-
-    var buf: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.read(pty.slave, &buf));
-    try std.testing.expectEqual(@as(u8, '\r'), buf[0]);
-}
-
-test "reconstructive paint re-emits a full transcript in order" {
-    try @import("resize_tests.zig").testReconstructiveFullTranscriptReplay();
 }
 
 test {

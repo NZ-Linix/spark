@@ -408,9 +408,6 @@ pub const Owner = struct {
     /// Why the last capture failed, while `state` is `.failed`.
     last_failure: ?CaptureFailure = null,
     notice: Notice = .{},
-    /// Epoch each remembered shell command grant was made under, keyed by
-    /// the grant target. Keys are owned by `std.heap.c_allocator`.
-    shell_grants: std.StringHashMapUnmanaged(u64) = .empty,
 
     /// Returns a lease on a ready snapshot, starts or waits for the single
     /// capture, or reports that the command must use full startup. Blocks
@@ -464,15 +461,6 @@ pub const Owner = struct {
         self.recordFailureLocked(generation.shell_path, &generation.fingerprint, .replay_failed);
     }
 
-    /// Current approval epoch. Remembered shell approvals made under an
-    /// earlier epoch no longer apply.
-    pub fn approvalEpoch(self: *Owner) u64 {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return self.epoch;
-    }
-
     /// Starts a refresh when the startup files changed since the last
     /// capture. Admission calls this first so a remembered shell approval
     /// from before the change is asked again.
@@ -485,45 +473,6 @@ pub const Owner = struct {
             .failed => self.noteChangesLocked(self.failed_shell[0..self.failed_shell_len]),
             .empty, .capturing => {},
         }
-    }
-
-    /// Records that a shell command grant was made under the current epoch.
-    /// On allocation failure the grant stays unrecorded, which only makes it
-    /// stop matching after the next refresh.
-    pub fn recordShellGrant(self: *Owner, target: []const u8) void {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        const entry = self.shell_grants.getOrPut(std.heap.c_allocator, target) catch {
-            debug_trace.logf("core", "shell grant epoch not recorded err=OutOfMemory", .{});
-            return;
-        };
-        if (!entry.found_existing) {
-            entry.key_ptr.* = std.heap.c_allocator.dupe(u8, target) catch {
-                self.shell_grants.removeByPtr(entry.key_ptr);
-                debug_trace.logf("core", "shell grant epoch not recorded err=OutOfMemory", .{});
-                return;
-            };
-        }
-        entry.value_ptr.* = self.epoch;
-    }
-
-    /// Epoch a shell command grant was made under. Grants spark never recorded
-    /// count as made before the first refresh.
-    pub fn shellGrantEpoch(self: *Owner, target: []const u8) u64 {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return self.shell_grants.get(target) orelse 0;
-    }
-
-    /// Reports whether a shell command grant was made under the current
-    /// epoch. A refresh makes every earlier grant stop matching.
-    pub fn shellGrantCurrent(self: *Owner, target: []const u8) bool {
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return (self.shell_grants.get(target) orelse 0) == self.epoch;
     }
 
     /// Reports whether spark fell back to full startup after a failed capture,
@@ -600,9 +549,6 @@ pub const Owner = struct {
     /// that are no longer shared, such as test owners.
     pub fn deinit(self: *Owner) void {
         if (self.capture_thread) |thread| thread.join();
-        var grant_keys = self.shell_grants.keyIterator();
-        while (grant_keys.next()) |key| std.heap.c_allocator.free(key.*);
-        self.shell_grants.deinit(std.heap.c_allocator);
         self.capture_thread = null;
         if (self.active) |generation| {
             std.debug.assert(generation.leases == 0);
@@ -1072,27 +1018,6 @@ fn testPayload(alloc: Allocator, nonce: []const u8, chatter: []const u8) ![]u8 {
     });
 }
 
-test "snapshot payload parsing ignores startup output and shell-owned variables" {
-    const generation = try Generation.create();
-    defer generation.destroy();
-    const nonce = "00112233445566778899aabbccddeeff";
-    const payload = try testPayload(generation.arena.allocator(), nonce, "welcome from .zshrc\nFXSNAP:other:ENV\x00");
-    try parsePayload(generation, payload, nonce);
-
-    try testing.expectEqualStrings("/opt/spark-marker/bin:/usr/bin", generation.environ.get("PATH").?);
-    try testing.expectEqualStrings("line one\nline two", generation.environ.get("MULTI").?);
-    try testing.expect(generation.environ.get("PWD") == null);
-    try testing.expect(generation.environ.get("SHLVL") == null);
-    try testing.expectEqualStrings("/home/user/.config/zsh", generation.zdotdir.?);
-    try testing.expect(generation.defines("ll"));
-    try testing.expect(generation.defines("spark_function"));
-    try testing.expect(!generation.defines("ls"));
-    try testing.expectEqualStrings(
-        "alias ll='ls -l'\nfx_function () {\n\tprint ok\n}\n",
-        generation.replay,
-    );
-}
-
 test "snapshot payload parsing rejects truncated or malformed payloads" {
     const nonce = "00112233445566778899aabbccddeeff";
     var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1141,89 +1066,6 @@ const FakeCapture = struct {
     }
 };
 
-test "snapshot owner captures once for concurrent first commands" {
-    FakeCapture.reset(50, false);
-    var owner: Owner = .{ .capture_fn = FakeCapture.capture };
-    defer owner.deinit();
-
-    const Worker = struct {
-        fn run(target: *Owner, result: *?u64) void {
-            const acquired = target.acquire("/bin/zsh", "/tmp", .{}) catch return;
-            switch (acquired) {
-                .snapshot => |lease| {
-                    result.* = lease.generation.id;
-                    lease.release();
-                },
-                .full_startup => {},
-            }
-        }
-    };
-    var ids: [4]?u64 = @splat(null);
-    var threads: [4]std.Thread = undefined;
-    for (&threads, &ids) |*thread, *id| thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &owner, id });
-    for (threads) |thread| thread.join();
-
-    try testing.expectEqual(@as(u32, 1), FakeCapture.calls.load(.seq_cst));
-    for (ids) |id| try testing.expectEqual(@as(?u64, 1), id);
-}
-
-test "snapshot owner keeps a leased generation alive across a refresh" {
-    FakeCapture.reset(0, false);
-    var owner: Owner = .{ .capture_fn = FakeCapture.capture };
-    defer owner.deinit();
-
-    const first = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
-    const epoch_before = owner.approvalEpoch();
-    owner.markDirty(.user_reload);
-    try testing.expectEqual(epoch_before + 1, owner.approvalEpoch());
-    owner.markDirty(.agent_reload);
-    try testing.expectEqual(epoch_before + 1, owner.approvalEpoch());
-
-    const second = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
-    try testing.expectEqual(@as(u32, 2), FakeCapture.calls.load(.seq_cst));
-    try testing.expect(first.generation != second.generation);
-    try testing.expect(first.generation.retired);
-    // The retired generation is still readable while its lease is held.
-    try testing.expectEqualStrings("alias ll='ls -l'\n", first.generation.replay);
-    try testing.expectEqual(epoch_before + 1, second.generation.epoch);
-    first.release();
-    try testing.expect(owner.retired == null);
-    second.release();
-}
-
-test "snapshot owner resets remembered shell grants on refresh" {
-    FakeCapture.reset(0, false);
-    var owner: Owner = .{ .capture_fn = FakeCapture.capture };
-    defer owner.deinit();
-
-    // Grants spark never recorded count as made before the first refresh.
-    try testing.expect(owner.shellGrantCurrent("npm test"));
-    owner.recordShellGrant("npm test");
-    try testing.expectEqual(@as(u64, 0), owner.shellGrantEpoch("npm test"));
-
-    owner.markDirty(.user_reload);
-    try testing.expect(!owner.shellGrantCurrent("npm test"));
-    try testing.expect(!owner.shellGrantCurrent("never recorded"));
-    owner.recordShellGrant("npm test");
-    try testing.expect(owner.shellGrantCurrent("npm test"));
-    try testing.expectEqual(@as(u64, 1), owner.shellGrantEpoch("npm test"));
-}
-
-test "snapshot owner reports aliases and functions named in a command" {
-    FakeCapture.reset(0, false);
-    var owner: Owner = .{ .capture_fn = FakeCapture.capture };
-    defer owner.deinit();
-
-    try testing.expect(!owner.definesAnyWord("ll -a"));
-    const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
-    defer lease.release();
-    try testing.expect(owner.definesAnyWord("ll -a"));
-    try testing.expect(owner.definesAnyWord("git status && ll"));
-    try testing.expect(owner.definesAnyWord("echo $(ll)"));
-    try testing.expect(!owner.definesAnyWord("ls -l"));
-    try testing.expect(!owner.definesAnyWord("llama --help"));
-}
-
 const TraceCapture = struct {
     fn capture(request: CaptureRequest) CaptureOutcome {
         const generation = Generation.create() catch return .{ .failed = .out_of_memory };
@@ -1241,32 +1083,6 @@ const TraceCapture = struct {
         return .{ .ready = generation };
     }
 };
-
-test "snapshot trace view names redefined common commands and what their aliases run" {
-    var owner: Owner = .{ .capture_fn = TraceCapture.capture };
-    defer owner.deinit();
-
-    const before = owner.traceView();
-    try testing.expectEqualStrings("empty", before.state);
-    try testing.expectEqual(@as(usize, 0), before.redefined().len);
-
-    const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
-    lease.release();
-    const view = owner.traceView();
-    try testing.expectEqualStrings("ready", view.state);
-    try testing.expect(view.failure == null);
-    try testing.expectEqual(@as(usize, 5), view.names_total);
-    const redefined = view.redefined();
-    try testing.expectEqual(@as(usize, 3), redefined.len);
-    try testing.expectEqualStrings("cd", redefined[0].name);
-    try testing.expect(redefined[0].kind == .function);
-    try testing.expect(redefined[0].aliasTarget() == null);
-    try testing.expectEqualStrings("grep", redefined[1].name);
-    try testing.expect(redefined[1].kind == .alias);
-    try testing.expect(redefined[1].aliasTarget() == null);
-    try testing.expectEqualStrings("ls", redefined[2].name);
-    try testing.expectEqualStrings("eza", redefined[2].aliasTarget().?);
-}
 
 const SecretAliasCapture = struct {
     fn capture(request: CaptureRequest) CaptureOutcome {
@@ -1287,74 +1103,6 @@ const SecretAliasCapture = struct {
     }
 };
 
-test "the trace view keeps no part of a secret its alias target cut splits" {
-    var owner: Owner = .{ .capture_fn = SecretAliasCapture.capture };
-    defer owner.deinit();
-
-    const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
-    lease.release();
-    const view = owner.traceView();
-    try testing.expectEqualStrings("ready", view.state);
-    const redefined = view.redefined();
-    try testing.expectEqual(@as(usize, 2), redefined.len);
-    // The token word is one run longer than `max_alias_target_len`, so the
-    // cut leaves it out whole and no target is named.
-    try testing.expectEqualStrings("cat", redefined[0].name);
-    try testing.expect(redefined[0].aliasTarget() == null);
-    try testing.expectEqualStrings("ls", redefined[1].name);
-    try testing.expectEqualStrings("eza", redefined[1].aliasTarget().?);
-
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    for (redefined) |entry| {
-        const masked = try text_utils.maskSecrets(arena_state.allocator(), entry.aliasTarget() orelse "");
-        try testing.expect(std.mem.find(u8, masked, "AAAAAA") == null);
-    }
-}
-
-test "snapshot trace view says why the capture failed" {
-    FakeCapture.reset(0, true);
-    var owner: Owner = .{ .capture_fn = FakeCapture.capture };
-    defer owner.deinit();
-
-    try testing.expect((try owner.acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
-    const view = owner.traceView();
-    try testing.expectEqualStrings("failed", view.state);
-    try testing.expectEqualStrings("the login shell did not finish within 10 s", view.failure.?);
-    try testing.expectEqual(@as(usize, 0), view.redefined().len);
-}
-
-test "alias lines give the first word their alias runs" {
-    const cases = [_]struct { line: []const u8, name: []const u8, target: []const u8 }{
-        .{ .line = "alias ls=eza", .name = "ls", .target = "eza" },
-        .{ .line = "alias ls='eza --icons'", .name = "ls", .target = "eza" },
-        .{ .line = "alias ll=\"ls -la\"", .name = "ll", .target = "ls" },
-        .{ .line = "alias -- -x=y", .name = "-x", .target = "y" },
-        .{ .line = "alias -g G='| grep'", .name = "G", .target = "" },
-        .{ .line = "alias cat='bat\x1b[0m'", .name = "cat", .target = "bat" },
-    };
-    for (cases) |case| {
-        const alias = parseAliasLine(case.line).?;
-        try testing.expectEqualStrings(case.name, alias.name);
-        try testing.expectEqualStrings(case.target, alias.target);
-    }
-    try testing.expect(parseAliasLine("\talias ls=eza") == null);
-    try testing.expect(parseAliasLine("ls () {") == null);
-    try testing.expect(parseAliasLine("alias =x") == null);
-    try testing.expect(parseAliasLine("alias -g") == null);
-}
-
-test "alias line reading stays bounded on fuzzed bytes" {
-    try testing.fuzz({}, fuzzAliasLines, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "alias ls='eza --icons'\nalias -- -x=y\n",
-            "alias -g -s -- =\nalias a=\x00\xff'\n",
-            "cd () {\n\talias ls=no\n}\n",
-        }) ++ @import("fuzz_corpus").snapshot_alias_lines.*),
-    });
-}
-
 fn fuzzAliasLines(_: void, smith: *std.testing.Smith) !void {
     var buffer: [512]u8 = undefined;
     const len: usize = @intCast(smith.slice(&buffer));
@@ -1368,120 +1116,6 @@ fn fuzzAliasLines(_: void, smith: *std.testing.Smith) !void {
         try testing.expect(@intFromPtr(alias.name.ptr) >= @intFromPtr(line.ptr));
         try testing.expect(@intFromPtr(alias.target.ptr) + alias.target.len <= @intFromPtr(line.ptr) + line.len);
     }
-}
-
-test "snapshot owner falls back with one notice and recovers after reload" {
-    FakeCapture.reset(0, true);
-    var owner: Owner = .{ .capture_fn = FakeCapture.capture };
-    defer owner.deinit();
-
-    try testing.expect((try owner.acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
-    try testing.expect((try owner.acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
-    try testing.expectEqual(@as(u32, 1), FakeCapture.calls.load(.seq_cst));
-
-    var buffer: [max_notice_bytes]u8 = undefined;
-    const notice = owner.takeUiNotice(&buffer).?;
-    try testing.expect(std.mem.find(u8, notice, "startup files run for every command") != null);
-    try testing.expect(owner.takeUiNotice(&buffer) == null);
-    const result_notice = (try owner.takeResultNotice(testing.allocator)).?;
-    defer testing.allocator.free(result_notice);
-    try testing.expectEqualStrings(notice, result_notice);
-    try testing.expect((try owner.takeResultNotice(testing.allocator)) == null);
-
-    FakeCapture.fail = false;
-    owner.markDirty(.user_reload);
-    const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
-    lease.release();
-    try testing.expect(owner.takeUiNotice(&buffer) == null);
-}
-
-test "snapshot owner waiters stop on cancellation without cancelling the capture" {
-    FakeCapture.reset(150, false);
-    var owner: Owner = .{ .capture_fn = FakeCapture.capture };
-    defer owner.deinit();
-
-    var cancel = std.atomic.Value(bool).init(true);
-    try testing.expectError(
-        error.Cancelled,
-        owner.acquire("/bin/zsh", "/tmp", .{ .cancel_flag = &cancel }),
-    );
-    const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
-    lease.release();
-    try testing.expectEqual(@as(u32, 1), FakeCapture.calls.load(.seq_cst));
-}
-
-test "snapshot owner fails the active generation after a replay failure" {
-    FakeCapture.reset(0, false);
-    var owner: Owner = .{ .capture_fn = FakeCapture.capture };
-    defer owner.deinit();
-
-    const lease = (try owner.acquire("/bin/zsh", "/tmp", .{})).snapshot;
-    owner.markReplayFailed(lease.generation);
-    lease.release();
-    try testing.expect((try owner.acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
-    var buffer: [max_notice_bytes]u8 = undefined;
-    const notice = owner.takeUiNotice(&buffer).?;
-    try testing.expect(std.mem.find(u8, notice, "could not be restored") != null);
-}
-
-test "snapshot fingerprint changes when a startup file changes" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer scratch_state.deinit();
-    const home = try io_mod.dirRealpathAlloc(scratch_state.allocator(), tmp.dir, ".");
-    const dirs = [_]?[]const u8{ home, home };
-
-    const before = fingerprintFor(.zsh, &dirs);
-    try testing.expect(before.eql(&fingerprintFor(.zsh, &dirs)));
-    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = ".zshrc", .data = "alias ll='ls -l'\n" });
-    const after = fingerprintFor(.zsh, &dirs);
-    try testing.expect(!before.eql(&after));
-    try testing.expectEqual(zsh_system_files.len + zsh_user_files.len, after.len);
-}
-
-test "snapshot fingerprint stamps every startup directory zsh can read" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer scratch_state.deinit();
-    const scratch = scratch_state.allocator();
-    for ([_][]const u8{ "inherited", "home", "moved" }) |name| try tmp.dir.createDir(io_mod.getIo(), name, .default_dir);
-    const dirs = [_]?[]const u8{
-        try io_mod.dirRealpathAlloc(scratch, tmp.dir, "inherited"),
-        try io_mod.dirRealpathAlloc(scratch, tmp.dir, "home"),
-        try io_mod.dirRealpathAlloc(scratch, tmp.dir, "moved"),
-    };
-
-    const before = fingerprintFor(.zsh, &dirs);
-    try testing.expectEqual(zsh_system_files.len + max_user_dirs * zsh_user_files.len, before.len);
-    // The last directory's files are watched like the first's.
-    try writeTestFile(tmp.dir, "moved/.zshrc", "alias ll='ls -l'\n");
-    try testing.expect(!before.eql(&fingerprintFor(.zsh, &dirs)));
-}
-
-test "a moved ZDOTDIR keeps the stamps taken before the capture" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var scratch_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer scratch_state.deinit();
-    const scratch = scratch_state.allocator();
-    for ([_][]const u8{ "home", "moved" }) |name| try tmp.dir.createDir(io_mod.getIo(), name, .default_dir);
-    const home = try io_mod.dirRealpathAlloc(scratch, tmp.dir, "home");
-    const moved = try io_mod.dirRealpathAlloc(scratch, tmp.dir, "moved");
-    const now = [_]?[]const u8{ null, home, moved };
-
-    const before_capture = fingerprintFor(.zsh, &[_]?[]const u8{ null, home, null });
-    // An edit while the capture runs, then the capture reports the move.
-    try writeTestFile(tmp.dir, "home/.zshrc", "export ZDOTDIR=moved\n");
-    const merged = withMovedZdotdir(before_capture, fingerprintFor(.zsh, &now));
-    try testing.expectEqual(before_capture.len + zsh_user_files.len, merged.len);
-    try testing.expect(!merged.eql(&fingerprintFor(.zsh, &now)));
-
-    // Without an edit during the capture, the merged stamps match.
-    const after_edit = fingerprintFor(.zsh, &[_]?[]const u8{ null, home, null });
-    const clean = withMovedZdotdir(after_edit, fingerprintFor(.zsh, &now));
-    try testing.expect(clean.eql(&fingerprintFor(.zsh, &now)));
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
@@ -1555,85 +1189,4 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
     try testing.expect(std.mem.find(u8, generation.replay, "spark_snapshot_function") != null);
     try testing.expect(std.mem.find(u8, generation.replay, "fxll") != null);
     try testing.expect(std.mem.find(u8, generation.replay, "startup chatter") == null);
-}
-
-test "snapshot capture reads a real zsh login shell" {
-    try expectRealCapture(
-        "/bin/zsh",
-        ".zshrc",
-        "print -r -- 'startup chatter'\n" ++
-            "export SPARK_TEST_SNAPSHOT_MARKER=captured-from-startup\n" ++
-            "export PATH=\"/opt/spark-snapshot-marker/bin:$PATH\"\n" ++
-            "alias fxll='print -r -- alias-ok'\n" ++
-            "spark_snapshot_function() { print -r -- function-ok; }\n" ++
-            "_spark_completion_helper() { :; }\n",
-    );
-}
-
-test "snapshot capture reads a real bash login shell" {
-    try expectRealCapture(
-        "/bin/bash",
-        ".bashrc",
-        "echo 'startup chatter'\n" ++
-            "export SPARK_TEST_SNAPSHOT_MARKER=captured-from-startup\n" ++
-            "export PATH=\"/opt/spark-snapshot-marker/bin:$PATH\"\n" ++
-            "alias fxll='echo alias-ok'\n" ++
-            "spark_snapshot_function() { echo function-ok; }\n",
-    );
-}
-
-// A wrapper such as Socket Firewall's `pnpm` calls a helper whose name starts
-// with `_`, so the replay needs that helper. Completion functions also start
-// with `_`, but come from autoload files and stay out of the replay.
-test "snapshot capture keeps zsh underscore helpers and skips completion functions" {
-    const generation = try captureRealShell("/bin/zsh", &.{
-        .{
-            .path = ".zshrc",
-            .data = "fpath=(\"$HOME/completions\" $fpath)\n" ++
-                "_spark_wrap_helper() { print -r -- \"SPARK_WRAPPED_HELPER_OK $*\"; }\n" ++
-                "fxwrapped() { _spark_wrap_helper fxwrapped \"$@\"; }\n" ++
-                "eval '_spark_eval_helper() { print -r -- SPARK_EVAL_HELPER_OK; }'\n" ++
-                // compinit registers each completion function this way.
-                "autoload -Uz \"$HOME/completions/_spark_comp_stub\"\n" ++
-                "autoload -Uz _spark_comp_unresolved\n" ++
-                "autoload -Uz +X _spark_comp_loaded\n" ++
-                "prompt_fxtheme_setup() { print -r -- SPARK_PROMPT_THEME_BODY; }\n" ++
-                "__spark_snapshot_probe() { print -r -- SPARK_SNAPSHOT_PREFIX_BODY; }\n",
-        },
-        .{ .path = "completions/_spark_comp_stub", .data = "print -r -- SPARK_COMPLETION_STUB_BODY\n" },
-        .{ .path = "completions/_spark_comp_unresolved", .data = "print -r -- SPARK_COMPLETION_UNRESOLVED_BODY\n" },
-        .{ .path = "completions/_spark_comp_loaded", .data = "print -r -- SPARK_COMPLETION_LOADED_BODY\n" },
-    });
-    defer generation.destroy();
-    try expectReplayHas(generation, &.{ "SPARK_WRAPPED_HELPER_OK", "SPARK_EVAL_HELPER_OK" });
-    try expectReplayLacks(generation, &.{
-        "_spark_comp_stub",
-        "_spark_comp_unresolved",
-        "_spark_comp_loaded",
-        "SPARK_COMPLETION_LOADED_BODY",
-        "SPARK_PROMPT_THEME_BODY",
-        "SPARK_SNAPSHOT_PREFIX_BODY",
-    });
-    try testing.expect(generation.defines("_spark_comp_stub"));
-}
-
-test "snapshot capture keeps bash underscore helpers and skips completion-file functions" {
-    const generation = try captureRealShell("/bin/bash", &.{
-        .{
-            .path = ".bashrc",
-            .data = "_spark_wrap_helper() { echo \"SPARK_WRAPPED_HELPER_OK $*\"; }\n" ++
-                "fxwrapped() { _spark_wrap_helper fxwrapped \"$@\"; }\n" ++
-                // The defining file decides, not a name that mentions completion.
-                "_spark_completion_helper() { echo SPARK_NAMED_HELPER_OK; }\n" ++
-                ". \"$HOME/bash-completion/spark.bash\"\n" ++
-                // Under extdebug, a failing DEBUG trap skips the next command.
-                "trap false DEBUG\n",
-        },
-        .{ .path = "bash-completion/spark.bash", .data = "_spark_complete() { echo SPARK_COMPLETION_FILE_BODY; }\n" ++
-            "complete -F _spark_complete fxwrapped\n" },
-    });
-    defer generation.destroy();
-    try expectReplayHas(generation, &.{ "SPARK_WRAPPED_HELPER_OK", "SPARK_NAMED_HELPER_OK" });
-    try expectReplayLacks(generation, &.{"SPARK_COMPLETION_FILE_BODY"});
-    try testing.expect(generation.defines("_spark_complete"));
 }

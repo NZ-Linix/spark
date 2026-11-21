@@ -82,10 +82,6 @@ fn parseDeadlineMs(raw: ?[]const u8) i64 {
 pub const CatalogOutcome = union(enum) {
     loaded: struct {
         has_model: bool,
-        refused_key: bool,
-        /// Why only the public list loaded; null when the provider answered
-        /// for the credential.
-        public_only: ?credentials.CatalogPublicOnlyReason,
     },
     failed: model_catalog.FailureCategory,
 };
@@ -114,8 +110,6 @@ pub const CatalogProbe = struct {
         self.outcome = switch (result) {
             .loaded => |loaded| .{ .loaded = .{
                 .has_model = contains(loaded.ids.items, self.model),
-                .refused_key = if (loaded.provenance.fallback_failure) |f| f.category == .authentication else false,
-                .public_only = loaded.provenance.access.public_only_reason,
             } },
             .failure => |failed| .{ .failed = failed.failure.category },
         };
@@ -597,9 +591,7 @@ pub fn waitNotice(alloc: Allocator, waiting: Waiting, deadline_ms: i64) Allocato
 
 fn providerLabel(provider: model_provider.ProviderId) []const u8 {
     return switch (provider) {
-        .gateway => "AI Gateway",
-        .codex => "ChatGPT",
-        .grok => "Grok",
+        .none => "the provider",
         .configured => "the configured provider",
     };
 }
@@ -616,7 +608,7 @@ pub fn catalogChecks(
     deadline_ms: i64,
 ) !void {
     const label = providerLabel(provider);
-    const login = doctor_runtime.loginCommand(provider);
+    const login = doctor_runtime.providerFix(provider);
     if (probe.start_error) |err| {
         try appendCheck(checks, alloc, "provider", .fail, try alloc.print("spark could not start the check of {s} ({s})", .{ label, @errorName(err) }), try alloc.dupe(u8, "run spark doctor again"));
         return;
@@ -636,18 +628,9 @@ pub fn catalogChecks(
             .cancellation, .transport, .runtime => try appendCheck(checks, alloc, "provider", .fail, try alloc.print("could not reach {s}", .{label}), try alloc.dupe(u8, "check the network connection, then run spark doctor again")),
         },
         .loaded => |loaded| {
-            if (loaded.refused_key) {
-                try appendCheck(checks, alloc, "auth", .fail, try alloc.print("{s} refused the credential", .{label}), try alloc.dupe(u8, login));
-            } else if (loaded.public_only) |reason| {
-                const fix = if (reason == .spark_login_team_required) "spark teams" else login;
-                try appendCheck(checks, alloc, "auth", .warn, try alloc.print("{s} sent only its public model list, so the credential is not confirmed", .{label}), try alloc.dupe(u8, fix));
-            } else {
-                try appendCheck(checks, alloc, "auth", .ok, try alloc.print("{s} accepted the credential", .{label}), null);
-            }
+            try appendCheck(checks, alloc, "auth", .ok, try alloc.print("{s} accepted the credential", .{label}), null);
             if (loaded.has_model) {
                 try appendCheck(checks, alloc, "model", .ok, try alloc.print("{s} is available", .{probe.model}), null);
-            } else if (loaded.public_only != null) {
-                try appendCheck(checks, alloc, "model", .warn, try alloc.print("{s} is not in the models spark can see", .{probe.model}), try alloc.dupe(u8, "spark models"));
             } else {
                 try appendCheck(checks, alloc, "model", .fail, try alloc.print("{s} is not an available model", .{probe.model}), try alloc.dupe(u8, "spark models"));
             }
@@ -841,31 +824,27 @@ test "catalog checks cover every outcome the slot can hold after wait" {
     const alloc = std.testing.allocator;
     var probe: CatalogProbe = .{
         .provider = undefined,
-        .access = .{ .public_only = .no_credential },
+        .access = .public_only,
         .endpoint = "",
         .model = "m/one",
     };
     const Case = struct { done: bool, outcome: CatalogOutcome, want: []const struct { []const u8, CheckStatus } };
     const cases = [_]Case{
         // A late result counts as no answer, whatever it says.
-        .{ .done = false, .outcome = .{ .loaded = .{ .has_model = true, .refused_key = false, .public_only = null } }, .want = &.{.{ "provider", .fail }} },
+        .{ .done = false, .outcome = .{ .loaded = .{ .has_model = true } }, .want = &.{.{ "provider", .fail }} },
         .{ .done = true, .outcome = .{ .failed = .authentication }, .want = &.{.{ "auth", .fail }} },
         .{ .done = true, .outcome = .{ .failed = .rate_limited }, .want = &.{.{ "provider", .warn }} },
         .{ .done = true, .outcome = .{ .failed = .transport }, .want = &.{.{ "provider", .fail }} },
         .{ .done = true, .outcome = .{ .failed = .resource_exhausted }, .want = &.{.{ "provider", .fail }} },
-        .{ .done = true, .outcome = .{ .loaded = .{ .has_model = true, .refused_key = false, .public_only = null } }, .want = &.{ .{ "auth", .ok }, .{ "model", .ok } } },
-        .{ .done = true, .outcome = .{ .loaded = .{ .has_model = true, .refused_key = true, .public_only = .authenticated_credential_rejected } }, .want = &.{ .{ "auth", .fail }, .{ "model", .ok } } },
-        .{ .done = true, .outcome = .{ .loaded = .{ .has_model = false, .refused_key = false, .public_only = null } }, .want = &.{ .{ "auth", .ok }, .{ "model", .fail } } },
-        // A public list, such as an spark login with no team loads, never confirms the credential.
-        .{ .done = true, .outcome = .{ .loaded = .{ .has_model = false, .refused_key = false, .public_only = .spark_login_team_required } }, .want = &.{ .{ "auth", .warn }, .{ "model", .warn } } },
-        .{ .done = true, .outcome = .{ .loaded = .{ .has_model = true, .refused_key = false, .public_only = .no_credential } }, .want = &.{ .{ "auth", .warn }, .{ "model", .ok } } },
+        .{ .done = true, .outcome = .{ .loaded = .{ .has_model = true } }, .want = &.{ .{ "auth", .ok }, .{ "model", .ok } } },
+        .{ .done = true, .outcome = .{ .loaded = .{ .has_model = false } }, .want = &.{ .{ "auth", .ok }, .{ "model", .fail } } },
     };
     for (cases) |case| {
         probe.in_time = case.done;
         probe.outcome = case.outcome;
         var checks: std.ArrayList(Check) = .empty;
         defer freeChecks(alloc, &checks);
-        try catalogChecks(&checks, alloc, &probe, .gateway, 5_000);
+        try catalogChecks(&checks, alloc, &probe, .none, 5_000);
         try std.testing.expectEqual(case.want.len, checks.items.len);
         for (case.want, checks.items) |want, got| {
             try std.testing.expectEqualStrings(want[0], got.name);
@@ -873,350 +852,6 @@ test "catalog checks cover every outcome the slot can hold after wait" {
             try std.testing.expectEqual(got.status != .ok, got.fix != null);
         }
     }
-}
-
-test "a public list asks for the step that would let the provider answer" {
-    const alloc = std.testing.allocator;
-    var probe: CatalogProbe = .{ .provider = undefined, .access = .{ .public_only = .no_credential }, .endpoint = "", .model = "m", .in_time = true };
-    const Case = struct { provider: model_provider.ProviderId, reason: credentials.CatalogPublicOnlyReason, fix: []const u8 };
-    for ([_]Case{
-        .{ .provider = .gateway, .reason = .spark_login_team_required, .fix = "spark teams" },
-        .{ .provider = .gateway, .reason = .spark_login_refresh_required, .fix = "spark login" },
-        .{ .provider = .codex, .reason = .chatgpt_subscription, .fix = "spark login codex" },
-        .{ .provider = .grok, .reason = .grok_subscription, .fix = "spark login grok" },
-    }) |case| {
-        probe.outcome = .{ .loaded = .{ .has_model = true, .refused_key = false, .public_only = case.reason } };
-        var checks: std.ArrayList(Check) = .empty;
-        defer freeChecks(alloc, &checks);
-        try catalogChecks(&checks, alloc, &probe, case.provider, 5_000);
-        try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
-        try std.testing.expect(std.mem.endsWith(u8, checks.items[0].detail, "so the credential is not confirmed"));
-        try std.testing.expectEqualStrings(case.fix, checks.items[0].fix.?);
-    }
-}
-
-test "a refused key never reads as accepted" {
-    const alloc = std.testing.allocator;
-    var probe: CatalogProbe = .{ .provider = undefined, .access = .{ .public_only = .no_credential }, .endpoint = "", .model = "m", .in_time = true };
-    probe.outcome = .{ .loaded = .{ .has_model = true, .refused_key = true, .public_only = .authenticated_credential_rejected } };
-    var checks: std.ArrayList(Check) = .empty;
-    defer freeChecks(alloc, &checks);
-    try catalogChecks(&checks, alloc, &probe, .gateway, 5_000);
-    try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
-    try std.testing.expectEqualStrings("spark login", checks.items[0].fix.?);
-}
-
-test "deadline override accepts only a bounded number that is not negative" {
-    try std.testing.expectEqual(default_deadline_ms, parseDeadlineMs(null));
-    try std.testing.expectEqual(@as(i64, 0), parseDeadlineMs("0"));
-    try std.testing.expectEqual(@as(i64, 1), parseDeadlineMs("1"));
-    try std.testing.expectEqual(max_test_deadline_ms, parseDeadlineMs("60000"));
-    for ([_][]const u8{ "-1", "abc", "", "60001" }) |raw| {
-        try std.testing.expectEqual(default_deadline_ms, parseDeadlineMs(raw));
-    }
-    try std.testing.expectEqual(@as(i64, 1), seconds(1));
-    try std.testing.expectEqual(@as(i64, 5), seconds(5_000));
-    try std.testing.expectEqual(@as(i64, 2), seconds(1_001));
-}
-
-test "a catalog request still out at the deadline is cancelled and joined before wait returns" {
-    const Hung = struct {
-        returned: std.atomic.Value(bool) = .init(false),
-        fn fetch(raw: ?*anyopaque, _: Allocator, input: gateway_provider.CliModelCatalogInput) gateway_provider.CliModelCatalogResult {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            // Stands in for a provider that never answers: only the cancel
-            // flag ends it.
-            while (!input.cancel_flag.?.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
-            self.returned.store(true, .release);
-            return .{ .failure = .{ .access = .init(input.access), .anonymous_fallback_used = false, .failure = .{ .category = .cancellation } } };
-        }
-    };
-    var hung: Hung = .{};
-    var probe: CatalogProbe = .{
-        .provider = .{ .context = &hung, .fetch_fn = Hung.fetch },
-        .access = .{ .public_only = .no_credential },
-        .endpoint = "",
-        .model = "m",
-    };
-    probe.start();
-    try std.testing.expect(probe.start_error == null);
-    var waiters: std.Io.Group = .init;
-    const started = io_mod.milliTimestamp();
-    try std.testing.expect(wait(started + 50, &probe, &.{}, &waiters, null) == null);
-    try std.testing.expect(hung.returned.load(.acquire));
-    try std.testing.expect(probe.task == null);
-    try std.testing.expect(!probe.in_time);
-    try std.testing.expect(io_mod.milliTimestamp() - started < 50 + reap_grace_ms);
-
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer freeChecks(alloc, &checks);
-    try catalogChecks(&checks, alloc, &probe, .gateway, 50);
-    try std.testing.expectEqualStrings("could not reach AI Gateway in 1 s", checks.items[0].detail);
-}
-
-test "a child still running at the deadline is killed with its group and its waiter joined" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.heap.c_allocator;
-    var waiters: std.Io.Group = .init;
-    var reader: ChildStatusReader = undefined;
-    reader.init();
-    // The grandchild holds the pipe open, as a server a check started would.
-    const probe = try ProcessProbe.create(alloc, "hung", &.{ "/bin/sh", "-c", "sleep 30 & sleep 30" }, &reader);
-    probe.spawn(&waiters, null);
-    const started = io_mod.milliTimestamp();
-    try std.testing.expect(wait(started + 50, null, &.{probe}, &waiters, null) == null);
-    try std.testing.expect(io_mod.milliTimestamp() - started < 50 + reap_grace_ms);
-    try std.testing.expect(probe.done.load(.acquire));
-    try std.testing.expect(probe.stopped.load(.acquire));
-    try std.testing.expect(probe.term.? == .signal);
-    // Nothing is left in the child's group, once the system reaps the
-    // grandchild it killed.
-    var left = true;
-    for (0..200) |_| {
-        std.posix.kill(-probe.pid, @fromBackingInt(@intCast(0))) catch |err| {
-            try std.testing.expectEqual(error.ProcessNotFound, err);
-            left = false;
-            break;
-        };
-        io_mod.sleep(5 * std.time.ns_per_ms);
-    }
-    try std.testing.expect(!left);
-}
-
-test "a waiter blocked by a process that left the group is cancelled after the grace and still reaps" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.heap.c_allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(dir);
-    const pid_file = try std.Io.Dir.path.join(alloc, &.{ dir, "escaped.pid" });
-    defer alloc.free(pid_file);
-    // A new session, so the group kill misses it, and it keeps stdout open.
-    const script = "perl -MPOSIX -e 'POSIX::setsid(); open(F, \">\", $ARGV[0]) or exit 1; print F $$; close F; sleep 20' \"$0\" & exit 0";
-    var waiters: std.Io.Group = .init;
-    var reader: ChildStatusReader = undefined;
-    reader.init();
-    const probe = try ProcessProbe.create(alloc, "escaped", &.{ "/bin/sh", "-c", script, pid_file }, &reader);
-    probe.spawn(&waiters, null);
-    // The pid file is written after setsid, so the group kill then misses it.
-    const escaped: std.posix.pid_t = for (0..2_000) |_| {
-        if (tmp.dir.readFileAlloc(io_mod.getIo(), "escaped.pid", alloc, .limited(32))) |text| {
-            defer alloc.free(text);
-            if (std.fmt.parseInt(std.posix.pid_t, text, 10)) |pid| break pid else |_| {}
-        } else |_| {}
-        io_mod.sleep(5 * std.time.ns_per_ms);
-    } else return error.EscapedProcessDidNotStart;
-    defer std.posix.kill(escaped, .KILL) catch {};
-    const started = io_mod.milliTimestamp();
-    try std.testing.expect(wait(started + 50, null, &.{probe}, &waiters, null) == null);
-    const took = io_mod.milliTimestamp() - started;
-    try std.testing.expect(probe.done.load(.acquire));
-    // The child exited on its own; only the waiter was stuck on the pipe.
-    try std.testing.expect(probe.term.? == .exited);
-    try std.testing.expect(took >= reap_grace_ms and took < 50 + reap_grace_ms + 1_000);
-}
-
-test "a server whose name spark mcp would read as an option gets no child and a rename fix in every state" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer freeChecks(alloc, &checks);
-    const statuses = [_]mcp_runtime.Status{
-        .{ .name = "-x", .source = .profile, .transport = .stdio, .state = .idle },
-        .{ .name = "--help", .source = .workspace, .transport = .stdio, .state = .idle },
-        .{ .name = "normal", .source = .profile, .transport = .stdio, .state = .idle },
-        .{ .name = "-w", .source = .workspace, .transport = .stdio, .state = .waiting_for_approval },
-        .{ .name = "-u", .source = .profile, .transport = .sse, .state = .unsupported },
-        .{ .name = "-f", .source = .profile, .transport = .stdio, .state = .failed, .last_error = "boom" },
-        .{ .name = "-m", .source = .profile, .transport = .http, .state = .missing_env, .missing = "TOKEN" },
-        .{ .name = "-i", .source = .workspace, .transport = .stdio, .state = .invalid_env },
-    };
-    try serverStatusChecks(&checks, alloc, &statuses);
-    try std.testing.expectEqual(@as(usize, 7), checks.items.len);
-    try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
-    try std.testing.expectEqualStrings("-x was not checked: spark mcp show reads a name that starts with \"-\" as an option", checks.items[0].detail);
-    const profile_fix = "rename the server in ~/.spark/mcp.json so its name does not start with \"-\"";
-    const project_fix = "rename the server in .mcp.json so its name does not start with \"-\"";
-    try std.testing.expectEqualStrings(profile_fix, checks.items[0].fix.?);
-    try std.testing.expectEqualStrings(project_fix, checks.items[1].fix.?);
-    try std.testing.expectEqualStrings("-w is waiting for approval", checks.items[2].detail);
-    try std.testing.expectEqualStrings(project_fix, checks.items[2].fix.?);
-    try std.testing.expectEqualStrings("-u uses a transport spark does not support", checks.items[3].detail);
-    try std.testing.expectEqualStrings(profile_fix, checks.items[3].fix.?);
-    try std.testing.expectEqualStrings("-f failed: boom", checks.items[4].detail);
-    try std.testing.expectEqualStrings(profile_fix, checks.items[4].fix.?);
-    try std.testing.expectEqualStrings("-m needs TOKEN", checks.items[5].detail);
-    try std.testing.expectEqualStrings(profile_fix, checks.items[5].fix.?);
-    try std.testing.expectEqualStrings("-i needs an environment variable", checks.items[6].detail);
-    try std.testing.expectEqualStrings(project_fix, checks.items[6].fix.?);
-
-    var waiters: std.Io.Group = .init;
-    var processes: std.ArrayList(*ProcessProbe) = .empty;
-    defer processes.deinit(std.heap.c_allocator);
-    // Past the deadline already, so no child starts for `normal` either.
-    var servers = try startServerChildren(std.heap.c_allocator, &waiters, &processes, &statuses, "/nonexistent/spark", 0, 5_000, 4);
-    try std.testing.expectEqual(@as(usize, 1), processes.items.len);
-    try std.testing.expectEqualStrings("normal", processes.items[0].name);
-    try std.testing.expect(wait(0, null, processes.items, &waiters, &servers) == null);
-    try std.testing.expect(processes.items[0].not_started);
-}
-
-test "every fix line passes a name from a config file to a shell as one word" {
-    const alloc = std.testing.allocator;
-    const hostile = "x; touch /tmp/p #";
-    var checks: std.ArrayList(Check) = .empty;
-    defer freeChecks(alloc, &checks);
-    try serverStatusChecks(&checks, alloc, &.{
-        .{ .name = hostile, .source = .workspace, .transport = .stdio, .state = .waiting_for_approval },
-        .{ .name = "it's", .source = .profile, .transport = .sse, .state = .unsupported },
-        .{ .name = "$(id)", .source = .profile, .transport = .stdio, .state = .failed },
-        .{ .name = "env", .source = .profile, .transport = .stdio, .state = .missing_env, .missing = "A`id`" },
-        .{ .name = "unnamed", .source = .profile, .transport = .stdio, .state = .invalid_env },
-    });
-    var login_reader: ChildStatusReader = undefined;
-    answer(&login_reader, "{\"status\":\"needs_login\"}");
-    var login: ProcessProbe = .{ .name = "a b", .term = .{ .exited = 0 }, .status = &login_reader };
-    var unstarted: ProcessProbe = .{ .name = "`id`", .not_started = true };
-    var results: std.ArrayList(ServerResult) = .empty;
-    defer results.deinit(alloc);
-    try serverChildChecks(&checks, &results, alloc, &.{ &login, &unstarted }, 5_000);
-    const want = [_][]const u8{
-        "spark mcp approve 'x; touch /tmp/p #'",
-        "give 'it'\\''s' a stdio command or an HTTP URL, or run spark mcp remove 'it'\\''s'",
-        "spark mcp show '$(id)'",
-        "set 'A`id`', then run spark doctor again",
-        "set the variable, then run spark doctor again",
-        "spark mcp login 'a b'",
-        "spark mcp show '`id`'",
-    };
-    try std.testing.expectEqual(want.len, checks.items.len);
-    for (want, checks.items) |fix, check| try std.testing.expectEqualStrings(fix, check.fix.?);
-}
-
-test "each checked server's result matches its line" {
-    const alloc = std.testing.allocator;
-    var ready_reader: ChildStatusReader = undefined;
-    answer(&ready_reader, "{\"status\":\"ready\",\"tools\":[{}]}");
-    var login_reader: ChildStatusReader = undefined;
-    answer(&login_reader, "{\"status\":\"needs_login\",\"error\":null,\"tools\":[]}");
-    var ready: ProcessProbe = .{ .name = "ready", .term = .{ .exited = 0 }, .status = &ready_reader };
-    var login: ProcessProbe = .{ .name = "login", .term = .{ .exited = 0 }, .status = &login_reader };
-    var late: ProcessProbe = .{ .name = "late" };
-    late.stopped.store(true, .release);
-    var unstarted: ProcessProbe = .{ .name = "unstarted", .not_started = true };
-    var crashed: ProcessProbe = .{ .name = "crashed", .term = .{ .signal = .SEGV } };
-    var checks: std.ArrayList(Check) = .empty;
-    defer freeChecks(alloc, &checks);
-    var results: std.ArrayList(ServerResult) = .empty;
-    defer results.deinit(alloc);
-    try serverChildChecks(&checks, &results, alloc, &.{ &ready, &login, &late, &unstarted, &crashed }, 5_000);
-    const want = [_]struct { CheckStatus, ServerResult.Connection, ServerResult.Authentication }{
-        .{ .ok, .ready, .ok },
-        .{ .fail, .failed, .needs_login },
-        .{ .fail, .timed_out, .not_checked },
-        .{ .fail, .timed_out, .not_checked },
-        .{ .fail, .failed, .not_checked },
-    };
-    for (want, checks.items, results.items) |w, check, result| {
-        try std.testing.expectEqual(w[0], check.status);
-        try std.testing.expectEqual(w[1], result.connection);
-        try std.testing.expectEqual(w[2], result.authentication);
-    }
-}
-
-test "a check killed at the deadline takes with it what it started in a group of its own" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.heap.c_allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(dir);
-    const pid_file = try std.Io.Dir.path.join(alloc, &.{ dir, "server.pid" });
-    defer alloc.free(pid_file);
-    // Like an `spark mcp show` child and its stdio server: the server moves to a
-    // group of its own, ignores SIGTERM and holds the pipe, and the child
-    // waits on it. It ignores SIGHUP too: the kernel hangs up a stopped
-    // process in a group that its parent's death orphans, which would end it
-    // without spark's own kill of what a check started outside its group, and
-    // this test must prove that kill.
-    const script = "perl -MPOSIX -e '$SIG{HUP} = \"IGNORE\"; $SIG{TERM} = \"IGNORE\"; POSIX::setpgid(0, 0); open(F, \">\", $ARGV[0]) or exit 1; print F $$; close F; sleep 20' \"$0\" & wait";
-    var waiters: std.Io.Group = .init;
-    var reader: ChildStatusReader = undefined;
-    reader.init();
-    const probe = try ProcessProbe.create(alloc, "server", &.{ "/bin/sh", "-c", script, pid_file }, &reader);
-    probe.spawn(&waiters, null);
-    const server: std.posix.pid_t = for (0..2_000) |_| {
-        if (tmp.dir.readFileAlloc(io_mod.getIo(), "server.pid", alloc, .limited(32))) |text| {
-            defer alloc.free(text);
-            if (std.fmt.parseInt(std.posix.pid_t, text, 10)) |pid| break pid else |_| {}
-        } else |_| {}
-        io_mod.sleep(5 * std.time.ns_per_ms);
-    } else return error.ServerDidNotStart;
-    defer std.posix.kill(server, .KILL) catch {};
-    const started = io_mod.milliTimestamp();
-    try std.testing.expect(wait(started + 50, null, &.{probe}, &waiters, null) == null);
-    // The pipe closed with the server, so no waiter needed the grace.
-    try std.testing.expect(io_mod.milliTimestamp() - started < 50 + reap_grace_ms);
-    try std.testing.expect(probe.stopped.load(.acquire));
-    var gone = false;
-    for (0..200) |_| {
-        if (!try process_tree.processIsAlive(alloc, server)) {
-            gone = true;
-            break;
-        }
-        io_mod.sleep(5 * std.time.ns_per_ms);
-    }
-    try std.testing.expect(gone);
-}
-
-test "an ending signal during the fan-out stops what started, starts nothing more, and is returned" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.heap.c_allocator;
-    defer stop_signal.store(0, .seq_cst);
-    var waiters: std.Io.Group = .init;
-    var processes: std.ArrayList(*ProcessProbe) = .empty;
-    const first = try ProcessProbe.create(alloc, "first", &.{ "/bin/sh", "-c", "sleep 30" }, null);
-    first.spawn(&waiters, null);
-    try processes.append(alloc, first);
-    // The handler's whole work, as if the signal reached it now.
-    recordStopSignal(.TERM);
-    const later = [_]mcp_runtime.Status{.{ .name = "later", .source = .profile, .transport = .stdio, .state = .idle }};
-    var servers = try startServerChildren(alloc, &waiters, &processes, &later, "/nonexistent/spark", io_mod.milliTimestamp() + 60_000, 60_000, 4);
-    try std.testing.expectEqual(@as(usize, 0), servers.next);
-    try std.testing.expect(try startGh(alloc, &waiters, &processes) == null);
-    const started = io_mod.milliTimestamp();
-    try std.testing.expectEqual(std.posix.SIG.TERM, wait(started + 60_000, null, processes.items, &waiters, &servers).?);
-    // It stopped at the signal, not at the deadline, and never started the
-    // check that waited in the queue.
-    try std.testing.expect(io_mod.milliTimestamp() - started < reap_grace_ms);
-    try std.testing.expect(first.stopped.load(.acquire));
-    try std.testing.expect(first.term.? == .signal);
-    try std.testing.expect(processes.items[1].not_started);
-    try std.testing.expectEqual(@as(std.posix.pid_t, 0), processes.items[1].pid);
-}
-
-test "no more server checks run at once than the cap, and the next starts when one ends" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.heap.c_allocator;
-    var waiters: std.Io.Group = .init;
-    var processes: std.ArrayList(*ProcessProbe) = .empty;
-    for (0..5) |_| try processes.append(alloc, try ProcessProbe.create(alloc, "slow", &.{ "/bin/sh", "-c", "sleep 0.2" }, null));
-    var servers: ServerChecks = .{ .probes = processes.items, .cap = 2 };
-    const far = io_mod.milliTimestamp() + 30_000;
-    servers.startMore(&waiters, far);
-    try std.testing.expectEqual(@as(usize, 2), servers.next);
-    // Both still run, so no slot is free.
-    servers.startMore(&waiters, far);
-    try std.testing.expectEqual(@as(usize, 2), servers.next);
-    const started = io_mod.milliTimestamp();
-    try std.testing.expect(wait(far, null, processes.items, &waiters, &servers) == null);
-    for (processes.items) |p| {
-        try std.testing.expect(!p.not_started and !p.stopped.load(.acquire));
-        try std.testing.expect(p.term.? == .exited);
-    }
-    // Two at a time, the last three needed two more rounds of 0.2 s.
-    try std.testing.expect(io_mod.milliTimestamp() - started >= 350);
 }
 
 /// Sends the doctor trace lines a test writes to `trace.log` in `tmp`.
@@ -1236,261 +871,10 @@ fn readTraceForTest(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
     return tmp.dir.readFileAlloc(io_mod.getIo(), "trace.log", alloc, .limited(1 << 20));
 }
 
-test "server checks still queued at the deadline are never started and say so" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.heap.c_allocator;
-    var waiters: std.Io.Group = .init;
-    var processes: std.ArrayList(*ProcessProbe) = .empty;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try startTraceForTest(alloc, tmp);
-    defer debug_trace.resetForTest();
-    for ([_][]const u8{ "first", "second", "third" }) |name| try processes.append(alloc, try ProcessProbe.create(alloc, name, &.{ "/bin/sh", "-c", "sleep 30" }, null));
-    // No start cutoff, so the one slot is still taken when the limit comes.
-    var servers: ServerChecks = .{ .probes = processes.items, .cap = 1 };
-    const started = io_mod.milliTimestamp();
-    servers.startMore(&waiters, started + 100);
-    try std.testing.expect(wait(started + 100, null, processes.items, &waiters, &servers) == null);
-    try std.testing.expect(processes.items[0].stopped.load(.acquire));
-    const trace = try readTraceForTest(alloc, tmp);
-    for (processes.items[1..]) |p| {
-        try std.testing.expect(p.not_started and !p.start_cutoff);
-        try std.testing.expectEqual(@as(std.posix.pid_t, 0), p.pid);
-        const line = try alloc.print("check {s} was never started, since doctor's limit came while it waited for a slot; dropping it", .{p.name});
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, line));
-    }
-    var checks: std.ArrayList(Check) = .empty;
-    defer freeChecks(std.testing.allocator, &checks);
-    var results: std.ArrayList(ServerResult) = .empty;
-    defer results.deinit(std.testing.allocator);
-    try serverChildChecks(&checks, &results, std.testing.allocator, processes.items, 1_000);
-    try std.testing.expect(std.mem.startsWith(u8, checks.items[0].detail, "first did not answer in 0."));
-    try std.testing.expect(std.mem.endsWith(u8, checks.items[0].detail, " s, when doctor's 1 s limit ended"));
-    try std.testing.expectEqualStrings("third was not checked: doctor reached its 1 s limit before it could start the check", checks.items[2].detail);
-}
-
-test "the cap is one check per CPU, at least 4 and at most 16" {
-    for ([_][2]usize{ .{ 1, 4 }, .{ 4, 4 }, .{ 8, 8 }, .{ 16, 16 }, .{ 64, 16 } }) |case| {
-        try std.testing.expectEqual(case[1], serverCapFor(case[0]));
-    }
-}
-
-test "a queued check needs a share of the limit left to start, and one too late is never started" {
-    try std.testing.expectEqual(@as(i64, 1_000), checkShareMs(5_000));
-    try std.testing.expectEqual(@as(i64, 300), checkShareMs(1_200));
-    try std.testing.expectEqual(@as(i64, 0), checkShareMs(1));
-    const alloc = std.heap.c_allocator;
-    var waiters: std.Io.Group = .init;
-    var processes: std.ArrayList(*ProcessProbe) = .empty;
-    for ([_][]const u8{ "first", "second" }) |name| try processes.append(alloc, try ProcessProbe.create(alloc, name, &.{ "/bin/sh", "-c", "sleep 30" }, null));
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try startTraceForTest(alloc, tmp);
-    defer debug_trace.resetForTest();
-    // The deadline is still ahead, but the last moment to start has passed.
-    const now = io_mod.milliTimestamp();
-    var servers: ServerChecks = .{ .probes = processes.items, .cap = 4, .last_start = now - 1 };
-    servers.startMore(&waiters, now + 60_000);
-    try std.testing.expectEqual(processes.items.len, servers.next);
-    for (processes.items) |p| {
-        try std.testing.expect(p.not_started and p.start_cutoff and p.done.load(.acquire));
-        try std.testing.expectEqual(@as(std.posix.pid_t, 0), p.pid);
-    }
-    // With nothing left to wait for, the wait ends at once.
-    try std.testing.expect(wait(now + 60_000, null, processes.items, &waiters, &servers) == null);
-    try std.testing.expect(io_mod.milliTimestamp() - now < 1_000);
-    const trace = try readTraceForTest(alloc, tmp);
-    var checks: std.ArrayList(Check) = .empty;
-    defer freeChecks(std.testing.allocator, &checks);
-    var results: std.ArrayList(ServerResult) = .empty;
-    defer results.deinit(std.testing.allocator);
-    try serverChildChecks(&checks, &results, std.testing.allocator, processes.items, 60_000);
-    for (processes.items, checks.items) |p, check| {
-        const line = try alloc.print("check {s} was never started, since too little of doctor's limit was left to start it; dropping it", .{p.name});
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, line));
-        const detail = try alloc.print("{s} was not checked: too little of doctor's 60 s limit was left to start it", .{p.name});
-        try std.testing.expectEqualStrings(detail, check.detail);
-        const fix = try alloc.print("spark mcp show {s}", .{p.name});
-        try std.testing.expectEqualStrings(fix, check.fix.?);
-    }
-}
-
-test "a signal drops each queued check with a trace line, and gh is never started" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.heap.c_allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try startTraceForTest(alloc, tmp);
-    defer debug_trace.resetForTest();
-    defer stop_signal.store(0, .seq_cst);
-    var waiters: std.Io.Group = .init;
-    var processes: std.ArrayList(*ProcessProbe) = .empty;
-    const names = [_][]const u8{ "first", "second", "third" };
-    for (names) |name| try processes.append(alloc, try ProcessProbe.create(alloc, name, &.{ "/bin/sh", "-c", "sleep 30" }, null));
-    var servers: ServerChecks = .{ .probes = processes.items, .cap = 4 };
-    // The handler's whole work, as if the signal reached it before any start.
-    recordStopSignal(.TERM);
-    try std.testing.expect(try startGh(alloc, &waiters, &processes) == null);
-    try std.testing.expectEqual(std.posix.SIG.TERM, wait(io_mod.milliTimestamp() + 60_000, null, processes.items, &waiters, &servers).?);
-    const trace = try readTraceForTest(alloc, tmp);
-    for (names, processes.items) |name, p| {
-        try std.testing.expect(p.not_started and !p.start_cutoff);
-        try std.testing.expectEqual(@as(std.posix.pid_t, 0), p.pid);
-        const line = try alloc.print("check {s} was never started, since doctor got a signal first; dropping it", .{name});
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, line));
-    }
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "check gh was never started, since doctor got a signal first"));
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, trace, "starting check"));
-}
-
-test "a check the limit cuts says how long it ran, not the whole limit" {
-    const alloc = std.testing.allocator;
-    var cut: ProcessProbe = .{ .name = "late", .stopped_after_ms = 1_234 };
-    cut.stopped.store(true, .release);
-    var whole: ProcessProbe = .{ .name = "hung", .stopped_after_ms = 4_960 };
-    whole.stopped.store(true, .release);
-    var checks: std.ArrayList(Check) = .empty;
-    defer freeChecks(alloc, &checks);
-    var results: std.ArrayList(ServerResult) = .empty;
-    defer results.deinit(alloc);
-    try serverChildChecks(&checks, &results, alloc, &.{ &cut, &whole }, 5_000);
-    try std.testing.expectEqualStrings("late did not answer in 1.2 s, when doctor's 5 s limit ended", checks.items[0].detail);
-    try std.testing.expectEqualStrings("spark mcp show late", checks.items[0].fix.?);
-    try std.testing.expectEqualStrings("hung did not answer in 5.0 s, when doctor's 5 s limit ended", checks.items[1].detail);
-    try std.testing.expectEqual(ServerResult.Connection.timed_out, results.items[0].connection);
-}
-
-test "the gh line reads only how gh repo view ended" {
-    const alloc = std.testing.allocator;
-    var ok: ProcessProbe = .{ .name = "gh", .term = .{ .exited = 0 } };
-    var signed_out: ProcessProbe = .{ .name = "gh", .term = .{ .exited = gh_auth_required } };
-    var failed: ProcessProbe = .{ .name = "gh", .term = .{ .exited = 1 } };
-    var crashed: ProcessProbe = .{ .name = "gh", .term = .{ .signal = .SEGV } };
-    var late: ProcessProbe = .{ .name = "gh" };
-    late.stopped.store(true, .release);
-    var missing: ProcessProbe = .{ .name = "gh", .spawn_error = error.FileNotFound, .done = .init(true) };
-    var lost: ProcessProbe = .{ .name = "gh" };
-    const see_why = "run gh repo view to see why";
-    const Case = struct { probe: *const ProcessProbe, status: CheckStatus, detail: []const u8, fix: ?[]const u8 };
-    for ([_]Case{
-        .{ .probe = &ok, .status = .ok, .detail = "gh can use this repository", .fix = null },
-        .{ .probe = &signed_out, .status = .warn, .detail = "gh is not signed in for this repository", .fix = "gh auth login" },
-        .{ .probe = &failed, .status = .warn, .detail = "gh could not use this repository", .fix = see_why },
-        .{ .probe = &crashed, .status = .warn, .detail = "gh repo view ended early (terminated with signal SEGV)", .fix = see_why },
-        .{ .probe = &late, .status = .warn, .detail = "gh repo view did not answer in 5 s", .fix = see_why },
-        .{ .probe = &missing, .status = .warn, .detail = "GitHub CLI not found on PATH; spark pr --create and spark issue --create need it", .fix = "install gh from https://cli.github.com" },
-        .{ .probe = &lost, .status = .warn, .detail = "gh repo view gave no result", .fix = see_why },
-    }) |case| {
-        var checks: std.ArrayList(Check) = .empty;
-        defer freeChecks(alloc, &checks);
-        try ghCheck(&checks, alloc, case.probe, 5_000);
-        try std.testing.expectEqual(@as(usize, 1), checks.items.len);
-        try std.testing.expectEqual(case.status, checks.items[0].status);
-        try std.testing.expectEqualStrings(case.detail, checks.items[0].detail);
-        if (case.fix) |fix| try std.testing.expectEqualStrings(fix, checks.items[0].fix.?) else try std.testing.expect(checks.items[0].fix == null);
-    }
-    // gh never started, because a signal came first: no line.
-    var checks: std.ArrayList(Check) = .empty;
-    defer freeChecks(alloc, &checks);
-    try ghCheck(&checks, alloc, null, 5_000);
-    try std.testing.expectEqual(@as(usize, 0), checks.items.len);
-}
-
-test "the wait notice names each network check doctor started and the limit" {
-    const alloc = std.testing.allocator;
-    const Case = struct { waiting: Waiting, want: ?[]const u8 };
-    for ([_]Case{
-        .{ .waiting = .{ .provider = .gateway, .mcp_servers = 3, .gh = .checking }, .want = "checking AI Gateway, 3 MCP servers, and gh (up to 5 s)...\n" },
-        .{ .waiting = .{ .mcp_servers = 1 }, .want = "checking 1 MCP server (up to 5 s)...\n" },
-        .{ .waiting = .{ .provider = .grok, .gh = .checking }, .want = "checking Grok and gh (up to 5 s)...\n" },
-        .{ .waiting = .{}, .want = null },
-    }) |case| {
-        const notice = try waitNotice(alloc, case.waiting, 5_000);
-        defer if (notice) |text| alloc.free(text);
-        if (case.want) |want| try std.testing.expectEqualStrings(want, notice.?) else try std.testing.expect(notice == null);
-    }
-}
-
 /// The entries in `dir`, for tests.
 fn entryCount(dir: std.Io.Dir) !usize {
     var count: usize = 0;
     var it = dir.iterate();
     while (try it.next(io_mod.getIo())) |_| count += 1;
     return count;
-}
-
-test "stopping a check that keeps starting processes in groups of their own leaves none of them" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.heap.c_allocator;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(dir);
-    // Each process it starts moves to a group of its own and writes its pid,
-    // like a stdio server an `spark mcp show` child starts. It starts one about
-    // every millisecond. The pause bounds the storm: started as fast as the
-    // machine allows, a stop that is slow to land lets thousands start, and the
-    // load they add slows the stop and the exit of what it killed further,
-    // until the processes fill the machine's memory. A longer pause leaves too
-    // few starting at the stop to fail a stop path that lists them before it
-    // stops the forker. Each ignores SIGHUP before it moves: the kernel hangs
-    // up a stopped process in a group that its parent's death orphans, which
-    // would end them without spark's own kill of what a check started outside its
-    // group, and this test must prove that kill.
-    const script = "while :; do /usr/bin/perl -e '$SIG{HUP} = \"IGNORE\"; setpgrp(0, 0); open(F, \">\", \"$ARGV[0]/\" . $$) or exit 1; close F; sleep 30' \"$0\" & sleep 0.001; done";
-    for (0..5) |round| {
-        var waiters: std.Io.Group = .init;
-        const before = try entryCount(tmp.dir);
-        const probe = try ProcessProbe.create(alloc, "forker", &.{ "/bin/sh", "-c", script, dir }, null);
-        probe.spawn(&waiters, null);
-        // Once it has started one, so the stop meets it while it starts more.
-        // On a loaded machine that takes longer than any fixed wait.
-        const started_one = for (0..1_000) |_| {
-            if (try entryCount(tmp.dir) > before) break true;
-            io_mod.sleep(5 * std.time.ns_per_ms);
-        } else false;
-        io_mod.sleep((5 * round) * std.time.ns_per_ms);
-        probe.stopped.store(true, .release);
-        // Under load the stop can take longer than `stop_land_ms` to land,
-        // which `stopTrees` allows; what it started must be gone either way.
-        stopTrees(&.{probe});
-        waiters.cancel(io_mod.getIo());
-        // Only after the stop, so a test that fails here does not leave the
-        // forker starting processes.
-        try std.testing.expect(started_one);
-        try std.testing.expect(probe.done.load(.acquire));
-    }
-    // Every process any round started is gone, once the system reaps it.
-    var started: usize = 0;
-    var it = tmp.dir.iterate();
-    while (try it.next(io_mod.getIo())) |entry| {
-        const pid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
-        started += 1;
-        const gone = for (0..200) |_| {
-            if (!try process_tree.processIsAlive(alloc, pid)) break true;
-            io_mod.sleep(5 * std.time.ns_per_ms);
-        } else false;
-        if (!gone) std.posix.kill(pid, .KILL) catch {};
-        try std.testing.expect(gone);
-    }
-    try std.testing.expect(started > 0);
-}
-
-test "a check that has already exited does not hold up the stop of the others" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-    const alloc = std.heap.c_allocator;
-    const io = io_mod.getIo();
-    // No waiter reaps it, so it stays a zombie that can start nothing.
-    var exited: ProcessProbe = .{ .name = "exited" };
-    exited.child = try std.process.spawn(io, .{ .argv = &.{ "/bin/sh", "-c", "exit 0" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
-    exited.pid = exited.child.id.?;
-    defer _ = exited.child.wait(io) catch {};
-    for (0..1_000) |_| {
-        if (!try process_tree.processIsAlive(alloc, exited.pid)) break;
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    const started = io_mod.milliTimestamp();
-    stopTrees(&.{&exited});
-    try std.testing.expect(exited.stop_landed);
-    try std.testing.expect(io_mod.milliTimestamp() - started < stop_land_ms);
 }

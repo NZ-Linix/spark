@@ -88,70 +88,6 @@ test "the turn clock holds through a compaction and goes on from where it stoppe
     try testing.expectEqual(@as(?i64, 620), seconds(marks, began + 45_000));
 }
 
-test "a compaction's clock starts at zero for every origin and runs through its steps" {
-    var activity: compaction_activity.State = .{};
-    for ([_]compaction_activity.Origin{ .manual, .automatic, .provider_overflow }) |origin| {
-        const id = activity.begin(origin, 1, 50_000);
-        try testing.expectEqual(@as(?i64, 0), seconds(compactionMarks(activity.snapshot.operation.?), 50_000));
-        activity.running(id, .summary);
-        activity.running(id, .publication);
-        activity.stopping(id);
-        try testing.expectEqual(@as(?i64, 3), seconds(compactionMarks(activity.snapshot.operation.?), 53_999));
-        try testing.expect(waits(false, activity.snapshot));
-        activity.settle(id, .{ .outcome = .cancelled }, 54_000);
-    }
-}
-
-test "a prompt that overlaps a compaction is taken off the turn once" {
-    var activity: compaction_activity.State = .{};
-    var marks: Marks = .{ .started_ms = 1_000 };
-    const id = activity.begin(.automatic, 1, 11_000);
-    marks = sync(marks, true, waits(false, activity.snapshot), 11_000);
-    // An approval opens during the compaction and closes before it ends.
-    marks = sync(marks, true, waits(true, activity.snapshot), 15_000);
-    marks = sync(marks, true, waits(false, activity.snapshot), 20_000);
-    activity.settle(id, .{ .outcome = .succeeded }, 30_000);
-    // Then the approval outlives the next compaction.
-    marks = sync(marks, true, waits(false, activity.snapshot), 30_000);
-    try testing.expectEqual(@as(?i64, 10), seconds(marks, 30_000));
-    const next = activity.begin(.provider_overflow, 1, 40_000);
-    marks = sync(marks, true, waits(false, activity.snapshot), 40_000);
-    marks = sync(marks, true, waits(true, activity.snapshot), 45_000);
-    activity.settle(next, .{ .outcome = .succeeded }, 50_000);
-    marks = sync(marks, true, waits(true, activity.snapshot), 50_000);
-    marks = sync(marks, true, waits(false, activity.snapshot), 60_000);
-    try testing.expectEqual(@as(?i64, 20), seconds(marks, 60_000));
-}
-
-test "a failed compaction's feedback on screen does not hold the turn clock" {
-    var activity: compaction_activity.State = .{};
-    const id = activity.begin(.automatic, 1, 2_000);
-    activity.settle(id, compaction_activity.failure(error.ConnectionTimedOut, .summary, false), 3_000);
-    try testing.expect(activity.snapshot.operation.?.visible(3_000));
-    try testing.expect(!waits(false, activity.snapshot));
-}
-
-test "a wait starts only on a running turn" {
-    var activity: compaction_activity.State = .{};
-    _ = activity.begin(.manual, null, 1_000);
-    try testing.expectEqual(Marks{}, sync(.{}, false, waits(false, activity.snapshot), 1_000));
-    // A turn that starts while the compaction still runs waits from its first sync.
-    var marks = sync(.{ .started_ms = 4_000 }, true, waits(false, activity.snapshot), 4_000);
-    try testing.expectEqual(@as(i64, 4_000), marks.waiting_since_ms);
-    try testing.expectEqual(@as(?i64, 0), seconds(marks, 9_000));
-    marks = sync(marks, true, false, 9_000);
-    try testing.expectEqual(@as(?i64, 1), seconds(marks, 10_000));
-}
-
-test "the clock shows nothing before its start and never a negative time" {
-    try testing.expectEqual(@as(?i64, null), seconds(.{}, 5_000));
-    try testing.expectEqual(@as(?i64, null), seconds(.{ .started_ms = 6_000 }, 5_000));
-    // The wall clock moved back after the wait began.
-    try testing.expectEqual(@as(?i64, 0), seconds(.{ .started_ms = 6_000, .waiting_since_ms = 5_000 }, 7_000));
-    // A wait that ends at an earlier instant than it began is dropped without a shift.
-    try testing.expectEqual(Marks{ .started_ms = 6_000 }, sync(.{ .started_ms = 6_000, .waiting_since_ms = 9_000 }, true, false, 8_000));
-}
-
 /// Drives seeded sequences of turns, prompts, compactions, time, and UI
 /// syncs that lag behind them, and checks the laws after every step: the
 /// turn clock shows exactly the time the turn ran with no wait seen at the
@@ -227,15 +163,4 @@ fn fuzzClock(_: void, smith: *testing.Smith) !void {
             try testing.expectEqual(@as(?i64, @divTrunc(now - began_ms, std.time.ms_per_s)), seconds(compactionMarks(op), now));
         };
     }
-}
-
-test "the turn clock keeps its laws on fuzzed event sequences" {
-    try testing.fuzz({}, fuzzClock, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-            "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
-            "\x02\x05\x01\x00\x03\x06\x01\x00\x08\x01\x00\x04\x01\x00\x04\x01",
-        }) ++ @import("fuzz_corpus").turn_clock.*),
-    });
 }

@@ -50,7 +50,6 @@ test {
     _ = @import("stream_provider.zig");
     _ = @import("../compactor/compactor.zig");
     _ = @import("runtime/parallel_execution.zig");
-    _ = @import("runtime/tests/gateway_flow.zig");
     _ = @import("runtime/tests/tool_flow.zig");
     _ = @import("runtime/tests/interruption_flow.zig");
     _ = @import("runtime/tests/finalization_flow.zig");

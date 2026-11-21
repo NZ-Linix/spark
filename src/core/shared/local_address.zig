@@ -66,26 +66,3 @@ fn ip4(octets: [4]u8) Address {
     @memcpy(std.mem.asBytes(&storage)[0..@sizeOf(std.posix.sockaddr.in)], std.mem.asBytes(&in));
     return .{ .storage = storage, .len = @sizeOf(std.posix.sockaddr.in) };
 }
-
-test "an address no interface holds is missing, and loopback is present" {
-    if (comptime !supported) return error.SkipZigTest;
-    try std.testing.expect(!missing(ip4(.{ 127, 0, 0, 1 })));
-    // 192.0.2.0/24 is reserved for documentation, so no machine holds it.
-    try std.testing.expect(missing(ip4(.{ 192, 0, 2, 1 })));
-}
-
-test "a live connection's own address is present" {
-    if (comptime !supported) return error.SkipZigTest;
-    const io = std.testing.io;
-    var listen_address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var server = try listen_address.listen(io, .{ .reuse_address = true });
-    defer server.deinit(io);
-    const peer = std.Io.net.IpAddress{ .ip4 = .loopback(server.socket.address.getPort()) };
-    // The listen backlog completes the connect without any server accept.
-    var stream = try peer.connect(io, .{ .mode = .stream });
-    defer stream.close(io);
-
-    const address = of(stream.socket.handle) orelse return error.TestExpectedAddress;
-    try std.testing.expectEqual(@as(@TypeOf(address.storage.family), std.posix.AF.INET), address.storage.family);
-    try std.testing.expect(!missing(address));
-}

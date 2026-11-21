@@ -79,13 +79,6 @@ pub const Reply = union(enum) {
     failed: struct { reason: FailureReason, detail: []u8 },
 };
 
-/// The model to try when the conversation's own model cannot write the
-/// summary. Another provider family, because a provider that refused once
-/// will likely refuse the same conversation again.
-fn fallbackModel(primary: []const u8) []const u8 {
-    return if (std.mem.startsWith(u8, primary, "anthropic/")) "openai/gpt-6-sol" else "anthropic/claude-sonnet-5";
-}
-
 /// The least reasoning a model accepts: `none` when it can turn reasoning
 /// off, otherwise its lowest level (levels are listed lowest first). Null
 /// when the model offers no levels to choose from.
@@ -126,14 +119,12 @@ pub const Summarizer = struct {
             if (err == error.Cancelled or err == error.OutOfMemory) return err;
             primary_error = err;
         }
-        // Only the gateway can route to another model family with this
-        // credential. Elsewhere an empty reply becomes the summary step's
-        // EmptySummary error.
-        if (self.caller.provider != .gateway) {
+        // Without a fallback model, an empty reply becomes the summary
+        // step's EmptySummary error.
+        const fallback = self.caller.fallback_model orelse {
             if (primary_error) |err| return err;
             return alloc.dupe(u8, "");
-        }
-        const fallback = self.caller.fallback_model orelse fallbackModel(prompt.model);
+        };
         trace.info(self.trace_ctx, .log, "fallback model={s} after={s}", .{
             fallback,
             if (primary_error) |err| @errorName(err) else "empty_summary",
@@ -196,11 +187,6 @@ test "lowest reasoning effort turns reasoning off when the model allows it" {
     try std.testing.expect(lowestReasoningEffort(.{}) == null);
 }
 
-test "the fallback is another model family" {
-    try std.testing.expectEqualStrings("openai/gpt-6-sol", fallbackModel("anthropic/claude-opus-5.5"));
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-5", fallbackModel("openai/gpt-6-sol"));
-}
-
 /// Answers from a script, recording what it was asked.
 const ScriptedCaller = struct {
     replies: []const ?[]const u8,
@@ -234,85 +220,3 @@ const ScriptedCaller = struct {
         return .{ .text = try alloc.dupe(u8, text) };
     }
 };
-
-test "a failed or empty summary falls back to another family at its lowest reasoning" {
-    var cancel = std.atomic.Value(bool).init(false);
-    const prompt: summarize.Prompt = .{ .model = "anthropic/claude-opus-5.5", .system = "s", .user = "u" };
-    for ([_]?[]const u8{ null, " \n" }) |first| {
-        var scripted: ScriptedCaller = .{ .replies = &.{ first, "summary" } };
-        defer scripted.calls.deinit(std.testing.allocator);
-        var summarizer: Summarizer = .{ .caller = scripted.caller(.gateway), .cancel_flag = &cancel, .trace_ctx = .{} };
-        const summary_model = summarizer.model();
-        const text = try summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt);
-        defer std.testing.allocator.free(text);
-        try std.testing.expectEqualStrings("summary", text);
-        try std.testing.expectEqualStrings("openai/gpt-6-sol", summarizer.fallback_used.?);
-        try std.testing.expectEqual(@as(usize, 2), scripted.calls.items.len);
-        try std.testing.expect(scripted.calls.items[0].reasoning.?.eql(types.ReasoningEffort.literal("low")));
-        try std.testing.expectEqualStrings("openai/gpt-6-sol", scripted.calls.items[1].model);
-        try std.testing.expect(scripted.calls.items[1].reasoning.?.eql(types.ReasoningEffort.literal("none")));
-    }
-    // Only the gateway can reach another family.
-    var direct: ScriptedCaller = .{ .replies = &.{null} };
-    defer direct.calls.deinit(std.testing.allocator);
-    var summarizer: Summarizer = .{ .caller = direct.caller(.codex), .cancel_flag = &cancel, .trace_ctx = .{} };
-    const summary_model = summarizer.model();
-    try std.testing.expectError(error.ModelFailed, summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt));
-    try std.testing.expectEqual(@as(usize, 1), direct.calls.items.len);
-}
-
-test "a refusal as too long outlasts the fallback's own failure" {
-    var cancel = std.atomic.Value(bool).init(false);
-    const prompt: summarize.Prompt = .{ .model = "anthropic/claude-opus-5.5", .system = "s", .user = "u" };
-    const cases = [_]struct { overflow: []const bool, replies: []const ?[]const u8, expected: ?summarize.ModelError }{
-        .{ .overflow = &.{ true, false }, .replies = &.{ null, null }, .expected = error.SummaryTooLong },
-        .{ .overflow = &.{ true, true }, .replies = &.{ null, null }, .expected = error.SummaryTooLong },
-        .{ .overflow = &.{ false, true }, .replies = &.{ null, null }, .expected = error.SummaryTooLong },
-        .{ .overflow = &.{ false, false }, .replies = &.{ null, null }, .expected = error.ModelFailed },
-        .{ .overflow = &.{true}, .replies = &.{ null, "summary" }, .expected = null },
-    };
-    for (cases) |case| {
-        var scripted: ScriptedCaller = .{ .replies = case.replies, .overflow = case.overflow };
-        defer scripted.calls.deinit(std.testing.allocator);
-        var summarizer: Summarizer = .{ .caller = scripted.caller(.gateway), .cancel_flag = &cancel, .trace_ctx = .{} };
-        const summary_model = summarizer.model();
-        if (case.expected) |expected| {
-            try std.testing.expectError(expected, summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt));
-        } else {
-            const text = try summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt);
-            defer std.testing.allocator.free(text);
-            try std.testing.expectEqualStrings("summary", text);
-        }
-        try std.testing.expectEqual(@as(usize, 2), scripted.calls.items.len);
-    }
-}
-
-test "a fallback the caller names replaces the compactor's choice" {
-    var cancel = std.atomic.Value(bool).init(false);
-    const prompt: summarize.Prompt = .{ .model = "anthropic/claude-opus-5.5", .system = "s", .user = "u" };
-    var scripted: ScriptedCaller = .{ .replies = &.{ null, "summary" } };
-    defer scripted.calls.deinit(std.testing.allocator);
-    var caller = scripted.caller(.gateway);
-    caller.fallback_model = "zai/glm-5.3";
-    var summarizer: Summarizer = .{ .caller = caller, .cancel_flag = &cancel, .trace_ctx = .{} };
-    const summary_model = summarizer.model();
-    const text = try summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt);
-    defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings("summary", text);
-    try std.testing.expectEqualStrings("zai/glm-5.3", summarizer.fallback_used.?);
-    try std.testing.expectEqualStrings("zai/glm-5.3", scripted.calls.items[1].model);
-}
-
-test "a request after the conversation goes to its own model only, with the agent's settings" {
-    var cancel = std.atomic.Value(bool).init(false);
-    const prompt: summarize.Prompt = .{ .model = "anthropic/claude-opus-5.5", .system = "", .user = "u", .after_conversation = true };
-    var scripted: ScriptedCaller = .{ .replies = &.{ null, "summary" } };
-    defer scripted.calls.deinit(std.testing.allocator);
-    var summarizer: Summarizer = .{ .caller = scripted.caller(.gateway), .cancel_flag = &cancel, .trace_ctx = .{} };
-    const summary_model = summarizer.model();
-    try std.testing.expectError(error.ModelFailed, summary_model.summarize_fn(summary_model.context, std.testing.allocator, prompt));
-    try std.testing.expectEqual(@as(usize, 1), scripted.calls.items.len);
-    try std.testing.expect(scripted.calls.items[0].after_conversation);
-    try std.testing.expect(scripted.calls.items[0].reasoning == null);
-    try std.testing.expect(summarizer.fallback_used == null);
-}

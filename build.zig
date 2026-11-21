@@ -12,7 +12,6 @@ const PgsoArtifact = enum {
     spark,
     file_index,
     ui_activity,
-    approval_review,
     unit_tests,
 };
 
@@ -270,62 +269,6 @@ pub fn build(b: *std.Build) void {
     );
     test_ui_activity_bench_step.dependOn(&run_ui_activity_bench_tests.step);
 
-    // --- file-diff approval review benchmark ---
-    const approval_review_bench = b.addExecutable(.{
-        .name = "approval-review-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmarks/approval_review.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    approval_review_bench.root_module.addImport(
-        "benchmark_exports",
-        benchmark_exports_mod,
-    );
-    const install_approval_review_bench = b.addInstallArtifact(
-        approval_review_bench,
-        .{},
-    );
-    const approval_review_bench_step = b.step(
-        "bench-approval-review",
-        "Build the file-diff approval review benchmark",
-    );
-    approval_review_bench_step.dependOn(&install_approval_review_bench.step);
-
-    const run_approval_review_bench = b.addRunArtifact(approval_review_bench);
-    run_approval_review_bench.step.dependOn(&install_approval_review_bench.step);
-    run_approval_review_bench.addPassthruArgs();
-    const run_approval_review_bench_step = b.step(
-        "run-bench-approval-review",
-        "Build and run the file-diff approval review benchmark",
-    );
-    run_approval_review_bench_step.dependOn(&run_approval_review_bench.step);
-
-    const approval_review_bench_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmarks/approval_review.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    approval_review_bench_tests.root_module.addImport(
-        "benchmark_exports",
-        benchmark_exports_mod,
-    );
-    const run_approval_review_bench_tests = b.addRunArtifact(
-        approval_review_bench_tests,
-    );
-    test_step.dependOn(&run_approval_review_bench_tests.step);
-    const test_approval_review_bench_step = b.step(
-        "test-approval-review-benchmark",
-        "Run file-diff approval review benchmark qualification tests",
-    );
-    test_approval_review_bench_step.dependOn(
-        &run_approval_review_bench_tests.step,
-    );
-
     const pgso_ir_step = b.step(
         "pgso-ir",
         "Emit selected ReleaseSafe LLVM bitcode for PGO/PGSO qualification",
@@ -335,14 +278,12 @@ pub fn build(b: *std.Build) void {
             .spark => exe,
             .file_index => file_index_bench,
             .ui_activity => ui_activity_bench,
-            .approval_review => approval_review_bench,
             .unit_tests => pgso_tests,
         };
         const output_name = switch (artifact) {
             .spark => "pgso/spark.bc",
             .file_index => "pgso/file-index.bc",
             .ui_activity => "pgso/ui-activity.bc",
-            .approval_review => "pgso/approval-review.bc",
             .unit_tests => "pgso/unit-tests.bc",
         };
         // Zig 0.17.1 writes this bitcode after LLVM's passes. PGSO needs the

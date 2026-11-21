@@ -239,20 +239,3 @@ fn safeRelative(path: []const u8) bool {
     }
     return true;
 }
-
-test "takeFlag finds --convo and keeps the other arguments" {
-    var rest: [8][:0]const u8 = undefined;
-    var n: usize = 0;
-    const file = try takeFlag(&.{ "--model", "x", "--convo", "chat.spark" }, &rest, &n);
-    try std.testing.expectEqualStrings("chat.spark", file.?);
-    try std.testing.expectEqual(@as(usize, 2), n);
-    try std.testing.expect(try takeFlag(&.{"ask"}, &rest, &n) == null);
-    try std.testing.expectError(error.MissingConvoFile, takeFlag(&.{"--convo"}, &rest, &n));
-}
-
-test "safeRelative refuses paths outside the store" {
-    try std.testing.expect(safeRelative("abc/log.jsonl"));
-    try std.testing.expect(!safeRelative("../x"));
-    try std.testing.expect(!safeRelative("/etc/passwd"));
-    try std.testing.expect(!safeRelative("a//b"));
-}

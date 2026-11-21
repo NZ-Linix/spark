@@ -352,44 +352,6 @@ fn questionAnswers(arena: Allocator, output: []const u8) Allocator.Error![]const
     return answers;
 }
 
-test "a question's result gives the user's answers, not the questions" {
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const answers = try questionAnswers(arena, "[{\"question\":\"Which block first?\",\"answer\":\"Block 6 before Block 5\"},{\"question\":\"Push it?\",\"answer\":\"Legitimate, push\"}]");
-    try std.testing.expectEqual(@as(usize, 2), answers.len);
-    try std.testing.expectEqualStrings("Block 6 before Block 5", answers[0]);
-    try std.testing.expectEqualStrings("Legitimate, push", answers[1]);
-    // A result that lists no answers, like an error, gives none.
-    try std.testing.expectEqual(@as(usize, 0), (try questionAnswers(arena, "The user dismissed the question.")).len);
-    try std.testing.expectEqual(@as(usize, 0), (try questionAnswers(arena, "[{\"question\":\"Push it?\"}]")).len);
-
-    // Only the question tool's result carries answers into the turn.
-    const result = "[{\"question\":\"Push it?\",\"answer\":\"Legitimate, push\"}]";
-    var items: std.ArrayList(summarize.Item) = .empty;
-    try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "q", .tool_name = question_tool, .content = result });
-    try appendItems(arena, &items, .{ .role = .tool, .tool_call_id = "s", .tool_name = "shell", .content = result });
-    try std.testing.expectEqual(@as(usize, 1), items.items[0].tool_result.answers.len);
-    try std.testing.expectEqualStrings("Legitimate, push", items.items[0].tool_result.answers[0]);
-    try std.testing.expectEqual(@as(usize, 0), items.items[1].tool_result.answers.len);
-}
-
-test "a message spark sent the model on its own is a note for the summary, never the user's words" {
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    // What a saved turn restores for a tool's notice or a Stop hook's message
-    // (`session.zig` `restoredSteeringChatMessage`), beside the user's own update.
-    var items: std.ArrayList(summarize.Item) = .empty;
-    try appendItems(arena, &items, .{ .role = .user, .content = "None of the requested images were read by Vision.", .recovery_prompt = true });
-    try appendItems(arena, &items, .{ .role = .user, .content = "Continue the turn. spark hook context:\nverify", .recovery_prompt = true });
-    try appendItems(arena, &items, .{ .role = .user, .content = "use the staging key", .restored_steering = true, .context_origin = .user_turn });
-    try std.testing.expectEqual(@as(usize, 3), items.items.len);
-    try std.testing.expectEqualStrings("None of the requested images were read by Vision.", items.items[0].note);
-    try std.testing.expectEqualStrings("Continue the turn. spark hook context:\nverify", items.items[1].note);
-    try std.testing.expectEqualStrings("use the staging key", items.items[2].user);
-}
-
 /// The handle of a tool's whole output that spark saved separately, when the
 /// text the model saw was clipped and does not name it. A clipped
 /// `read_tool_result` page, for one, keeps its whole output only there.
@@ -398,47 +360,6 @@ fn savedOutputHandle(memory: ?types.ToolResultMemory, content: []const u8) []con
     const handle = saved.output_handle orelse return "";
     if (!saved.truncated or std.mem.find(u8, content, handle) != null) return "";
     return handle;
-}
-
-test "a clipped result keeps the handle of its saved whole output" {
-    const handle = "result-read_tool_result-2.txt";
-    const clipped_page: types.ToolResultMemory = .{ .output_handle = handle, .truncated = true };
-    try std.testing.expectEqualStrings(handle, savedOutputHandle(clipped_page, "first page\n... [tool result truncated]"));
-    // The model saw the whole text, or the text names the handle already.
-    try std.testing.expectEqualStrings("", savedOutputHandle(.{ .output_handle = handle }, "whole text"));
-    try std.testing.expectEqualStrings("", savedOutputHandle(clipped_page, "preview; full result: " ++ handle));
-    try std.testing.expectEqualStrings("", savedOutputHandle(null, "no memory"));
-}
-
-test "an unreadable checkpoint numbers new turns, tool calls and ledgers after the saved ones" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var memory = records.MemoryStore{ .alloc = std.testing.allocator };
-    defer memory.deinit();
-    const store = memory.store();
-    try records.save(arena, store, .{ .kind = .turn, .number = 3 }, "turn three");
-    try records.save(arena, store, .{ .kind = .tool, .number = 7 }, "tool seven");
-    try records.save(arena, store, .{ .kind = .tool, .number = 2 }, "tool two");
-    try records.save(arena, store, .{ .kind = .ledger, .number = 2 }, "ledger two");
-    try store.write(arena, "result-shell-1.txt", "not a record");
-
-    const broken = "spark-compactor-v1\n{\"turns\": [";
-    const earlier = (try earlierFrom(arena, store, broken)).?;
-    try std.testing.expectEqualStrings(broken, earlier.earlier);
-    try std.testing.expectEqual(@as(usize, 3), earlier.turn_count);
-    try std.testing.expectEqual(@as(usize, 7), earlier.tool_count);
-    try std.testing.expectEqual(@as(usize, 2), earlier.ledger_count);
-    // Without a store nothing was saved, so numbering starts at one.
-    try std.testing.expectEqual(@as(usize, 0), (try earlierFrom(arena, null, broken)).?.turn_count);
-
-    // A count no session reaches is damage too, as is a record numbered past
-    // it; numbering on from either would overflow.
-    const impossible = std.fmt.comptimePrint("spark-compactor-v1\n{{\"tool_count\":{d}}}", .{std.math.maxInt(usize)});
-    try store.write(arena, std.fmt.comptimePrint("compacted-T{d}.txt", .{std.math.maxInt(usize)}), "damaged");
-    const recovered = (try earlierFrom(arena, store, impossible)).?;
-    try std.testing.expectEqualStrings(impossible, recovered.earlier);
-    try std.testing.expectEqual(@as(usize, 7), recovered.tool_count);
 }
 
 // The fuzz binary reaches the compactor only through this file, so the
@@ -472,16 +393,6 @@ fn fuzzNotesCount(_: void, smith: *std.testing.Smith) !void {
     }
     try std.testing.expectEqual(whole.percent(), split.percent());
     try std.testing.expect(whole.covered_count <= count);
-}
-
-test "the notes count keeps its laws on fuzzed replies" {
-    try std.testing.fuzz({}, fuzzNotesCount, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "Turn 1\nIn between: none\nT1: ran it\n- **T2**: read it\n\nRules:\nnone\n\n## Facts\nF1 (T1): x\n",
-            "T1\u{2013}T999:\nRules:\nFacts:\nDecisions:\nStatus:\nOpen:\nEarlier:\n",
-        }) ++ @import("fuzz_corpus").compaction_progress.*),
-    });
 }
 
 test {

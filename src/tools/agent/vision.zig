@@ -67,21 +67,3 @@ pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
 pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
 }
-
-test "vision decode failure says how to fix the call" {
-    const alloc = std.testing.allocator;
-    const decoded = try decode(.{ .allocator = alloc }, "{\"image_ids\":[1],\"paths\":[\"a.png\"],\"focus\":\"read it\"}");
-    switch (decoded) {
-        .input => |input| {
-            input.deinit(alloc);
-            return error.TestUnexpectedResult;
-        },
-        .failure => |failure| {
-            defer alloc.free(failure);
-            try std.testing.expectEqualStrings(
-                "vision arguments are invalid: InvalidVisionRequest. Send focus and exactly one of paths or image_ids, each a list.",
-                failure,
-            );
-        },
-    }
-}

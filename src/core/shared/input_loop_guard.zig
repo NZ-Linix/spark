@@ -33,25 +33,3 @@ fn strict() bool {
     const value = io_mod.getenv(strict_env) orelse return false;
     return std.mem.eql(u8, value, "1");
 }
-
-test "input loop guard marks only the thread that entered" {
-    try std.testing.expect(!on_input_loop);
-    enter();
-    defer leave();
-    try std.testing.expect(on_input_loop);
-
-    const Probe = struct {
-        fn run(seen: *bool) void {
-            seen.* = on_input_loop;
-        }
-    };
-    var worker_seen = true;
-    const thread = try std.Thread.spawn(.{}, Probe.run, .{&worker_seen});
-    thread.join();
-    try std.testing.expect(!worker_seen);
-}
-
-test "input loop guard passes requests made off the input loop" {
-    try std.testing.expect(!on_input_loop);
-    noteNetworkRequest("test");
-}

@@ -1,5 +1,5 @@
-//! State of a read-only panel in the footer, such as `/status` and
-//! `/permissions` open: a title over labeled lines, built when it opens and
+//! State of a read-only panel in the footer, such as `/status`
+//! open: a title over labeled lines, built when it opens and
 //! scrolled when they do not all fit. It writes nothing to the transcript.
 
 const std = @import("std");
@@ -10,12 +10,10 @@ pub const Row = output_contracts.PanelRow;
 
 pub const Kind = enum {
     status,
-    permissions,
 
     pub fn title(self: Kind) []const u8 {
         return switch (self) {
             .status => "Status",
-            .permissions => "Permissions",
         };
     }
 };
@@ -29,12 +27,6 @@ pub const Facts = union(Kind) {
         history_turns: usize,
         /// Null when the shell has no session.
         session_saved: ?bool,
-        session_grants: usize,
-    },
-    permissions: struct {
-        mode: types.PermissionMode,
-        session_grants: usize,
-        configured_rules: usize,
     },
 };
 
@@ -46,7 +38,6 @@ pub const Inputs = union(Kind) {
         /// Why the settings could not be read at open, an error name.
         settings_error: ?[]const u8,
     },
-    permissions,
 };
 
 /// A panel's rows and what they were built from. Owns everything.

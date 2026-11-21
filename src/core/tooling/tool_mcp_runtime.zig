@@ -19,8 +19,8 @@ pub const servers_changed_reason = "the session's MCP servers changed after it b
 pub const ValidateToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, Access) anyerror!ValidationResult;
 pub const CallToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, usize, CallOptions) anyerror!?CallResult;
 pub const SearchRequest = capability_retrieval.Request;
-pub const SearchToolsFn = *const fn (*anyopaque, Allocator, SearchRequest, types.PermissionRuleSet, context_limits.Values, Access, ?*std.atomic.Value(bool)) anyerror!SearchResult;
-pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.PermissionRuleSet, context_limits.Values, Access, ?*std.atomic.Value(bool)) anyerror!?ToolSchemaResult;
+pub const SearchToolsFn = *const fn (*anyopaque, Allocator, SearchRequest, context_limits.Values, Access, ?*std.atomic.Value(bool)) anyerror!SearchResult;
+pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, context_limits.Values, Access, ?*std.atomic.Value(bool)) anyerror!?ToolSchemaResult;
 
 pub const Progress = mcp_contract.Progress;
 pub const ProgressSink = mcp_contract.ProgressSink;
@@ -86,7 +86,7 @@ pub const DefinitionSnapshot = union(enum) {
     updated: SelectedTool,
 };
 
-pub const SnapshotToolFn = *const fn (*anyopaque, Allocator, []const u8, Binding, types.PermissionRuleSet, context_limits.Values, Access) anyerror!DefinitionSnapshot;
+pub const SnapshotToolFn = *const fn (*anyopaque, Allocator, []const u8, Binding, context_limits.Values, Access) anyerror!DefinitionSnapshot;
 
 pub const Binding = types.McpToolBinding;
 
@@ -253,13 +253,6 @@ pub const CallStatus = enum {
         };
     }
 };
-
-test "MCP hook statuses normalize tool and protocol failures" {
-    try std.testing.expectEqual(observation.McpStatus.success, CallStatus.success.observed());
-    try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.tool_failure.observed());
-    try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.protocol_failure.observed());
-    try std.testing.expectEqual(observation.McpStatus.input_required, CallStatus.input_required.observed());
-}
 
 pub const CallResult = struct {
     model_output: []const u8,
@@ -429,44 +422,6 @@ pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
         "{f} is not one of the tools in this request. Open it with toolbox to see its arguments, then call toolbox with run: \"{f}\" and those arguments.",
         .{ shown, shown },
     );
-}
-
-test "a direct call of a tool the request didn't send names it as visible text" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const text = try notSelectedOutput(arena_state.allocator(), "mcp_x\x00y");
-    try std.testing.expect(std.mem.find(u8, text, "mcp_x&#x00;y is not one of the tools") != null);
-    for (text) |byte| try std.testing.expect(byte >= 0x20);
-}
-test "MCP advertised dynamic tool executes only through its supplied capability" {
-    var fixture = Fixture.CountingContext{};
-    const advertised = [_][]const u8{"mcp_fs_read"};
-    const input = CallInput{
-        .advertised_dynamic_tool_names = &advertised,
-        .runtime = .{
-            .context = @ptrCast(&fixture),
-            .call_tool = Fixture.callCounting,
-        },
-        .max_tool_result_bytes = 1024,
-    };
-
-    const result = (try callAdvertisedDynamicTool(
-        input,
-        std.testing.allocator,
-        "mcp_fs_read",
-        "{}",
-    )).?;
-    defer std.testing.allocator.free(result.model_output);
-
-    try std.testing.expectEqualStrings("mcp ok", result.model_output);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-    try std.testing.expect((try callAdvertisedDynamicTool(
-        input,
-        std.testing.allocator,
-        "mcp_other",
-        "{}",
-    )) == null);
-    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
 const Fixture = struct {

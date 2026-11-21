@@ -35,25 +35,17 @@ const leased_lock = @import("../shared/leased_lock.zig");
 const process_tree = @import("../execution/process_tree.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const oauth = @import("oauth.zig");
-const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const session_presence = @import("session_presence.zig");
-const subscription_session = @import("subscription_session.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const Source = enum {
-    codex,
-    grok,
-    spark_login,
     mcp,
 
     fn files(self: Source) Files {
         return switch (self) {
-            .codex => .{ .record = "chatgpt-revocations.json", .lock = "chatgpt-revocations.lock", .label = "Codex kept sign-outs" },
-            .grok => .{ .record = "grok-revocations.json", .lock = "grok-revocations.lock", .label = "Grok kept sign-outs" },
-            .spark_login => .{ .record = "auth-revocations.json", .lock = "auth-revocations.lock", .label = "spark login kept sign-outs", .keychain_marker = "auth-revocations.keychain" },
             .mcp => .{ .record = "mcp-revocations.json", .lock = "mcp-revocations.lock", .label = "MCP kept sign-outs", .keychain_marker = "mcp-revocations.keychain" },
         };
     }
@@ -138,11 +130,9 @@ const Lease = struct {
 };
 
 /// How long sending one sign-out can take: each of its requests within the
-/// transport's limit, plus the lock's slack. The spark login asks for its
-/// issuer's endpoints, then revokes two tokens (`login_flow.revokeTokens`).
-fn sendBudgetMs(source: Source) i64 {
-    const requests: i64 = if (source == .spark_login) 3 else 1;
-    return requests * oauth_transport.default_request_timeout_ms + leased_lock.slack_ms;
+/// transport's limit, plus the lock's slack.
+fn sendBudgetMs(_: Source) i64 {
+    return oauth_transport.default_request_timeout_ms + leased_lock.slack_ms;
 }
 
 fn processId() i64 {
@@ -439,9 +429,7 @@ pub const Place = struct {
 
     fn of(source: Source) Place {
         // libfx hosts keep logins themselves; the Keychain code is macOS-only.
-        if (comptime host_target.is_wasm) return .{ .source = source };
-        const in_keychain = source == .spark_login and oauth_session.storesInKeychain();
-        return .{ .source = source, .keychain = if (in_keychain) native_keychain_backend else null };
+        return .{ .source = source };
     }
 
     /// The profile folder, or null when there is none and `open` is `.existing`.
@@ -459,7 +447,7 @@ pub const Place = struct {
         };
         if (open == .create) return try io_mod.openOrCreateVerifiedPrivateDirFromDir(parent, profile_paths.rootName());
         var verified_parent: io_mod.VerifiedDir = .{ .dir = parent };
-        return subscription_session.openExistingPrivateFxDir(&verified_parent) catch |err| switch (err) {
+        return openExistingPrivateFxDir(&verified_parent) catch |err| switch (err) {
             error.FileNotFound => null,
             else => err,
         };
@@ -477,6 +465,25 @@ pub const Place = struct {
         return true;
     }
 };
+
+fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
+    var dir = try home_dir.dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    errdefer dir.close(io_mod.getIo());
+    const initial_stat = try dir.stat(io_mod.getIo());
+    if (initial_stat.kind != .directory) return error.DurablePathUnsafe;
+    if (initial_stat.permissions.toMode() & 0o200 == 0) return error.PrivateStatePermissionsUnsupported;
+    dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700)) catch {
+        return error.PrivateStatePermissionsUnsupported;
+    };
+    const stat = try dir.stat(io_mod.getIo());
+    if (stat.kind != .directory or stat.permissions.toMode() & 0o777 != 0o700) {
+        return error.PrivateStatePermissionsUnsupported;
+    }
+    return .{ .dir = dir };
+}
 
 /// A source's record, read and written under its lock.
 const Mutation = struct {
@@ -760,7 +767,7 @@ fn retryAt(alloc: Allocator, place: Place, now_ms: i64, revoker: Revoker, before
 const testing = std.testing;
 const day_ms = std.time.ms_per_day;
 /// The spark login's marker file while its record is in the Keychain.
-const keychain_marker = Source.spark_login.files().keychain_marker;
+const keychain_marker = Source.mcp.files().keychain_marker;
 
 fn testPlace(tmp: *testing.TmpDir, source: Source) Place {
     return .{ .source = source, .parent = tmp.dir };
@@ -860,9 +867,9 @@ fn recordMode(tmp: *testing.TmpDir, name: []const u8) !?u32 {
 test "a kept sign-out is a private record that a confirmed retry removes" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    const place = testPlace(&tmp, .codex);
+    const place = testPlace(&tmp, .mcp);
     try keepAt(testing.allocator, place, .{ .refresh_token = "refresh-1" }, 10 * day_ms, null);
-    try testing.expectEqual(@as(?u32, 0o600), try recordMode(&tmp, "chatgpt-revocations.json"));
+    try testing.expectEqual(@as(?u32, 0o600), try recordMode(&tmp, "mcp-revocations.json"));
     try expectKept(place, &.{"refresh-1"});
 
     var fake: FakeRevoker = .{};
@@ -872,346 +879,11 @@ test "a kept sign-out is a private record that a confirmed retry removes" {
     try testing.expect(!outcome.failed);
     try testing.expectEqual(@as(usize, 1), fake.sent.items.len);
     try testing.expectEqualStrings("refresh-1", fake.sent.items[0]);
-    try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, "chatgpt-revocations.json"));
-}
-
-test "a refused retry keeps the sign-out and the ones after it" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .grok);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "a" }, 1, null);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "b" }, 2, null);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "c" }, 3, null);
-
-    var fake: FakeRevoker = .{ .refuse = &.{"b"} };
-    defer fake.deinit();
-    const outcome = try retryAt(testing.allocator, place, 4, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 1), outcome.revoked);
-    try testing.expect(outcome.failed);
-    // It stopped at the refusal: "c" was never sent.
-    try testing.expectEqual(@as(usize, 2), fake.sent.items.len);
-    try expectKept(place, &.{ "b", "c" });
-}
-
-test "an MCP server that refuses keeps only its own sign-outs back, and the other servers' still go" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .mcp);
-    const refusing = "https://refusing.example.com/mcp";
-    const working = "https://working.example.com/mcp";
-    try keepAt(testing.allocator, place, .{ .refresh_token = "refused-1", .server_url = refusing }, 1, null);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "works-1", .server_url = working }, 2, null);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "refused-2", .server_url = refusing }, 3, null);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "works-2", .server_url = working }, 4, null);
-
-    var fake: FakeRevoker = .{ .refuse = &.{"refused-1"} };
-    defer fake.deinit();
-    const outcome = try retryAt(testing.allocator, place, 5, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 2), outcome.revoked);
-    try testing.expect(outcome.failed);
-    // The refusing server got one request; its second sign-out waits.
-    try testing.expectEqual(@as(usize, 3), fake.sent.items.len);
-    try testing.expectEqualStrings("refused-1", fake.sent.items[0]);
-    try testing.expectEqualStrings("works-1", fake.sent.items[1]);
-    try testing.expectEqualStrings("works-2", fake.sent.items[2]);
-    try expectKept(place, &.{ "refused-1", "refused-2" });
-}
-
-test "a sign-out kept exactly 30 days is retried and one kept longer is dropped unsent" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .codex);
-    const now = 100 * day_ms;
-    try keepAt(testing.allocator, place, .{ .refresh_token = "old" }, now - max_age_ms - 1, null);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "edge" }, now - max_age_ms, null);
-
-    var fake: FakeRevoker = .{ .refuse = &.{"edge"} };
-    defer fake.deinit();
-    _ = try retryAt(testing.allocator, place, now, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 1), fake.sent.items.len);
-    try testing.expectEqualStrings("edge", fake.sent.items[0]);
-    try expectKept(place, &.{"edge"});
-}
-
-test "a saved time after now, from a clock set back, still expires 30 days later" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .codex);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "future" }, 500 * day_ms, null);
-
-    var fake: FakeRevoker = .{ .refuse = &.{"future"} };
-    defer fake.deinit();
-    // The clock reads 400 days now: the sign-out counts from here.
-    _ = try retryAt(testing.allocator, place, 400 * day_ms, fake.revoker(), null);
-    try expectKept(place, &.{"future"});
-    _ = try retryAt(testing.allocator, place, 430 * day_ms + 1, fake.revoker(), null);
-    try expectKept(place, &.{});
-    try testing.expectEqual(@as(usize, 1), fake.sent.items.len);
-}
-
-test "the same refresh token is kept once" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .codex);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "same" }, 1, null);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "same" }, 2, null);
-    try expectKept(place, &.{"same"});
-    try testing.expectEqual(@as(usize, 1), try countInRecord(&tmp, "chatgpt-revocations.json", "\"same\""));
-}
-
-test "keeping more sign-outs than the limit drops the oldest" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .grok);
-    var names: [max_entries + 2][8]u8 = undefined;
-    for (&names, 0..) |*name, index| {
-        const text = try std.mem.print(name, "t{d:0>7}", .{index});
-        try keepAt(testing.allocator, place, .{ .refresh_token = text }, @intCast(index), null);
-    }
-    const kept = try keptTokens(testing.allocator, place);
-    defer freeTokens(testing.allocator, kept);
-    try testing.expectEqual(max_entries, kept.len);
-    try testing.expectEqualStrings("t0000002", kept[0]);
-    try testing.expectEqualStrings("t0000009", kept[max_entries - 1]);
-    try testing.expectEqual(max_entries, try countInRecord(&tmp, "grok-revocations.json", "\"refresh_token\""));
-}
-
-test "an empty, cut off, other-version, oversized, or shared record is dropped and replaced" {
-    const cases = [_]struct { bytes: []const u8, mode: u32 }{
-        .{ .bytes = "", .mode = 0o600 },
-        .{ .bytes = "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refr", .mode = 0o600 },
-        .{ .bytes = "{\"version\":2,\"entries\":[]}", .mode = 0o600 },
-        .{ .bytes = "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"\"}]}", .mode = 0o600 },
-        .{ .bytes = "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"x\"}]}", .mode = 0o644 },
-    };
-    for (cases) |case| {
-        var tmp = testing.tmpDir(.{ .iterate = true });
-        defer tmp.cleanup();
-        const place = testPlace(&tmp, .codex);
-        try writeRecord(&tmp, "chatgpt-revocations.json", case.bytes, case.mode);
-        try keepAt(testing.allocator, place, .{ .refresh_token = "new" }, 1, null);
-        try expectKept(place, &.{"new"});
-        try testing.expectEqual(@as(?u32, 0o600), try recordMode(&tmp, "chatgpt-revocations.json"));
-    }
-
-    // A record past the limit is too long to read.
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const big = try testing.allocator.alloc(u8, max_record_bytes + 2);
-    defer testing.allocator.free(big);
-    @memset(big, ' ');
-    try writeRecord(&tmp, "chatgpt-revocations.json", big, 0o600);
-    var fake: FakeRevoker = .{};
-    defer fake.deinit();
-    _ = try retryAt(testing.allocator, testPlace(&tmp, .codex), 1, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 0), fake.sent.items.len);
-    try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, "chatgpt-revocations.json"));
-}
-
-test "tokens that are empty or too long are not kept" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .spark_login);
-    try testing.expectError(error.InvalidKeptSignOut, keepAt(testing.allocator, place, .{ .refresh_token = "" }, 1, null));
-    const long = try testing.allocator.alloc(u8, max_field_bytes + 1);
-    defer testing.allocator.free(long);
-    @memset(long, 'a');
-    try testing.expectError(error.InvalidKeptSignOut, keepAt(testing.allocator, place, .{ .refresh_token = "r", .access_token = long }, 1, null));
-    try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, "auth-revocations.json"));
-}
-
-test "a sign-out its revoker calls unusable is dropped and the retry goes on" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .spark_login);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "broken" }, 1, null);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "fine", .access_token = "access", .issuer = "https://vercel.com", .client_id = "cl" }, 2, null);
-    var fake: FakeRevoker = .{ .unusable = &.{"broken"} };
-    defer fake.deinit();
-    const outcome = try retryAt(testing.allocator, place, 3, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 1), outcome.revoked);
-    try testing.expect(!outcome.failed);
-    try expectKept(place, &.{});
-}
-
-test "the spark login's sign-out keeps its issuer, client id, and both tokens" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .spark_login);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "refresh", .access_token = "access", .issuer = "https://vercel.com", .client_id = "cl_1" }, 1, null);
-    var mutation = (try Mutation.begin(place, .existing)).?;
-    defer mutation.deinit();
-    var list = try mutation.load(testing.allocator);
-    defer list.deinit(testing.allocator);
-    const kept = list.entries.items[0].asTokens();
-    try testing.expectEqualStrings("refresh", kept.refresh_token);
-    try testing.expectEqualStrings("access", kept.access_token);
-    try testing.expectEqualStrings("https://vercel.com", kept.issuer);
-    try testing.expectEqualStrings("cl_1", kept.client_id);
-}
-
-test "an MCP login's sign-out keeps its revocation in its own private record" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .mcp);
-    const tokens: Tokens = .{
-        .refresh_token = "refresh",
-        .client_id = "client",
-        .token_type_hint = "refresh_token",
-        .revocation_endpoint = "https://auth.example.com/revoke",
-        .client_secret = "secret \"quoted\"",
-        .client_auth = "client_secret_basic",
-        .server_url = "https://mcp.example.com/mcp",
-    };
-    try keepAt(testing.allocator, place, tokens, 1, null);
-    try testing.expectEqual(@as(?u32, 0o600), try recordMode(&tmp, "mcp-revocations.json"));
-    try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, "auth-revocations.json"));
-
-    var mutation = (try Mutation.begin(place, .existing)).?;
-    defer mutation.deinit();
-    var list = try mutation.load(testing.allocator);
-    defer list.deinit(testing.allocator);
-    const kept = list.entries.items[0].asTokens();
-    inline for (field_names) |name| try testing.expectEqualStrings(@field(tokens, name), @field(kept, name));
-}
-
-test "MCP sign-outs are kept under their credential store's home, and found there without the lock" {
-    if (comptime host_target.is_wasm) return error.SkipZigTest;
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, ".");
-    defer testing.allocator.free(home);
-    try testing.expect(!mcpMayHaveKept(home));
-    const place = mcpPlace(home, false);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "r", .revocation_endpoint = "https://as/revoke" }, 1, null);
-    try testing.expect(mcpMayHaveKept(home));
-    try testing.expectEqual(@as(?u32, 0o600), try recordMode(&tmp, "mcp-revocations.json"));
-
-    var fake: FakeRevoker = .{};
-    defer fake.deinit();
-    _ = try retryAt(testing.allocator, place, 2, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 1), fake.sent.items.len);
-    try testing.expect(!mcpMayHaveKept(home));
-}
-
-test "an MCP Keychain record has its own marker, apart from the spark login's" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var keychain: MemoryKeychain = .{};
-    defer keychain.deinit();
-    const place: Place = .{ .source = .mcp, .keychain = keychain.backend(), .parent = tmp.dir };
-    try keepAt(testing.allocator, place, .{ .refresh_token = "r", .revocation_endpoint = "https://as/revoke" }, 1, null);
-    try testing.expectEqual(@as(?u32, 0o600), try recordMode(&tmp, "mcp-revocations.keychain"));
-    try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, keychain_marker));
     try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, "mcp-revocations.json"));
-    // The spark login's record, which is somewhere else, still reads as empty.
-    var fake: FakeRevoker = .{};
-    defer fake.deinit();
-    _ = try retryAt(testing.allocator, testPlace(&tmp, .spark_login), 2, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 0), fake.sent.items.len);
-}
-
-test "a sign-out a live spark is sending is left to it until its lease ends" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .codex);
-    // This test's own process is the live sender.
-    try keepAt(testing.allocator, place, .{ .refresh_token = "in-flight" }, 1_000, .{ .pid = processId(), .until_ms = 2_000 });
-    var fake: FakeRevoker = .{};
-    defer fake.deinit();
-    _ = try retryAt(testing.allocator, place, 1_500, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 0), fake.sent.items.len);
-    try expectKept(place, &.{"in-flight"});
-    _ = try retryAt(testing.allocator, place, 2_001, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 1), fake.sent.items.len);
-    try expectKept(place, &.{});
-}
-
-test "a sign-out whose sender is gone is sent at once" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .grok);
-    // No process has this ID: its spark was killed while it sent the sign-out.
-    const gone: i64 = std.math.maxInt(i32);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "orphan" }, 1_000, .{ .pid = gone, .until_ms = 50_000 });
-    var fake: FakeRevoker = .{};
-    defer fake.deinit();
-    const outcome = try retryAt(testing.allocator, place, 1_500, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 1), outcome.revoked);
-    try expectKept(place, &.{});
-}
-
-test "a sign-out whose sender exited but is not reaped yet is sent at once" {
-    if (comptime builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .codex);
-    // The child exits at once, and stays a zombie until it is waited for.
-    var child = try std.process.spawn(testing.io, .{
-        .argv = &.{ "/bin/sh", "-c", "exit 0" },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
-    defer _ = child.wait(testing.io) catch {};
-    const pid: i64 = child.id.?;
-    var waited: usize = 0;
-    while (processAlive(testing.allocator, pid) and waited < 200) : (waited += 1) io_mod.sleep(10 * std.time.ns_per_ms);
-    try testing.expect(!processAlive(testing.allocator, pid));
-    try keepAt(testing.allocator, place, .{ .refresh_token = "zombie" }, 1_000, .{ .pid = pid, .until_ms = 50_000 });
-    var fake: FakeRevoker = .{};
-    defer fake.deinit();
-    const outcome = try retryAt(testing.allocator, place, 1_500, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 1), outcome.revoked);
-}
-
-test "a retry leases what it sends, so a retry at the same time skips it" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .codex);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "once" }, 1, null);
-    // The provider refuses, so the sign-out stays kept with this retry's lease.
-    var first: FakeRevoker = .{ .refuse = &.{"once"} };
-    defer first.deinit();
-    _ = try retryAt(testing.allocator, place, 10, first.revoker(), null);
-    var second: FakeRevoker = .{};
-    defer second.deinit();
-    _ = try retryAt(testing.allocator, place, 11, second.revoker(), null);
-    try testing.expectEqual(@as(usize, 0), second.sent.items.len);
-    _ = try retryAt(testing.allocator, place, 11 + sendBudgetMs(.codex), second.revoker(), null);
-    try testing.expectEqual(@as(usize, 1), second.sent.items.len);
-}
-
-test "a retry with nothing kept sends nothing and creates no file" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    for (std.enums.values(Source)) |source| {
-        var fake: FakeRevoker = .{};
-        defer fake.deinit();
-        const outcome = try retryAt(testing.allocator, testPlace(&tmp, source), 1, fake.revoker(), null);
-        try testing.expectEqual(@as(usize, 0), outcome.revoked);
-        try testing.expectEqual(@as(usize, 0), fake.sent.items.len);
-    }
-    // There was no profile folder, and the retries made none.
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io_mod.getIo(), profile_paths.rootName(), .{}));
 }
 
 fn keepAnother(fake: *FakeRevoker) anyerror!void {
     try keepAt(testing.allocator, fake.place.?, .{ .refresh_token = "added-meanwhile" }, 5, null);
-}
-
-test "a sign-out another spark keeps during a retry survives the retry's removal" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .codex);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "first" }, 1, null);
-    // While the retry waits for the provider, another spark's logout keeps a
-    // new sign-out. The retry then forgets only the one it revoked.
-    var fake: FakeRevoker = .{ .during = keepAnother, .place = place };
-    defer fake.deinit();
-    const outcome = try retryAt(testing.allocator, place, 6, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 1), outcome.revoked);
-    try expectKept(place, &.{"added-meanwhile"});
 }
 
 /// An in-memory Keychain item for the spark login's record.
@@ -1250,148 +922,6 @@ const MemoryKeychain = struct {
     }
 };
 
-test "the spark login's Keychain record has a token-free marker, and a start with none reads no item" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var keychain: MemoryKeychain = .{};
-    defer keychain.deinit();
-    const place: Place = .{ .source = .spark_login, .keychain = keychain.backend(), .parent = tmp.dir };
-
-    var fake: FakeRevoker = .{};
-    defer fake.deinit();
-    _ = try retryAt(testing.allocator, place, 1, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 0), keychain.loads);
-
-    try keepAt(testing.allocator, place, .{ .refresh_token = "refresh", .access_token = "access", .issuer = "https://vercel.com", .client_id = "cl" }, 1, null);
-    try testing.expect(keychain.value != null);
-    try testing.expectEqual(@as(?u32, 0o600), try recordMode(&tmp, keychain_marker));
-    try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, "auth-revocations.json"));
-
-    const outcome = try retryAt(testing.allocator, place, 2, fake.revoker(), null);
-    try testing.expectEqual(@as(usize, 1), outcome.revoked);
-    try testing.expect(keychain.value == null);
-    try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, keychain_marker));
-}
-
-test "a Keychain that refuses the write keeps nothing and leaves no marker" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var keychain: MemoryKeychain = .{ .fail_store = true };
-    defer keychain.deinit();
-    const place: Place = .{ .source = .spark_login, .keychain = keychain.backend(), .parent = tmp.dir };
-    try testing.expectError(error.KeychainWriteFailed, keepAt(testing.allocator, place, .{ .refresh_token = "r" }, 1, null));
-    try testing.expectEqual(@as(?u32, null), try recordMode(&tmp, keychain_marker));
-}
-
-test "a record that cannot be written keeps nothing and leaves what is there" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var spark_dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, profile_paths.rootName());
-    defer spark_dir.close();
-    // A folder where the record belongs can be neither read nor replaced.
-    try spark_dir.dir.createDir(io_mod.getIo(), "chatgpt-revocations.json", .default_dir);
-    if (keepAt(testing.allocator, testPlace(&tmp, .codex), .{ .refresh_token = "r" }, 1, null)) |_| return error.TestExpectedError else |_| {}
-    const stat = try spark_dir.dir.statFile(io_mod.getIo(), "chatgpt-revocations.json", .{ .follow_symlinks = false });
-    try testing.expectEqual(std.Io.File.Kind.directory, stat.kind);
-}
-
-test "kept sign-outs match a plain list model over random keep, forget, and expire steps" {
-    var prng: std.Random.DefaultPrng = .init(0x5157_2026);
-    const random = prng.random();
-    for (0..40) |_| {
-        var tmp = testing.tmpDir(.{ .iterate = true });
-        defer tmp.cleanup();
-        const place = testPlace(&tmp, .grok);
-        // The model: refresh token and saved time, oldest first.
-        var model: std.ArrayList(struct { token: u8, saved: i64 }) = .empty;
-        defer model.deinit(testing.allocator);
-        var now: i64 = 1000 * day_ms;
-        for (0..30) |_| {
-            now += random.intRangeAtMost(i64, 0, 12 * day_ms);
-            const token = random.intRangeAtMost(u8, 0, 11);
-            const text = [_]u8{ 'k', 'a' + token };
-            switch (random.intRangeAtMost(u8, 0, 2)) {
-                0 => {
-                    try keepAt(testing.allocator, place, .{ .refresh_token = &text }, now, null);
-                    var index: usize = 0;
-                    while (index < model.items.len) {
-                        if (now - model.items[index].saved > max_age_ms) _ = model.orderedRemove(index) else index += 1;
-                    }
-                    var known = false;
-                    for (model.items) |item| known = known or item.token == token;
-                    if (!known) try model.append(testing.allocator, .{ .token = token, .saved = now });
-                    while (model.items.len > max_entries) _ = model.orderedRemove(0);
-                },
-                1 => {
-                    try forgetAt(testing.allocator, place, &text);
-                    for (model.items, 0..) |item, index| {
-                        if (item.token == token) {
-                            _ = model.orderedRemove(index);
-                            break;
-                        }
-                    }
-                },
-                else => {
-                    // A retry the provider refuses at once only expires.
-                    var fake: FakeRevoker = .{ .refuse = &.{ "ka", "kb", "kc", "kd", "ke", "kf", "kg", "kh", "ki", "kj", "kk", "kl" } };
-                    defer fake.deinit();
-                    _ = try retryAt(testing.allocator, place, now, fake.revoker(), null);
-                    var index: usize = 0;
-                    while (index < model.items.len) {
-                        if (now - model.items[index].saved > max_age_ms) _ = model.orderedRemove(index) else index += 1;
-                    }
-                },
-            }
-            const kept = try keptTokens(testing.allocator, place);
-            defer freeTokens(testing.allocator, kept);
-            try testing.expectEqual(model.items.len, kept.len);
-            for (model.items, kept) |want, got| {
-                const want_text = [_]u8{ 'k', 'a' + want.token };
-                try testing.expectEqualSlices(u8, &want_text, got);
-            }
-        }
-    }
-}
-
-test "many keep and retry rounds on one record end with nothing kept" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .codex);
-    var name: [16]u8 = undefined;
-    for (0..300) |round| {
-        const token = try std.mem.print(&name, "round-{d}", .{round});
-        try keepAt(testing.allocator, place, .{ .refresh_token = token }, @intCast(round), null);
-        if (round % 3 == 2) {
-            var fake: FakeRevoker = .{};
-            defer fake.deinit();
-            const outcome = try retryAt(testing.allocator, place, @intCast(round), fake.revoker(), null);
-            try testing.expectEqual(@as(usize, 3), outcome.revoked);
-        }
-    }
-    try expectKept(place, &.{});
-}
-
-test "the retry notice runs once and only when something is kept" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const place = testPlace(&tmp, .codex);
-    const Counter = struct {
-        var runs: usize = 0;
-        fn run(_: *const anyopaque) void {
-            runs += 1;
-        }
-    };
-    const notice: oauth.BeforeRevocation = .{ .context = &Counter.runs, .run = Counter.run };
-    var fake: FakeRevoker = .{};
-    defer fake.deinit();
-    _ = try retryAt(testing.allocator, place, 1, fake.revoker(), notice);
-    try testing.expectEqual(@as(usize, 0), Counter.runs);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "a" }, 1, null);
-    try keepAt(testing.allocator, place, .{ .refresh_token = "b" }, 1, null);
-    _ = try retryAt(testing.allocator, place, 1, fake.revoker(), notice);
-    try testing.expectEqual(@as(usize, 1), Counter.runs);
-}
-
 fn fuzzRecord(_: void, smith: *testing.Smith) !void {
     var buffer: [4096]u8 = undefined;
     const len: usize = @intCast(smith.slice(&buffer));
@@ -1416,23 +946,6 @@ fn fuzzRecord(_: void, smith: *testing.Smith) !void {
 
     // Any saved time expires without overflow, at any clock reading.
     for ([_]i64{ std.math.minInt(i64), 0, std.math.maxInt(i64) }) |now| {
-        _ = again.expire(alloc, .codex, now);
+        _ = again.expire(alloc, .mcp, now);
     }
-}
-
-test "a kept sign-out record parses or is refused on fuzzed bytes, and what parses writes back the same" {
-    try testing.fuzz({}, fuzzRecord, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "{\"version\":1,\"entries\":[]}",
-            "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"r\"}]}",
-            "{\"version\":1,\"entries\":[{\"saved_at_ms\":-9223372036854775808,\"refresh_token\":\"r\",\"access_token\":\"a\",\"issuer\":\"https://vercel.com\",\"client_id\":\"c\"}]}",
-            "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"r\"},{\"saved_at_ms\":2,\"refresh_token\":\"r\"}]}",
-            "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"r\",\"client_id\":\"c\",\"token_type_hint\":\"refresh_token\",\"revocation_endpoint\":\"https://as/revoke\",\"client_secret\":\"s\",\"client_auth\":\"client_secret_basic\",\"server_url\":\"https://mcp\"}]}",
-            "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"r\",\"client_secret\":7}]}",
-            "{\"version\":1,\"entries\":[{\"saved_at_ms\":1.5,\"refresh_token\":\"r\"}]}",
-            "{\"version\":1,\"entries\":[{\"saved_at_ms\":1,\"refresh_token\":\"\\u0000\\ud800\"}]}",
-            "[1,2,3]",
-        }) ++ @import("fuzz_corpus").kept_sign_outs.*),
-    });
 }

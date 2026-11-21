@@ -1,8 +1,5 @@
 const std = @import("std");
 const observation = @import("../agent/runtime/observation.zig");
-const auth_runtime = @import("../auth/auth_runtime.zig");
-const auth_transition = @import("../auth/auth_transition.zig");
-const credentials = @import("../auth/credentials.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
@@ -12,7 +9,6 @@ const gateway_step = @import("../agent/runtime/gateway_step.zig");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
-const stored_login_testing = @import("../auth/stored_login_testing.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -118,16 +114,10 @@ pub const Request = struct {
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
-    gateway_team: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     prompt_excerpt: []const u8,
     cancel_flag: *std.atomic.Value(bool),
     timeout_ms: u32 = default_timeout_ms,
-    /// The shared sign-in `api_key` belongs to. With it, the request sends
-    /// the stored token, which another spark process may have refreshed, and
-    /// after a 401 sends once more only with a stored token that replaced the
-    /// rejected one. It never refreshes the sign-in itself.
-    shared_sign_in: ?auth_runtime.SharedSignIn = null,
 };
 
 /// Why a title generation attempt did not install a generated title. Static
@@ -170,51 +160,10 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
         .raw = .fromMilliseconds(request.timeout_ms),
     });
     if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
-    var token: Token = .{ .bytes = request.api_key };
-    defer token.deinit(alloc);
-    // Another spark process may have refreshed the shared sign-in since this one
-    // read it (tests/tla/session_title/SessionTitle.tla TitleFirstSendUsesStore).
-    if (request.shared_sign_in) |sign_in| {
-        if (try auth_runtime.readStoredCredential(alloc, sign_in)) |stored| token.adopt(alloc, stored);
-    }
-    if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
-
-    var sent = try send(alloc, request, token.bytes, deadline);
+    var sent = try send(alloc, request, request.api_key, deadline);
     defer sent.deinit(alloc);
-    if (request.shared_sign_in) |sign_in| {
-        if (rejectedAsStale(sent, sign_in)) {
-            if (try auth_runtime.storedReplacement(alloc, sign_in, token.bytes)) |replacement| {
-                token.adopt(alloc, replacement);
-                debug_trace.logf("session", "event=title_generation replay=stored_credential", .{});
-                sent.deinit(alloc);
-                // Keeps the deferred deinit safe if the next send fails.
-                sent = .{ .unavailable = .{ .reason = .cancelled } };
-                sent = try send(alloc, request, token.bytes, deadline);
-            } else {
-                debug_trace.logf("session", "event=title_generation replay=skipped reason=no_stored_replacement", .{});
-            }
-        }
-    }
     return finish(alloc, request, sent);
 }
-
-/// The token a title request sends: the caller's copy until the request reads
-/// one from the store, which it then owns and wipes.
-const Token = struct {
-    bytes: []const u8,
-    owned: ?credentials.Credential = null,
-
-    fn adopt(self: *Token, alloc: Allocator, credential: credentials.Credential) void {
-        if (self.owned) |*old| old.deinit(alloc);
-        self.owned = credential;
-        self.bytes = credential.token;
-    }
-
-    fn deinit(self: *Token, alloc: Allocator) void {
-        if (self.owned) |*credential| credential.deinit(alloc);
-        self.* = undefined;
-    }
-};
 
 /// One request to the title model, or why it could not complete.
 const Sent = union(enum) {
@@ -229,26 +178,6 @@ const Sent = union(enum) {
     }
 };
 
-/// Whether the gateway rejected the request with 401, which a token another
-/// spark process already replaced can explain (tests/tla/session_title/
-/// SessionTitle.tla TitleGivesUpOnlyWhenUnrecoverable). The title has no tools
-/// and shows nothing while it streams, so sending it again is always safe.
-fn rejectedAsStale(sent: Sent, sign_in: auth_runtime.SharedSignIn) bool {
-    const failure = switch (sent) {
-        .result => |result| switch (result) {
-            .failed => |failed| failed,
-            .completed => return false,
-        },
-        .unavailable => return false,
-    };
-    return auth_transition.decideAuthReplay(.{
-        .authentication_rejected = failure.kind == .unauthorized,
-        .refreshable = credentials.sourceRefreshable(sign_in.source),
-        .delivery_safe = true,
-        .already_replayed = false,
-    }) == .refresh_and_replay;
-}
-
 fn send(alloc: Allocator, request: Request, token: []const u8, deadline: std.Io.Clock.Timestamp) Allocator.Error!Sent {
     const instructions = [_]types.ChatMessage{.{ .role = .system, .content = instructions_text }};
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = request.prompt_excerpt }};
@@ -259,7 +188,6 @@ fn send(alloc: Allocator, request: Request, token: []const u8, deadline: std.Io.
             .secret_bytes = token,
             .source = request.credential_source,
             .account_id = request.account_id,
-            .tenant_context = request.gateway_team,
         } };
     var delivery = stream_provider.DeliveryCertainty.init();
     var attempt_evidence: stream_provider.AttemptEvidence = .{};
@@ -327,9 +255,7 @@ fn finish(alloc: Allocator, request: Request, sent: Sent) !Outcome {
 fn ignoreEvent(_: *anyopaque, _: stream_provider.Event) void {}
 
 /// One background title generation call with owned inputs. The model call is
-/// bounded by `default_timeout_ms`, and a read of the shared sign-in can also
-/// wait for another spark process that holds the store's lock, which cancelling
-/// does not interrupt. `destroy` cancels, joins, and frees, so it is safe
+/// bounded by `default_timeout_ms`. `destroy` cancels, joins, and frees, so it is safe
 /// before `spawn` returns and after completion. All fields are written before
 /// `done` is published and read after it (or after join).
 pub const Task = struct {
@@ -345,11 +271,8 @@ pub const Task = struct {
     model: []u8,
     prompt_excerpt: []u8,
     api_key: ?[]u8 = null,
-    gateway_team: ?[]u8 = null,
     account_id: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
-    /// Sends with the stored token of a shared sign-in (`Request.shared_sign_in`).
-    reads_shared_sign_in: bool = false,
     stream_provider: stream_provider.Provider,
     title: ?[]u8 = null,
     failure: ?anyerror = null,
@@ -366,10 +289,8 @@ pub const Task = struct {
         model: []const u8,
         prompt_excerpt: []const u8,
         api_key: ?[]const u8 = null,
-        gateway_team: ?[]const u8 = null,
         account_id: ?[]const u8 = null,
         credential_source: ?types.CredentialSource = null,
-        reads_shared_sign_in: bool = false,
         stream_provider: stream_provider.Provider,
     };
 
@@ -385,8 +306,6 @@ pub const Task = struct {
         errdefer alloc.free(prompt_excerpt);
         const api_key: ?[]u8 = if (init.api_key) |value| try alloc.dupe(u8, value) else null;
         errdefer if (api_key) |value| alloc.free(value);
-        const gateway_team: ?[]u8 = if (init.gateway_team) |value| try alloc.dupe(u8, value) else null;
-        errdefer if (gateway_team) |value| alloc.free(value);
         const account_id: ?[]u8 = if (init.account_id) |value| try alloc.dupe(u8, value) else null;
         errdefer if (account_id) |value| alloc.free(value);
 
@@ -397,10 +316,8 @@ pub const Task = struct {
             .model = model,
             .prompt_excerpt = prompt_excerpt,
             .api_key = api_key,
-            .gateway_team = gateway_team,
             .account_id = account_id,
             .credential_source = init.credential_source,
-            .reads_shared_sign_in = init.reads_shared_sign_in,
             .stream_provider = init.stream_provider,
         };
         return task;
@@ -463,7 +380,6 @@ pub const Task = struct {
             std.crypto.secureZero(u8, key);
             alloc.free(key);
         }
-        if (self.gateway_team) |team| alloc.free(team);
         if (self.account_id) |id| alloc.free(id);
         if (self.title) |title| alloc.free(title);
         alloc.destroy(self);
@@ -487,14 +403,9 @@ pub const Task = struct {
             .api_key = self.api_key orelse "",
             .credential_source = self.credential_source,
             .account_id = self.account_id,
-            .gateway_team = self.gateway_team,
             .session_id = self.session_id,
             .prompt_excerpt = self.prompt_excerpt,
             .cancel_flag = &self.cancel_requested,
-            .shared_sign_in = if (self.reads_shared_sign_in)
-                auth_runtime.SharedSignIn.forSource(self.credential_source, self.account_id, self.gateway_team)
-            else
-                null,
         }) catch |err| {
             self.failure = err;
             self.status = .unavailable;
@@ -540,256 +451,6 @@ test "shouldGenerate requires an enabled, supported, untitled first submit" {
     for (blocked) |gate| try std.testing.expect(!shouldGenerate(gate));
 }
 
-test "promptExcerpt trims and bounds usable text" {
-    try std.testing.expectEqualStrings("fix the renderer", promptExcerpt("  fix the renderer  ").?);
-    try std.testing.expect(promptExcerpt("   \n\t ") == null);
-    try std.testing.expect(promptExcerpt("/compact") == null);
-    try std.testing.expectEqualStrings("/compact extra", promptExcerpt("/compact extra").?);
-
-    const long = text_utils.repeat("x", max_prompt_excerpt_bytes + 100);
-    try std.testing.expectEqual(@as(usize, max_prompt_excerpt_bytes), promptExcerpt(long).?.len);
-}
-
-test "promptExcerpt caps on a UTF-8 boundary" {
-    const alloc = std.testing.allocator;
-    const wide = try alloc.alloc(u8, max_prompt_excerpt_bytes + 2);
-    defer alloc.free(wide);
-    @memset(wide, 0);
-    // Fill with 2-byte codepoints so the raw byte cap lands mid-sequence.
-    for (0..wide.len / 2) |index| {
-        wide[index * 2] = 0xc3;
-        wide[index * 2 + 1] = 0xa9;
-    }
-    const excerpt = promptExcerpt(wide).?;
-    try std.testing.expect(excerpt.len <= max_prompt_excerpt_bytes);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(excerpt));
-}
-
-test "sanitizeGeneratedTitle normalizes model output" {
-    const alloc = std.testing.allocator;
-
-    const plain = (try sanitizeGeneratedTitle(alloc, "Fix renderer\n")).?;
-    defer alloc.free(plain);
-    try std.testing.expectEqualStrings("Fix renderer", plain);
-
-    const quoted = (try sanitizeGeneratedTitle(alloc, "\"Fix renderer\"")).?;
-    defer alloc.free(quoted);
-    try std.testing.expectEqualStrings("Fix renderer", quoted);
-
-    const multiline = (try sanitizeGeneratedTitle(alloc, "Fix renderer\nExtra explanation")).?;
-    defer alloc.free(multiline);
-    try std.testing.expectEqualStrings("Fix renderer", multiline);
-
-    const controlled = (try sanitizeGeneratedTitle(alloc, "Fix\x07 renderer\x1b[0m")).?;
-    defer alloc.free(controlled);
-    try std.testing.expect(std.mem.findScalar(u8, controlled, 0x07) == null);
-    try std.testing.expectEqualStrings("Fix renderer[0m", controlled);
-
-    try std.testing.expect((try sanitizeGeneratedTitle(alloc, "")) == null);
-    try std.testing.expect((try sanitizeGeneratedTitle(alloc, " \n \" \" ")) == null);
-    try std.testing.expect((try sanitizeGeneratedTitle(alloc, "\xff\xfe invalid")) == null);
-}
-
-test "sanitizeGeneratedTitle enforces the byte cap on a UTF-8 boundary" {
-    const alloc = std.testing.allocator;
-    const long = (try sanitizeGeneratedTitle(alloc, text_utils.repeat("word ", 40))).?;
-    defer alloc.free(long);
-    try std.testing.expect(long.len <= max_generated_title_bytes);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(long));
-
-    var wide: std.ArrayList(u8) = .empty;
-    defer wide.deinit(alloc);
-    for (0..max_generated_title_bytes) |_| try wide.appendSlice(alloc, "é");
-    const capped = (try sanitizeGeneratedTitle(alloc, wide.items)).?;
-    defer alloc.free(capped);
-    try std.testing.expect(capped.len <= max_generated_title_bytes);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(capped));
-}
-
-test "sanitizeGeneratedTitle bounds oversized single-line model output" {
-    const alloc = std.testing.allocator;
-    // A pathological title response can emit several KB on one line; the cap
-    // must hold without overrunning the pre-sized strip buffer.
-    const oversized = text_utils.repeat("x", 4096);
-    const capped = (try sanitizeGeneratedTitle(alloc, oversized)).?;
-    defer alloc.free(capped);
-    try std.testing.expectEqual(@as(usize, max_generated_title_bytes), capped.len);
-
-    const oversized_with_controls = text_utils.repeat("ab\x07", 1024) ++ "";
-    const stripped = (try sanitizeGeneratedTitle(alloc, oversized_with_controls)).?;
-    defer alloc.free(stripped);
-    try std.testing.expect(stripped.len <= max_generated_title_bytes);
-    try std.testing.expect(std.mem.findScalar(u8, stripped, 0x07) == null);
-}
-
-test "run returns unavailable when the provider stream fails" {
-    const Failing = struct {
-        fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
-            try request.admission.admit();
-            return .{ .failed = .{ .kind = .rate_limited } };
-        }
-    };
-    var cancelled = std.atomic.Value(bool).init(false);
-    const outcome = try run(std.testing.allocator, .{
-        .stream_provider = .{ .stream_fn = Failing.stream },
-        .model = "test/title",
-        .api_key = "key",
-        .prompt_excerpt = "fix the renderer",
-        .cancel_flag = &cancelled,
-    });
-    switch (outcome) {
-        .generated => |title| {
-            std.testing.allocator.free(title);
-            return error.TestExpectedUnavailable;
-        },
-        .unavailable => |failure| {
-            try std.testing.expectEqual(FailureReason.provider_failure, failure.reason);
-            try std.testing.expectEqualStrings("rate_limited", failure.detail);
-        },
-    }
-}
-
-test "run reports a transport error with its error name" {
-    const Failing = struct {
-        fn stream(_: ?*anyopaque, _: Allocator, _: stream_provider.ModelRequest) anyerror!stream_provider.Result {
-            return error.ConnectionRefused;
-        }
-    };
-    var cancelled = std.atomic.Value(bool).init(false);
-    const outcome = try run(std.testing.allocator, .{
-        .stream_provider = .{ .stream_fn = Failing.stream },
-        .model = "test/title",
-        .api_key = "key",
-        .prompt_excerpt = "fix the renderer",
-        .cancel_flag = &cancelled,
-    });
-    switch (outcome) {
-        .generated => |title| {
-            std.testing.allocator.free(title);
-            return error.TestExpectedUnavailable;
-        },
-        .unavailable => |failure| {
-            try std.testing.expectEqual(FailureReason.transport_error, failure.reason);
-            try std.testing.expectEqualStrings("ConnectionRefused", failure.detail);
-        },
-    }
-}
-
-test "run sanitizes provider content into a generated title" {
-    const Fake = struct {
-        fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
-            try request.admission.admit();
-            try std.testing.expectEqualStrings("test/title", request.model);
-            try std.testing.expectEqual(@as(usize, 1), request.instructions.len);
-            try std.testing.expectEqual(@as(usize, 1), request.messages.len);
-            try std.testing.expectEqualStrings("fix the renderer", request.messages[0].content.?);
-            try std.testing.expectEqual(types.ToolChoice.none, request.tool_choice);
-            try std.testing.expectEqual(@as(?u32, max_output_tokens), request.max_output_tokens);
-            return .{ .completed = .{ .completion = .{
-                .content = "\"Fix the renderer\"\n",
-                .finish_reason = .stop,
-            }, .ownership = .borrowed } };
-        }
-    };
-    var cancelled = std.atomic.Value(bool).init(false);
-    var capture: @import("../agent/runtime/observation_testing.zig").Capture = .{};
-    var observer = capture.observer();
-    const outcome = try run(std.testing.allocator, .{
-        .observer = &observer,
-        .stream_provider = .{ .stream_fn = Fake.stream },
-        .model = "test/title",
-        .api_key = "key",
-        .prompt_excerpt = "fix the renderer",
-        .cancel_flag = &cancelled,
-    });
-    const title = switch (outcome) {
-        .generated => |title| title,
-        .unavailable => return error.TestExpectedGeneratedTitle,
-    };
-    defer std.testing.allocator.free(title);
-    try std.testing.expectEqualStrings("Fix the renderer", title);
-    try std.testing.expectEqual(@as(usize, 1), capture.count(.model_start));
-    try std.testing.expectEqual(capture.count(.model_start), capture.count(.model_end));
-    try std.testing.expectEqual(@as(usize, 1), capture.purposes[@backingInt(observation.ModelPurpose.title)]);
-}
-
-test "run treats unsanitizable output as unavailable" {
-    const Empty = struct {
-        fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
-            try request.admission.admit();
-            return .{ .completed = .{ .completion = .{
-                .content = "  \n ",
-                .finish_reason = .stop,
-            }, .ownership = .borrowed } };
-        }
-    };
-    var cancelled = std.atomic.Value(bool).init(false);
-    const outcome = try run(std.testing.allocator, .{
-        .stream_provider = .{ .stream_fn = Empty.stream },
-        .model = "test/title",
-        .api_key = "key",
-        .prompt_excerpt = "fix the renderer",
-        .cancel_flag = &cancelled,
-    });
-    switch (outcome) {
-        .generated => |title| {
-            std.testing.allocator.free(title);
-            return error.TestExpectedUnavailable;
-        },
-        .unavailable => |failure| try std.testing.expectEqual(FailureReason.unsanitizable, failure.reason),
-    }
-}
-
-test "run reports empty provider content" {
-    const Empty = struct {
-        fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
-            try request.admission.admit();
-            return .{ .completed = .{ .completion = .{
-                .content = null,
-                .finish_reason = .stop,
-            }, .ownership = .borrowed } };
-        }
-    };
-    var cancelled = std.atomic.Value(bool).init(false);
-    const outcome = try run(std.testing.allocator, .{
-        .stream_provider = .{ .stream_fn = Empty.stream },
-        .model = "test/title",
-        .api_key = "key",
-        .prompt_excerpt = "fix the renderer",
-        .cancel_flag = &cancelled,
-    });
-    switch (outcome) {
-        .generated => |title| {
-            std.testing.allocator.free(title);
-            return error.TestExpectedUnavailable;
-        },
-        .unavailable => |failure| try std.testing.expectEqual(FailureReason.empty_content, failure.reason),
-    }
-}
-
-test "run honors an already-set cancel flag" {
-    const Unreachable = struct {
-        fn stream(_: ?*anyopaque, _: Allocator, _: stream_provider.ModelRequest) anyerror!stream_provider.Result {
-            return error.TestUnexpectedStream;
-        }
-    };
-    var cancelled = std.atomic.Value(bool).init(true);
-    const outcome = try run(std.testing.allocator, .{
-        .stream_provider = .{ .stream_fn = Unreachable.stream },
-        .model = "test/title",
-        .api_key = "key",
-        .prompt_excerpt = "fix the renderer",
-        .cancel_flag = &cancelled,
-    });
-    switch (outcome) {
-        .generated => |title| {
-            std.testing.allocator.free(title);
-            return error.TestExpectedUnavailable;
-        },
-        .unavailable => |failure| try std.testing.expectEqual(FailureReason.cancelled, failure.reason),
-    }
-}
-
 /// Stands in for a gateway that never sends response headers. It returns
 /// once the title call is cancelled, or after a bound, so a regression fails
 /// instead of hanging.
@@ -805,40 +466,6 @@ const HeadWaitProvider = struct {
     }
 };
 
-/// Accepts only `accepted`. When `rotate_to` is set, the first send finds the
-/// login renewed by another spark process after it was read: the store gets that
-/// token, and the gateway rejects the one that was sent.
-const SharedLoginGateway = struct {
-    home: *stored_login_testing.StoredLoginHome,
-    accepted: []const u8,
-    rotate_to: ?[]const u8 = null,
-    sends: usize = 0,
-    accepted_sends: usize = 0,
-
-    fn stream(raw: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
-        const self: *SharedLoginGateway = @ptrCast(@alignCast(raw.?));
-        try request.admission.admit();
-        self.sends += 1;
-        if (self.sends == 1) if (self.rotate_to) |token| try self.home.store(token, "team-a", stored_login_testing.far_future_ms);
-        if (!std.mem.eql(u8, request.credential.secret().?, self.accepted)) return .{ .failed = .{ .kind = .unauthorized } };
-        self.accepted_sends += 1;
-        return .{ .completed = .{ .completion = .{ .content = "Fix the renderer", .finish_reason = .stop }, .ownership = .borrowed } };
-    }
-
-    fn titleRequest(self: *SharedLoginGateway, cancelled: *std.atomic.Value(bool), team: []const u8) Request {
-        return .{
-            .stream_provider = .{ .context = self, .stream_fn = stream },
-            .model = "test/title",
-            .api_key = "launch-token",
-            .credential_source = .spark_login,
-            .gateway_team = team,
-            .prompt_excerpt = "fix the renderer",
-            .cancel_flag = cancelled,
-            .shared_sign_in = auth_runtime.SharedSignIn.forSource(.spark_login, null, team),
-        };
-    }
-};
-
 fn expectTitle(outcome: Outcome) !void {
     switch (outcome) {
         .generated => |title| {
@@ -847,119 +474,4 @@ fn expectTitle(outcome: Outcome) !void {
         },
         .unavailable => return error.TestExpectedGeneratedTitle,
     }
-}
-
-test "run sends the stored token of a shared sign-in, and replays a 401 only with a newer stored token" {
-    const alloc = std.testing.allocator;
-    var home: stored_login_testing.StoredLoginHome = undefined;
-    try home.install(alloc);
-    defer home.deinit();
-    var cancelled = std.atomic.Value(bool).init(false);
-
-    // Another spark process refreshed the login before the title read it.
-    try home.store("other-spark-token", "team-a", stored_login_testing.far_future_ms);
-    var renewed: SharedLoginGateway = .{ .home = &home, .accepted = "other-spark-token" };
-    try expectTitle(try run(alloc, renewed.titleRequest(&cancelled, "team-a")));
-    try std.testing.expectEqual(@as(usize, 1), renewed.sends);
-
-    // ...or between the read and the send: one replay with its token.
-    try home.store("read-token", "team-a", stored_login_testing.far_future_ms);
-    var rotated: SharedLoginGateway = .{ .home = &home, .accepted = "rotated-token", .rotate_to = "rotated-token" };
-    try expectTitle(try run(alloc, rotated.titleRequest(&cancelled, "team-a")));
-    try std.testing.expectEqual(@as(usize, 2), rotated.sends);
-
-    // The store still holds the rejected token: no second send, no refresh.
-    try home.store("revoked-token", "team-a", stored_login_testing.far_future_ms);
-    var revoked: SharedLoginGateway = .{ .home = &home, .accepted = "never" };
-    const unavailable = try run(alloc, revoked.titleRequest(&cancelled, "team-a"));
-    try std.testing.expectEqual(FailureReason.provider_failure, unavailable.unavailable.reason);
-    try std.testing.expectEqualStrings("unauthorized", unavailable.unavailable.detail);
-    try std.testing.expectEqual(@as(usize, 1), revoked.sends);
-
-    // Another spark process signed in to another team: its token is never sent.
-    try home.store("team-b-token", "team-b", stored_login_testing.far_future_ms);
-    var other_team: SharedLoginGateway = .{ .home = &home, .accepted = "launch-token" };
-    try expectTitle(try run(alloc, other_team.titleRequest(&cancelled, "team-a")));
-    try std.testing.expectEqual(@as(usize, 1), other_team.sends);
-}
-
-test "run frees every stored token when an allocation fails" {
-    const Sweep = struct {
-        fn run_once(alloc: Allocator, home: *stored_login_testing.StoredLoginHome) !void {
-            try home.store("read-token", "team-a", stored_login_testing.far_future_ms);
-            var cancelled = std.atomic.Value(bool).init(false);
-            var gateway: SharedLoginGateway = .{ .home = home, .accepted = "rotated-token", .rotate_to = "rotated-token" };
-            switch (try run(alloc, gateway.titleRequest(&cancelled, "team-a"))) {
-                .generated => |title| alloc.free(title),
-                .unavailable => {},
-            }
-        }
-    };
-    var home: stored_login_testing.StoredLoginHome = undefined;
-    try home.install(std.testing.allocator);
-    defer home.deinit();
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Sweep.run_once, .{&home});
-}
-
-test "joinOrCancel cancels a title call when the turn is cancelled" {
-    const task = try Task.create(.{
-        .session_id = "session-1",
-        .model = "test/title",
-        .prompt_excerpt = "fix the renderer",
-        .api_key = "key",
-        .stream_provider = .{ .stream_fn = HeadWaitProvider.stream },
-    });
-    defer task.destroy();
-    try task.spawn();
-    var turn_cancel = std.atomic.Value(bool).init(true);
-    task.joinOrCancel(&turn_cancel, after_turn_grace_ms);
-    try std.testing.expectEqual(Task.Status.unavailable, task.status);
-    try std.testing.expectEqual(FailureReason.cancelled, task.failure_reason.?);
-}
-
-test "joinOrCancel cancels a title call that outlasts the grace after the turn" {
-    const task = try Task.create(.{
-        .session_id = "session-1",
-        .model = "test/title",
-        .prompt_excerpt = "fix the renderer",
-        .api_key = "key",
-        .stream_provider = .{ .stream_fn = HeadWaitProvider.stream },
-    });
-    defer task.destroy();
-    try task.spawn();
-    var turn_cancel = std.atomic.Value(bool).init(false);
-    const started = io_mod.milliTimestamp();
-    task.joinOrCancel(&turn_cancel, 50);
-    // The call itself would have waited out its 15 s deadline.
-    try std.testing.expect(io_mod.milliTimestamp() - started < 2_000);
-    try std.testing.expectEqual(Task.Status.unavailable, task.status);
-    try std.testing.expectEqual(FailureReason.cancelled, task.failure_reason.?);
-}
-
-test "joinOrCancel keeps a title that answers within the grace" {
-    const Slow = struct {
-        fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
-            try request.admission.admit();
-            io_mod.sleep(30 * std.time.ns_per_ms);
-            return .{ .completed = .{ .completion = .{
-                .content = "Fix the renderer",
-                .finish_reason = .stop,
-            }, .ownership = .borrowed } };
-        }
-    };
-    const task = try Task.create(.{
-        .session_id = "session-1",
-        .model = "test/title",
-        .prompt_excerpt = "fix the renderer",
-        .api_key = "key",
-        .stream_provider = .{ .stream_fn = Slow.stream },
-    });
-    defer task.destroy();
-    try task.spawn();
-    var turn_cancel = std.atomic.Value(bool).init(false);
-    task.joinOrCancel(&turn_cancel, after_turn_grace_ms);
-    try std.testing.expectEqual(Task.Status.generated, task.status);
-    const title = task.takeTitle().?;
-    defer std.heap.c_allocator.free(title);
-    try std.testing.expectEqualStrings("Fix the renderer", title);
 }

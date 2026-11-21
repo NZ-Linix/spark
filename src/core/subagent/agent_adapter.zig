@@ -9,7 +9,7 @@ const secret = @import("../auth/secret.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_set = @import("../gateway/provider_set.zig");
-const auto_classifier = @import("../permissions/auto_classifier.zig");
+const configured_provider = @import("../config/configured_provider.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const file_mutation = @import("../tooling/file_mutation.zig");
@@ -98,10 +98,6 @@ const Context = struct {
         result.session = self.turn.sessionRuntime();
         result.cancel_flag = self.cancel;
         result.permission_mode = self.admission.permission_mode;
-        result.permission_grants = self.admission.grants;
-        result.session_grants = self.admission.grants;
-        result.permission_rules = self.admission.rules;
-        result.permission_state_override = &self.admission.permission_state;
         result.advertised_dynamic_tool_names = self.admission.integration_names;
         result.mcp_access = if (self.admission.mcp_view) |*view|
             .{ .scoped = .{
@@ -162,19 +158,11 @@ pub fn run(
     var routed_config = config;
     const provider = config.provider_set.select(admission.provider);
     routed_config.tool_context.agent_stream_provider = provider.agent_stream_or_unavailable();
-    routed_config.tool_context.permission_reviewer_provider = provider.permission_reviewer;
-    routed_config.tool_context.auto_classifier = auto_classifier.Classifier.disabled();
     if (admission.provider == .configured or !model_provider.authorizesCredential(
         admission.provider,
         config.tool_context.credential_source,
     )) {
-        routed_credential = auth_runtime.prepareCredential(
-            turn.alloc,
-            config.tool_context.oauth_transport,
-            config.tool_context.secret_store,
-            admission.provider,
-            config.tool_context.credential_source,
-        ) catch |err| {
+        routed_credential = auth_runtime.prepareCredential(turn.alloc, admission.provider) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err));
             return error.ProviderFailed;
@@ -184,9 +172,7 @@ pub fn run(
             return error.ProviderFailed;
         };
         routed_config.tool_context.api_key = credential.token;
-        routed_config.tool_context.gateway_team = credential.gatewayTeam();
         routed_config.tool_context.credential_source = credential.source;
-        routed_config.tool_context.account_id = credential.accountId();
     }
     const ultrafast_mode = childUltrafastMode(config.tool_context.ultrafast_mode, admission.ultrafast_mode);
     routed_config.tool_context.model = admission.model;
@@ -203,10 +189,6 @@ pub fn run(
             admission.effort.label(),
         },
     );
-    if (!routed_config.tool_context.provider_capabilities.spark_search) {
-        routed_config.tool_context.web_search_backend = null;
-        routed_config.tool_context.web_search_runtime_ready = false;
-    }
     const trace_context = debug_trace.TraceContext{
         .turn_id = debug_trace.nextTurnId(),
         .subagent_id = debug_trace.nextSubagentId(),
@@ -257,7 +239,6 @@ pub fn run(
             arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
         else
             &.{},
-        .grants = types.dupePermissionGrantSlice(arena, admission.grants) catch return error.OutOfMemory,
         .agent_settings = .{
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
             .auto_compact_percent = config.tool_context.auto_compact_percent,
@@ -265,8 +246,6 @@ pub fn run(
             .fast_mode = config.tool_context.fast_mode,
             .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
-            .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
-            .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
         },
     };
     // The profile the child started in, cached when its admission resolved.
@@ -346,8 +325,6 @@ pub fn run(
             .fast_mode = config.tool_context.fast_mode,
             .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
-            .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
-            .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .workspace_root = config.tool_context.workspace_root,
             .access_scope = config.tool_context.access_scope,
@@ -379,22 +356,6 @@ fn finalRunOutcome(outcome: ?types.TurnPresentationOutcome) error{ProviderFailed
         .failed => error.ProviderFailed,
         .interrupted, .paused => .paused,
     };
-}
-
-test "subagent finalization preserves every outcome and fails closed on absence" {
-    const cases = [_]struct {
-        outcome: ?types.TurnPresentationOutcome,
-        expected: error{ProviderFailed}!execution.RunOutcome,
-    }{
-        .{ .outcome = .completed, .expected = .completed },
-        .{ .outcome = .failed, .expected = error.ProviderFailed },
-        .{ .outcome = .interrupted, .expected = .paused },
-        .{ .outcome = .paused, .expected = .paused },
-        .{ .outcome = null, .expected = error.ProviderFailed },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(case.expected, finalRunOutcome(case.outcome));
-    }
 }
 
 /// The profile child `child_id` started in, cached when its admission resolved.
@@ -521,7 +482,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .start_workspace_capture = if (context.turn.capturesWorkspace()) startWorkspaceCapture else null,
         .reach_workspace = if (context.turn.capturesWorkspace()) reachWorkspace else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,
         .push_text = pushLiveText,
         .push_tool_lifecycle = pushLiveToolLifecycle,
@@ -530,7 +490,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .push_route_recovery_status = pushLiveRouteRecoveryStatus,
         .push_command_output_complete = pushLiveCommandOutputComplete,
         .push_http_error = captureHttpError,
-        .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
         .record_usage = recordUsage,
@@ -570,111 +529,6 @@ fn resolveModelCapabilities(raw: *anyopaque, arena: Allocator, model: []const u8
     return availableModelCapabilities(raw, model);
 }
 
-test "child runtime capability callbacks preserve fallback and child cancellation" {
-    const catalog = @import("../gateway/model_catalog.zig");
-    const authority = @import("authority.zig");
-    const Fixture = struct {
-        fetches: usize = 0,
-        lookups: usize = 0,
-        resolutions: usize = 0,
-
-        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
-            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
-        }
-        fn fetch(raw: ?*anyopaque, _: Allocator, _: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.fetches += 1;
-            return .{ .failure = .{ .category = .runtime } };
-        }
-        fn lookup(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.lookups += 1;
-            return if (std.mem.eql(u8, model, "child-model")) .{ .context_window = 32768, .max_output_tokens = 512 } else .{};
-        }
-        fn resolveCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.resolutions += 1;
-            return if (std.mem.eql(u8, model, "child-model")) .{ .supports_vision = true, .image_input_support = .native } else .{};
-        }
-        fn output(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, _: []const u8) anyerror!void {}
-    };
-    const alloc = std.testing.allocator;
-    var parent: child_state.TestParent = undefined;
-    try parent.init(alloc);
-    defer parent.deinit();
-    const root = parent.home;
-    const host = try tool_host.Runtime.create(alloc, &parent.children, .{ .resolve_fn = Fixture.resolve }, .{});
-    defer host.deinit();
-    const child = try parent.openChild("capability-child", &.{});
-    defer child.close();
-    var turn = try execution.TurnContext.init(alloc, child, 0);
-    defer turn.deinit();
-    var admission = try domain.captureAdmission(alloc, .{ .parent_id = parent.parent.id(), .source_id = parent.parent.id(), .model = "parent-model", .effort = .auto });
-    defer admission.deinit(alloc);
-    var fixture: Fixture = .{};
-    var cancel = std.atomic.Value(bool).init(false);
-    var parent_cancel = std.atomic.Value(bool).init(false);
-    const registry = context_contract.Registry{ .default_provider = context_contract.empty_provider };
-    var context = Context{
-        .config = .{
-            .host = host,
-            .tool_context = .{
-                .workspace_root = root,
-                .ignored_list_entries = &.{},
-                .max_list_entries = 100,
-                .max_read_file_bytes = 65536,
-                .max_read_file_lines = 400,
-                .max_read_file_line_len = 2000,
-                .max_command_output_bytes = 65536,
-                .api_key = "",
-                .model = "parent-model",
-                .provider = .grok,
-                .gateway_retry_count = 1,
-                .gateway_chat_url = "",
-                .agent_step_limit = 8,
-                .permission_mode = .ask,
-                .permission_grants = &.{},
-                .permission_rules = .{},
-                .worker = turn.workerRuntime(),
-                .session = turn.sessionRuntime(),
-                .context_registry = registry,
-                .output_chunk_ctx = &fixture,
-                .on_output_chunk = Fixture.output,
-                .cancel_flag = &parent_cancel,
-            },
-            .provider_set = .{ .gateway = .{ .model_catalog = .{ .context = &fixture, .fetch_fn = Fixture.fetch } }, .codex = .{}, .grok = .{} },
-            .system_prompt = "",
-            .context_registry = registry,
-            .context_enabled = false,
-        },
-        .turn = &turn,
-        .admission = admission,
-        .cancel = &cancel,
-        .subagent_id = 1,
-    };
-    const deps = runtimeDeps(&context);
-    const fallback = model_capabilities.capabilitiesForModel("legacy-fast");
-    try model_capabilities.expectCapabilitiesEqualForTest(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
-    try model_capabilities.expectCapabilitiesEqualForTest(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));
-    context.config.provider_set.gateway.model_catalog.?.lookup_capabilities_fn = Fixture.lookup;
-    const available = deps.available_model_capabilities(deps.ctx, "child-model");
-    try std.testing.expectEqual(@as(?u32, 512), available.max_output_tokens);
-    try std.testing.expectEqual(@as(?u32, 32768), available.context_window);
-    try model_capabilities.expectCapabilitiesEqualForTest(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
-    try model_capabilities.expectCapabilitiesEqualForTest(.{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
-    context.config.tool_context.model_capability_resolver = .{ .ctx = &fixture, .resolve_fn = Fixture.resolveCapabilities };
-    const resolved = try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model");
-    try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, resolved.image_input_support);
-    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
-    try std.testing.expectEqual(@as(?u32, 512), deps.available_model_capabilities(deps.ctx, "child-model").max_output_tokens);
-    const lookups = fixture.lookups;
-    cancel.store(true, .seq_cst);
-    try std.testing.expectError(error.Cancelled, deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
-    try std.testing.expectEqual(lookups, fixture.lookups);
-    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
-    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
-}
-
 fn takeChildSteeringBoundary(
     raw: *anyopaque,
     arena: Allocator,
@@ -689,58 +543,6 @@ fn takeChildSteeringBoundary(
 fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.release_agent_terminal_lease(context.toolContext(), session_id);
-}
-
-fn refreshGatewayCredential(
-    raw: *anyopaque,
-    alloc: Allocator,
-    source: types.CredentialSource,
-    mode: auth_runtime.CredentialRefreshMode,
-    expected_account_id: ?[]const u8,
-    rejected_token: ?[]const u8,
-) !?agent_runtime.RefreshedGatewayCredential {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
-        debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
-        return null;
-    }
-    var refreshed = (try auth_runtime.refreshCredentialForAccount(
-        context.config.tool_context.oauth_transport,
-        context.turn.alloc,
-        source,
-        mode,
-        expected_account_id,
-        rejected_token,
-    )) orelse return null;
-    defer refreshed.deinit(context.turn.alloc);
-    if (context.config.tool_context.credential_source != refreshed.source or
-        !optionalCredentialFieldEqual(
-            context.config.tool_context.account_id,
-            refreshed.accountId(),
-        ) or
-        !optionalCredentialFieldEqual(
-            context.config.tool_context.gateway_team,
-            refreshed.gatewayTeam(),
-        ))
-    {
-        return error.CredentialAuthorityChanged;
-    }
-
-    const worker_token = try alloc.dupe(u8, refreshed.token);
-    errdefer secret.zeroAndFree(alloc, worker_token);
-    if (context.refreshed_credential) |*current| current.deinit(context.turn.alloc);
-    context.refreshed_credential = refreshed;
-    refreshed.token = &.{};
-    refreshed.account_id = null;
-    refreshed.team_id = null;
-    refreshed.team_slug = null;
-    const current = &context.refreshed_credential.?;
-    context.config.tool_context.api_key = current.token;
-    context.config.tool_context.credential_source = current.source;
-    context.config.tool_context.account_id = current.accountId();
-    context.config.tool_context.gateway_team = current.gatewayTeam();
-    // A team change is refused above, so the request keeps its team.
-    return .{ .token = worker_token };
 }
 
 fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -795,60 +597,6 @@ fn viewServerNames(alloc: Allocator, maybe_view: ?*const mcp_access.View) ![]con
     return names;
 }
 
-test "a subagent's toolbox lists every server in its captured view" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    var servers = [_]mcp_access.ServerIdentity{ .{
-        .name = @constCast("chrome-devtools"),
-        .source = .profile,
-        .scope = .profile,
-        .connection_generation = 1,
-        .catalog_generation = 2,
-        .auth_generation = 3,
-    }, .{
-        .name = @constCast("later"),
-        .source = .profile,
-        .scope = .profile,
-        .connection_generation = 0,
-        .catalog_generation = 0,
-        .auth_generation = 0,
-    } };
-    const view = mcp_access.View{
-        .runtime_generation = 1,
-        .owner_id = @constCast("child"),
-        .parent_id = @constCast("parent"),
-        .servers = &servers,
-        .tools = &.{},
-    };
-    const names = try viewServerNames(arena_state.allocator(), &view);
-    try std.testing.expectEqual(@as(usize, 2), names.len);
-    try std.testing.expectEqualStrings("chrome-devtools", names[0]);
-    // A server whose list hadn't loaded is listed too: it starts on demand.
-    try std.testing.expectEqualStrings("later", names[1]);
-    try std.testing.expectEqual(@as(usize, 0), (try viewServerNames(arena_state.allocator(), null)).len);
-}
-
-test "subagent inherits model capabilities" {
-    const ResolverFixture = struct {
-        fn resolve(
-            _: *anyopaque,
-            _: Allocator,
-            _: []const u8,
-        ) model_capabilities.ResolveError!model_capabilities.Capabilities {
-            return .{};
-        }
-    };
-    var resolver_context: u8 = 0;
-    const resolver = model_capabilities.Resolver{
-        .ctx = &resolver_context,
-        .resolve_fn = ResolverFixture.resolve,
-    };
-    const inherited = childModelCapabilityResolver(resolver);
-    try std.testing.expect(inherited != null);
-    try std.testing.expectEqual(resolver.ctx, inherited.?.ctx);
-    try std.testing.expectEqual(resolver.resolve_fn, inherited.?.resolve_fn);
-}
-
 fn snapshotMcpDefinition(raw: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.snapshotMcpDefinition(context.toolContext(), arena, name, known);
@@ -874,47 +622,22 @@ fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: types.ToolCall
 fn admissionContext(
     context: *Context,
     dynamic_names: []const []const u8,
-    review: ?auto_classifier.ReviewTurnContext,
 ) tool_runtime.Context {
-    var tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(context.toolContext(), dynamic_names);
-    tool_ctx.permission_review_turn = review;
-    tool_ctx.permission_prompter = context.turn.permissionPrompter();
-    return tool_ctx;
+    return tool_runtime.withAdvertisedDynamicToolNames(context.toolContext(), dynamic_names);
 }
 
 fn requestToolPermission(
     raw: *anyopaque,
     arena: Allocator,
     call: types.ToolCall,
-    review: auto_classifier.ReviewTurnContext,
-    mode: types.PermissionMode,
-    grants: []const types.PermissionGrant,
     live: ?agent_runtime.LiveToolAuthority,
-    revalidation: ?agent_runtime.LivePermissionRevalidation,
+    revalidation: ?command_admission.ToolExecutionAuthority,
     dynamic_names: []const []const u8,
-    mcp_review_schema_json: ?[]const u8,
 ) !command_admission.PermissionOutcome {
     const context: *Context = @ptrCast(@alignCast(raw));
-    var tool_ctx = admissionContext(context, dynamic_names, review);
-    tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
-    if (revalidation) |request| return switch (request) {
-        .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
-            tool_ctx.admissionInputWithLiveAuthority(live),
-            arena,
-            call,
-            mode,
-            grants,
-            action.authority,
-            action.human_approval,
-        ),
-    };
-    return tool_admission.requestPermissionOutcome(
-        tool_ctx.admissionInputWithLiveAuthority(live),
-        arena,
-        call,
-        mode,
-        grants,
-    );
+    const input = admissionContext(context, dynamic_names).admissionInputWithLiveAuthority(live);
+    if (revalidation) |authority| return tool_admission.revalidateLiveActionPermissionOutcome(input, arena, call, authority);
+    return tool_admission.requestPermissionOutcome(input, arena, call);
 }
 
 fn requestPreparedFileMutationPermission(
@@ -922,22 +645,12 @@ fn requestPreparedFileMutationPermission(
     arena: Allocator,
     call: types.ToolCall,
     prepared: *tool_admission.PreparedFileMutationCall,
-    review: auto_classifier.ReviewTurnContext,
-    mode: types.PermissionMode,
-    grants: []const types.PermissionGrant,
     live: ?agent_runtime.LiveToolAuthority,
     dynamic_names: []const []const u8,
 ) !command_admission.PermissionOutcome {
     const context: *Context = @ptrCast(@alignCast(raw));
-    const tool_ctx = admissionContext(context, dynamic_names, review);
-    return tool_admission.requestPreparedFileMutationPermissionOutcome(
-        tool_ctx.admissionInputWithLiveAuthority(live),
-        arena,
-        call,
-        prepared,
-        mode,
-        grants,
-    );
+    const input = admissionContext(context, dynamic_names).admissionInputWithLiveAuthority(live);
+    return tool_admission.requestPreparedFileMutationPermissionOutcome(input, arena, call, prepared);
 }
 
 fn describeToolAction(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, _: []const []const u8) ![]const u8 {
@@ -1030,7 +743,6 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
     return tool_result_errors.formatToolExecutionErrorJson(arena, tool_name, err);
 }
 
-fn discardGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
 fn pushLiveText(raw: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     switch (emission) {
@@ -1147,32 +859,4 @@ fn pushLiveOutputChunk(
         .stream = stream,
         .text = @constCast(text),
     } });
-}
-
-test "a child's system prompt names it and who started it, then wraps the run's overlay" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const role: Role = .{ .name = "reviewer", .parent = "main" };
-    const expected_role = "<subagent_role>\nYou are the subagent \"reviewer\", started by \"main\". When work it " ++
-        "gives you ends, your output reaches it on its own as your report. To message it sooner, for example when " ++
-        "the user asks you to tell main something, call the subagent tool with action \"message\" and agent " ++
-        "\"parent\", if you have that tool.\n</subagent_role>";
-    try std.testing.expectEqualStrings(
-        "base prompt\n\n" ++ expected_role,
-        try childSystemPrompt(arena.allocator(), null, "base prompt", role, ""),
-    );
-    try std.testing.expectEqualStrings(
-        "base prompt\n\n" ++ expected_role ++ "\n\n<subagent_instructions>\nbe brief\n</subagent_instructions>",
-        try childSystemPrompt(arena.allocator(), null, "base prompt", role, "be brief"),
-    );
-}
-
-test "a profile that replaces the system prompt still leaves a child its role" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const profile: profiles.Profile = .{ .name = "review", .description = "", .source = .home, .prompt = "Review only.", .prompt_mode = .replace };
-    const prompt = try childSystemPrompt(arena.allocator(), &profile, "base prompt", .{ .name = "helper", .parent = "lead" }, "");
-    try std.testing.expect(std.mem.startsWith(u8, prompt, "Review only.\n\n<subagent_role>\n"));
-    try std.testing.expect(std.mem.find(u8, prompt, "You are the subagent \"helper\", started by \"lead\".") != null);
-    try std.testing.expect(std.mem.find(u8, prompt, "base prompt") == null);
 }

@@ -4,8 +4,6 @@ const io_mod = @import("../shared/io.zig");
 const terminal_env = @import("../shared/terminal_env.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
-const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
-const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
@@ -40,11 +38,9 @@ const execution_process_provider = @import("../execution/process_provider.zig");
 const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
-const login_flow = @import("../auth/login_flow.zig");
 const pending_revocation = @import("../auth/pending_revocation.zig");
 const oauth = @import("../auth/oauth.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
-const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
@@ -54,10 +50,6 @@ const session_adapter = @import("../session/session_adapter.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
-const test_builtin_gateway = if (builtin.is_test)
-    @import("../../builtins/gateway.zig")
-else
-    struct {};
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -70,8 +62,6 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
-const usage = @import("../../usage/usage.zig");
-const usage_host = @import("../app/usage_host.zig");
 
 const slack_install = @import("../slack/install.zig");
 const Allocator = std.mem.Allocator;
@@ -85,23 +75,17 @@ pub const Command = union(enum) {
     acp: []const [:0]const u8,
     pr: []const [:0]const u8,
     issue: []const [:0]const u8,
-    login: []const [:0]const u8,
-    logout: []const [:0]const u8,
-    setup: []const [:0]const u8,
     status: []const [:0]const u8,
-    permissions: []const [:0]const u8,
     mcp: []const [:0]const u8,
     slack: []const [:0]const u8,
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
     doctor: []const [:0]const u8,
-    teams: []const [:0]const u8,
     session: []const [:0]const u8,
     sessions: []const [:0]const u8,
     resume_session: ResumeInvocation,
-    credits: []const [:0]const u8,
-    usage: []const [:0]const u8,
     upgrade: []const [:0]const u8,
+    pair: []const [:0]const u8,
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
     config: []const [:0]const u8,
@@ -163,8 +147,6 @@ pub const LaunchModifiers = struct {
     effort_override: ?types.ReasoningEffort = null,
     fast_override: ?bool = null,
     ultrafast_override: ?bool = null,
-    provider_order_override: ?[][]const u8 = null,
-    provider_strict_override: ?bool = null,
     /// `--permission-mode` and its shortcuts; never saved.
     permission_override: ?types.PermissionMode = null,
 
@@ -180,7 +162,6 @@ pub const LaunchModifiers = struct {
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
         if (self.model_override) |model| alloc.free(model);
-        if (self.provider_order_override) |order| freeProviderOrderOverride(alloc, order);
         if (self.profile_name) |name| alloc.free(name);
         self.* = .{};
     }
@@ -192,33 +173,15 @@ pub const LaunchModifiers = struct {
     pub fn hasModelOverrides(self: LaunchModifiers) bool {
         return self.provider_override != null or self.model_override != null or
             self.effort_override != null or self.fast_override != null or
-            self.ultrafast_override != null or self.provider_order_override != null or
-            self.provider_strict_override != null or self.permission_override != null;
+            self.ultrafast_override != null or self.permission_override != null;
     }
 
     pub fn hasOnlyUltrafastOverride(self: LaunchModifiers) bool {
         return self.ultrafast_override != null and self.provider_override == null and
             self.model_override == null and self.effort_override == null and
-            self.fast_override != true and self.provider_order_override == null and
-            self.provider_strict_override == null;
+            self.fast_override != true;
     }
 };
-
-fn freeProviderOrderOverride(alloc: Allocator, order: []const []const u8) void {
-    for (order) |slug| alloc.free(@constCast(slug));
-    if (order.len > 0) alloc.free(order);
-}
-
-/// Parses one `--provider-order` value, replacing any earlier occurrence.
-/// The returned slice is owned by `alloc`.
-fn parseProviderOrderFlag(alloc: Allocator, raw: []const u8, previous: ?[][]const u8) ![][]const u8 {
-    const parsed: [][]const u8 = switch (config_runtime.parseProviderOrderList(alloc, raw)) {
-        .ok => |maybe| maybe orelse return error.InvalidProviderOrderValue,
-        .invalid => return error.InvalidProviderOrderValue,
-    };
-    if (previous) |old| freeProviderOrderOverride(alloc, old);
-    return parsed;
-}
 
 pub const InteractiveLaunch = struct {
     requested_resume: ?ResumeTarget = null,
@@ -264,7 +227,9 @@ pub const Config = struct {
     models_path: []const u8,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
-    gateway_provider: gateway_provider.Provider,
+    /// The OAuth transport Slack install and MCP sign-in use. Unavailable unless
+    /// the host supplies one.
+    oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     provider_set: provider_set.Set,
     process_provider: execution_process_provider.Provider = execution_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -293,42 +258,6 @@ const LocalSurfaceOptions = struct {
     format: output_contracts.OutputFormat = .text,
 };
 
-fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
-    if (rest.len == 0) return null;
-    if (rest.len != 1) return error.InvalidLoginProviderArgs;
-    return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
-}
-
-const LoginArgs = struct {
-    provider: ?model_provider.ProviderId = null,
-    /// Paste an AI Gateway API key instead of signing in through the browser.
-    api_key: bool = false,
-};
-
-const LoginFlag = enum { api_key };
-const login_flag_ids = cli_flags.idTable(LoginFlag, &builtin_commands.login_options);
-
-/// `spark login [vercel|codex|grok] [--api-key]`, in either order.
-fn parseLoginArgs(rest: []const [:0]const u8) error{ InvalidLoginProviderArgs, ApiKeyNeedsVercel }!LoginArgs {
-    var parsed: LoginArgs = .{};
-    var provider_arg: ?[]const u8 = null;
-    var parser: cli_flags.Parser = .init(&builtin_commands.login_options, rest);
-    while (parser.next() catch return error.InvalidLoginProviderArgs) |item| switch (item) {
-        .positional => |arg| {
-            if (provider_arg != null) return error.InvalidLoginProviderArgs;
-            provider_arg = arg;
-        },
-        .option => |match| switch (login_flag_ids[match.index].?) {
-            .api_key => parsed.api_key = true,
-        },
-    };
-    if (provider_arg) |name| {
-        parsed.provider = provider_catalog.parse(name) orelse return error.InvalidLoginProviderArgs;
-    }
-    if (parsed.api_key and (parsed.provider orelse .gateway) != .gateway) return error.ApiKeyNeedsVercel;
-    return parsed;
-}
-
 fn selectCatalogModel(
     entries: []const model_catalog.ModelCatalogEntry,
     saved: ?[]const u8,
@@ -355,11 +284,6 @@ const SessionListOptions = struct {
     live: bool = false,
     /// The first paging flag given, which `--live` refuses.
     paging_flag: ?[]const u8 = null,
-};
-
-const UsageOptions = struct {
-    format: output_contracts.OutputFormat = .text,
-    period: usage.Period = .month,
 };
 
 const WorkspaceOptions = struct {
@@ -503,9 +427,6 @@ const LaunchFlag = enum {
     no_additional_dirs,
     tool_placement,
     provider,
-    provider_order,
-    provider_strict,
-    no_provider_strict,
     model,
     effort,
     fast,
@@ -513,8 +434,6 @@ const LaunchFlag = enum {
     ultrafast,
     no_ultrafast,
     permission_mode,
-    ask,
-    auto,
     full_access,
     yolo,
     profile,
@@ -554,7 +473,6 @@ fn parseLaunchFlags(alloc: Allocator, args: []const [:0]const u8, comptime mode:
     var modifiers: LaunchModifiers = .{};
     errdefer {
         if (modifiers.model_override) |model| alloc.free(model);
-        if (modifiers.provider_order_override) |order| freeProviderOrderOverride(alloc, order);
         if (modifiers.profile_name) |name| alloc.free(name);
     }
 
@@ -603,13 +521,8 @@ fn parseLaunchFlags(alloc: Allocator, args: []const [:0]const u8, comptime mode:
                 modifiers.fast_override = false;
             },
             .no_ultrafast => modifiers.ultrafast_override = false,
-            .provider_order => modifiers.provider_order_override = try parseProviderOrderFlag(alloc, value, modifiers.provider_order_override),
-            .provider_strict => modifiers.provider_strict_override = true,
-            .no_provider_strict => modifiers.provider_strict_override = false,
             .permission_mode => modifiers.permission_override = types.PermissionMode.parse(value) orelse
                 return error.InvalidPermissionModeValue,
-            .ask => modifiers.permission_override = .ask,
-            .auto => modifiers.permission_override = .auto,
             .full_access, .yolo => modifiers.permission_override = .yolo,
             .profile => {
                 if (value.len == 0) return error.MissingProfileValue;
@@ -762,9 +675,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .ask)) return .{ .ask = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .acp)) return .{ .acp = args[1..] };
         },
-        'b' => if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] },
         'c' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .config)) return .{ .config = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .completion)) return .{ .completion = args[1..] };
         },
@@ -774,25 +685,20 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         'i' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .issue)) return .{ .issue = args[1..] };
         },
-        'l' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .login)) return .{ .login = args[1..] };
-            if (command_specs.matchesTopLevel(command_catalog, command, .logout)) return .{ .logout = args[1..] };
-        },
         'm' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .mcp)) return .{ .mcp = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .models)) return .{ .models = args[1..] };
         },
         'p' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .pr)) return .{ .pr = args[1..] };
-            if (command_specs.matchesTopLevel(command_catalog, command, .permissions)) return .{ .permissions = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .provider)) return .{ .provider = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .pair)) return .{ .pair = args[1..] };
         },
         'r' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .@"resume")) return .{ .resume_session = .{ .args = args[1..], .legacy_command = true } };
             if (command_specs.matchesTopLevel(command_catalog, command, .replay)) return .{ .replay = args[1..] };
         },
         's' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .setup)) return .{ .setup = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .status)) return .{ .status = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .sessions)) return .{ .sessions = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .session)) {
@@ -803,11 +709,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             }
             if (command_specs.matchesTopLevel(command_catalog, command, .slack)) return .{ .slack = args[1..] };
         },
-        't' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .teams)) return .{ .teams = args[1..] };
-        },
         'u' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .usage)) return .{ .usage = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .upgrade)) return .{ .upgrade = args[1..] };
         },
         'w' => {
@@ -1104,408 +1006,6 @@ const OwnOutput = struct {
     }
 };
 
-test "a command that ends because spark couldn't write its output reports that write" {
-    var output: OwnOutput = .{};
-    // A failed write elsewhere, such as to the network, keeps its name.
-    try std.testing.expectEqual(@as(anyerror, error.WriteFailed), output.commandError(error.WriteFailed));
-    OwnOutput.noteFailure(&output, error.WriteFailed);
-    try std.testing.expectEqual(@as(anyerror, error.OutputWriteFailed), output.commandError(error.WriteFailed));
-    try std.testing.expectEqual(@as(anyerror, error.NoSpaceLeft), output.commandError(error.NoSpaceLeft));
-}
-
-test "a command whose output reader went away reports that, however the write failed" {
-    var output: OwnOutput = .{};
-    OwnOutput.noteFailure(&output, error.BrokenPipe);
-    // A writer that only reports `WriteFailed`, such as `DepsWriter`, too.
-    try std.testing.expectEqual(@as(anyerror, error.OutputReaderGone), output.commandError(error.WriteFailed));
-    try std.testing.expectEqual(@as(anyerror, error.OutputReaderGone), output.commandError(error.BrokenPipe));
-    try std.testing.expectEqual(@as(anyerror, error.NoSpaceLeft), output.commandError(error.NoSpaceLeft));
-}
-
-fn runNoConfigIfRequestedWithDeps(
-    alloc: Allocator,
-    args: []const [:0]const u8,
-    version: []const u8,
-    command_catalog: CommandCatalog,
-    deps: RunDeps,
-) !bool {
-    if (args.len != 1 or !command_specs.matchesTopLevel(command_catalog, args[0], .help)) {
-        return false;
-    }
-    try writeTopLevelHelp(alloc, command_catalog, deps, version, .stdout);
-    return true;
-}
-
-const ProviderActivationCaller = enum {
-    provider_command,
-    provider_login,
-};
-
-const CliTeamValidationContext = struct {
-    alloc: Allocator,
-    cfg: *const Config,
-};
-
-fn validateCliTeamCredential(
-    raw: ?*anyopaque,
-    candidate: credentials.Credential,
-) std.mem.Allocator.Error!login_flow.TeamValidationResult {
-    const context: *CliTeamValidationContext = @ptrCast(@alignCast(raw.?));
-    const access = credentials.catalogAccessAt(candidate, io_mod.milliTimestamp());
-    if (access.authorizationCredential() == null) return .rejected;
-    const provider = context.cfg.provider_set.gateway.model_catalog orelse return .rejected;
-    const fetched = try provider.fetch(context.alloc, .{
-        .access = access,
-        .endpoint = context.cfg.models_path,
-        .view = .picker,
-    });
-    return switch (fetched) {
-        .failure => .rejected,
-        .catalog => |catalog_value| result: {
-            var catalog = catalog_value;
-            defer model_catalog.freeModelCatalog(context.alloc, &catalog);
-            break :result if (catalog.items.len > 0) .accepted else .rejected;
-        },
-    };
-}
-
-fn writeProviderActivationError(
-    alloc: Allocator,
-    deps: RunDeps,
-    caller: ProviderActivationCaller,
-    detail: []const u8,
-) !void {
-    const message = try alloc.print(
-        "{s}: {s}\n",
-        .{ if (caller == .provider_login) "spark login" else "spark provider", detail },
-    );
-    defer alloc.free(message);
-    try writeStderr(deps, message);
-}
-
-fn writeHostManagedAuthResult(deps: RunDeps) !void {
-    try writeStdout(deps, credentials.host_managed_auth_message);
-    try writeStdout(deps, "\n");
-}
-
-fn activateProviderSelection(
-    alloc: Allocator,
-    cfg: Config,
-    deps: RunDeps,
-    target: model_provider.ProviderId,
-    caller: ProviderActivationCaller,
-    exact_source: ?credentials.Source,
-) !bool {
-    return activateProviderSelectionFallible(alloc, cfg, deps, target, caller, exact_source) catch |err| {
-        switch (err) {
-            error.CredentialStorageUnavailable,
-            error.CredentialTemporarilyUnavailable,
-            error.CredentialRefreshPersistenceUncertain,
-            error.CredentialAuthorityChanged,
-            => {},
-            else => return err,
-        }
-        const detail = try auth_runtime.preparationFailureText(alloc, target, err);
-        defer alloc.free(detail);
-        try writeProviderActivationError(alloc, deps, caller, detail);
-        return false;
-    };
-}
-
-/// `SPARK_TRACE` and `SPARK_TRACE_LOG` keep a trace for the auth commands too, such
-/// as why a sign-in starts on the first team or whether a sign-out forgot the
-/// kept team. Without a working directory the command goes on without one.
-fn configureAuthCommandTrace(alloc: Allocator) void {
-    const workspace_root = io_mod.realpathAlloc(alloc, ".") catch return;
-    defer alloc.free(workspace_root);
-    debug_trace.configureFromEnv(alloc, workspace_root);
-}
-
-fn runProviderLogin(alloc: Allocator, cfg: Config, provider: model_provider.ProviderId) !void {
-    configureAuthCommandTrace(alloc);
-    switch (provider) {
-        .gateway => try login_flow.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
-        .codex => try chatgpt_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
-        .grok => try grok_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener),
-        .configured => return error.ConfiguredProviderUsesEnvironmentAuth,
-    }
-}
-
-fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_provider.ProviderId, caller: ProviderActivationCaller, err: anyerror) !void {
-    debug_trace.logf("auth", "provider sign-in failed provider={t} err={s}", .{ provider, @errorName(err) });
-    const failure = auth_runtime.classifyCredentialFailure(provider_catalog.find(provider).login_source, err);
-    if (failure.reason == .invalid_storage or failure.reason == .persistence_uncertain) {
-        const detail = try auth_runtime.preparationFailureText(alloc, provider, err);
-        defer alloc.free(detail);
-        try writeProviderActivationError(alloc, deps, caller, detail);
-        return;
-    }
-    try writeProviderActivationError(alloc, deps, caller, switch (err) {
-        error.ClientIdMissing => "missing SPARK_OAUTH_CLIENT_ID; configure the spark Vercel App client id first",
-        error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
-        error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run spark login again",
-        else => "failed to sign in",
-    });
-}
-
-fn activateProviderSelectionFallible(
-    alloc: Allocator,
-    cfg: Config,
-    deps: RunDeps,
-    target: model_provider.ProviderId,
-    caller: ProviderActivationCaller,
-    exact_source: ?credentials.Source,
-) !bool {
-    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    defer alloc.free(workspace_root);
-    var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch |err| {
-        const message = try config_runtime.configuredProviderMessage(alloc, err);
-        defer if (message) |text| alloc.free(text);
-        try writeProviderActivationError(alloc, deps, caller, message orelse "could not load settings");
-        debug_trace.logf("config", "provider selection settings load failed err={s}", .{@errorName(err)});
-        return false;
-    };
-    defer settings.deinit(alloc);
-
-    if (target == .configured) {
-        const bound = target.bind(settings.providers orelse .{}) catch |err| switch (err) {
-            error.UnknownConfiguredProvider => {
-                const detail = try config_runtime.unknownProviderMessage(alloc, target.label());
-                defer alloc.free(detail);
-                try writeProviderActivationError(alloc, deps, caller, detail);
-                // A name spark doesn't know is a bad argument, so the caller
-                // exits as a usage error.
-                return error.UnknownConfiguredProvider;
-            },
-            error.ConfiguredProviderChanged, error.ConfiguredProviderRemoved => return err,
-        };
-        const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
-        var attempt = config_runtime.attemptUserPreferences(alloc, .{
-            .provider = bound,
-            .model_preference = .{ .provider = bound, .model = selected_model },
-        });
-        defer attempt.deinit(alloc);
-        switch (attempt) {
-            .failure => {
-                try writeProviderActivationError(alloc, deps, caller, "failed to save provider selection");
-                return false;
-            },
-            .outcome => {},
-        }
-        const message = try alloc.print("Provider set to {s}.\n", .{bound.label()});
-        defer alloc.free(message);
-        if (caller == .provider_command) try writeStdout(deps, message);
-        return true;
-    }
-    const preferred_source = exact_source orelse settings.credential_source;
-    var prepared_credential = if (cfg.auth_mode == .host_managed)
-        null
-    else
-        try auth_runtime.prepareCredential(
-            alloc,
-            cfg.gateway_provider.oauth_transport,
-            cfg.secret_store,
-            target,
-            preferred_source,
-        );
-    defer if (prepared_credential) |*credential| credential.deinit(alloc);
-
-    const already_selected = (settings.provider orelse @as(model_provider.ProviderId, .gateway)).eql(target);
-    // A selected provider without a persisted model still needs one chosen
-    // below; SPARK_MODEL only covers a single run, so it does not count here.
-    const has_persisted_model = if (config_runtime.selectProviderModel(cfg.default_model, &settings, target, null)) |_| true else |_| false;
-    if (caller == .provider_command and already_selected and has_persisted_model and
-        (cfg.auth_mode == .host_managed or prepared_credential != null))
-    {
-        try writeStdout(deps, switch (target) {
-            .gateway => "Gateway is already selected.\n",
-            .codex => "Codex is already selected.\n",
-            .grok => "Grok is already selected.\n",
-            .configured => "Configured provider is already selected.\n",
-        });
-        return true;
-    }
-
-    var performed_login: ?model_provider.ProviderId = null;
-    if (cfg.auth_mode == .local and prepared_credential == null and provider_catalog.find(target).subscription and caller == .provider_command) {
-        runProviderLogin(alloc, cfg, target) catch |err| {
-            try writeProviderLoginFailure(alloc, deps, target, caller, err);
-            return false;
-        };
-        performed_login = target;
-        prepared_credential = try auth_runtime.prepareCredential(
-            alloc,
-            cfg.gateway_provider.oauth_transport,
-            cfg.secret_store,
-            target,
-            preferred_source,
-        );
-    }
-
-    const credential = if (cfg.auth_mode == .host_managed)
-        null
-    else if (prepared_credential) |*value|
-        value
-    else {
-        try writeProviderActivationError(
-            alloc,
-            deps,
-            caller,
-            switch (target) {
-                .codex => "Codex credential is unavailable",
-                .grok => "Grok credential is unavailable",
-                .gateway => "configure a Gateway credential first",
-                .configured => "configure the provider auth environment variable first",
-            },
-        );
-        return false;
-    };
-    const catalog_provider = cfg.provider_set.select(target).model_catalog orelse {
-        try writeProviderActivationError(alloc, deps, caller, switch (target) {
-            .codex => "Codex model catalog is unavailable",
-            .grok => "Grok model catalog is unavailable",
-            .gateway => "Gateway model catalog is unavailable",
-            .configured => "Configured model catalog is unavailable",
-        });
-        return false;
-    };
-    const fetch_result = model_catalog.fetchWithPublicFallback(catalog_provider, alloc, .{
-        .access = if (cfg.auth_mode == .host_managed)
-            .host_managed
-        else
-            credentials.catalogAccessAt(
-                credential.?.*,
-                io_mod.milliTimestamp(),
-            ).withExplicitAuthority(),
-        .endpoint = cfg.models_path,
-        .view = .picker,
-    });
-    var loaded = switch (fetch_result) {
-        .loaded => |loaded| blk: {
-            if (loaded.provenance.access.level != .authenticated or
-                loaded.provenance.anonymous_fallback_used)
-            {
-                var rejected = loaded.catalog;
-                model_catalog.freeModelCatalog(alloc, &rejected);
-                try writeProviderActivationError(
-                    alloc,
-                    deps,
-                    caller,
-                    "target credential did not produce an authenticated model catalog",
-                );
-                return false;
-            }
-            break :blk loaded;
-        },
-        .failed => |failure| {
-            debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
-            const detail = if (failure.failure.category == .transport)
-                try alloc.print(
-                    "couldn't connect to {s} to load the target model catalog; check your network connection or firewall",
-                    .{model_catalog.serviceName(target)},
-                )
-            else
-                try alloc.print(
-                    "could not load the target model catalog ({s})",
-                    .{@tagName(failure.failure.category)},
-                );
-            defer alloc.free(detail);
-            try writeProviderActivationError(alloc, deps, caller, detail);
-            return false;
-        },
-    };
-    defer model_catalog.freeModelCatalog(alloc, &loaded.catalog);
-    const saved_model = settings.models.get(target);
-    const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
-        try writeProviderActivationError(alloc, deps, caller, "target model catalog is empty");
-        return false;
-    };
-    var attempt = config_runtime.attemptUserPreferences(alloc, .{
-        .provider = target,
-        .model_preference = .{ .provider = target, .model = selected_model },
-        .credential_source = exact_source,
-    });
-    defer attempt.deinit(alloc);
-    switch (attempt) {
-        .failure => |failure| {
-            debug_trace.logf("config", "provider selection persistence failed err={s}", .{@errorName(failure.err)});
-            try writeProviderActivationError(alloc, deps, caller, "failed to save provider selection");
-            return false;
-        },
-        .outcome => {},
-    }
-    if (performed_login) |provider| switch (provider) {
-        .codex => try writeStdout(deps, "Signed in with Codex.\n"),
-        .grok => try writeStdout(deps, "Signed in with Grok.\n"),
-        .gateway, .configured => unreachable,
-    };
-    if (caller == .provider_command) {
-        try writeStdout(deps, switch (target) {
-            .gateway => "Provider set to Gateway.\n",
-            .codex => "Provider set to Codex.\n",
-            .grok => "Provider set to Grok.\n",
-            .configured => "Provider set to configured connection.\n",
-        });
-    }
-    return true;
-}
-
-fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
-    const parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
-        if (err == error.InvalidResumeArgs) {
-            try writeTopLevelUsage(cfg.command_catalog, deps, .@"resume");
-            return usage_failure;
-        }
-        if (removedResumeHint(err)) |hint| {
-            try writeStderr(deps, hint);
-            return usage_failure;
-        }
-        var writer: std.Io.Writer.Allocating = .init(alloc);
-        defer writer.deinit();
-        switch (err) {
-            error.PrintFlagUseAsk, error.UnknownCommandTypo, error.EmptyLaunchPrompt, error.UnquotedPrompt => {
-                try writeLaunchWordProblem(&writer.writer, cfg.command_catalog, args, err);
-                try writeStderr(deps, writer.written());
-                return usage_failure;
-            },
-            else => {},
-        }
-        if (err == error.InvalidFlag or err == error.UnknownLaunchFlag) {
-            try writer.writer.writeAll("spark: ");
-            const failure = if (err == error.InvalidFlag) launchFlagFailure(args) else unknownLaunchFlagFailure(args);
-            if (failure) |found| try found.write(&writer.writer);
-            try writer.writer.writeAll("\n");
-        } else if (globalLaunchErrorMessage(err)) |message| {
-            try writer.writer.print("spark: {s}\n", .{message});
-        } else {
-            try writer.writer.print("spark: invalid global launch option: {s}\n", .{@errorName(err)});
-        }
-        try writer.writer.writeAll(builtin_commands.launch_usage);
-        try writeStderr(deps, writer.written());
-        return usage_failure;
-    };
-    switch (parsed_launch) {
-        .interactive => |launch| {
-            if (launch.modifiers.profile_name) |name| {
-                if (try app_profile_runtime.launchFailure(alloc, name)) |message| {
-                    defer alloc.free(message);
-                    try writeStderr(deps, message);
-                    var rejected = launch;
-                    rejected.deinit(alloc);
-                    return .handled_failure;
-                }
-            }
-            try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
-            return .{ .interactive = launch };
-        },
-        .noninteractive => |value| {
-            var noninteractive = value;
-            defer noninteractive.deinit(alloc);
-            return runNonInteractiveWithDeps(alloc, &noninteractive, cfg, deps);
-        },
-    }
-}
-
 fn runNonInteractiveWithDeps(
     alloc: Allocator,
     parsed_launch: *NonInteractiveLaunch,
@@ -1589,9 +1089,8 @@ fn runNonInteractiveWithDeps(
                 .default_model = cfg.default_model,
                 .default_agent_step_limit = cfg.default_agent_step_limit,
                 .gateway_retry_count = cfg.gateway_retry_count,
-                .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
+                .gateway_chat_url = cfg.gateway_chat_url,
                 .gateway_models_path = cfg.models_path,
-                .gateway_provider = cfg.gateway_provider,
                 .provider_set = cfg.provider_set,
                 .process_provider = cfg.process_provider,
                 .secret_store = cfg.secret_store,
@@ -1622,20 +1121,16 @@ fn runNonInteractiveWithDeps(
         },
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
-        .login, .logout, .setup, .teams, .credits => {
-            try writeStderr(deps, "spark has no sign-in. Start spark and run /connect to add an OpenAI-compatible endpoint.\n");
-            return usage_failure;
-        },
         .provider => |rest| {
             if (rest.len != 1) {
                 try writeStderr(deps, "usage: spark provider <name>\n");
                 return usage_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "spark provider: expected gateway, codex, grok, or a configured name\n");
+                try writeStderr(deps, "spark provider: expected a configured provider name\n");
                 return usage_failure;
             };
-            const activated = activateProviderSelection(alloc, cfg, deps, target, .provider_command, null) catch |err| switch (err) {
+            const activated = activateProviderSelection(alloc, deps, target) catch |err| switch (err) {
                 error.UnknownConfiguredProvider => return usage_failure,
                 else => return err,
             };
@@ -1690,28 +1185,6 @@ fn runNonInteractiveWithDeps(
             try writeFormattedOutput(deps, text, opts.format);
             return .handled_success;
         },
-        .permissions => |rest| {
-            const opts = parseLocalSurfaceArgs(rest) catch |err| {
-                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .permissions, "permissions", err, rest);
-                return usage_failure;
-            };
-            var startup = try deps.load_startup_state_without_credentials(alloc, cfg.default_model, cfg.default_agent_step_limit);
-            defer startup.deinit(alloc);
-            try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
-            const rules = try permissionRulesForSnapshot(alloc, startup.permission_rules);
-            defer if (rules.rules.len > 0) alloc.free(rules.rules);
-
-            const text = try (output_contracts.PermissionsSnapshot{
-                .workspace_root = startup.workspace_root,
-                .mode = permissionModeForSnapshot(startup.permission_mode),
-                .grants = &.{},
-                .rules = rules,
-                .runtime_grants_available = false,
-            }).render(alloc, opts.format);
-            defer alloc.free(text);
-            try writeFormattedOutput(deps, text, opts.format);
-            return .handled_success;
-        },
         .slack => |rest| {
             if (rest.len == 0) {
                 const help = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, .slack);
@@ -1725,7 +1198,7 @@ fn runNonInteractiveWithDeps(
             };
             var arena: std.heap.ArenaAllocator = .init(alloc);
             defer arena.deinit();
-            const snapshot = slack_install.run(arena.allocator(), opts.action, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
+            const snapshot = slack_install.run(arena.allocator(), opts.action, cfg.oauth_transport, cfg.url_opener) catch |err| {
                 try writeCommandFailure(alloc, deps, "slack", err, opts.format);
                 return .handled_failure;
             };
@@ -1756,7 +1229,7 @@ fn runNonInteractiveWithDeps(
             else
                 try deps.load_startup_state(
                     alloc,
-                    cfg.gateway_provider.oauth_transport,
+                    cfg.oauth_transport,
                     cfg.secret_store,
                     cfg.default_model,
                     cfg.default_agent_step_limit,
@@ -1769,9 +1242,7 @@ fn runNonInteractiveWithDeps(
             available_providers.definitions = startup.configured_providers.definitions;
             const catalog_provider = available_providers.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
-                    .gateway => "spark models: Gateway model catalog is unavailable\n",
-                    .codex => "spark models: Codex model catalog is unavailable\n",
-                    .grok => "spark models: Grok model catalog is unavailable\n",
+                    .none => "spark models: no provider is set; run spark provider <name>\n",
                     .configured => "spark models: Configured model catalog is unavailable\n",
                 });
                 return .handled_failure;
@@ -1816,7 +1287,6 @@ fn runNonInteractiveWithDeps(
                 ids.items,
                 entries.items,
                 available_providers.select(startup.provider),
-                startup.provider,
             );
             defer alloc.free(details);
 
@@ -1824,8 +1294,6 @@ fn runNonInteractiveWithDeps(
                 .ids = ids.items,
                 .details = details,
                 .provider = startup.provider,
-                .private_models_hidden = loaded.provenance.access.private_models_may_be_hidden,
-                .public_only_reason = loaded.provenance.access.public_only_reason,
             }).render(alloc, opts.format);
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
@@ -1947,57 +1415,6 @@ fn runNonInteractiveWithDeps(
                 },
             }
         },
-        .usage => |rest| {
-            const opts = parseUsageArgs(rest) catch |err| {
-                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
-                return usage_failure;
-            };
-            const home = io_mod.homeDir() orelse {
-                try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
-                return .handled_failure;
-            };
-            var startup = (if (cfg.auth_mode == .host_managed)
-                deps.load_startup_state_with_auth_mode(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                    cfg.auth_mode,
-                )
-            else
-                deps.load_startup_state(
-                    alloc,
-                    cfg.gateway_provider.oauth_transport,
-                    cfg.secret_store,
-                    cfg.default_model,
-                    cfg.default_agent_step_limit,
-                )) catch |err| {
-                try writeUsageCommandFailure(alloc, deps, err, opts.format);
-                return .handled_failure;
-            };
-            defer startup.deinit(alloc);
-
-            var dashboard = usage.Dashboard.init(alloc, usage_host.host(home));
-            defer dashboard.deinit();
-            var label_buf: usage_host.LabelBuffer = undefined;
-            if (startup.credential) |c| {
-                if (usage_host.fromCredential(c, &label_buf)) |credential| {
-                    dashboard.open(credential);
-                } else {
-                    dashboard.openUnavailable(.unsupported_provider);
-                }
-            } else {
-                dashboard.openUnavailable(.no_gateway_sign_in);
-            }
-            dashboard.waitForFetch();
-            var snapshot = try dashboard.snapshot(alloc);
-            defer snapshot.deinit();
-            const text = try (output_contracts.UsageSnapshot{ .snapshot = &snapshot, .period = opts.period }).render(alloc, opts.format);
-            defer alloc.free(text);
-            try writeFormattedOutput(deps, text, opts.format);
-            return if (snapshot.status == .ready) .handled_success else .handled_failure;
-        },
         .upgrade => |rest| {
             const upgrade_runtime = @import("../upgrade/upgrade_runtime.zig");
             var rejected_channel: ?[]const u8 = null;
@@ -2065,6 +1482,20 @@ fn runNonInteractiveWithDeps(
             if (opts.format == .json) try writeStdout(deps, "\n");
             return if (result.snapshot.status == .failed) .handled_failure else .handled_success;
         },
+        .pair => |rest| {
+            const cli_pair = @import("cli_pair.zig");
+            const outcome = cli_pair.run(alloc, rest) catch |err| {
+                try writeStderrLine(alloc, deps, "spark pair: couldn't start spark-bridge: {s}\n", @errorName(err));
+                return .handled_failure;
+            };
+            switch (outcome) {
+                .missing => {
+                    try writeStderr(deps, "spark pair: spark-bridge isn't installed. Put it beside spark or on your PATH.\n");
+                    return .handled_failure;
+                },
+                .exited => |code| return if (code == 0) .handled_success else .handled_failure,
+            }
+        },
         .completion => |rest| {
             const shell = if (rest.len == 1) completion.parseShell(rest[0]) else null;
             if (shell == null) {
@@ -2119,6 +1550,290 @@ fn runNonInteractiveWithDeps(
             try writeStderr(deps, "\n\n");
             try writeTopLevelHelp(alloc, cfg.command_catalog, deps, cfg.version, .stderr);
             return error.UnknownCliCommand;
+        },
+    }
+}
+
+/// One detail per id when the provider described its models, by the same capability merge a
+/// session uses for its effort and speed options. Empty when
+/// there are no entries. Names borrow from `entries`. Caller frees the returned slice.
+fn modelDetails(
+    alloc: Allocator,
+    ids: []const []const u8,
+    entries: []const model_catalog.ModelCatalogEntry,
+    bundle: provider_set.Bundle,
+) ![]const output_contracts.ModelDetail {
+    if (entries.len == 0) return &.{};
+    const details = try alloc.alloc(output_contracts.ModelDetail, ids.len);
+    for (ids, details) |id, *detail| {
+        const entry = for (entries) |candidate| {
+            if (std.mem.eql(u8, candidate.id, id)) break candidate;
+        } else null;
+        const capabilities = model_capabilities.mergeCapabilities(
+            bundle.fallbackModelCapabilities(id),
+            if (entry) |found| model_catalog_metadata.fromCatalogEntry(found) else null,
+        );
+        detail.* = .{
+            .name = if (entry) |found| found.name else null,
+            .efforts = capabilities.reasoning_efforts,
+            .fast = capabilities.supports_fast_mode,
+            .ultrafast = capabilities.supports_ultrafast_mode,
+        };
+    }
+    return details;
+}
+
+fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {
+    return switch (failure.category) {
+        .authentication => "AuthenticationRejected",
+        .cancellation => "the request was cancelled",
+        .malformed_response => "MalformedResponse",
+        .resource_exhausted => "OutOfMemory",
+        .rate_limited, .gateway_unavailable, .transport, .http_status, .runtime => "Unavailable",
+    };
+}
+
+fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
+    return .{
+        .auth_mode = cfg.auth_mode,
+        .command_usage = command_specs.topLevelUsage(cfg.command_catalog, .ask),
+        .default_model = cfg.default_model,
+        .default_agent_step_limit = cfg.default_agent_step_limit,
+        .gateway_retry_count = cfg.gateway_retry_count,
+        .gateway_chat_url = cfg.gateway_chat_url,
+        .gateway_models_path = cfg.models_path,
+        .oauth_transport = cfg.oauth_transport,
+        .provider_set = cfg.provider_set,
+        .process_provider = cfg.process_provider,
+        .secret_store = cfg.secret_store,
+        .prompt_policy = cfg.prompt_policy,
+        .skill_root_policy = cfg.skill_root_policy,
+        .ignored_list_entries = cfg.ignored_list_entries,
+        .max_list_entries = cfg.max_list_entries,
+        .max_read_file_bytes = cfg.max_read_file_bytes,
+        .max_read_file_lines = cfg.max_read_file_lines,
+        .max_read_file_line_len = cfg.max_read_file_line_len,
+        .max_command_output_bytes = cfg.max_command_output_bytes,
+        .max_tool_result_bytes = cfg.max_tool_result_bytes,
+        .max_history_turns = cfg.max_history_turns,
+        .mode_registry = cfg.mode_registry,
+        .load_mcp_host = cfg.load_mcp_host,
+    };
+}
+
+/// The line `spark logout` writes to a terminal's stderr while it waits for the
+/// provider to revoke the login, so a slow provider does not look like a hang.
+/// Like doctor's wait notice, pipes and unit tests never get it.
+const LogoutWaitLine = struct {
+    deps: RunDeps,
+    text: []const u8,
+
+    const request_s = oauth_transport.default_request_timeout_ms / std.time.ms_per_s;
+    /// Before a retry of sign-outs that earlier logouts kept
+    /// (`pending_revocation.retry`), which sends one sign-out after another.
+    const mcp_kept = std.fmt.comptimePrint("revoking earlier MCP sign-outs at their servers (up to {d} s each)...\n", .{request_s});
+
+    fn notice(self: *const LogoutWaitLine) ?oauth.BeforeRevocation {
+        if (builtin.is_test or !stderrIsTerminal()) return null;
+        return .{ .context = self, .run = write };
+    }
+
+    fn write(context: *const anyopaque) void {
+        const self: *const LogoutWaitLine = @ptrCast(@alignCast(context));
+        writeStderr(self.deps, self.text) catch |err| {
+            debug_trace.logf("auth", "logout wait line not written err={s}", .{@errorName(err)});
+        };
+    }
+};
+
+fn testConfig() Config {
+    return .{
+        .version = "0.0.0",
+        .command_catalog = testCommandCatalog(),
+        .default_model = "test-model",
+        .default_agent_step_limit = 42,
+        .models_path = "/v1/models",
+        .gateway_retry_count = 1,
+        .gateway_chat_url = "https://example.test/chat",
+        .provider_set = @import("../../builtins/providers.zig").native,
+        .url_opener = host.unavailable_url_opener,
+        .secret_store = host.unavailable_secret_store,
+        .prompt_policy = .{ .system_prompt = "system" },
+        .skill_root_policy = .{ .managed_root_source = .global_spark },
+        .ignored_list_entries = &.{},
+        .max_list_entries = 10,
+        .max_read_file_bytes = 1024,
+        .max_read_file_lines = 100,
+        .max_read_file_line_len = 200,
+        .max_command_output_bytes = 4096,
+        .max_tool_result_bytes = 4096,
+        .max_history_turns = 8,
+        .context_registry = test_surface_context_registry,
+        .mode_registry = .{ .default_mode_id = "surface" },
+        .inspect_mcp_profile_config = clearMcpConfigInspectionForTest,
+        .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
+        .tool_set = .{
+            .registry = .{ .tools = &.{} },
+            .order = &.{},
+            .read_only_tool_names = &.{},
+        },
+    };
+}
+
+fn stubLoadStartupState(
+    alloc: Allocator,
+    _: oauth_transport.Provider,
+    _: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+) !app_lifecycle.StartupState {
+    var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
+    errdefer state.deinit(alloc);
+    state.workspace_root = try alloc.dupe(u8, "/tmp/spark");
+    state.selected_model = try alloc.dupe(u8, default_model);
+    state.credential = .{
+        .token = try alloc.dupe(u8, "test-key"),
+        .source = .configured,
+    };
+    state.credential.?.team_id = try alloc.dupe(u8, "team_123");
+    return state;
+}
+
+test "a command that ends because spark couldn't write its output reports that write" {
+    var output: OwnOutput = .{};
+    // A failed write elsewhere, such as to the network, keeps its name.
+    try std.testing.expectEqual(@as(anyerror, error.WriteFailed), output.commandError(error.WriteFailed));
+    OwnOutput.noteFailure(&output, error.WriteFailed);
+    try std.testing.expectEqual(@as(anyerror, error.OutputWriteFailed), output.commandError(error.WriteFailed));
+    try std.testing.expectEqual(@as(anyerror, error.NoSpaceLeft), output.commandError(error.NoSpaceLeft));
+}
+
+fn runNoConfigIfRequestedWithDeps(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+    version: []const u8,
+    command_catalog: CommandCatalog,
+    deps: RunDeps,
+) !bool {
+    if (args.len != 1 or !command_specs.matchesTopLevel(command_catalog, args[0], .help)) {
+        return false;
+    }
+    try writeTopLevelHelp(alloc, command_catalog, deps, version, .stdout);
+    return true;
+}
+
+fn writeProviderActivationError(alloc: Allocator, deps: RunDeps, detail: []const u8) !void {
+    const message = try alloc.print("spark provider: {s}\n", .{detail});
+    defer alloc.free(message);
+    try writeStderr(deps, message);
+}
+
+fn writeHostManagedAuthResult(deps: RunDeps) !void {
+    try writeStdout(deps, credentials.host_managed_auth_message);
+    try writeStdout(deps, "\n");
+}
+
+/// Makes the configured provider `target` the saved selection, with the model
+/// saved for it, else the first one its settings declare.
+fn activateProviderSelection(alloc: Allocator, deps: RunDeps, target: model_provider.ProviderId) !bool {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch |err| {
+        const message = try config_runtime.configuredProviderMessage(alloc, err);
+        defer if (message) |text| alloc.free(text);
+        try writeProviderActivationError(alloc, deps, message orelse "could not load settings");
+        debug_trace.logf("config", "provider selection settings load failed err={s}", .{@errorName(err)});
+        return false;
+    };
+    defer settings.deinit(alloc);
+
+    const bound = target.bind(settings.providers orelse .{}) catch |err| switch (err) {
+        error.UnknownConfiguredProvider => {
+            const detail = try config_runtime.unknownProviderMessage(alloc, target.label());
+            defer alloc.free(detail);
+            try writeProviderActivationError(alloc, deps, detail);
+            // A name spark doesn't know is a bad argument, so the caller
+            // exits as a usage error.
+            return error.UnknownConfiguredProvider;
+        },
+        error.ConfiguredProviderChanged, error.ConfiguredProviderRemoved => return err,
+    };
+    const definition = if (settings.providers) |providers| providers.get(bound.label()) else null;
+    const selected_model = settings.models.get(bound) orelse
+        (if (definition) |value| (if (value.model_metadata.len > 0) value.model_metadata[0].id else null) else null) orelse {
+        try writeProviderActivationError(alloc, deps, "the provider declares no models; add one with /provider");
+        return false;
+    };
+    var attempt = config_runtime.attemptUserPreferences(alloc, .{
+        .provider = bound,
+        .model_preference = .{ .provider = bound, .model = selected_model },
+    });
+    defer attempt.deinit(alloc);
+    switch (attempt) {
+        .failure => {
+            try writeProviderActivationError(alloc, deps, "failed to save provider selection");
+            return false;
+        },
+        .outcome => {},
+    }
+    const message = try alloc.print("Provider set to {s} with {s}.\n", .{ bound.label(), selected_model });
+    defer alloc.free(message);
+    try writeStdout(deps, message);
+    return true;
+}
+
+fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
+    const parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
+        if (err == error.InvalidResumeArgs) {
+            try writeTopLevelUsage(cfg.command_catalog, deps, .@"resume");
+            return usage_failure;
+        }
+        if (removedResumeHint(err)) |hint| {
+            try writeStderr(deps, hint);
+            return usage_failure;
+        }
+        var writer: std.Io.Writer.Allocating = .init(alloc);
+        defer writer.deinit();
+        switch (err) {
+            error.PrintFlagUseAsk, error.UnknownCommandTypo, error.EmptyLaunchPrompt, error.UnquotedPrompt => {
+                try writeLaunchWordProblem(&writer.writer, cfg.command_catalog, args, err);
+                try writeStderr(deps, writer.written());
+                return usage_failure;
+            },
+            else => {},
+        }
+        if (err == error.InvalidFlag or err == error.UnknownLaunchFlag) {
+            try writer.writer.writeAll("spark: ");
+            const failure = if (err == error.InvalidFlag) launchFlagFailure(args) else unknownLaunchFlagFailure(args);
+            if (failure) |found| try found.write(&writer.writer);
+            try writer.writer.writeAll("\n");
+        } else if (globalLaunchErrorMessage(err)) |message| {
+            try writer.writer.print("spark: {s}\n", .{message});
+        } else {
+            try writer.writer.print("spark: invalid global launch option: {s}\n", .{@errorName(err)});
+        }
+        try writer.writer.writeAll(builtin_commands.launch_usage);
+        try writeStderr(deps, writer.written());
+        return usage_failure;
+    };
+    switch (parsed_launch) {
+        .interactive => |launch| {
+            if (launch.modifiers.profile_name) |name| {
+                if (try app_profile_runtime.launchFailure(alloc, name)) |message| {
+                    defer alloc.free(message);
+                    try writeStderr(deps, message);
+                    var rejected = launch;
+                    rejected.deinit(alloc);
+                    return .handled_failure;
+                }
+            }
+            try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
+            return .{ .interactive = launch };
+        },
+        .noninteractive => |value| {
+            var noninteractive = value;
+            defer noninteractive.deinit(alloc);
+            return runNonInteractiveWithDeps(alloc, &noninteractive, cfg, deps);
         },
     }
 }
@@ -2485,12 +2200,9 @@ fn statusSnapshotFromStartupWithBuild(
         .model_origin = startup.model_origin.label(),
         .effort = startup.effort,
         .provider = startup.provider,
-        .auth = startup.auth,
-        .auth_help = startup.auth.missingHelp(.cli),
         .permission_mode = permissionModeForSnapshot(startup.permission_mode),
         .workspace_root = startup.workspace_root,
         .history_turns = 0,
-        .session_permission_grants = 0,
         .agent_step_limit = startup.agent_step_limit,
         .ultrafast_requested = startup.ultrafast_mode,
         .update_channel = startup.update_channel.label(),
@@ -2517,7 +2229,6 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
         .workspace_root = snapshot.workspace_root,
         .model = snapshot.model,
         .provider = snapshot.provider,
-        .auth = snapshot.auth,
         .permission_mode = permissionModeForSnapshot(snapshot.permission_mode),
         .agent_step_limit = snapshot.agent_step_limit,
         .checks = snapshot.checks,
@@ -2616,7 +2327,7 @@ fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: 
         .home = home,
         .workspace_root = workspace_root,
         .hosts = .{ .context = &hosts, .get = CliMcpHosts.get, .release = CliMcpHosts.release, .changed = CliMcpHosts.changed },
-        .kept_sign_outs = .{ .transport = cfg.gateway_provider.oauth_transport, .notice = wait_line.notice() },
+        .kept_sign_outs = .{ .transport = cfg.oauth_transport, .notice = wait_line.notice() },
     }, args);
     return switch (code) {
         0 => .handled_success,
@@ -2764,12 +2475,10 @@ fn writeUsageOrJsonError(
 /// absent.
 fn parsedOptions(kind: TopLevelKind) ?[]const command_specs.OptionDoc {
     return switch (kind) {
-        .status, .models, .permissions, .credits => &builtin_commands.json_only_options,
+        .status, .models => &builtin_commands.json_only_options,
         .doctor => &builtin_commands.doctor_options,
         .slack => &command_specs.slack_options,
         .sessions => &builtin_commands.sessions_options,
-        .login => &builtin_commands.login_options,
-        .usage => &builtin_commands.usage_options,
         .upgrade => &builtin_commands.upgrade_options,
         .workspace => &builtin_commands.workspace_options,
         .config => &builtin_commands.config_parse_options,
@@ -2812,46 +2521,6 @@ fn flagProblem(alloc: Allocator, kind: TopLevelKind, args: anytype) !?[]u8 {
         return null;
     }
     return try writer.toOwnedSlice();
-}
-
-test "a doctor usage error names the flag that is wrong, not --fix" {
-    const alloc = std.testing.allocator;
-    const args = [_][:0]const u8{ "--fix", "--bogus" };
-    const problem = (try flagProblem(alloc, .doctor, @as([]const [:0]const u8, &args))).?;
-    defer alloc.free(problem);
-    try std.testing.expect(std.mem.find(u8, problem, "--bogus") != null);
-    try std.testing.expect(std.mem.find(u8, problem, "--fix") == null);
-}
-
-fn writeUsageCommandFailure(
-    alloc: Allocator,
-    deps: RunDeps,
-    err: anyerror,
-    format: output_contracts.OutputFormat,
-) !void {
-    const message = usageFailureMessage(err);
-    if (format == .json) {
-        return writeJsonCommandFailure(
-            alloc,
-            deps,
-            "usage",
-            err,
-            message,
-        );
-    }
-    try writeStderr(deps, "spark usage: ");
-    try writeStderr(deps, message);
-    try writeStderr(deps, "\n");
-}
-
-fn usageFailureMessage(err: anyerror) []const u8 {
-    return switch (err) {
-        error.HomeNotSet => io_mod.no_home_dir_reason,
-        error.DurablePathUnsafe,
-        error.PrivateStatePermissionsUnsupported,
-        => "the ~/.spark folder is unsafe",
-        else => "couldn't load the spark profile",
-    };
 }
 
 fn writeWorkspaceCommandError(
@@ -2928,82 +2597,14 @@ fn statusModes(registry: mode_registry.Registry, permission_mode: types.Permissi
     return .{ .current = registry.startingModeId(permission_mode), .all = registry.modes };
 }
 
-test "status reports the mode a new session starts in" {
-    const modes = [_]mode_registry.ModeSpec{
-        .{ .id = "auto", .name = "Auto", .permission_mode = .auto },
-        .{ .id = "ask", .name = "Ask", .permission_mode = .ask },
-        .{ .id = "full-access", .name = "Full access", .permission_mode = .yolo },
-    };
-    const registry = mode_registry.Registry{ .default_mode_id = "auto", .modes = modes[0..] };
-
-    const full = statusModes(registry, .yolo) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("full-access", full.current);
-    try std.testing.expectEqual(@as(usize, 3), full.all.len);
-    try std.testing.expectEqualStrings("ask", statusModes(registry, .ask).?.current);
-    try std.testing.expect(statusModes(.{ .default_mode_id = "surface" }, .auto) == null);
-}
-
 fn permissionModeForSnapshot(mode: anytype) types.PermissionMode {
-    return switch (mode) {
-        .ask => .ask,
-        .auto => .auto,
-        .yolo => .yolo,
-    };
+    _ = mode;
+    return .yolo;
 }
 
 fn permissionModeLabel(mode: anytype) []const u8 {
-    return switch (mode) {
-        .ask => "ask",
-        .auto => "auto",
-        .yolo => "yolo",
-    };
-}
-
-fn permissionRulesForSnapshot(alloc: Allocator, active_rules: anytype) !types.PermissionRuleSet {
-    if (active_rules.rules.len == 0) return .{};
-    const rules = try alloc.alloc(types.PermissionRule, active_rules.rules.len);
-    for (active_rules.rules, 0..) |rule, i| {
-        rules[i] = .{
-            .permission = rule.permission,
-            .pattern = rule.pattern,
-            .action = switch (rule.action) {
-                .allow => .allow,
-                .ask => .ask,
-                .deny => .deny,
-            },
-        };
-    }
-    return .{ .rules = rules };
-}
-
-/// One detail per id when the provider described its models, by the same capability merge a
-/// session uses for its effort and speed options; Ultrafast is a Gateway-only lane. Empty when
-/// there are no entries. Names borrow from `entries`. Caller frees the returned slice.
-fn modelDetails(
-    alloc: Allocator,
-    ids: []const []const u8,
-    entries: []const model_catalog.ModelCatalogEntry,
-    bundle: provider_set.Bundle,
-    provider: model_provider.ProviderId,
-) ![]const output_contracts.ModelDetail {
-    if (entries.len == 0) return &.{};
-    const details = try alloc.alloc(output_contracts.ModelDetail, ids.len);
-    for (ids, details) |id, *detail| {
-        const entry = for (entries) |candidate| {
-            if (std.mem.eql(u8, candidate.id, id)) break candidate;
-        } else null;
-        const capabilities = model_capabilities.mergeCapabilities(
-            bundle.fallbackModelCapabilities(id),
-            if (entry) |found| model_catalog_metadata.fromCatalogEntry(found) else null,
-        );
-        detail.* = .{
-            .name = if (entry) |found| found.name else null,
-            .efforts = capabilities.reasoning_efforts,
-            .fast = capabilities.supports_fast_mode,
-            .ultrafast = provider == .gateway and capabilities.supports_ultrafast_mode,
-        };
-    }
-    return details;
+    _ = mode;
+    return "yolo";
 }
 
 /// What `spark models` says when it could not load the catalog. A connection spark
@@ -3016,16 +2617,6 @@ fn modelListFailureMessage(alloc: Allocator, failure: model_catalog.Failure, pro
         );
     }
     return alloc.print("could not list models: {s}", .{catalogFailureDetail(failure)});
-}
-
-fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {
-    return switch (failure.category) {
-        .authentication => "AuthenticationRejected",
-        .cancellation => "the request was cancelled",
-        .malformed_response => "MalformedResponse",
-        .resource_exhausted => "OutOfMemory",
-        .rate_limited, .gateway_unavailable, .transport, .http_status, .runtime => "Unavailable",
-    };
 }
 
 fn writeCommandFailure(
@@ -3234,14 +2825,6 @@ fn parseSessionConvertArgs(args: []const [:0]const u8) !output_contracts.OutputF
         },
     };
     return format;
-}
-
-test "sessions convert reads its flags through the shared parser" {
-    try std.testing.expectEqual(output_contracts.OutputFormat.text, try parseSessionConvertArgs(&.{}));
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, try parseSessionConvertArgs(&.{"--json"}));
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, try parseSessionConvertArgs(&.{ "--json", "--json" }));
-    try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseSessionConvertArgs(&.{"--jsno"}));
-    try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseSessionConvertArgs(&.{"extra"}));
 }
 
 /// `spark sessions convert`: converts every v1 session v2 does not hold yet,
@@ -3631,151 +3214,6 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
     };
 }
 
-test "session detail failure names an older spark's damaged file and points at doctor (D78)" {
-    var text = CaptureOutput.init(std.testing.allocator);
-    defer text.deinit();
-    try writeSessionDetailFailure(std.testing.allocator, text.deps(), "old-session", error.InvalidSessionFormat, "events.jsonl can't be read (AccessDenied)", .text);
-    try std.testing.expectEqualStrings(
-        "spark session: session old-session can't be read: events.jsonl can't be read (AccessDenied); run `spark doctor`\n",
-        text.stderr.written(),
-    );
-    var json = CaptureOutput.init(std.testing.allocator);
-    defer json.deinit();
-    try writeSessionDetailFailure(std.testing.allocator, json.deps(), "old-session", error.InvalidSessionFormat, "events.jsonl can't be read (AccessDenied)", .json);
-    try std.testing.expect(std.mem.find(u8, json.stdout.written(), "\"code\":\"InvalidSessionFormat\"") != null);
-    try std.testing.expect(std.mem.find(u8, json.stdout.written(), "run `spark doctor`") != null);
-}
-
-test "session detail failures separate corruption from unsupported schema" {
-    var corrupt_text = CaptureOutput.init(std.testing.allocator);
-    defer corrupt_text.deinit();
-    try writeSessionDetailFailure(
-        std.testing.allocator,
-        corrupt_text.deps(),
-        "broken-session",
-        error.InvalidSessionFormat,
-        "",
-        .text,
-    );
-    try std.testing.expectEqualStrings("", corrupt_text.stdout.written());
-    try std.testing.expectEqualStrings(
-        "spark session: session broken-session is corrupt; run `spark session recover broken-session`\n",
-        corrupt_text.stderr.written(),
-    );
-
-    var corrupt_json = CaptureOutput.init(std.testing.allocator);
-    defer corrupt_json.deinit();
-    try writeSessionDetailFailure(
-        std.testing.allocator,
-        corrupt_json.deps(),
-        "broken-session",
-        error.InvalidSessionFormat,
-        "",
-        .json,
-    );
-    try std.testing.expectEqualStrings("", corrupt_json.stderr.written());
-    try std.testing.expect(
-        std.mem.find(
-            u8,
-            corrupt_json.stdout.written(),
-            "\"error\":\"session broken-session is corrupt; run `spark session recover broken-session`\"",
-        ) != null,
-    );
-    try std.testing.expect(
-        std.mem.find(
-            u8,
-            corrupt_json.stdout.written(),
-            "\"code\":\"InvalidSessionFormat\"",
-        ) != null,
-    );
-
-    var unsupported_text = CaptureOutput.init(std.testing.allocator);
-    defer unsupported_text.deinit();
-    try writeSessionDetailFailure(
-        std.testing.allocator,
-        unsupported_text.deps(),
-        "future-session",
-        error.UnsupportedSessionSchema,
-        "",
-        .text,
-    );
-    try std.testing.expectEqualStrings("", unsupported_text.stdout.written());
-    try std.testing.expectEqualStrings(
-        "spark session: session future-session uses an unsupported session version\n",
-        unsupported_text.stderr.written(),
-    );
-}
-
-test "session recovery boundary failures keep stable text and json guidance" {
-    var text_output = CaptureOutput.init(std.testing.allocator);
-    defer text_output.deinit();
-    try writeLookupFailure(
-        std.testing.allocator,
-        text_output.deps(),
-        "session",
-        error.SessionRecoveryBoundaryInvalid,
-        .text,
-    );
-    try std.testing.expectEqualStrings("", text_output.stdout.written());
-    try std.testing.expectEqualStrings(
-        "spark session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
-        text_output.stderr.written(),
-    );
-
-    var json_output = CaptureOutput.init(std.testing.allocator);
-    defer json_output.deinit();
-    try writeLookupFailure(
-        std.testing.allocator,
-        json_output.deps(),
-        "session",
-        error.SessionRecoveryBoundaryInvalid,
-        .json,
-    );
-    try std.testing.expectEqualStrings("", json_output.stderr.written());
-    try std.testing.expect(
-        std.mem.find(
-            u8,
-            json_output.stdout.written(),
-            "\"code\":\"SessionRecoveryBoundaryInvalid\"",
-        ) != null,
-    );
-    try std.testing.expect(
-        std.mem.find(
-            u8,
-            json_output.stdout.written(),
-            "\"error\":\"no exact trustworthy recovery boundary was found; the source was left unchanged\"",
-        ) != null,
-    );
-}
-
-fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
-    return .{
-        .auth_mode = cfg.auth_mode,
-        .command_usage = command_specs.topLevelUsage(cfg.command_catalog, .ask),
-        .default_model = cfg.default_model,
-        .default_agent_step_limit = cfg.default_agent_step_limit,
-        .gateway_retry_count = cfg.gateway_retry_count,
-        .gateway_chat_url = cfg.gateway_provider.chat_url.resolve(cfg.gateway_chat_url),
-        .gateway_models_path = cfg.models_path,
-        .gateway_provider = cfg.gateway_provider,
-        .provider_set = cfg.provider_set,
-        .process_provider = cfg.process_provider,
-        .secret_store = cfg.secret_store,
-        .prompt_policy = cfg.prompt_policy,
-        .skill_root_policy = cfg.skill_root_policy,
-        .ignored_list_entries = cfg.ignored_list_entries,
-        .max_list_entries = cfg.max_list_entries,
-        .max_read_file_bytes = cfg.max_read_file_bytes,
-        .max_read_file_lines = cfg.max_read_file_lines,
-        .max_read_file_line_len = cfg.max_read_file_line_len,
-        .max_command_output_bytes = cfg.max_command_output_bytes,
-        .max_tool_result_bytes = cfg.max_tool_result_bytes,
-        .max_history_turns = cfg.max_history_turns,
-        .mode_registry = cfg.mode_registry,
-        .load_mcp_host = cfg.load_mcp_host,
-    };
-}
-
 fn workflowConfigWithLaunchModifiers(
     cfg: Config,
     modifiers: LaunchModifiers,
@@ -3806,13 +3244,11 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
 /// `spark: put agent-run flags after the command, as in spark ask --model <id>`.
 fn writeModelModifierUsage(alloc: Allocator, deps: RunDeps, command: Command, modifiers: LaunchModifiers) !void {
     const example = firstAgentRunFlag(modifiers);
-    const routing = modifiers.provider_order_override != null or modifiers.provider_strict_override != null;
     const target: ?[]const u8 = switch (command) {
         .ask => "ask",
         .pr => "pr",
         .issue => "issue",
-        // ACP sessions don't apply gateway provider routing.
-        .acp => if (routing) null else "acp",
+        .acp => "acp",
         else => null,
     };
     const message = if (target) |name|
@@ -3831,8 +3267,7 @@ fn firstAgentRunFlag(modifiers: LaunchModifiers) []const u8 {
     if (modifiers.effort_override != null) return "--effort <level>";
     if (modifiers.fast_override) |fast| return if (fast) "--fast" else "--no-fast";
     if (modifiers.ultrafast_override) |ultrafast| return if (ultrafast) "--ultrafast" else "--no-ultrafast";
-    if (modifiers.provider_order_override != null) return "--provider-order <a,b,...>";
-    return if (modifiers.provider_strict_override == true) "--provider-strict" else "--no-provider-strict";
+    return "--model <id>";
 }
 
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
@@ -3843,9 +3278,8 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.InvalidProfileName => "--profile names use lowercase letters, digits, '-', or '_'",
         error.InvalidInstancesValue => "--instances takes a whole number of at least 1",
         error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
-        error.InvalidProviderValue => "--provider accepts gateway, codex, grok, or a configured provider name",
-        error.InvalidProviderOrderValue => "--provider-order accepts comma-separated provider slugs (letters, digits, '-')",
-        error.InvalidPermissionModeValue => "--permission-mode accepts ask, auto, or full-access",
+        error.InvalidProviderValue => "--provider accepts a configured provider name",
+        error.InvalidPermissionModeValue => "--permission-mode accepts full-access",
         error.InvalidToolPlacementOverride => "--tool-placement takes <tool>=toolbox or <tool>=direct",
         error.UnknownToolPlacementTool => "--tool-placement names a built-in tool that can move: " ++ config_runtime.tool_placement.movable_list,
         error.InvalidToolPlacementValue => "--tool-placement puts a tool in toolbox or direct",
@@ -3853,7 +3287,7 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     };
 }
 
-const AcpFlag = enum { permission_mode, ask, auto, full_access, yolo, provider, model, effort, fast, no_fast, ultrafast, no_ultrafast, log_file };
+const AcpFlag = enum { permission_mode, full_access, yolo, provider, model, effort, fast, no_fast, ultrafast, no_ultrafast, log_file };
 const acp_flag_ids = cli_flags.idTable(AcpFlag, &builtin_commands.acp_options);
 
 fn parseAcpArgs(alloc: Allocator, args: []const [:0]const u8, bad: *?BadAgentValue) !AcpOptions {
@@ -3875,47 +3309,6 @@ fn parseAcpArgs(alloc: Allocator, args: []const [:0]const u8, bad: *?BadAgentVal
         },
     };
     return opts;
-}
-
-test "ACP arguments take the agent-run flags and a log file" {
-    const alloc = std.testing.allocator;
-    var bad: ?BadAgentValue = null;
-    var enabled = try parseAcpArgs(alloc, &.{ "--model", "provider/astra", "--ultrafast" }, &bad);
-    defer enabled.deinit(alloc);
-    try std.testing.expectEqualStrings("provider/astra", enabled.agent.model.?);
-    try std.testing.expectEqual(@as(?bool, true), enabled.agent.ultrafast);
-
-    var last = try parseAcpArgs(alloc, &.{ "--ultrafast", "--no-ultrafast", "--model=a", "--model", "b", "--effort", "high", "--fast", "--ask", "--provider", "codex", "--log-file", "/tmp/acp.log" }, &bad);
-    defer last.deinit(alloc);
-    try std.testing.expectEqual(@as(?bool, false), last.agent.ultrafast);
-    try std.testing.expectEqualStrings("b", last.agent.model.?);
-    try std.testing.expectEqualStrings("high", last.agent.effort.?.label());
-    try std.testing.expect(last.agent.fast.?);
-    try std.testing.expectEqual(types.PermissionMode.ask, last.agent.permission.?);
-    try std.testing.expectEqualStrings("codex", last.agent.provider.?.label());
-    try std.testing.expectEqualStrings("/tmp/acp.log", last.log_file.?);
-
-    try std.testing.expectError(error.InvalidAgentRunValue, parseAcpArgs(alloc, &.{ "--effort", "high effort" }, &bad));
-    try std.testing.expectEqualStrings("--effort", bad.?.flag);
-    try std.testing.expectEqualStrings("high effort", bad.?.value);
-    // ACP sessions don't apply gateway provider routing, so the flag isn't offered.
-    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(alloc, &.{ "--provider-order", "a" }, &bad));
-}
-
-test "pr and issue take the agent-run flags before their context" {
-    const alloc = std.testing.allocator;
-    var bad: ?BadAgentValue = null;
-    var opts = try parseWorkflowArgs(alloc, &.{ "--auto", "--model", "m", "--effort=low", "--provider-order", "a,b", "--create", "fix", "the", "--model", "x" }, &bad);
-    defer opts.deinit(alloc);
-    try std.testing.expectEqual(types.PermissionMode.auto, opts.agent.permission.?);
-    try std.testing.expectEqualStrings("m", opts.agent.model.?);
-    try std.testing.expectEqual(@as(usize, 2), opts.agent.provider_order.?.len);
-    try std.testing.expect(opts.create);
-    // Flags after the context are part of it.
-    try std.testing.expectEqualStrings("fix the --model x", opts.context);
-
-    try std.testing.expectError(error.InvalidAgentRunValue, parseWorkflowArgs(alloc, &.{ "--permission-mode", "sometimes" }, &bad));
-    try std.testing.expectEqualStrings("--permission-mode", bad.?.flag);
 }
 
 /// Prints the settings `spark config list` or `spark config get` asks for. `get` of a
@@ -4142,12 +3535,9 @@ const DoctorProbes = struct {
     /// before an error is still in `self`, for `wait` to stop.
     fn start(self: *DoctorProbes, cfg: Config, deps: RunDeps, snapshot: *const doctor_runtime.Snapshot, workspace_root: []const u8) !void {
         const probe_alloc = std.heap.c_allocator;
-        // An expired login is reported as it is: doctor never refreshes it. A
-        // configured provider's model list comes from its settings, with no
+        // A configured provider's model list comes from its settings, with no
         // request, so asking it would confirm nothing.
-        if (snapshot.auth.missingHelp(.cli) == null and !snapshot.auth.expired and snapshot.model.len > 0 and snapshot.provider != .configured) {
-            try self.startCatalog(cfg, deps, snapshot.model);
-        }
+        _ = deps;
         if (cfg.load_mcp_host) |load| {
             // A config doctor cannot load is already a check of its own.
             const doctor_host = load(probe_alloc, workspace_root, cfg.tool_set.registry, .{}) catch |err| blk: {
@@ -4177,7 +3567,7 @@ const DoctorProbes = struct {
         startup.* = (if (cfg.auth_mode == .host_managed)
             deps.load_catalog_startup_state_with_auth_mode(probe_alloc, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit, cfg.auth_mode, null, null)
         else
-            deps.load_startup_state(probe_alloc, cfg.gateway_provider.oauth_transport, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit)) catch |err| {
+            deps.load_startup_state(probe_alloc, cfg.oauth_transport, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit)) catch |err| {
             // Startup itself refuses this setup, and the config check says why.
             debug_trace.logf("doctor", "provider check skipped: startup state failed err={s}", .{@errorName(err)});
             return;
@@ -4235,62 +3625,6 @@ const DoctorProbes = struct {
         try doctor_probes.ghCheck(out, alloc, self.gh, deadline_ms);
     }
 };
-
-/// The line `spark logout` writes to a terminal's stderr while it waits for the
-/// provider to revoke the login, so a slow provider does not look like a hang.
-/// Like doctor's wait notice, pipes and unit tests never get it.
-const LogoutWaitLine = struct {
-    deps: RunDeps,
-    text: []const u8,
-
-    const request_s = oauth_transport.default_request_timeout_ms / std.time.ms_per_s;
-    const codex = std.fmt.comptimePrint("revoking the Codex login at OpenAI (up to {d} s)...\n", .{request_s});
-    const grok = std.fmt.comptimePrint("revoking the Grok login at xAI (up to {d} s)...\n", .{request_s});
-    /// The spark login asks for its issuer's endpoints, then revokes two tokens
-    /// (`login_flow.revokeLoggedOutSession`), each request with its own limit.
-    const spark_login = std.fmt.comptimePrint("revoking the spark login at Vercel (up to {d} s)...\n", .{3 * request_s});
-
-    /// Before a retry of sign-outs that earlier logouts kept
-    /// (`pending_revocation.retry`), which sends one sign-out after another.
-    const codex_kept = std.fmt.comptimePrint("revoking earlier Codex sign-outs at OpenAI (up to {d} s each)...\n", .{request_s});
-    const grok_kept = std.fmt.comptimePrint("revoking earlier Grok sign-outs at xAI (up to {d} s each)...\n", .{request_s});
-    const spark_login_kept = std.fmt.comptimePrint("revoking earlier spark sign-outs at Vercel (up to {d} s each)...\n", .{3 * request_s});
-    const mcp_kept = std.fmt.comptimePrint("revoking earlier MCP sign-outs at their servers (up to {d} s each)...\n", .{request_s});
-
-    fn notice(self: *const LogoutWaitLine) ?oauth.BeforeRevocation {
-        if (builtin.is_test or !stderrIsTerminal()) return null;
-        return .{ .context = self, .run = write };
-    }
-
-    fn write(context: *const anyopaque) void {
-        const self: *const LogoutWaitLine = @ptrCast(@alignCast(context));
-        writeStderr(self.deps, self.text) catch |err| {
-            debug_trace.logf("auth", "logout wait line not written err={s}", .{@errorName(err)});
-        };
-    }
-};
-
-/// Revokes the provider's sign-outs that earlier logouts kept because it did
-/// not confirm them (`pending_revocation`). A refused retry keeps them for the
-/// next one and prints nothing: the logout that kept them already warned.
-fn retryKeptSignOuts(alloc: Allocator, cfg: Config, deps: RunDeps, provider: model_provider.ProviderId) void {
-    const transport = cfg.gateway_provider.oauth_transport;
-    switch (provider) {
-        .codex => {
-            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.codex_kept };
-            _ = chatgpt_oauth.retryKeptSignOuts(alloc, transport, wait_line.notice());
-        },
-        .grok => {
-            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.grok_kept };
-            _ = grok_oauth.retryKeptSignOuts(alloc, transport, wait_line.notice());
-        },
-        .gateway => {
-            const wait_line: LogoutWaitLine = .{ .deps = deps, .text = LogoutWaitLine.spark_login_kept };
-            _ = login_flow.retryKeptSignOuts(alloc, transport, wait_line.notice());
-        },
-        else => {},
-    }
-}
 
 /// Whether doctor's stderr is a terminal, for its wait notice.
 fn stderrIsTerminal() bool {
@@ -4589,56 +3923,6 @@ fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
     return options;
 }
 
-test "spark sessions ls names the default list action" {
-    try std.testing.expectEqual(@as(usize, 0), sessionListArgs(&.{"ls"}).len);
-    try std.testing.expectEqualStrings("--json", sessionListArgs(&.{ "ls", "--json" })[0]);
-    try std.testing.expectEqualStrings("--json", sessionListArgs(&.{"--json"})[0]);
-}
-
-test "spark models ls names the default list action" {
-    try std.testing.expectEqual(@as(usize, 0), modelsListArgs(&.{"ls"}).len);
-    try std.testing.expectEqualStrings("--json", modelsListArgs(&.{ "ls", "--json" })[0]);
-    try std.testing.expectEqualStrings("--json", modelsListArgs(&.{"--json"})[0]);
-}
-
-test "spark sessions --live reads through the shared parser and names the paging flag it refuses" {
-    const live = try parseSessionListArgs(&.{ "--live", "--all", "--json" });
-    try std.testing.expect(live.live);
-    try std.testing.expectEqual(session_store.SessionListScope.all_workspaces, live.scope);
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, live.format);
-    try std.testing.expectEqual(@as(?[]const u8, null), live.paging_flag);
-    try std.testing.expectEqualStrings("--cursor", (try parseSessionListArgs(&.{ "--cursor", "v1:1:abc", "--live", "--limit", "5" })).paging_flag.?);
-    try std.testing.expectEqualStrings("--limit", (try parseSessionListArgs(&.{ "--live", "--limit=5" })).paging_flag.?);
-    try std.testing.expect(!(try parseSessionListArgs(&.{})).live);
-    try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseSessionListArgs(&.{"--liv"}));
-}
-
-const UsageFlag = enum { period, json };
-const usage_flag_ids = cli_flags.idTable(UsageFlag, &builtin_commands.usage_options);
-
-fn parseUsageArgs(args: []const [:0]const u8) !UsageOptions {
-    var options = UsageOptions{};
-    var parser: cli_flags.Parser = .init(&builtin_commands.usage_options, args);
-    while (parser.next() catch return error.InvalidUsageArgs) |item| switch (item) {
-        .positional => return error.InvalidUsageArgs,
-        .option => |match| switch (usage_flag_ids[match.index].?) {
-            .period => {
-                const period = match.value.?;
-                options.period = if (std.mem.eql(u8, period, "today"))
-                    .today
-                else if (std.mem.eql(u8, period, "7d"))
-                    .days_7
-                else if (std.mem.eql(u8, period, "month"))
-                    .month
-                else
-                    return error.InvalidUsageArgs;
-            },
-            .json => options.format = .json,
-        },
-    };
-    return options;
-}
-
 fn parseSessionListCursor(raw: []const u8) !session_store.ResumableSessionContinuation {
     if (raw.len == 0 or raw.len > 320) return error.InvalidLocalSurfaceArgs;
     var fields = std.mem.splitScalar(u8, raw, ':');
@@ -4842,7 +4126,7 @@ fn removedResumeHint(err: anyerror) ?[]const u8 {
     };
 }
 
-const WorkflowFlag = enum { permission_mode, ask, auto, full_access, yolo, provider, model, effort, fast, no_fast, ultrafast, no_ultrafast, provider_order, provider_strict, no_provider_strict, create };
+const WorkflowFlag = enum { permission_mode, full_access, yolo, provider, model, effort, fast, no_fast, ultrafast, no_ultrafast, create };
 // `spark issue` documents the same flags as `spark pr`.
 const workflow_flag_ids = cli_flags.idTable(WorkflowFlag, &builtin_commands.pr_options);
 
@@ -4898,2169 +4182,6 @@ fn isVersionFlag(arg: []const u8) bool {
 
 fn testCommandCatalog() CommandCatalog {
     return builtin_commands.top_level_registry;
-}
-
-test "launch flags may follow the resume word and its target" {
-    const alloc = std.testing.allocator;
-    const command_catalog = testCommandCatalog();
-    const Case = struct { args: []const [:0]const u8, target: std.meta.Tag(ResumeTarget), model: ?[]const u8 = null, fast: ?bool = null, prompt: ?[]const u8 = null };
-    const cases = [_]Case{
-        .{ .args = &.{ "-c", "--model", "x" }, .target = .remembered, .model = "x" },
-        .{ .args = &.{ "--continue", "--fast" }, .target = .remembered, .fast = true },
-        .{ .args = &.{ "--resume", "last", "--model", "x" }, .target = .last, .model = "x" },
-        .{ .args = &.{ "-r", "--model", "x" }, .target = .pick, .model = "x" },
-        .{ .args = &.{ "-c", "hello world", "--model", "x" }, .target = .remembered, .model = "x", .prompt = "hello world" },
-        .{ .args = &.{ "--model", "y", "-c", "--model", "x" }, .target = .remembered, .model = "x" },
-        .{ .args = &.{ "session", "resume", "last", "--fast" }, .target = .last, .fast = true },
-    };
-    for (cases) |case| {
-        var parsed = try parseInteractiveLaunch(alloc, case.args, command_catalog);
-        switch (parsed) {
-            .interactive => |*launch| {
-                defer launch.deinit(alloc);
-                try std.testing.expectEqual(case.target, std.meta.activeTag(launch.requested_resume.?));
-                if (case.model) |model| try std.testing.expectEqualStrings(model, launch.modifiers.model_override.?);
-                if (case.fast) |fast| try std.testing.expectEqual(fast, launch.modifiers.fast_override.?);
-                if (case.prompt) |prompt| try std.testing.expectEqualStrings(prompt, launch.initial_prompt.?) else try std.testing.expect(launch.initial_prompt == null);
-            },
-            .noninteractive => |*value| {
-                value.deinit(alloc);
-                return error.TestExpectedInteractiveLaunch;
-            },
-        }
-    }
-
-    const bad: []const [:0]const u8 = &.{ "-c", "--bogus" };
-    try std.testing.expectError(error.InvalidFlag, parseInteractiveLaunch(alloc, bad, command_catalog));
-    try std.testing.expectEqualStrings("--bogus", launchFlagFailure(bad).?.unknown.flag);
-    try std.testing.expectError(error.InvalidResumeArgs, parseInteractiveLaunch(alloc, &.{ "session", "resume", "last", "hello" }, command_catalog));
-}
-
-test "parse recognizes every top-level command and preserves unknown commands" {
-    const command_catalog = testCommandCatalog();
-    try std.testing.expectEqual(Command.interactive, parse(command_catalog, &.{}));
-    try std.testing.expectEqual(Command.help, parse(command_catalog, &.{@constCast("help")}));
-
-    switch (parse(command_catalog, &.{ @constCast("ask"), @constCast("hello") })) {
-        .ask => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("acp"), @constCast("--model"), @constCast("m") })) {
-        .acp => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("pr"), @constCast("ready") })) {
-        .pr => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("issue"), @constCast("flaky") })) {
-        .issue => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{@constCast("setup")})) {
-        .setup => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("status"), @constCast("--json") })) {
-        .status => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{@constCast("permissions")})) {
-        .permissions => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("models"), @constCast("--json") })) {
-        .models => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("models"), @constCast("ls"), @constCast("--json") })) {
-        .models => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("mcp"), @constCast("add"), @constCast("fixture"), @constCast("node") })) {
-        .mcp => |rest| try std.testing.expectEqual(@as(usize, 3), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{@constCast("doctor")})) {
-        .doctor => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{@constCast("background")})) {
-        .unknown => |command| try std.testing.expectEqualStrings("background", command),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("session"), @constCast("last") })) {
-        .session => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("session"), @constCast("resume"), @constCast("last") })) {
-        .resume_session => |invocation| try std.testing.expectEqual(@as(usize, 1), invocation.args.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("sessions"), @constCast("--json") })) {
-        .sessions => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("sessions"), @constCast("ls"), @constCast("--json") })) {
-        .sessions => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("resume"), @constCast("last") })) {
-        .resume_session => |invocation| try std.testing.expectEqual(@as(usize, 1), invocation.args.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("credits"), @constCast("--json") })) {
-        .credits => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("usage"), @constCast("--period"), @constCast("24h") })) {
-        .usage => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{@constCast("upgrade")})) {
-        .upgrade => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("update"), @constCast("--channel"), @constCast("dev") })) {
-        .upgrade => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{ @constCast("replay"), @constCast("tape") })) {
-        .replay => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{@constCast("wat")})) {
-        .unknown => |value| try std.testing.expectEqualStrings("wat", value),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{@constCast("task")})) {
-        .unknown => |value| try std.testing.expectEqualStrings("task", value),
-        else => return error.TestExpectedEqual,
-    }
-    switch (parse(command_catalog, &.{@constCast("tasks")})) {
-        .unknown => |value| try std.testing.expectEqualStrings("tasks", value),
-        else => return error.TestExpectedEqual,
-    }
-}
-
-test "help aliases route to help" {
-    const command_catalog = testCommandCatalog();
-    try std.testing.expectEqual(Command.help, parse(command_catalog, &.{@constCast("--help")}));
-    try std.testing.expectEqual(Command.help, parse(command_catalog, &.{@constCast("-h")}));
-}
-
-test "usage arguments accept today, 7d or 30d and one JSON flag" {
-    const defaults = try parseUsageArgs(&.{});
-    try std.testing.expectEqual(usage.Period.month, defaults.period);
-    try std.testing.expectEqual(output_contracts.OutputFormat.text, defaults.format);
-
-    const selected = try parseUsageArgs(&.{
-        @constCast("--json"),
-        @constCast("--period"),
-        @constCast("7d"),
-    });
-    try std.testing.expectEqual(usage.Period.days_7, selected.period);
-    try std.testing.expectEqual(usage.Period.today, (try parseUsageArgs(&.{ @constCast("--period"), @constCast("today") })).period);
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, selected.format);
-
-    for ([_][]const [:0]const u8{
-        &.{@constCast("--period")},
-        &.{ @constCast("--period"), @constCast("session") },
-        &.{ @constCast("--period"), @constCast("24h") },
-        &.{@constCast("--period=")},
-        &.{@constCast("--json=1")},
-        &.{@constCast("30d")},
-    }) |invalid| {
-        try std.testing.expectError(error.InvalidUsageArgs, parseUsageArgs(invalid));
-    }
-
-    const last = try parseUsageArgs(&.{ "--period", "today", "--period=7d", "--json", "--json" });
-    try std.testing.expectEqual(usage.Period.days_7, last.period);
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, last.format);
-}
-
-test "global launch modifiers preserve repeatable context limits before the command" {
-    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
-        @constCast("--context-limit"),
-        @constCast("skill_chunk_bytes=4096"),
-        @constCast("--context-limit=mcp_description_bytes=off"),
-        @constCast("ask"),
-        @constCast("hello"),
-    });
-    defer parsed.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.context_limit_overrides.len);
-    try std.testing.expectEqual(config_runtime.context_limits.Name.skill_chunk_bytes, parsed.modifiers.context_limit_overrides[0].name);
-    try std.testing.expectEqual(@as(usize, 4096), parsed.modifiers.context_limit_overrides[0].value.bytes);
-    try std.testing.expectEqual(config_runtime.context_limits.Name.mcp_description_bytes, parsed.modifiers.context_limit_overrides[1].name);
-    try std.testing.expect(parsed.modifiers.context_limit_overrides[1].value == .off);
-    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
-    try std.testing.expectEqualStrings("hello", parsed.remaining[1]);
-}
-
-test "global context limits reject missing values and stop at the command" {
-    try std.testing.expectError(
-        error.InvalidFlag,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--context-limit")}),
-    );
-    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
-        @constCast("ask"),
-        @constCast("--context-limit"),
-        @constCast("skill_chunk_bytes=1"),
-    });
-    defer parsed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), parsed.modifiers.context_limit_overrides.len);
-    try std.testing.expectEqual(@as(usize, 3), parsed.remaining.len);
-}
-
-test "--instances takes a whole number of at least 1" {
-    const invalid = [_][]const [:0]const u8{
-        &.{ @constCast("--instances"), @constCast("0") },
-        &.{@constCast("--instances=0")},
-        &.{ @constCast("--instances"), @constCast("two") },
-        &.{@constCast("--instances=-1")},
-        &.{@constCast("--instances=")},
-    };
-    for (invalid) |args| try std.testing.expectError(error.InvalidInstancesValue, parseGlobalLaunchArgs(std.testing.allocator, args));
-    // A bare `--instances` is the shared parser's missing value.
-    try std.testing.expectError(error.InvalidFlag, parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--instances")}));
-    try std.testing.expectEqualStrings("--instances", launchFlagFailure(&.{@constCast("--instances")}).?.missing_value);
-    try std.testing.expectEqualStrings("--instances takes a whole number of at least 1", globalLaunchErrorMessage(error.InvalidInstancesValue).?);
-
-    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--instances"), @constCast("3") });
-    defer parsed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(?usize, 3), parsed.modifiers.instances);
-}
-
-test "global launch modifiers own repeatable additional directories and suppression" {
-    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
-        @constCast("--add-dir"),
-        @constCast("/tmp/shared one"),
-        @constCast("--context-limit=skill_chunk_bytes=2048"),
-        @constCast("--add-dir=/tmp/shared-two"),
-        @constCast("--no-additional-dirs"),
-        @constCast("ask"),
-        @constCast("inspect"),
-    });
-    defer parsed.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.additional_directories.len);
-    try std.testing.expectEqualStrings("/tmp/shared one", parsed.modifiers.additional_directories[0]);
-    try std.testing.expectEqualStrings("/tmp/shared-two", parsed.modifiers.additional_directories[1]);
-    try std.testing.expect(parsed.modifiers.saved_directories_suppressed);
-    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
-}
-
-test "global launch modifiers own provider model effort and fast overrides before the command" {
-    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
-        @constCast("--provider"),
-        @constCast("grok"),
-        @constCast("--model"),
-        @constCast("provider/launch-model"),
-        @constCast("--effort=high"),
-        @constCast("--fast"),
-        @constCast("--add-dir"),
-        @constCast("/tmp/shared"),
-    });
-    defer parsed.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(?model_provider.ProviderId, .grok), parsed.modifiers.provider_override);
-    try std.testing.expectEqualStrings("provider/launch-model", parsed.modifiers.model_override.?);
-    try std.testing.expect(parsed.modifiers.effort_override.?.eql(types.ReasoningEffort.literal("high")));
-    try std.testing.expectEqual(@as(?bool, true), parsed.modifiers.fast_override);
-    try std.testing.expect(parsed.modifiers.hasModelOverrides());
-    try std.testing.expectEqual(@as(usize, 1), parsed.modifiers.additional_directories.len);
-    try std.testing.expectEqual(@as(usize, 0), parsed.remaining.len);
-
-    var routed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
-        @constCast("--provider-order"),
-        @constCast("azure, anthropic"),
-        @constCast("--provider-strict"),
-    });
-    defer routed.deinit(std.testing.allocator);
-    const order = routed.modifiers.provider_order_override.?;
-    try std.testing.expectEqual(@as(usize, 2), order.len);
-    try std.testing.expectEqualStrings("azure", order[0]);
-    try std.testing.expectEqualStrings("anthropic", order[1]);
-    try std.testing.expectEqual(@as(?bool, true), routed.modifiers.provider_strict_override);
-
-    var spaced = try parseGlobalLaunchArgs(std.testing.allocator, &.{
-        @constCast("--model= provider/spaced "),
-        @constCast("--effort"),
-        @constCast("low"),
-        @constCast("--no-fast"),
-    });
-    defer spaced.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("provider/spaced", spaced.modifiers.model_override.?);
-    try std.testing.expect(spaced.modifiers.effort_override.?.eql(types.ReasoningEffort.literal("low")));
-    try std.testing.expectEqual(@as(?bool, false), spaced.modifiers.fast_override);
-
-    var untouched = try parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("ask"), @constCast("--fast") });
-    defer untouched.deinit(std.testing.allocator);
-    try std.testing.expect(!untouched.modifiers.hasModelOverrides());
-    try std.testing.expectEqual(@as(usize, 2), untouched.remaining.len);
-}
-
-test "global launch modifiers accept configured provider names" {
-    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
-        @constCast("--provider"),
-        @constCast("my-llm"),
-    });
-    defer parsed.deinit(std.testing.allocator);
-
-    const provider = parsed.modifiers.provider_override.?;
-    try std.testing.expect(provider == .configured);
-    try std.testing.expectEqualStrings("my-llm", provider.label());
-}
-
-test "global model overrides fail closed when malformed" {
-    try std.testing.expectError(
-        error.InvalidFlag,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider")}),
-    );
-    try std.testing.expectError(
-        error.InvalidProviderValue,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--provider"), @constCast("bogus name") }),
-    );
-    try std.testing.expectError(
-        error.InvalidFlag,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--model")}),
-    );
-    try std.testing.expectError(
-        error.MissingModelValue,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--model=")}),
-    );
-    try std.testing.expectError(
-        error.InvalidFlag,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--effort")}),
-    );
-    try std.testing.expectError(
-        error.InvalidEffortValue,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--effort=not an effort")}),
-    );
-    try std.testing.expectError(
-        error.InvalidFlag,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider-order")}),
-    );
-    try std.testing.expectError(
-        error.InvalidProviderOrderValue,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider-order=Bad Slug")}),
-    );
-    try std.testing.expectError(
-        error.InvalidProviderOrderValue,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider-order=azure,azure")}),
-    );
-    try std.testing.expectError(
-        error.InvalidPermissionModeValue,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--permission-mode=never")}),
-    );
-    try std.testing.expectError(
-        error.InvalidFlag,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--fast=1")}),
-    );
-    try std.testing.expectEqualStrings("--model", launchFlagFailure(&.{@constCast("--model")}).?.missing_value);
-    try std.testing.expectEqualStrings("--fast", launchFlagFailure(&.{@constCast("--fast=1")}).?.unexpected_value);
-    try std.testing.expect(launchFlagFailure(&.{ @constCast("--fast"), @constCast("ask") }) == null);
-}
-
-test "global launch flags let the last one win" {
-    const cases = [_]struct {
-        args: []const [:0]const u8,
-        fast: ?bool = null,
-        ultrafast: ?bool = null,
-        strict: ?bool = null,
-        permission: ?types.PermissionMode = null,
-    }{
-        .{ .args = &.{ "--fast", "--no-fast" }, .fast = false, .ultrafast = false },
-        .{ .args = &.{ "--no-fast", "--fast" }, .fast = true, .ultrafast = false },
-        .{ .args = &.{ "--ultrafast", "--fast" }, .fast = true, .ultrafast = false },
-        .{ .args = &.{ "--fast", "--ultrafast" }, .fast = false, .ultrafast = true },
-        .{ .args = &.{ "--provider-strict", "--no-provider-strict" }, .strict = false },
-        .{ .args = &.{ "--ask", "--full-access" }, .permission = .yolo },
-        .{ .args = &.{ "--yolo", "--permission-mode", "auto" }, .permission = .auto },
-        .{ .args = &.{ "--permission-mode=full-access", "--ask" }, .permission = .ask },
-    };
-    for (cases) |case| {
-        var parsed = try parseGlobalLaunchArgs(std.testing.allocator, case.args);
-        defer parsed.deinit(std.testing.allocator);
-        try std.testing.expectEqual(case.fast, parsed.modifiers.fast_override);
-        try std.testing.expectEqual(case.ultrafast, parsed.modifiers.ultrafast_override);
-        try std.testing.expectEqual(case.strict, parsed.modifiers.provider_strict_override);
-        try std.testing.expectEqual(case.permission, parsed.modifiers.permission_override);
-        try std.testing.expectEqual(@as(usize, 0), parsed.remaining.len);
-    }
-
-    var repeated = try parseGlobalLaunchArgs(std.testing.allocator, &.{ "--model=a", "--model", "b", "--no-additional-dirs", "--no-additional-dirs", "-c" });
-    defer repeated.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("b", repeated.modifiers.model_override.?);
-    try std.testing.expect(repeated.modifiers.saved_directories_suppressed);
-    try std.testing.expectEqualStrings("-c", repeated.remaining[0]);
-}
-
-test "argsAfterGlobalLaunchArgs skips provider routing flags" {
-    const remaining = argsAfterGlobalLaunchArgs(&.{
-        @constCast("--provider-order"),
-        @constCast("azure,anthropic"),
-        @constCast("--provider-strict"),
-        @constCast("ask"),
-    });
-    try std.testing.expectEqual(@as(usize, 1), remaining.len);
-    try std.testing.expectEqualStrings("ask", remaining[0]);
-
-    const equals_form = argsAfterGlobalLaunchArgs(&.{
-        @constCast("--provider-order=azure"),
-        @constCast("--no-provider-strict"),
-        @constCast("ask"),
-    });
-    try std.testing.expectEqual(@as(usize, 1), equals_form.len);
-    try std.testing.expectEqualStrings("ask", equals_form[0]);
-}
-
-test "additional directory flags fail closed when malformed" {
-    try std.testing.expectError(
-        error.InvalidFlag,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--add-dir")}),
-    );
-    try std.testing.expectError(
-        error.MissingAddDirectoryValue,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--add-dir=")}),
-    );
-}
-
-test "parse acp args extracts known flags and rejects invalid arguments" {
-    const alloc = std.testing.allocator;
-    var bad: ?BadAgentValue = null;
-    var opts = try parseAcpArgs(alloc, &.{ "--model", "openai/gpt-4o", "--log-file", "/tmp/spark.log" }, &bad);
-    defer opts.deinit(alloc);
-    try std.testing.expectEqualStrings("openai/gpt-4o", opts.agent.model.?);
-    try std.testing.expectEqualStrings("/tmp/spark.log", opts.log_file.?);
-
-    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(alloc, &.{"--unknown"}, &bad));
-    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(alloc, &.{"--model"}, &bad));
-    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(alloc, &.{"--log-file"}, &bad));
-    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(alloc, &.{ "--model", "first", "stray" }, &bad));
-}
-
-test "ACP command routes parsed options and launch config through the injected runner" {
-    const Capture = struct {
-        expected: Config,
-        calls: usize = 0,
-        config_matches: bool = false,
-        launch_matches: bool = false,
-
-        fn run(raw: ?*anyopaque, _: Allocator, cfg: acp_runner.Config) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.calls += 1;
-            const expected = self.expected;
-            self.config_matches =
-                std.mem.eql(u8, cfg.default_model, expected.default_model) and
-                cfg.default_agent_step_limit == expected.default_agent_step_limit and
-                cfg.gateway_retry_count == expected.gateway_retry_count and
-                std.mem.eql(
-                    u8,
-                    cfg.gateway_chat_url,
-                    expected.gateway_provider.chat_url.resolve(expected.gateway_chat_url),
-                ) and
-                std.mem.eql(u8, cfg.gateway_models_path, expected.models_path) and
-                cfg.gateway_provider.chat_url.resolve_fn == expected.gateway_provider.chat_url.resolve_fn and
-                std.mem.eql(u8, cfg.prompt_policy.system_prompt, expected.prompt_policy.system_prompt) and
-                cfg.ignored_list_entries.len == expected.ignored_list_entries.len and
-                cfg.max_list_entries == expected.max_list_entries and
-                cfg.max_read_file_bytes == expected.max_read_file_bytes and
-                cfg.max_read_file_lines == expected.max_read_file_lines and
-                cfg.max_read_file_line_len == expected.max_read_file_line_len and
-                cfg.max_command_output_bytes == expected.max_command_output_bytes and
-                cfg.max_tool_result_bytes == expected.max_tool_result_bytes and
-                cfg.max_history_turns == expected.max_history_turns and
-                std.mem.eql(
-                    u8,
-                    cfg.context_registry.defaultProvider().id,
-                    expected.context_registry.defaultProvider().id,
-                ) and
-                std.mem.eql(u8, cfg.mode_registry.default_mode_id, expected.mode_registry.default_mode_id) and
-                cfg.provider_set.gateway.permission_reviewer.?.review_fn == expected.provider_set.gateway.permission_reviewer.?.review_fn;
-
-            const limit_matches = cfg.context_limit_overrides.len == 1 and
-                cfg.context_limit_overrides[0].name == .project_instructions_total_bytes and
-                switch (cfg.context_limit_overrides[0].value) {
-                    .bytes => |bytes| bytes == 1234,
-                    .off => false,
-                };
-            self.launch_matches =
-                limit_matches and
-                cfg.additional_directories.len == 1 and
-                std.mem.eql(u8, cfg.additional_directories[0], "/tmp/acp-extra") and
-                cfg.saved_directories_suppressed and
-                std.mem.eql(u8, cfg.model_override.?, "model-override") and
-                std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log");
-        }
-    };
-
-    var cfg = testConfig();
-    cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
-    var capture = Capture{ .expected = cfg };
-    cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{
-            @constCast("--context-limit"),
-            @constCast("project_instructions_total_bytes=1234"),
-            @constCast("--add-dir"),
-            @constCast("/tmp/acp-extra"),
-            @constCast("--no-additional-dirs"),
-            @constCast("acp"),
-            @constCast("--model"),
-            @constCast("model-override"),
-            @constCast("--log-file"),
-            @constCast("/tmp/acp.log"),
-        },
-        cfg,
-        .{},
-    );
-
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqual(@as(usize, 1), capture.calls);
-    try std.testing.expect(capture.config_matches);
-    try std.testing.expect(capture.launch_matches);
-}
-
-test "ACP runner errors preserve their identity" {
-    const Fixture = struct {
-        fn run(_: ?*anyopaque, _: Allocator, _: acp_runner.Config) anyerror!void {
-            return error.TestAcpRunnerFailed;
-        }
-    };
-
-    var cfg = testConfig();
-    cfg.acp_runner = .{ .run_fn = Fixture.run };
-    try std.testing.expectError(
-        error.TestAcpRunnerFailed,
-        runIfRequested(std.testing.allocator, &.{@constCast("acp")}, cfg),
-    );
-}
-
-test "parse local surface args accepts only json" {
-    const empty = try parseLocalSurfaceArgs(&.{});
-    try std.testing.expectEqual(output_contracts.OutputFormat.text, empty.format);
-
-    const opts = try parseLocalSurfaceArgs(&.{@constCast("--json")});
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, opts.format);
-
-    try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseLocalSurfaceArgs(&.{@constCast("--wat")}));
-}
-
-test "parse upgrade args accepts a remembered release channel" {
-    var rejected: ?[]const u8 = null;
-    const defaults = try parseUpgradeArgs(&.{}, &rejected);
-    try std.testing.expectEqual(output_contracts.OutputFormat.text, defaults.format);
-    try std.testing.expect(defaults.channel == null);
-
-    const selected = try parseUpgradeArgs(&.{
-        @constCast("--channel"),
-        @constCast("dev"),
-        @constCast("--json"),
-    }, &rejected);
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, selected.format);
-    try std.testing.expectEqual(update_target.Channel.dev, selected.channel.?);
-
-    const stable = try parseUpgradeArgs(&.{@constCast("--channel=stable")}, &rejected);
-    try std.testing.expectEqual(update_target.Channel.stable, stable.channel.?);
-    try std.testing.expect(rejected == null);
-
-    try std.testing.expectError(
-        error.InvalidUpgradeArgs,
-        parseUpgradeArgs(&.{ @constCast("--channel"), @constCast("nightly") }, &rejected),
-    );
-    try std.testing.expectEqualStrings("nightly", rejected.?);
-
-    rejected = null;
-    const last = try parseUpgradeArgs(&.{ "--channel=dev", "--channel", "stable" }, &rejected);
-    try std.testing.expectEqual(update_target.Channel.stable, last.channel.?);
-}
-
-test "upgrade channel saved line says whether the file changed" {
-    const alloc = std.testing.allocator;
-    const set = try channelSavedLine(alloc, .dev, .{ .committed = .{ .scope = .user } });
-    defer alloc.free(set);
-    try std.testing.expectEqualStrings("Release channel set to dev in ~/.spark/settings.json.\n", set);
-
-    const same = try channelSavedLine(alloc, .stable, .unchanged);
-    defer alloc.free(same);
-    try std.testing.expectEqualStrings("Release channel is already stable.\n", same);
-}
-
-test "runIfRequested names an upgrade channel that does not exist" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("upgrade"), @constCast("--channel=nightly") },
-        testConfig(),
-        capture.deps(),
-    );
-    try std.testing.expectEqual(usage_failure, result);
-    try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        capture.stderr.written(),
-        "spark upgrade: invalid value for --channel: nightly\nusage: spark upgrade",
-    ));
-}
-
-test "runIfRequested reports bad upgrade arguments as json with --json" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("upgrade"), @constCast("--json"), @constCast("--channel=nightly") },
-        testConfig(),
-        capture.deps(),
-    );
-    try std.testing.expectEqual(usage_failure, result);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"upgrade\",\"error\":\"invalid arguments\",\"code\":\"InvalidUpgradeArgs\"}\n",
-        capture.stdout.written(),
-    );
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-}
-
-test "parse session list args supports bounded canonical pagination" {
-    const empty = try parseSessionListArgs(&.{});
-    try std.testing.expectEqual(output_contracts.OutputFormat.text, empty.format);
-    try std.testing.expectEqual(session_store.session_list_default_limit, empty.limit);
-    try std.testing.expect(empty.continuation == null);
-
-    const paged = try parseSessionListArgs(&.{
-        @constCast("--json"),
-        @constCast("--all"),
-        @constCast("--limit"),
-        @constCast("2"),
-        @constCast("--cursor"),
-        @constCast("v1:20:session-a"),
-    });
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, paged.format);
-    try std.testing.expectEqual(session_store.SessionListScope.all_workspaces, paged.scope);
-    try std.testing.expectEqual(@as(usize, 2), paged.limit);
-    try std.testing.expectEqual(@as(i64, 20), paged.continuation.?.updated_at_ms);
-    try std.testing.expectEqualStrings("session-a", paged.continuation.?.id);
-
-    const repeated = try parseSessionListArgs(&.{ "--all", "--all", "--limit=5", "--limit", "3" });
-    try std.testing.expectEqual(session_store.SessionListScope.all_workspaces, repeated.scope);
-    try std.testing.expectEqual(@as(usize, 3), repeated.limit);
-    try std.testing.expectError(
-        error.InvalidLocalSurfaceArgs,
-        parseSessionListArgs(&.{ @constCast("--limit"), @constCast("0") }),
-    );
-    try std.testing.expectError(
-        error.InvalidLocalSurfaceArgs,
-        parseSessionListArgs(&.{ @constCast("--limit"), @constCast("101") }),
-    );
-    try std.testing.expectError(
-        error.InvalidLocalSurfaceArgs,
-        parseSessionListArgs(&.{@constCast("--cursor")}),
-    );
-    try std.testing.expectError(
-        error.InvalidLocalSurfaceArgs,
-        parseSessionListArgs(&.{ @constCast("--cursor"), @constCast("v1:020:session-a") }),
-    );
-    try std.testing.expectError(
-        error.InvalidLocalSurfaceArgs,
-        parseSessionListArgs(&.{ @constCast("--cursor"), @constCast("v2:20:session-a") }),
-    );
-    try std.testing.expectError(
-        error.InvalidLocalSurfaceArgs,
-        parseSessionListArgs(&.{ @constCast("--cursor"), @constCast("v1:20:../unsafe") }),
-    );
-}
-
-test "parse session detail args owns string ids and frees through deinit" {
-    var latest = try parseSessionDetailArgs(std.testing.allocator, &.{ @constCast("last"), @constCast("--json") });
-    defer latest.deinit(std.testing.allocator);
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, latest.format);
-    try std.testing.expectEqual(SessionDetailTarget.last, latest.target.?);
-
-    var specific = try parseSessionDetailArgs(std.testing.allocator, &.{@constCast(" sess-1 ")});
-    defer specific.deinit(std.testing.allocator);
-    switch (specific.target.?) {
-        .id => |value| try std.testing.expectEqualStrings("sess-1", value),
-        else => return error.TestExpectedEqual,
-    }
-
-    try std.testing.expectError(error.InvalidSessionDetailArgs, parseSessionDetailArgs(std.testing.allocator, &.{ @constCast("a"), @constCast("b") }));
-    try std.testing.expectError(error.InvalidSessionDetailArgs, parseSessionDetailArgs(std.testing.allocator, &.{@constCast("")}));
-}
-
-test "session target flags keep the last --id and reject two targets" {
-    var repeated = try parseSessionDetailArgs(std.testing.allocator, &.{ "--id=a", "--id", "last", "--json" });
-    defer repeated.deinit(std.testing.allocator);
-    switch (repeated.target.?) {
-        .id => |value| try std.testing.expectEqualStrings("last", value),
-        else => return error.TestExpectedEqual,
-    }
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, repeated.format);
-
-    try std.testing.expectError(error.InvalidSessionDetailArgs, parseSessionDetailArgs(std.testing.allocator, &.{ "last", "--id", "a" }));
-}
-
-test "session targets accept a generated id that starts with a dash" {
-    const alloc = std.testing.allocator;
-    const id = "-_u88j00skyI";
-
-    var detail = try parseSessionDetailArgs(alloc, &.{ "--json", id });
-    defer detail.deinit(alloc);
-    try std.testing.expectEqualStrings(id, detail.target.?.id);
-
-    var recovery = try parseSessionRecoveryArgs(alloc, &.{ id, "--json" });
-    defer recovery.deinit(alloc);
-    try std.testing.expectEqualStrings(id, recovery.session_id);
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, recovery.format);
-
-    try std.testing.expectError(error.InvalidSessionRecoveryArgs, parseSessionRecoveryArgs(alloc, &.{ id, "--jsno" }));
-    try std.testing.expectError(error.InvalidSessionDetailArgs, parseSessionDetailArgs(alloc, &.{ id, "-other" }));
-}
-
-test "parse session detail args accepts explicit id flag" {
-    var specific = try parseSessionDetailArgs(std.testing.allocator, &.{
-        @constCast("--id"),
-        @constCast("release.2026.06"),
-        @constCast("--json"),
-    });
-    defer specific.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, specific.format);
-    switch (specific.target.?) {
-        .last => return error.TestExpectedExactResumeId,
-        .id => |id| try std.testing.expectEqualStrings("release.2026.06", id),
-    }
-}
-
-test "parse session detail args treats last after id flag as exact id" {
-    var specific = try parseSessionDetailArgs(std.testing.allocator, &.{
-        @constCast("--id"),
-        @constCast("last"),
-    });
-    defer specific.deinit(std.testing.allocator);
-
-    switch (specific.target.?) {
-        .last => return error.TestExpectedExactResumeId,
-        .id => |id| try std.testing.expectEqualStrings("last", id),
-    }
-}
-
-test "parse session recovery args accepts exact ids and rejects ambiguity" {
-    var positional = try parseSessionRecoveryArgs(
-        std.testing.allocator,
-        &.{
-            @constCast("session.v3"),
-            @constCast("--json"),
-        },
-    );
-    defer positional.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("session.v3", positional.session_id);
-    try std.testing.expectEqual(
-        output_contracts.OutputFormat.json,
-        positional.format,
-    );
-
-    var exact = try parseSessionRecoveryArgs(
-        std.testing.allocator,
-        &.{
-            @constCast("--id"),
-            @constCast("last"),
-        },
-    );
-    defer exact.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("last", exact.session_id);
-
-    try std.testing.expectError(
-        error.InvalidSessionRecoveryArgs,
-        parseSessionRecoveryArgs(
-            std.testing.allocator,
-            &.{@constCast("--id")},
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidSessionRecoveryArgs,
-        parseSessionRecoveryArgs(
-            std.testing.allocator,
-            &.{
-                @constCast("first"),
-                @constCast("second"),
-            },
-        ),
-    );
-}
-
-test "parse resume args defaults to last owns ids and rejects invalid input" {
-    const implicit = try parseResumeArgs(std.testing.allocator, &.{}, false);
-    try std.testing.expectEqual(ResumeTarget.last, implicit);
-
-    const explicit = try parseResumeArgs(std.testing.allocator, &.{@constCast("last")}, false);
-    try std.testing.expectEqual(ResumeTarget.last, explicit);
-
-    var target = try parseResumeArgs(std.testing.allocator, &.{@constCast(" session-123 ")}, false);
-    defer target.deinit(std.testing.allocator);
-    switch (target) {
-        .id => |value| try std.testing.expectEqualStrings("session-123", value),
-        else => return error.TestExpectedEqual,
-    }
-
-    try std.testing.expectError(error.InvalidResumeArgs, parseResumeArgs(std.testing.allocator, &.{ @constCast("a"), @constCast("b") }, false));
-    try std.testing.expectError(error.InvalidResumeArgs, parseResumeArgs(std.testing.allocator, &.{@constCast("   ")}, false));
-}
-
-test "removed resume spellings fail with a hint" {
-    const cases = [_]struct { args: []const [:0]const u8, top_level_alias: bool, err: anyerror }{
-        .{ .args = &.{ "--id", "release.2026.06" }, .top_level_alias = false, .err = error.RemovedResumeIdFlag },
-        .{ .args = &.{ "--resume", "--last" }, .top_level_alias = false, .err = error.RemovedResumeLastFlag },
-        .{ .args = &.{"--resume-last"}, .top_level_alias = true, .err = error.RemovedResumeLast },
-        .{ .args = &.{"--resume-session.123"}, .top_level_alias = true, .err = error.RemovedResumeIdAlias },
-    };
-    for (cases) |case| {
-        try std.testing.expectError(case.err, parseResumeArgs(std.testing.allocator, case.args, case.top_level_alias));
-        try std.testing.expect(removedResumeHint(case.err) != null);
-    }
-}
-
-test "parse resume args accepts an operand on the top-level resume flag" {
-    var target = try parseResumeArgs(std.testing.allocator, &.{
-        @constCast("--resume"),
-        @constCast("session-123"),
-    }, true);
-    defer target.deinit(std.testing.allocator);
-
-    switch (target) {
-        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
-        .id => |id| try std.testing.expectEqualStrings("session-123", id),
-    }
-
-    const latest = try parseResumeArgs(std.testing.allocator, &.{
-        @constCast("--resume"),
-        @constCast("last"),
-    }, true);
-    try std.testing.expectEqual(ResumeTarget.last, latest);
-}
-
-test "parseInteractiveLaunch accepts legacy and revision-bearing upgrade relaunches" {
-    const alloc = std.testing.allocator;
-    const command_catalog = testCommandCatalog();
-    const revision = "abcdef0123456789abcdef0123456789abcdef01";
-
-    const cases = [_]struct {
-        args: []const [:0]const u8,
-        expected_revision: ?[]const u8,
-    }{
-        .{
-            .args = &.{ @constCast("resume"), @constCast("session-123"), @constCast("--upgrade-relaunch") },
-            .expected_revision = null,
-        },
-        .{
-            .args = &.{ @constCast("resume"), @constCast("session-123"), @constCast("--upgrade-relaunch"), @constCast(revision) },
-            .expected_revision = revision,
-        },
-    };
-
-    for (cases) |case| {
-        const parsed = try parseInteractiveLaunch(alloc, case.args, command_catalog);
-        switch (parsed) {
-            .interactive => |value| {
-                var launch = value;
-                defer launch.deinit(alloc);
-                const relaunch = launch.upgrade_relaunch orelse return error.TestExpectedUpgradeRelaunch;
-                if (case.expected_revision) |expected| {
-                    try std.testing.expectEqualStrings(expected, relaunch.previous_revision.?);
-                } else try std.testing.expect(relaunch.previous_revision == null);
-            },
-            .noninteractive => |value| {
-                var noninteractive = value;
-                defer noninteractive.deinit(alloc);
-                return error.TestExpectedInteractiveLaunch;
-            },
-        }
-    }
-
-    try std.testing.expectError(
-        error.InvalidResumeArgs,
-        parseInteractiveLaunch(alloc, &.{
-            @constCast("resume"),
-            @constCast("session-123"),
-            @constCast("--upgrade-relaunch"),
-            @constCast("not-a-revision"),
-        }, command_catalog),
-    );
-}
-
-test "parseInteractiveLaunch shares native resume grammar" {
-    const alloc = std.testing.allocator;
-    const command_catalog = testCommandCatalog();
-    const cases = [_]struct {
-        args: []const [:0]const u8,
-        expected_id: ?[]const u8,
-    }{
-        .{ .args = &.{ @constCast("--resume"), @constCast("last") }, .expected_id = null },
-        .{ .args = &.{ @constCast("--resume"), @constCast("session-123") }, .expected_id = "session-123" },
-        .{ .args = &.{@constCast("--resume=session-123")}, .expected_id = "session-123" },
-        .{ .args = &.{ @constCast("-r"), @constCast("last") }, .expected_id = null },
-        .{ .args = &.{ @constCast("-r"), @constCast("session-123") }, .expected_id = "session-123" },
-        .{ .args = &.{ @constCast("session"), @constCast("resume"), @constCast("last") }, .expected_id = null },
-        .{ .args = &.{ @constCast("session"), @constCast("resume"), @constCast("session.v3") }, .expected_id = "session.v3" },
-    };
-    for (cases) |case| {
-        const parsed = try parseInteractiveLaunch(alloc, case.args, command_catalog);
-        switch (parsed) {
-            .interactive => |value| {
-                var launch = value;
-                defer launch.deinit(alloc);
-                const target = launch.requested_resume orelse return error.TestExpectedResumeTarget;
-                if (case.expected_id) |expected_id| switch (target) {
-                    .id => |id| try std.testing.expectEqualStrings(expected_id, id),
-                    .remembered, .pick, .last => return error.TestExpectedExactResumeId,
-                } else try std.testing.expectEqual(ResumeTarget.last, target);
-            },
-            .noninteractive => |value| {
-                var noninteractive = value;
-                defer noninteractive.deinit(alloc);
-                return error.TestExpectedInteractiveLaunch;
-            },
-        }
-    }
-
-    try std.testing.expectError(
-        error.InvalidResumeArgs,
-        parseInteractiveLaunch(
-            alloc,
-            &.{ @constCast("--resume"), @constCast("one"), @constCast("a prompt"), @constCast("three") },
-            command_catalog,
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidFlag,
-        parseInteractiveLaunch(alloc, &.{@constCast("--add-dir")}, command_catalog),
-    );
-}
-
-test "workflow drafts come only from the completed final response" {
-    const alloc = std.testing.allocator;
-    const final = "Add greeting constant\n\n## Summary\n\n- Export `greeting` from **greeting.ts**.";
-
-    const draft = try draftFromRun(alloc, .{
-        .exit_code = 0,
-        .assistant_output = @constCast("Let me look at the branch first.\n\n" ++ final),
-        .final_source = @constCast(final),
-    });
-    defer draft.deinit(alloc);
-    try std.testing.expectEqualStrings("Add greeting constant", draft.title);
-    try std.testing.expectEqualStrings("## Summary\n\n- Export `greeting` from **greeting.ts**.", draft.body);
-
-    for ([_][]const u8{ "", "Done." }) |final_source| {
-        try std.testing.expectError(error.InvalidGithubDraft, draftFromRun(alloc, .{
-            .exit_code = 0,
-            .assistant_output = @constCast("Let me look at the branch first."),
-            .final_source = @constCast(final_source),
-        }));
-    }
-}
-
-test "parse workflow args consumes leading flags and joins remaining context exactly" {
-    var bad: ?BadAgentValue = null;
-    var opts = try parseWorkflowArgs(std.testing.allocator, &.{ "--auto", "--create", "ready", "for", "review" }, &bad);
-    defer opts.deinit(std.testing.allocator);
-    try std.testing.expectEqual(types.PermissionMode.auto, opts.agent.permission.?);
-    try std.testing.expect(opts.create);
-    try std.testing.expectEqualStrings("ready for review", opts.context);
-
-    var later_flag = try parseWorkflowArgs(std.testing.allocator, &.{ "context", "--auto" }, &bad);
-    defer later_flag.deinit(std.testing.allocator);
-    try std.testing.expect(later_flag.agent.permission == null);
-    try std.testing.expect(!later_flag.create);
-    try std.testing.expectEqualStrings("context --auto", later_flag.context);
-
-    var empty = try parseWorkflowArgs(std.testing.allocator, &.{}, &bad);
-    defer empty.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("", empty.context);
-}
-
-test "pr and issue reject a flag they don't take instead of sending it as context" {
-    var bad: ?BadAgentValue = null;
-    try std.testing.expectError(error.InvalidWorkflowArgs, parseWorkflowArgs(std.testing.allocator, &.{ "--modle", "x" }, &bad));
-    try std.testing.expectError(error.InvalidWorkflowArgs, parseWorkflowArgs(std.testing.allocator, &.{ "--auto", "--add-dir", "/tmp" }, &bad));
-    try std.testing.expectError(error.InvalidWorkflowArgs, parseWorkflowArgs(std.testing.allocator, &.{ "--config", "fast_mode=true" }, &bad));
-
-    var dashed = try parseWorkflowArgs(std.testing.allocator, &.{ "--create", "--", "--verbose", "is", "gone" }, &bad);
-    defer dashed.deinit(std.testing.allocator);
-    try std.testing.expect(dashed.create);
-    try std.testing.expectEqualStrings("--verbose is gone", dashed.context);
-}
-
-test "runIfRequested help writes top-level help" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("help")}, testConfig(), capture.deps());
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "-=✦ v0.0.0\nFast, native coding agent for the terminal."));
-    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-}
-
-// `builtins/mcp.zig` "spark mcp approve saves the approval of a project server"
-// checks what approving saves.
-test "top-level MCP approve runs without interactive startup" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var environ = std.process.Environ.Map.init(alloc);
-    defer environ.deinit();
-    try environ.put("HOME", home);
-    try environ.put("PATH", "");
-    io_mod.setEnvironMap(&environ);
-    defer io_mod.resetEnvironForTest();
-
-    var capture = CaptureOutput.init(alloc);
-    defer capture.deinit();
-    var deps = capture.deps();
-    deps.load_startup_state_without_credentials = failingStartupStateWithoutCredentials;
-
-    const result = try runIfRequestedWithDeps(
-        alloc,
-        &.{ @constCast("mcp"), @constCast("approve"), @constCast("fixture") },
-        testConfig(),
-        deps,
-    );
-    // The test config loads no host, so there is no project server to approve.
-    try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expectEqualStrings("No project server named fixture in .mcp.json.\n", capture.stderr.written());
-}
-
-test "top-level MCP and usage treat a relative HOME as unset" {
-    const alloc = std.testing.allocator;
-    var environ = std.process.Environ.Map.init(alloc);
-    defer environ.deinit();
-    try environ.put("HOME", "relative/home");
-    try environ.put("PATH", "");
-    io_mod.setEnvironMap(&environ);
-    defer io_mod.resetEnvironForTest();
-
-    const commands = [_][]const [:0]u8{
-        &.{ @constCast("mcp"), @constCast("add"), @constCast("probe"), @constCast("/bin/echo") },
-        &.{@constCast("usage")},
-    };
-    for (commands) |argv| {
-        var capture = CaptureOutput.init(alloc);
-        defer capture.deinit();
-        const result = try runIfRequestedWithDeps(alloc, argv, testConfig(), capture.deps());
-        try std.testing.expectEqual(RunResult.handled_failure, result);
-        try std.testing.expectEqualStrings("", capture.stdout.written());
-        try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "HOME") != null);
-    }
-}
-
-test "workspace launch modifiers preserve supported command help" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    const deps = capture.deps();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("--add-dir"), @constCast("/tmp/shared"), @constCast("ask"), @constCast("--help") },
-        testConfig(),
-        deps,
-    );
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "spark ask\n\n"));
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-}
-
-test "workspace launch modifiers still reject unsupported local command help" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    const deps = capture.deps();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("--add-dir"), @constCast("/tmp/shared"), @constCast("status"), @constCast("--help") },
-        testConfig(),
-        deps,
-    );
-    try std.testing.expectEqual(usage_failure, result);
-    try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "only supported for interactive, resume, ask, ACP, PR, and issue launches") != null);
-}
-
-test "global workspace launch option errors use user-facing copy" {
-    const cases = [_]struct {
-        args: []const [:0]const u8,
-        expected: []const u8,
-    }{
-        .{
-            .args = &.{@constCast("--add-dir")},
-            .expected = "spark: --add-dir needs a value\n",
-        },
-        .{
-            .args = &.{@constCast("--add-dir=")},
-            .expected = "spark: --add-dir requires a directory path\n",
-        },
-        .{
-            .args = &.{@constCast("--fast=on")},
-            .expected = "spark: --fast doesn't take a value\n",
-        },
-    };
-
-    for (cases) |case| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-        const deps = capture.deps();
-
-        const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), deps);
-        try std.testing.expectEqual(usage_failure, result);
-        try std.testing.expectEqualStrings("", capture.stdout.written());
-        try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), case.expected));
-        try std.testing.expect(std.mem.endsWith(u8, capture.stderr.written(), "<command>\n"));
-    }
-}
-
-test "runIfRequested version flags write configured version" {
-    const cases = [_][]const [:0]const u8{
-        &.{@constCast("--version")},
-        &.{@constCast("-v")},
-    };
-
-    for (cases) |args| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-
-        const result = try runIfRequestedWithDeps(std.testing.allocator, args, testConfig(), capture.deps());
-        try std.testing.expectEqual(RunResult.handled_success, result);
-        try std.testing.expectEqualStrings("0.0.0\n", capture.stdout.written());
-        try std.testing.expectEqualStrings("", capture.stderr.written());
-    }
-}
-
-test "runIfRequested version flags reject extra args" {
-    const cases = [_][]const [:0]const u8{
-        &.{ @constCast("--version"), @constCast("extra") },
-        &.{ @constCast("-v"), @constCast("extra") },
-    };
-
-    for (cases) |args| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-
-        const result = try runIfRequestedWithDeps(std.testing.allocator, args, testConfig(), capture.deps());
-        try std.testing.expectEqual(usage_failure, result);
-        try std.testing.expectEqualStrings("", capture.stdout.written());
-        try std.testing.expectEqualStrings("usage: spark --version\n", capture.stderr.written());
-    }
-}
-
-test "setup is a paste-only stored-key adapter" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    var cfg = testConfig();
-    cfg.secret_store = capture.secretStore();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("setup")},
-        cfg,
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqual(@as(usize, 1), capture.setup_store_calls);
-    try std.testing.expectEqual(@as(usize, 1), capture.setup_read_calls);
-    try std.testing.expect(capture.setup_value_matched);
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "Paste AI Gateway API key") != null);
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "Vercel CLI") == null);
-    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), cfg.secret_store.backend_label) != null);
-}
-
-test "setup delegates secure input to an interactive host store" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    capture.setup_interactive_store = true;
-    var cfg = testConfig();
-    cfg.secret_store = capture.secretStore();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("setup")},
-        cfg,
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqual(@as(usize, 1), capture.setup_store_calls);
-    try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
-    try std.testing.expect(!capture.setup_value_matched);
-}
-
-test "setup preserves the disabled secret-store failure" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    capture.setup_store_disabled = true;
-    var cfg = testConfig();
-    cfg.secret_store = capture.secretStore();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("setup")},
-        cfg,
-        capture.deps(),
-    );
-
-    try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
-    try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
-    try std.testing.expectEqualStrings(
-        "spark setup is deprecated and stops working in spark 0.0.18; use spark login vercel --api-key\n" ++
-            "spark setup: stored API keys are disabled by SPARK_DISABLE_KEYCHAIN\n",
-        capture.stderr.written(),
-    );
-}
-
-test "login --api-key stores a pasted key like setup, without the deprecation warning" {
-    for ([_][]const [:0]const u8{
-        &.{"--api-key"},
-        &.{ "vercel", "--api-key" },
-        &.{ "--api-key", "vercel" },
-    }) |rest| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-        var cfg = testConfig();
-        cfg.secret_store = capture.secretStore();
-        var argv: [3][:0]const u8 = undefined;
-        argv[0] = "login";
-        @memcpy(argv[1 .. rest.len + 1], rest);
-
-        const result = try runIfRequestedWithDeps(std.testing.allocator, argv[0 .. rest.len + 1], cfg, capture.deps());
-        try std.testing.expectEqual(RunResult.handled_success, result);
-        try std.testing.expectEqual(@as(usize, 1), capture.setup_store_calls);
-        try std.testing.expect(capture.setup_value_matched);
-        try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "deprecated") == null);
-        try std.testing.expect(std.mem.find(u8, capture.stdout.written(), cfg.secret_store.backend_label) != null);
-    }
-
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    capture.setup_store_disabled = true;
-    var cfg = testConfig();
-    cfg.secret_store = capture.secretStore();
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ "login", "--api-key" }, cfg, capture.deps());
-    try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqualStrings("spark login: stored API keys are disabled by SPARK_DISABLE_KEYCHAIN\n", capture.stderr.written());
-}
-
-test "login arguments take one provider and --api-key only for vercel" {
-    try std.testing.expectEqual(LoginArgs{}, try parseLoginArgs(&.{}));
-    try std.testing.expectEqual(LoginArgs{ .provider = .codex }, try parseLoginArgs(&.{"codex"}));
-    try std.testing.expectEqual(LoginArgs{ .provider = .gateway, .api_key = true }, try parseLoginArgs(&.{ "--api-key", "vercel" }));
-    try std.testing.expectError(error.ApiKeyNeedsVercel, parseLoginArgs(&.{ "codex", "--api-key" }));
-    try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginArgs(&.{ "vercel", "codex" }));
-    try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginArgs(&.{"--bogus"}));
-}
-
-test "workspace indeterminate errors report the reconciled durable state" {
-    const cases = [_]struct {
-        reconciliation: workspace_commands.Reconciliation,
-        expected: []const u8,
-    }{
-        .{
-            .reconciliation = .{ .intended = .{} },
-            .expected = "reloaded settings match the requested update",
-        },
-        .{
-            .reconciliation = .{ .previous = .{} },
-            .expected = "reloaded settings match the previous state",
-        },
-        .{
-            .reconciliation = .unconfirmed,
-            .expected = "reloaded settings match neither the requested nor previous state",
-        },
-    };
-
-    for (cases) |case| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-        try writeWorkspaceIndeterminateError(
-            std.testing.allocator,
-            capture.deps(),
-            &.{@constCast("--json")},
-            case.reconciliation,
-        );
-        try std.testing.expect(std.mem.find(u8, capture.stdout.written(), case.expected) != null);
-        try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "\"code\":\"SettingsCommitIndeterminate\"") != null);
-        try std.testing.expectEqualStrings("", capture.stderr.written());
-    }
-}
-
-test "workspace json errors keep stable codes with shared user-facing copy" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    try writeWorkspaceCommandError(
-        std.testing.allocator,
-        testCommandCatalog(),
-        capture.deps(),
-        &.{@constCast("--json")},
-        error.PrimaryDirectory,
-    );
-    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "\"error\":\"the primary workspace cannot be added or removed\"") != null);
-    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "\"code\":\"PrimaryDirectory\"") != null);
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-}
-
-test "workspace unknown directory errors keep stable json codes" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    try writeWorkspaceCommandError(
-        std.testing.allocator,
-        testCommandCatalog(),
-        capture.deps(),
-        &.{@constCast("--json")},
-        error.UnknownAdditionalDirectory,
-    );
-    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "\"error\":\"directory is not configured as an additional workspace\"") != null);
-    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "\"code\":\"UnknownAdditionalDirectory\"") != null);
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-}
-
-test "runIfRequested rejects removed record flag as unknown input" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("--record")},
-        testConfig(),
-        capture.deps(),
-    );
-    try std.testing.expectEqual(usage_failure, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "spark: unknown flag --record\nusage: spark "));
-}
-
-test "global ultrafast launch modifier is ACP-only" {
-    var acp = try parseGlobalLaunchArgs(
-        std.testing.allocator,
-        &.{ @constCast("--ultrafast"), @constCast("acp") },
-    );
-    defer acp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(?bool, true), acp.modifiers.ultrafast_override);
-    try std.testing.expect(acp.modifiers.hasOnlyUltrafastOverride());
-    try std.testing.expectEqualStrings("acp", acp.remaining[0]);
-}
-
-test "runNoConfigIfRequested handles help without config" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    try std.testing.expect(try runNoConfigIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("help")},
-        "0.0.0",
-        testCommandCatalog(),
-        capture.deps(),
-    ));
-    try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "-=✦ v0.0.0\nFast, native coding agent for the terminal."));
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-
-    try std.testing.expect(!try runNoConfigIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("status")},
-        "0.0.0",
-        testCommandCatalog(),
-        capture.deps(),
-    ));
-}
-
-test "CLI surface uses the supplied command catalog for parsing usage and help" {
-    const specs = [_]command_specs.TopLevelSpec{
-        .{
-            .kind = .help,
-            .token = "guide",
-            .aliases = &.{"-?"},
-            .usage = "guide",
-            .summary = "Show injected help",
-        },
-        .{
-            .kind = .setup,
-            .token = "start",
-            .usage = "start",
-            .summary = "Run injected setup",
-        },
-    };
-    const help_groups = [_]command_specs.TopLevelHelpGroup{
-        .{ .entries = &.{
-            .{ .kind = .setup, .usage = "start" },
-            .{ .kind = .help, .usage = "guide" },
-        } },
-    };
-    const command_catalog = CommandCatalog{
-        .specs = &specs,
-        .description = "Injected command catalog.",
-        .interactive_hint = "Injected interactive hint.",
-        .help_groups = &help_groups,
-    };
-
-    try std.testing.expectEqual(Command.help, parse(command_catalog, &.{@constCast("-?")}));
-    switch (parse(command_catalog, &.{@constCast("start")})) {
-        .setup => {},
-        else => return error.TestExpectedEqual,
-    }
-
-    var help_capture = CaptureOutput.init(std.testing.allocator);
-    defer help_capture.deinit();
-    try std.testing.expect(try runNoConfigIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("guide")},
-        "1.2.3",
-        command_catalog,
-        help_capture.deps(),
-    ));
-    try std.testing.expect(std.mem.find(u8, help_capture.stdout.written(), "Injected command catalog.") != null);
-
-    var usage_capture = CaptureOutput.init(std.testing.allocator);
-    defer usage_capture.deinit();
-    var cfg = testConfig();
-    cfg.command_catalog = command_catalog;
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("start"), @constCast("unexpected") },
-        cfg,
-        usage_capture.deps(),
-    );
-    try std.testing.expectEqual(usage_failure, result);
-    try std.testing.expectEqualStrings("usage: spark start\n", usage_capture.stderr.written());
-}
-
-test "workflow config does not carry placeholder gateway tools" {
-    const skill_roots = [_]skill_contract.RootSpec{
-        .{ .source = .workspace_shared, .path = "skills" },
-    };
-    var chat_url_probe = ChatUrlProbe{};
-    var surface_cfg = testConfig();
-    surface_cfg.skill_root_policy.workspace_roots = &skill_roots;
-    surface_cfg.gateway_provider.chat_url = chat_url_probe.provider();
-    const cfg = workflowConfig(surface_cfg);
-    try std.testing.expect(!@hasField(@TypeOf(cfg), "gateway_tools_json"));
-    try std.testing.expect(!@hasField(@TypeOf(cfg), "context_registry"));
-    try std.testing.expectEqualStrings("test-model", cfg.default_model);
-    try std.testing.expectEqualStrings("http://127.0.0.1:43123/chat", cfg.gateway_chat_url);
-    try std.testing.expect(chat_url_probe.called);
-    try std.testing.expectEqualStrings("surface", cfg.mode_registry.default_mode_id);
-    try std.testing.expectEqualStrings("skills", cfg.skill_root_policy.workspace_roots[0].path);
-}
-test "runIfRequested invalid local flags write usage" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--wat") }, testConfig(), capture.deps());
-    try std.testing.expectEqual(usage_failure, result);
-    try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expectEqualStrings("spark status: unknown flag --wat\nusage: spark status [--json]\n", capture.stderr.written());
-}
-
-test "runIfRequested names the bad flag after a session id that starts with a dash" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("session"), @constCast("recover"), @constCast("-_u88j00skyI"), @constCast("--jsno") },
-        testConfig(),
-        capture.deps(),
-    );
-    try std.testing.expectEqual(usage_failure, result);
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "spark session: unknown flag --jsno (did you mean --json?)\n"));
-}
-
-test "runIfRequested invalid json local flags write json error" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json"), @constCast("--wat") }, testConfig(), capture.deps());
-    try std.testing.expectEqual(usage_failure, result);
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "\"kind\":\"status\"") != null);
-    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "\"code\":\"InvalidLocalSurfaceArgs\"") != null);
-}
-
-test "runIfRequested resume no args returns last target" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("session"), @constCast("resume") }, testConfig(), capture.deps());
-    switch (result) {
-        .interactive => |launch| try std.testing.expectEqual(ResumeTarget.last, launch.requested_resume.?),
-        else => return error.TestExpectedEqual,
-    }
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-}
-
-test "runIfRequested -r and a bare --resume ask which session to resume" {
-    const spellings = [_][]const [:0]const u8{
-        &.{@constCast("-r")},
-        &.{@constCast("--resume")},
-    };
-    for (spellings) |args| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-
-        const result = try runIfRequestedWithDeps(
-            std.testing.allocator,
-            args,
-            testConfig(),
-            capture.deps(),
-        );
-        switch (result) {
-            .interactive => |launch| try std.testing.expectEqual(ResumeTarget.pick, launch.requested_resume.?),
-            else => return error.TestExpectedEqual,
-        }
-        try std.testing.expectEqualStrings("", capture.stdout.written());
-        try std.testing.expectEqualStrings("", capture.stderr.written());
-    }
-
-    var extra_capture = CaptureOutput.init(std.testing.allocator);
-    defer extra_capture.deinit();
-    const extra = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("-r"), @constCast("session.123"), @constCast("a prompt"), @constCast("extra") },
-        testConfig(),
-        extra_capture.deps(),
-    );
-    try std.testing.expectEqual(usage_failure, extra);
-}
-
-test "runIfRequested top-level resume aliases return the existing target" {
-    const aliases = [_][]const [:0]const u8{
-        &.{@constCast("--continue")},
-        &.{@constCast("-c")},
-    };
-    for (aliases) |args| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-
-        const result = try runIfRequestedWithDeps(
-            std.testing.allocator,
-            args,
-            testConfig(),
-            capture.deps(),
-        );
-        switch (result) {
-            .interactive => |launch| {
-                try std.testing.expectEqual(ResumeTarget.remembered, launch.requested_resume.?);
-            },
-            else => return error.TestExpectedEqual,
-        }
-        try std.testing.expectEqualStrings("", capture.stdout.written());
-        try std.testing.expectEqualStrings("", capture.stderr.written());
-    }
-
-    var operand_capture = CaptureOutput.init(std.testing.allocator);
-    defer operand_capture.deinit();
-
-    const operand = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("--resume"), @constCast("session.123") },
-        testConfig(),
-        operand_capture.deps(),
-    );
-    switch (operand) {
-        .interactive => |launch_value| {
-            var launch = launch_value;
-            defer launch.deinit(std.testing.allocator);
-            switch (launch.requested_resume.?) {
-                .id => |id| try std.testing.expectEqualStrings("session.123", id),
-                .remembered, .pick, .last => return error.TestExpectedExactResumeId,
-            }
-        },
-        else => return error.TestExpectedEqual,
-    }
-}
-
-test "runIfRequested removed resume spellings exit with the replacement" {
-    const cases = [_]struct { args: []const [:0]const u8, stderr: []const u8 }{
-        .{ .args = &.{"--resume-session.123"}, .stderr = "spark: --resume-<id> was removed; use spark --resume <id>\n" },
-        .{ .args = &.{"--resume-"}, .stderr = "spark: --resume-<id> was removed; use spark --resume <id>\n" },
-        .{ .args = &.{ "--resume-last", "unexpected" }, .stderr = "spark: --resume-last was removed; use spark --resume last\n" },
-        .{ .args = &.{ "resume", "--resume", "--last" }, .stderr = "spark: spark resume was removed; use spark --resume [last|<id>] or spark session resume [last|<id>]\n" },
-        .{ .args = &.{ "resume", "--resume" }, .stderr = "spark: spark resume was removed; use spark --resume [last|<id>] or spark session resume [last|<id>]\n" },
-    };
-    for (cases) |case| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-
-        const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), capture.deps());
-        try std.testing.expectEqual(usage_failure, result);
-        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
-    }
-}
-
-test "runIfRequested rejects malformed resume aliases with canonical usage" {
-    const cases = [_][]const [:0]const u8{
-        &.{ @constCast("--continue"), @constCast("unexpected"), @constCast("extra") },
-        &.{ @constCast("--resume"), @constCast("   ") },
-        &.{ @constCast("session"), @constCast("resume"), @constCast("a"), @constCast("b") },
-    };
-    for (cases) |args| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-
-        const result = try runIfRequestedWithDeps(
-            std.testing.allocator,
-            args,
-            testConfig(),
-            capture.deps(),
-        );
-        try std.testing.expectEqual(usage_failure, result);
-        try std.testing.expectEqualStrings(
-            "usage: spark session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c\n",
-            capture.stderr.written(),
-        );
-    }
-}
-
-test "runIfRequested resume id returns owned id" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("--resume"), @constCast("abc123") }, testConfig(), capture.deps());
-    switch (result) {
-        .interactive => |launch_value| {
-            var launch = launch_value;
-            defer launch.deinit(std.testing.allocator);
-            switch (launch.requested_resume.?) {
-                .id => |value| try std.testing.expectEqualStrings("abc123", value),
-                else => return error.TestExpectedEqual,
-            }
-        },
-        else => return error.TestExpectedEqual,
-    }
-}
-
-test "runIfRequested invalid resume writes usage" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("--resume"), @constCast("a"), @constCast("b"), @constCast("c") }, testConfig(), capture.deps());
-    try std.testing.expectEqual(usage_failure, result);
-    try std.testing.expectEqualStrings(
-        "usage: spark session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c\n",
-        capture.stderr.written(),
-    );
-}
-
-test "runIfRequested takes one argument that isn't a command as the first prompt" {
-    const cases = [_]struct {
-        args: []const [:0]const u8,
-        prompt: []const u8,
-        model: ?[]const u8 = null,
-    }{
-        .{ .args = &.{@constCast("wat")}, .prompt = "wat" },
-        .{ .args = &.{@constCast("fix the login bug")}, .prompt = "fix the login bug" },
-        // Short words stay prompts rather than typos of short commands.
-        .{ .args = &.{@constCast("add")}, .prompt = "add" },
-        .{ .args = &.{ @constCast("--model"), @constCast("a"), @constCast("fix it") }, .prompt = "fix it", .model = "a" },
-        .{ .args = &.{ @constCast("fix it"), @constCast("--model=b") }, .prompt = "fix it", .model = "b" },
-        .{ .args = &.{ @constCast("--model=a"), @constCast("fix it"), @constCast("--model"), @constCast("b") }, .prompt = "fix it", .model = "b" },
-        .{ .args = &.{ @constCast("--"), @constCast("-p is a flag?") }, .prompt = "-p is a flag?" },
-    };
-    for (cases) |case| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-
-        const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), capture.deps());
-        var launch = switch (result) {
-            .interactive => |value| value,
-            else => return error.TestExpectedInteractiveLaunch,
-        };
-        defer launch.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings(case.prompt, launch.initial_prompt.?);
-        try std.testing.expect(launch.requested_resume == null);
-        if (case.model) |model| {
-            try std.testing.expectEqualStrings(model, launch.modifiers.model_override.?);
-        } else {
-            try std.testing.expect(launch.modifiers.model_override == null);
-        }
-        try std.testing.expectEqualStrings("", capture.stderr.written());
-    }
-}
-
-test "runIfRequested takes a first prompt after a resume target" {
-    const cases = [_]struct {
-        args: []const [:0]const u8,
-        target: std.meta.Tag(ResumeTarget),
-        id: ?[]const u8 = null,
-    }{
-        .{ .args = &.{ @constCast("-c"), @constCast("fix it") }, .target = .remembered },
-        .{ .args = &.{ @constCast("--continue"), @constCast("fix it") }, .target = .remembered },
-        .{ .args = &.{ @constCast("-r"), @constCast("last"), @constCast("fix it") }, .target = .last },
-        .{ .args = &.{ @constCast("-r"), @constCast("session.123"), @constCast("fix it") }, .target = .id, .id = "session.123" },
-        .{ .args = &.{ @constCast("--resume"), @constCast("session.123"), @constCast("fix it") }, .target = .id, .id = "session.123" },
-        .{ .args = &.{ @constCast("--resume=last"), @constCast("fix it") }, .target = .last },
-        .{ .args = &.{ @constCast("--model"), @constCast("a"), @constCast("-c"), @constCast("fix it") }, .target = .remembered },
-    };
-    for (cases) |case| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-
-        const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), capture.deps());
-        var launch = switch (result) {
-            .interactive => |value| value,
-            else => return error.TestExpectedInteractiveLaunch,
-        };
-        defer launch.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings("fix it", launch.initial_prompt.?);
-        const target = launch.requested_resume.?;
-        try std.testing.expectEqual(case.target, std.meta.activeTag(target));
-        if (case.id) |id| try std.testing.expectEqualStrings(id, target.id);
-        try std.testing.expectEqualStrings("", capture.stderr.written());
-    }
-
-    // A second word after the prompt is a usage error. Launch flags may
-    // follow the target or the prompt; another test covers them.
-    const rejected = [_][]const [:0]const u8{
-        &.{ @constCast("-r"), @constCast("a"), @constCast("b"), @constCast("c") },
-        &.{ @constCast("-c"), @constCast("fix it"), @constCast("again") },
-    };
-    for (rejected) |args| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-        const result = try runIfRequestedWithDeps(std.testing.allocator, args, testConfig(), capture.deps());
-        try std.testing.expectEqual(usage_failure, result);
-    }
-
-    var empty_capture = CaptureOutput.init(std.testing.allocator);
-    defer empty_capture.deinit();
-    const empty = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("-c"), @constCast(" ") }, testConfig(), empty_capture.deps());
-    try std.testing.expectEqual(usage_failure, empty);
-    try std.testing.expectEqualStrings("spark: the prompt is empty\n", empty_capture.stderr.written());
-}
-
-test "runIfRequested explains a first argument that is neither a command nor a prompt" {
-    const cases = [_]struct {
-        args: []const [:0]const u8,
-        stderr: []const u8,
-    }{
-        .{
-            .args = &.{ @constCast("fix"), @constCast("the"), @constCast("login"), @constCast("bug") },
-            .stderr = "spark: put the prompt in quotes: spark \"fix the login bug\"\n",
-        },
-        .{
-            .args = &.{ @constCast("--fast"), @constCast("fix"), @constCast("it") },
-            .stderr = "spark: put the prompt in quotes: spark \"fix it\"\n",
-        },
-        .{ .args = &.{@constCast("stauts")}, .stderr = "spark: unknown command stauts (did you mean status?)\n" },
-        .{ .args = &.{ @constCast("sesions"), @constCast("--json") }, .stderr = "spark: unknown command sesions (did you mean sessions?)\n" },
-        .{ .args = &.{@constCast("version")}, .stderr = "spark: unknown command version (did you mean --version?)\n" },
-        .{
-            .args = &.{ @constCast("-p"), @constCast("fix the bug") },
-            .stderr = "spark: -p isn't an spark flag; to run one request and exit, use spark ask \"fix the bug\"\n",
-        },
-        .{
-            .args = &.{@constCast("--print")},
-            .stderr = "spark: --print isn't an spark flag; to run one request and exit, use spark ask \"<prompt>\"\n",
-        },
-        .{
-            .args = &.{@constCast("--print=fix it")},
-            .stderr = "spark: --print isn't an spark flag; to run one request and exit, use spark ask \"fix it\"\n",
-        },
-        .{ .args = &.{@constCast(" ")}, .stderr = "spark: the prompt is empty\n" },
-    };
-    for (cases) |case| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-
-        const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), capture.deps());
-        try std.testing.expectEqual(usage_failure, result);
-        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
-        try std.testing.expectEqualStrings("", capture.stdout.written());
-    }
-}
-
-test "runIfRequested suggests the nearest flag for an unknown one, before or after a prompt" {
-    const cases = [_]struct {
-        args: []const [:0]const u8,
-        first_line: []const u8,
-    }{
-        .{ .args = &.{ @constCast("--modle"), @constCast("x") }, .first_line = "spark: unknown flag --modle (did you mean --model?)\n" },
-        .{ .args = &.{@constCast("--verison")}, .first_line = "spark: unknown flag --verison (did you mean --version?)\n" },
-        .{ .args = &.{ @constCast("fix it"), @constCast("--modle=x") }, .first_line = "spark: unknown flag --modle (did you mean --model?)\n" },
-    };
-    for (cases) |case| {
-        var capture = CaptureOutput.init(std.testing.allocator);
-        defer capture.deinit();
-
-        const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), capture.deps());
-        try std.testing.expectEqual(usage_failure, result);
-        try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), case.first_line));
-    }
-}
-
-test "runIfRequested model fetch failure is handled" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    var probe = ModelFetchProbe{ .outcome = .failure };
-    var cfg = testConfig();
-    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
-
-    var deps = capture.deps();
-    deps.load_startup_state = stubLoadStartupState;
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
-    try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqualStrings(
-        "spark models: could not list models: Unavailable\n",
-        capture.stderr.written(),
-    );
-}
-
-test "runIfRequested model fetch failure preserves json output" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    var probe = ModelFetchProbe{ .outcome = .failure };
-    var cfg = testConfig();
-    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
-
-    var deps = capture.deps();
-    deps.load_startup_state = stubLoadStartupState;
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("models"), @constCast("--json") },
-        cfg,
-        deps,
-    );
-    try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"models\",\"error\":\"could not list models: Unavailable\",\"code\":\"Unavailable\"}\n",
-        capture.stdout.written(),
-    );
-    try std.testing.expectEqualStrings("", capture.stderr.written());
-}
-
-test "runIfRequested model provider cancellation is handled" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    var probe = ModelFetchProbe{ .outcome = .cancelled };
-    var cfg = testConfig();
-    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
-
-    var deps = capture.deps();
-    deps.load_startup_state = stubLoadStartupState;
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("models")}, cfg, deps);
-    try std.testing.expectEqual(RunResult.handled_failure, result);
-    try std.testing.expectEqualStrings(
-        "spark models: could not list models: the request was cancelled\n",
-        capture.stderr.written(),
-    );
-}
-
-test "runIfRequested models passes startup team to fetch seam" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    var probe = ModelFetchProbe{};
-    var cfg = testConfig();
-    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
-
-    var deps = capture.deps();
-    deps.load_startup_state = stubLoadStartupState;
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("models"), @constCast("--json") }, cfg, deps);
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(probe.called);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"]}\n",
-        capture.stdout.written(),
-    );
-}
-
-test "runIfRequested models ls lists the same catalog as models" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    var probe = ModelFetchProbe{};
-    var cfg = testConfig();
-    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
-
-    var deps = capture.deps();
-    deps.load_startup_state = stubLoadStartupState;
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("models"), @constCast("ls"), @constCast("--json") },
-        cfg,
-        deps,
-    );
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expect(probe.called);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"]}\n",
-        capture.stdout.written(),
-    );
-}
-
-test "runIfRequested models json describes each model from its catalog entry" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    var probe = ModelFetchProbe{ .outcome = .described };
-    var cfg = testConfig();
-    cfg.provider_set.gateway.cli_model_catalog = probe.provider();
-
-    var deps = capture.deps();
-    deps.load_startup_state = stubLoadStartupState;
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("models"), @constCast("--json") }, cfg, deps);
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false," ++
-            "\"ids\":[\"private/blue-hornbill\"],\"models\":[{\"id\":\"private/blue-hornbill\",\"name\":\"Blue Hornbill\"," ++
-            "\"efforts\":[\"low\",\"high\"],\"fast\":true,\"ultrafast\":true}]}\n",
-        capture.stdout.written(),
-    );
-}
-
-test "modelDetails lets the catalog entry decide and keeps Ultrafast to the Gateway" {
-    const Fallback = struct {
-        fn capabilities(_: []const u8) model_capabilities.Capabilities {
-            return .{
-                .supports_fast_mode = true,
-                .reasoning_efforts = .fromSlice(&.{types.ReasoningEffort.literal("medium")}),
-            };
-        }
-    };
-    var bundle = testConfig().provider_set.gateway;
-    bundle.fallback_model_capabilities_fn = Fallback.capabilities;
-    const entries = [_]model_catalog.ModelCatalogEntry{.{
-        .id = @constCast("openai/gpt-6-astra"),
-        .name = @constCast("GPT-6 Astra"),
-        .model_type = @constCast("language"),
-        .supports_ultrafast_mode = true,
-    }};
-    const ids = [_][]const u8{ "openai/gpt-6-astra", "provider/unlisted" };
-
-    const gateway = try modelDetails(std.testing.allocator, &ids, &entries, bundle, .gateway);
-    defer std.testing.allocator.free(gateway);
-    try std.testing.expectEqualStrings("GPT-6 Astra", gateway[0].name.?);
-    try std.testing.expect(gateway[0].ultrafast);
-    try std.testing.expect(!gateway[0].fast);
-    try std.testing.expectEqual(@as(usize, 0), gateway[0].efforts.len);
-    try std.testing.expectEqual(@as(?[]const u8, null), gateway[1].name);
-    try std.testing.expect(gateway[1].fast);
-    try std.testing.expectEqualStrings("medium", gateway[1].efforts.slice()[0].label());
-
-    const codex = try modelDetails(std.testing.allocator, &ids, &entries, bundle, .codex);
-    defer std.testing.allocator.free(codex);
-    try std.testing.expect(!codex[0].ultrafast);
-
-    const undescribed = try modelDetails(std.testing.allocator, &ids, &.{}, bundle, .gateway);
-    try std.testing.expectEqual(@as(usize, 0), undescribed.len);
-}
-
-test "runIfRequested credits renders through the configured provider" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-    var probe = CreditsProviderProbe{ .outcome = .success };
-    var cfg = testConfig();
-    cfg.provider_set.gateway.credits = probe.provider();
-
-    var deps = capture.deps();
-    deps.load_startup_state = stubLoadStartupState;
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("credits"), @constCast("--json") }, cfg, deps);
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqual(@as(usize, 1), probe.calls);
-    try std.testing.expect(probe.saw_expected_input);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"credits\",\"balance\":\"10\",\"used\":\"2\",\"plan\":\"pro\",\"token_pass\":null}\n",
-        capture.stdout.written(),
-    );
-}
-
-test "runIfRequested credits failures use nonzero text and json contracts" {
-    var text_capture = CaptureOutput.init(std.testing.allocator);
-    defer text_capture.deinit();
-    var text_probe = CreditsProviderProbe{ .outcome = .failure };
-    var text_cfg = testConfig();
-    text_cfg.provider_set.gateway.credits = text_probe.provider();
-    var text_deps = text_capture.deps();
-    text_deps.load_startup_state = stubLoadStartupState;
-
-    const text_result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("credits")},
-        text_cfg,
-        text_deps,
-    );
-    try std.testing.expectEqual(RunResult.handled_failure, text_result);
-    try std.testing.expectEqualStrings("", text_capture.stdout.written());
-    try std.testing.expectEqualStrings(
-        "[credits] error: gateway unavailable\n",
-        text_capture.stderr.written(),
-    );
-
-    var json_capture = CaptureOutput.init(std.testing.allocator);
-    defer json_capture.deinit();
-    var json_probe = CreditsProviderProbe{ .outcome = .failure };
-    var json_cfg = testConfig();
-    json_cfg.provider_set.gateway.credits = json_probe.provider();
-    var json_deps = json_capture.deps();
-    json_deps.load_startup_state = stubLoadStartupState;
-
-    const json_result = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("credits"), @constCast("--json") },
-        json_cfg,
-        json_deps,
-    );
-    try std.testing.expectEqual(RunResult.handled_failure, json_result);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"credits\",\"error\":\"gateway unavailable\"}\n",
-        json_capture.stdout.written(),
-    );
-    try std.testing.expectEqualStrings("", json_capture.stderr.written());
-}
-
-test "runIfRequested local json success appends exactly one newline" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    var deps = capture.deps();
-    deps.load_startup_status = stubLoadStartupStatus;
-
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
-    try std.testing.expectEqual(RunResult.handled_success, result);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"spark needs access to the model connection. Run spark login to sign in, spark login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/spark\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":false,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
-        capture.stdout.written(),
-    );
-    try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
-}
-
-test "status and doctor inspect MCP configuration once per command" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-
-    var environ = std.process.Environ.Map.init(alloc);
-    defer environ.deinit();
-    try environ.put("HOME", home);
-    try environ.put("PATH", "");
-    io_mod.setEnvironMap(&environ);
-    defer io_mod.resetEnvironForTest();
-
-    mcp_local_inspection_calls_for_test = 0;
-    var cfg = testConfig();
-    cfg.inspect_mcp_local_config = failingMcpLocalInspectionForTest;
-
-    var status_capture = CaptureOutput.init(alloc);
-    defer status_capture.deinit();
-    var status_deps = status_capture.deps();
-    status_deps.load_startup_status = stubLoadStartupStatus;
-    const status_result = try runIfRequestedWithDeps(
-        alloc,
-        &.{ @constCast("status"), @constCast("--json") },
-        cfg,
-        status_deps,
-    );
-    try std.testing.expectEqual(RunResult.handled_success, status_result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
-    try std.testing.expect(std.mem.find(
-        u8,
-        status_capture.stdout.written(),
-        "\"mcp_config_error\":\"McpConfigInvalidJson\"",
-    ) != null);
-
-    mcp_local_inspection_calls_for_test = 0;
-    var doctor_capture = CaptureOutput.init(alloc);
-    defer doctor_capture.deinit();
-    const doctor_result = try runIfRequestedWithDeps(
-        alloc,
-        &.{ @constCast("doctor"), @constCast("--json") },
-        cfg,
-        doctor_capture.deps(),
-    );
-    // The broken MCP config is a failed check, so doctor exits 1.
-    try std.testing.expectEqual(RunResult.handled_failure, doctor_result);
-    try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(
-            u8,
-            doctor_capture.stdout.written(),
-            "\"name\":\"mcp_config\"",
-        ),
-    );
-    try std.testing.expect(std.mem.find(
-        u8,
-        doctor_capture.stdout.written(),
-        "\"detail\":\"failed to load ~/.spark/mcp.json: McpConfigInvalidJson\"",
-    ) != null);
-}
-
-test "writeRenderedJsonLine falls back to heap and appends exactly one newline" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    var tiny_buf: [8]u8 = undefined;
-    const startup = app_lifecycle.StartupStatus{
-        .workspace_root = @constCast("/tmp/spark"),
-        .selected_model = "test-model",
-        .permission_mode = .ask,
-        .agent_step_limit = 42,
-        .ultrafast_mode = true,
-    };
-
-    try writeRenderedJsonLine(
-        std.testing.allocator,
-        capture.deps(),
-        tiny_buf[0..],
-        .{ .status = statusSnapshotFromStartup(startup) },
-    );
-
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"spark needs access to the model connection. Run spark login to sign in, spark login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/spark\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":true}\n",
-        capture.stdout.written(),
-    );
-}
-
-test "writeRenderedJsonLine renders doctor json through output contract" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    var checks = [_]doctor_runtime.Check{
-        .{ .name = "auth", .status = .ok, .detail = "AI_GATEWAY_API_KEY is configured" },
-        .{ .name = "gh", .status = .warn, .detail = "GitHub CLI not found in PATH" },
-    };
-    const snapshot = doctor_runtime.Snapshot{
-        .workspace_root = @constCast("/tmp/spark"),
-        .model = "test-model",
-        .auth = .{ .active_source = .ai_gateway_api_key },
-        .permission_mode = .auto,
-        .agent_step_limit = 42,
-        .checks = checks[0..],
-    };
-
-    var tiny_buf: [8]u8 = undefined;
-    try writeRenderedJsonLine(
-        std.testing.allocator,
-        capture.deps(),
-        tiny_buf[0..],
-        .{ .doctor = doctorSnapshotFromRuntime(snapshot) },
-    );
-
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/spark\",\"model\":\"test-model\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"auto\",\"agent_step_limit\":42,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}\n",
-        capture.stdout.written(),
-    );
 }
 
 const CaptureOutput = struct {
@@ -7208,60 +4329,6 @@ fn unexpectedAcpRunForTest(_: ?*anyopaque, _: Allocator, _: acp_runner.Config) a
     return error.TestUnexpectedAcpRun;
 }
 
-fn testConfig() Config {
-    return .{
-        .version = "0.0.0",
-        .command_catalog = testCommandCatalog(),
-        .default_model = "test-model",
-        .default_agent_step_limit = 42,
-        .models_path = "/v1/models",
-        .gateway_retry_count = 1,
-        .gateway_chat_url = "https://example.test/chat",
-        .gateway_provider = test_builtin_gateway.provider,
-        .provider_set = provider_set.gateway_only(test_builtin_gateway.provider_bundle),
-        .url_opener = host.unavailable_url_opener,
-        .secret_store = host.unavailable_secret_store,
-        .prompt_policy = .{ .system_prompt = "system" },
-        .skill_root_policy = .{ .managed_root_source = .global_spark },
-        .ignored_list_entries = &.{},
-        .max_list_entries = 10,
-        .max_read_file_bytes = 1024,
-        .max_read_file_lines = 100,
-        .max_read_file_line_len = 200,
-        .max_command_output_bytes = 4096,
-        .max_tool_result_bytes = 4096,
-        .max_history_turns = 8,
-        .context_registry = test_surface_context_registry,
-        .mode_registry = .{ .default_mode_id = "surface" },
-        .inspect_mcp_profile_config = clearMcpConfigInspectionForTest,
-        .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
-        .tool_set = .{
-            .registry = .{ .tools = &.{} },
-            .order = &.{},
-            .read_only_tool_names = &.{},
-        },
-    };
-}
-
-fn stubLoadStartupState(
-    alloc: Allocator,
-    _: oauth_transport.Provider,
-    _: host.SecretStore,
-    default_model: []const u8,
-    default_agent_step_limit: usize,
-) !app_lifecycle.StartupState {
-    var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
-    errdefer state.deinit(alloc);
-    state.workspace_root = try alloc.dupe(u8, "/tmp/spark");
-    state.selected_model = try alloc.dupe(u8, default_model);
-    state.credential = .{
-        .token = try alloc.dupe(u8, "test-key"),
-        .source = .ai_gateway_api_key,
-    };
-    state.credential.?.team_id = try alloc.dupe(u8, "team_123");
-    return state;
-}
-
 fn stubLoadStartupStateWithoutCredentials(
     alloc: Allocator,
     _: []const u8,
@@ -7312,106 +4379,6 @@ fn failingStartupState(
     return error.StartupShouldNotRun;
 }
 
-const ModelFetchProbe = struct {
-    const Outcome = enum {
-        success,
-        /// Succeeds with the catalog entry behind the id, as the Gateway does.
-        described,
-        failure,
-        cancelled,
-    };
-
-    called: bool = false,
-    outcome: Outcome = .success,
-
-    fn describedEntry(alloc: Allocator) !model_catalog.ModelCatalogEntry {
-        const id = try alloc.dupe(u8, "private/blue-hornbill");
-        errdefer alloc.free(id);
-        const name = try alloc.dupe(u8, "Blue Hornbill");
-        errdefer alloc.free(name);
-        const model_type = try alloc.dupe(u8, "language");
-        errdefer alloc.free(model_type);
-        var efforts: std.ArrayList(types.ReasoningEffort) = .empty;
-        errdefer efforts.deinit(alloc);
-        try efforts.appendSlice(alloc, &.{ types.ReasoningEffort.literal("low"), types.ReasoningEffort.literal("high") });
-        return .{
-            .id = id,
-            .name = name,
-            .model_type = model_type,
-            .reasoning_efforts = efforts,
-            .supports_fast_mode = true,
-            .supports_ultrafast_mode = true,
-        };
-    }
-
-    fn provider(self: *ModelFetchProbe) gateway_provider.CliModelCatalogProvider {
-        return .{
-            .context = self,
-            .fetch_fn = fetch,
-        };
-    }
-
-    fn failure(
-        input: gateway_provider.CliModelCatalogInput,
-        category: model_catalog.FailureCategory,
-    ) gateway_provider.CliModelCatalogResult {
-        return .{ .failure = .{
-            .access = .init(input.access),
-            .anonymous_fallback_used = false,
-            .failure = .{ .category = category },
-        } };
-    }
-
-    fn fetch(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        input: gateway_provider.CliModelCatalogInput,
-    ) gateway_provider.CliModelCatalogResult {
-        const self: *ModelFetchProbe = @ptrCast(@alignCast(raw.?));
-        self.called = true;
-        if (!std.mem.eql(u8, input.access.authorizationCredential() orelse "", "test-key") or
-            !std.mem.eql(u8, input.access.teamContext() orelse "", "team_123") or
-            input.access.credentialSource() != .ai_gateway_api_key or
-            !std.mem.eql(u8, input.endpoint, "/v1/models") or
-            input.cancel_flag != null)
-        {
-            return failure(input, .runtime);
-        }
-
-        switch (self.outcome) {
-            .failure => return failure(input, .runtime),
-            .cancelled => return failure(input, .cancellation),
-            .success, .described => {},
-        }
-
-        var ids: std.ArrayList([]u8) = .empty;
-        const id = alloc.dupe(u8, "private/blue-hornbill") catch {
-            return failure(input, .resource_exhausted);
-        };
-        ids.append(alloc, id) catch {
-            alloc.free(id);
-            return failure(input, .resource_exhausted);
-        };
-        var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
-        if (self.outcome == .described) {
-            const entry = describedEntry(alloc) catch {
-                collections.freeStringList(alloc, &ids);
-                return failure(input, .resource_exhausted);
-            };
-            entries.append(alloc, entry) catch {
-                model_catalog.freeModelCatalogEntry(alloc, entry);
-                collections.freeStringList(alloc, &ids);
-                return failure(input, .resource_exhausted);
-            };
-        }
-        return .{ .loaded = .{
-            .ids = ids,
-            .entries = entries,
-            .provenance = .{ .access = .init(input.access) },
-        } };
-    }
-};
-
 const ChatUrlProbe = struct {
     called: bool = false,
 
@@ -7428,47 +4395,3 @@ const ChatUrlProbe = struct {
         return "http://127.0.0.1:43123/chat";
     }
 };
-
-const CreditsProviderProbe = struct {
-    outcome: enum { success, failure },
-    calls: usize = 0,
-    saw_expected_input: bool = false,
-
-    fn provider(self: *CreditsProviderProbe) gateway_provider.CreditsProvider {
-        return .{
-            .context = self,
-            .fetch_fn = fetch,
-        };
-    }
-
-    fn fetch(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        input: gateway_provider.CreditsLookupInput,
-    ) output_contracts.CreditsSnapshot {
-        const self: *CreditsProviderProbe = @ptrCast(@alignCast(raw.?));
-        self.calls += 1;
-        self.saw_expected_input =
-            std.mem.eql(u8, input.credential orelse "", "test-key") and
-            std.mem.eql(u8, input.tenant orelse "", "team_123");
-        if (self.outcome == .failure) {
-            return ownedCreditsErrorSnapshot(alloc, "gateway unavailable");
-        }
-
-        var snapshot = output_contracts.CreditsSnapshot{};
-        snapshot.balance = alloc.dupe(u8, "10") catch return ownedCreditsErrorSnapshot(alloc, "invalid JSON response from gateway");
-        snapshot.used = alloc.dupe(u8, "2") catch {
-            snapshot.deinit(alloc);
-            return ownedCreditsErrorSnapshot(alloc, "invalid JSON response from gateway");
-        };
-        snapshot.plan = alloc.dupe(u8, "pro") catch {
-            snapshot.deinit(alloc);
-            return ownedCreditsErrorSnapshot(alloc, "invalid JSON response from gateway");
-        };
-        return snapshot;
-    }
-};
-
-fn ownedCreditsErrorSnapshot(alloc: Allocator, message: []const u8) output_contracts.CreditsSnapshot {
-    return .{ .err_message = alloc.dupe(u8, message) catch null };
-}

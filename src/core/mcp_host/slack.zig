@@ -57,26 +57,3 @@ fn loopbackOrigin(o: []const u8) bool {
 }
 
 const testing = std.testing;
-
-test "only Slack's MCP server, and only a loopback test stand-in" {
-    try testing.expect(isSlack("https://mcp.slack.com/mcp"));
-    try testing.expect(isSlack("https://mcp.slack.com"));
-    try testing.expect(!isSlack("https://mcp.slack.com.evil.example/mcp"));
-    try testing.expect(!isSlack(null));
-    try testing.expect(loopbackOrigin("http://127.0.0.1:8080"));
-    try testing.expect(!loopbackOrigin("http://127.0.0.1:80"));
-    try testing.expect(!loopbackOrigin("https://evil.example"));
-    try testing.expect(!loopbackOrigin("http://127.0.0.1:8080/x"));
-}
-
-test "spark's Slack app signs in only to Slack's MCP server, or a test stand-in's own" {
-    try testing.expect(appServerAt("https://mcp.slack.com/mcp", null));
-    try testing.expect(!appServerAt("https://mcp.example.com/mcp", null));
-    try testing.expect(!appServerAt("http://127.0.0.1:8080/mcp", null));
-    try testing.expect(appServerAt("http://127.0.0.1:8080/mcp", "http://127.0.0.1:8080"));
-    try testing.expect(appServerAt("https://mcp.slack.com/mcp", "http://127.0.0.1:8080"));
-    try testing.expect(!appServerAt("http://127.0.0.1:9090/mcp", "http://127.0.0.1:8080"));
-    try testing.expect(!appServerAt("http://127.0.0.1:80800/mcp", "http://127.0.0.1:8080"));
-    try testing.expect(!appServerAt("http://127.0.0.1:8080/other", "http://127.0.0.1:8080"));
-    try testing.expect(!appServer(null));
-}

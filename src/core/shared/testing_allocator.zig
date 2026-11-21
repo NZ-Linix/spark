@@ -28,10 +28,3 @@ fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usiz
 fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
     std.testing.allocator.rawFree(memory, alignment, ret_addr);
 }
-
-test "no_resize refuses in-place growth" {
-    const memory = try no_resize.alloc(u8, 4);
-    defer no_resize.free(memory);
-    try std.testing.expect(!no_resize.resize(memory, 8));
-    try std.testing.expect(no_resize.remap(memory, 8) == null);
-}

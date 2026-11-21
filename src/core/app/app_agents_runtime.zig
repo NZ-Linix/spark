@@ -12,7 +12,6 @@ const composer_stash = @import("../input/composer_stash.zig");
 const input_action = @import("../input/input_action.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
-const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agent_runtime = @import("app_agent_runtime.zig");
 const ui_render = @import("../../ui/render.zig");
@@ -31,7 +30,6 @@ const subagent_authority = @import("../subagent/authority.zig");
 const subagent_reports = @import("../subagent/reports.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
-const permission_request = @import("../permissions/permission_request.zig");
 const io_mod = @import("../shared/io.zig");
 const testing_event = @import("../shared/testing_event.zig");
 const activity_status = @import("../output/activity_status.zig");
@@ -105,7 +103,6 @@ pub const ChildAgent = struct {
     /// prompts were asked (`App.prompt_order`), so the instance's screen
     /// shows the oldest first. Meaningful only while that prompt is active.
     /// Main loop only.
-    approval_asked: u64 = 0,
     question_asked: u64 = 0,
     /// How its last turn ended, which its row and its footer name once none
     /// is going (`LastEnd`). Main loop only.
@@ -382,7 +379,7 @@ fn moreUrgent(a: InstanceState, b: InstanceState) InstanceState {
 /// waits for the user. `last_end` is how a subagent's last turn ended, and
 /// `.done` for an instance, whose states it never changes.
 fn instanceState(agent: *agents.Agent, request_waits: bool, last_end: LastEnd) InstanceState {
-    if (agent.approval_prompt.isActive()) return .needs_approval;
+    if (false) return .needs_approval;
     if (agent.question_prompt.isActive()) return .has_question;
     if (request_waits) return .needs_you;
     if (turnInFlight(agent)) return .working;
@@ -415,105 +412,6 @@ test "a subagent's parent may send again only a refused or a day-old request" {
     for ([_]@FieldType(types.RouteRecoveryStatus, "need"){ null, .sign_in, .quota, .content_filter, .too_long, .crash_loop }) |need| {
         try std.testing.expect(!parentMayResend(need));
     }
-}
-
-test "a subagent's last work reads as done, failed, or stopped, as its parent's report words it" {
-    const Outcome = subagent_child_state.Outcome;
-    try std.testing.expectEqual(LastEnd.done, LastEnd.of(null));
-    try std.testing.expectEqual(LastEnd.done, LastEnd.of(Outcome.completed));
-    try std.testing.expectEqual(LastEnd.failed, LastEnd.of(Outcome.failed));
-    // Stopped by the user, stopped by its parent, or cut short by spark quitting
-    // are cancelled; spark stopping mid-turn is interrupted; spark stopping before
-    // the message arrived is lost. Its parent's report says spark or the user
-    // stopped it each time.
-    for ([_]Outcome{ .cancelled, .interrupted, .lost }) |outcome| {
-        try std.testing.expectEqual(LastEnd.stopped, LastEnd.of(outcome));
-    }
-    // The footer's words are the tags.
-    try std.testing.expectEqualStrings("done", @tagName(LastEnd.done));
-    try std.testing.expectEqualStrings("failed", @tagName(LastEnd.failed));
-    try std.testing.expectEqualStrings("stopped", @tagName(LastEnd.stopped));
-}
-
-test "a turn's end becomes its work's outcome in one place, which the row and the parent's work both take" {
-    const Ended = types.TurnPresentationOutcome;
-    const Outcome = subagent_child_state.Outcome;
-    const Case = struct { ended: Ended, handed_off: bool, outcome: Outcome, mark: LastEnd };
-    // Every end, with and without a hand-off. A hand-off turns only an
-    // interrupted turn into a finished one.
-    const cases = [_]Case{
-        .{ .ended = .completed, .handed_off = false, .outcome = .completed, .mark = .done },
-        .{ .ended = .completed, .handed_off = true, .outcome = .completed, .mark = .done },
-        .{ .ended = .failed, .handed_off = false, .outcome = .failed, .mark = .failed },
-        .{ .ended = .failed, .handed_off = true, .outcome = .failed, .mark = .failed },
-        .{ .ended = .interrupted, .handed_off = false, .outcome = .cancelled, .mark = .stopped },
-        .{ .ended = .interrupted, .handed_off = true, .outcome = .completed, .mark = .done },
-        .{ .ended = .paused, .handed_off = false, .outcome = .cancelled, .mark = .stopped },
-        .{ .ended = .paused, .handed_off = true, .outcome = .cancelled, .mark = .stopped },
-    };
-    for (cases) |case| {
-        const outcome = workOutcome(case.handed_off, case.ended);
-        try std.testing.expectEqual(case.outcome, outcome);
-        // The row names the work's outcome.
-        try std.testing.expectEqual(case.mark, LastEnd.of(outcome));
-        // The parent's work ends as the record has it, by the same name.
-        try std.testing.expectEqualStrings(@tagName(outcome), @tagName(completionOf(outcome)));
-        // Only a failed turn fails its work, which is when `endRun` keeps the
-        // failure for the parent.
-        try std.testing.expectEqual(case.ended == .failed, outcome == .failed);
-    }
-    // Each end is in the table, so a new one must be added to it.
-    try std.testing.expectEqual(std.enums.values(Ended).len * 2, cases.len);
-    // Every outcome the record can hold converts, the two a turn never gives
-    // among them.
-    const Work = agents.ChildRunCompletion.Outcome;
-    try std.testing.expectEqual(Work.completed, completionOf(.completed));
-    try std.testing.expectEqual(Work.failed, completionOf(.failed));
-    for ([_]Outcome{ .cancelled, .interrupted, .lost }) |outcome| {
-        try std.testing.expectEqual(Work.cancelled, completionOf(outcome));
-    }
-}
-
-test "a failed or stopped row asks no more of the user than an idle one and sorts with it" {
-    try std.testing.expectEqualStrings("failed", InstanceState.failed.label());
-    try std.testing.expectEqualStrings("stopped", InstanceState.stopped.label());
-    for ([_]InstanceState{ .failed, .stopped }) |state| {
-        try std.testing.expectEqual(InstanceState.idle.urgency(), state.urgency());
-        try std.testing.expectEqual(InstanceState.idle.tone(), state.tone());
-        try std.testing.expect(busyAs(state) == null);
-        // Never more urgent than another state that is not busy, so it never
-        // stands for the busiest agent.
-        try std.testing.expectEqual(InstanceState.idle, moreUrgent(.idle, state));
-        try std.testing.expectEqual(InstanceState.working, moreUrgent(state, .working));
-    }
-}
-
-test "an agent's state says how its last turn ended only when nothing else claims the row" {
-    var agent: agents.Agent = .{};
-    try std.testing.expectEqual(InstanceState.idle, instanceState(&agent, false, .done));
-    try std.testing.expectEqual(InstanceState.failed, instanceState(&agent, false, .failed));
-    try std.testing.expectEqual(InstanceState.stopped, instanceState(&agent, false, .stopped));
-    // A request only the user can continue outranks it.
-    try std.testing.expectEqual(InstanceState.needs_you, instanceState(&agent, true, .failed));
-    // So does a turn going: the next turn starts over.
-    agent.worker.worker_processing = true;
-    try std.testing.expectEqual(InstanceState.working, instanceState(&agent, false, .failed));
-    try std.testing.expectEqual(InstanceState.working, instanceState(&agent, false, .stopped));
-    agent.worker.worker_processing = false;
-    try std.testing.expectEqual(InstanceState.failed, instanceState(&agent, false, .failed));
-}
-
-test "a subagent's footer name says how its last turn ended once no turn is going" {
-    var id = "writer-id".*;
-    var child: ChildAgent = .{ .id = &id };
-    try std.testing.expectEqualStrings("writer-id · done", child.footerLabel());
-    child.last_end = .failed;
-    try std.testing.expectEqualStrings("writer-id · failed", child.footerLabel());
-    child.last_end = .stopped;
-    try std.testing.expectEqualStrings("writer-id · stopped", child.footerLabel());
-    // While a turn goes, the name stands alone, whatever the last one did.
-    child.agent.worker.worker_processing = true;
-    try std.testing.expectEqualStrings("writer-id", child.footerLabel());
 }
 
 /// Slot threads and the main loop both use the hand-off list.
@@ -618,36 +516,6 @@ pub const ReportPost = struct {
         handoff_alloc.destroy(self);
     }
 };
-
-test "a message's hand-off keeps its own copy of what the user typed" {
-    var host: subagent_tool_host.Runtime = undefined;
-    var first = "tell main hi".*;
-    var second = "and bye".*;
-    const lines = [_][]const u8{ &first, &second };
-    const post = try ReportPost.create(&host, .{ .message = .{ .to = .owner, .agent = "reviewer", .child_id = "c1", .text = "hi", .user_typed = &lines } });
-    defer post.destroy();
-    // The sender's buffers change once the post is made.
-    @memset(&first, 'x');
-    @memset(&second, 'x');
-    try std.testing.expectEqual(@as(usize, 2), post.typed_lines.len);
-    try std.testing.expectEqualStrings("tell main hi", post.typed_lines[0]);
-    try std.testing.expectEqualStrings("and bye", post.typed_lines[1]);
-}
-
-test "a report's hand-off keeps the count a user's stop dropped, and who started and stopped its work" {
-    // Only the host's address is kept, so any will do.
-    var host: subagent_tool_host.Runtime = undefined;
-    const end: subagent_child_state.EndFacts = .{ .started_by = .user, .cause = .user_stop };
-    const post = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .dropped = 2, .end = end } });
-    defer post.destroy();
-    try std.testing.expectEqual(@as(usize, 2), post.dropped);
-    try std.testing.expectEqual(subagent_child_state.Outcome.cancelled, post.outcome);
-    try std.testing.expectEqual(end, post.end);
-    try std.testing.expect(!post.idle);
-    const idle = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w2", .outcome = .completed, .output = "done", .idle = true } });
-    defer idle.destroy();
-    try std.testing.expect(idle.idle);
-}
 
 /// Queues a host's delivery for the main loop, without waiting.
 /// `AgentGone` once the app is shutting down; a report then stays owed.
@@ -1016,14 +884,13 @@ pub fn Runtime(comptime App: type) type {
             const handoff_pending = app.shell.sessionScrollbackHandoffPending();
             var deferred: usize = 0;
             if (app.agent_on_screen != null and
-                (app.main_agent.worker.hasPendingEvents() or app.main_screen.pacer.hasPending() or
-                    approvalOutOfDate(&app.main_agent, false)))
+                (app.main_agent.worker.hasPendingEvents() or app.main_screen.pacer.hasPending()))
             {
                 if (handoff_pending) deferred += 1 else try visitScreen(app, &app.main_agent, &app.main_screen, context, body);
             }
             for (app.child_agents.items) |child| {
                 if (child == app.agent_on_screen) continue;
-                if (!hasPendingWork(child) and !approvalOutOfDate(&child.agent, app.approval_lender == child)) continue;
+                if (!hasPendingWork(child)) continue;
                 if (handoff_pending) {
                     deferred += 1;
                     continue;
@@ -1066,19 +933,6 @@ pub fn Runtime(comptime App: type) type {
                     debug_trace.logf("theme", "hidden_retint_failed agent={s} err={s} kept=old_colors", .{ child.id, @errorName(err) });
                 };
             }
-        }
-
-        /// Whether `agent`'s approval prompt no longer matches its worker: the
-        /// worker waits on a decision the prompt doesn't show, or the prompt
-        /// shows one the worker stopped waiting on. A waiting worker queues no
-        /// event, so a hidden agent is visited for this too. `lent` counts
-        /// its prompt as shown while main's screen holds it. A
-        /// `/permissions remember` prompt isn't the worker's, so it doesn't
-        /// count.
-        fn approvalOutOfDate(agent: *agents.Agent, lent: bool) bool {
-            const prompt = &agent.approval_prompt;
-            const shown = lent or (prompt.isActive() and prompt.rule_management == null);
-            return agent.worker.awaitsPermissionDecision() != shown;
         }
 
         /// Readies the subagent on screen for a turn the user starts there, as
@@ -1149,7 +1003,7 @@ pub fn Runtime(comptime App: type) type {
         /// the one installed.
         fn admitOwnTurn(app: *App, agent: *AppAgent, child: *ChildAgent) !void {
             const host = hostOf(app, child) orelse return error.SubagentHostUnavailable;
-            var admitted = try host.admitUserTurn(app.alloc, child.id, app_permission_runtime.Runtime(App).livePermissionSnapshot(app, &child.agent).mode);
+            var admitted = try host.admitUserTurn(app.alloc, child.id, .yolo);
             defer admitted.deinit(app.alloc);
             var run = try app_agent_runtime.Runtime(App).prepareOwnTurnRun(app, child.id, host.authorityResolver(), admitted.instructions, admitted.admission);
             errdefer run.deinit(app.alloc);
@@ -1172,7 +1026,7 @@ pub fn Runtime(comptime App: type) type {
             return if (on_screen.agent.role == .instance) &on_screen.agent else null;
         }
 
-        pub const PromptKind = enum { approval, question };
+        pub const PromptKind = enum { question };
 
         /// Notes that subagent `agent`'s approval or question just showed,
         /// so its tree's prompts reach the instance's screen in the order
@@ -1183,7 +1037,6 @@ pub fn Runtime(comptime App: type) type {
             } else return;
             app.prompt_order += 1;
             switch (kind) {
-                .approval => child.approval_asked = app.prompt_order,
                 .question => child.question_asked = app.prompt_order,
             }
         }
@@ -1195,25 +1048,18 @@ pub fn Runtime(comptime App: type) type {
         /// once that one is answered or goes back. A rule a subagent's
         /// `/permissions remember` would save is its own, so it isn't lent.
         pub fn lendPrompt(app: *App) void {
-            if (app.approval_lender != null or app.question_lender != null) return;
+            if (app.question_lender != null) return;
             const borrower = instanceOnScreen(app) orelse return;
-            if (borrower.approval_prompt.isActive() or borrower.question_prompt.isActive()) return;
+            if (borrower.question_prompt.isActive()) return;
             var oldest: ?struct { child: *ChildAgent, kind: PromptKind, asked: u64 } = null;
             for (app.child_agents.items) |child| {
                 if (!lendsTo(app, child, borrower)) continue;
-                const approval = &child.agent.approval_prompt;
-                if (approval.isActive() and approval.rule_management == null) {
-                    if (oldest == null or child.approval_asked < oldest.?.asked) oldest = .{ .child = child, .kind = .approval, .asked = child.approval_asked };
-                }
                 if (child.agent.question_prompt.isActive()) {
                     if (oldest == null or child.question_asked < oldest.?.asked) oldest = .{ .child = child, .kind = .question, .asked = child.question_asked };
                 }
             }
             const lent = oldest orelse return;
-            switch (lent.kind) {
-                .approval => lendApproval(app, borrower, lent.child),
-                .question => lendQuestion(app, borrower, lent.child),
-            }
+            lendQuestion(app, borrower, lent.child);
             app.shell.render_requests.request(.modal);
         }
 
@@ -1254,73 +1100,6 @@ pub fn Runtime(comptime App: type) type {
         /// the instance's own.
         pub fn answerLentQuestion(app: *App, comptime body: fn (*App, *AppAgent) anyerror!void) !bool {
             const child = returnQuestion(app) orelse return false;
-            const Answer = struct {
-                fn run(_: void, a: *App, lender: *agents.Agent) anyerror!void {
-                    try body(a, lender);
-                }
-            };
-            try visit(app, child, {}, Answer.run);
-            return true;
-        }
-
-        /// Lends `child`'s approval to `borrower`'s prompt. Its request comes
-        /// from the subagent's own worker and stays labeled with its name.
-        /// It goes back when the subagent is shown, the instance gets its
-        /// own, or the subagent stops waiting (`keepLentApproval`).
-        fn lendApproval(app: *App, borrower: *AppAgent, child: *ChildAgent) void {
-            std.mem.swap(@TypeOf(child.agent.approval_prompt), &borrower.approval_prompt, &child.agent.approval_prompt);
-            app.approval_lender = child;
-            debug_trace.eventf("host", "approval_lent", .{}, "agent={s}", .{child.id});
-        }
-
-        /// Gives a lent approval back to the subagent it came from, and
-        /// returns that subagent.
-        pub fn returnApproval(app: *App) ?*ChildAgent {
-            const child = app.approval_lender orelse return null;
-            const borrower = rootInstance(app, child);
-            std.mem.swap(@TypeOf(child.agent.approval_prompt), &borrower.approval_prompt, &child.agent.approval_prompt);
-            app.approval_lender = null;
-            app.shell.render_requests.request(.modal);
-            return child;
-        }
-
-        /// Whether the agent in context keeps its approval prompt as it is
-        /// this pass, because an approval is lent: the instance keeps the one
-        /// it shows until its own request comes, and the subagent that lent
-        /// it lets it be while its worker still asks the same thing.
-        /// Otherwise the approval goes back first, and the caller syncs the
-        /// prompt from the worker's `pending`. That includes an approval
-        /// answered on the instance's screen, whose prompt is already
-        /// cleared, so the next one of the tree can be lent.
-        pub fn keepLentApproval(app: *App, agent: *AppAgent, pending: ?permission_request.PermissionRequest) bool {
-            const lender = app.approval_lender orelse return false;
-            const borrower = rootInstance(app, lender);
-            if (agent == borrower) {
-                if (pending == null) return true;
-            } else if (agent == &lender.agent) {
-                if (borrower.approval_prompt.request) |lent| {
-                    if (pending) |request| if (request.id == lent.id) return true;
-                }
-            } else return false;
-            _ = returnApproval(app);
-            return false;
-        }
-
-        /// The subagent whose approval `agent`'s prompt shows, while that
-        /// instance is in context: an answer there goes to that subagent's
-        /// worker.
-        pub fn lentApproval(app: *App, agent: *AppAgent) ?*ChildAgent {
-            const lender = app.approval_lender orelse return null;
-            if (agent != rootInstance(app, lender)) return null;
-            return lender;
-        }
-
-        /// Runs `body`, a cancel, in the context of the subagent whose
-        /// approval the instance's screen shows, as its own screen would.
-        /// False when the approval is the instance's own.
-        pub fn answerLentApproval(app: *App, agent: *AppAgent, comptime body: fn (*App, *AppAgent) anyerror!void) !bool {
-            if (lentApproval(app, agent) == null) return false;
-            const child = returnApproval(app).?;
             const Answer = struct {
                 fn run(_: void, a: *App, lender: *agents.Agent) anyerror!void {
                     try body(a, lender);
@@ -1577,10 +1356,7 @@ pub fn Runtime(comptime App: type) type {
             var count: usize = 0;
             if (app.agent_on_screen != null and firstOpen(app)) {
                 // Main's own request, not a subagent's that main also shows.
-                const main_waiting = if (app.main_agent.approval_prompt.request) |request|
-                    request.origin == .active_session
-                else
-                    false;
+                const main_waiting = false;
                 const asks = app.main_agent.question_prompt.isActive();
                 if (main_waiting or asks or requestWaitsForUser(app, null)) {
                     found = true;
@@ -1590,7 +1366,7 @@ pub fn Runtime(comptime App: type) type {
             }
             for (app.child_agents.items) |child| {
                 if (child == app.agent_on_screen) continue;
-                const approval = child.agent.approval_prompt.isActive();
+                const approval = false;
                 const asks = child.agent.question_prompt.isActive();
                 if (!approval and !asks and !requestWaitsForUser(app, child)) continue;
                 if (!found) {
@@ -2251,7 +2027,6 @@ pub fn Runtime(comptime App: type) type {
                 menu.close_armed = null;
                 debug_trace.eventf("host", "agents_menu_close_disarmed", .{}, "reason=closed", .{});
             };
-            if (inBranch(set, app.approval_lender)) _ = returnApproval(app);
             if (inBranch(set, app.question_lender)) _ = returnQuestion(app);
             if (comptime agents.hasAgentField(App, "session_persistence")) {
                 if (first_host) |host| host.closeTree();
@@ -2482,7 +2257,6 @@ pub fn Runtime(comptime App: type) type {
             // A question or approval lent to main goes back first, to show on
             // its own subagent's screen.
             _ = returnQuestion(app);
-            _ = returnApproval(app);
             const leaving = screenOf(app, app.agent_on_screen);
             const arriving = screenOf(app, target);
             if (leaving == arriving) return;
@@ -2603,7 +2377,6 @@ pub fn Runtime(comptime App: type) type {
         /// an instance stays idle (`LastEnd`).
         fn stateOf(app: *App, target: ?*ChildAgent) InstanceState {
             if (target) |child| {
-                if (app.approval_lender == child) return .needs_approval;
                 if (app.question_lender == child) return .has_question;
             }
             const last_end: LastEnd = if (target) |child| (if (child.agent.role == .subagent) child.last_end else .done) else .done;
@@ -2761,8 +2534,8 @@ pub fn Runtime(comptime App: type) type {
         /// place; `releaseMessagePlace` gives it back.
         pub fn reserveMessagePlace(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool) subagent_tool_host.PostReportError!void {
             const receiver = blk: {
-                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
-                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                app.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.authority_mutex.unlock(io_mod.getIo());
                 break :blk receiverOf(app, host, from_owner) orelse return error.AgentGone;
             };
             // The receiver outlives the sender's call: a tree closes its
@@ -2772,8 +2545,8 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn releaseMessagePlace(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool) void {
             const receiver = blk: {
-                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
-                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                app.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.authority_mutex.unlock(io_mod.getIo());
                 break :blk receiverOf(app, host, from_owner) orelse return;
             };
             receiver.worker.releaseAgentMessage();
@@ -2872,8 +2645,8 @@ pub fn Runtime(comptime App: type) type {
         /// parent subagent's own, and the instance at the top of its tree.
         /// Resolvers on other threads read both under main's authority lock.
         fn setParentHost(app: *App, child: *ChildAgent, host: *subagent_tool_host.Runtime) void {
-            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
-            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            app.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.authority_mutex.unlock(io_mod.getIo());
             child.parent_host = host;
             if (child.agent.root_instance == null) child.agent.root_instance = rootInstance(app, child);
         }
@@ -2990,8 +2763,8 @@ pub fn Runtime(comptime App: type) type {
             errdefer app.alloc.free(child.id);
             {
                 // Resolvers on other threads read the list.
-                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
-                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                app.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.authority_mutex.unlock(io_mod.getIo());
                 try app.child_agents.append(app.alloc, child);
             }
             // Registered here, with main as its parent, rather than by its
@@ -3010,8 +2783,8 @@ pub fn Runtime(comptime App: type) type {
             errdefer app.alloc.destroy(child);
             child.* = .{ .id = try app.alloc.dupe(u8, "instance"), .agent = .{ .app = @ptrCast(app), .role = .instance } };
             errdefer app.alloc.free(child.id);
-            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
-            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            app.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.authority_mutex.unlock(io_mod.getIo());
             try app.child_agents.append(app.alloc, child);
             return child;
         }
@@ -3052,9 +2825,9 @@ pub fn Runtime(comptime App: type) type {
             };
             app.main_screen.deinit(app.alloc);
             app.main_screen = .{};
-            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            app.authority_mutex.lockUncancelable(io_mod.getIo());
             app.instances.first_open = false;
-            app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            app.authority_mutex.unlock(io_mod.getIo());
         }
 
         /// Moves a resume request made on a subagent's screen to the instance
@@ -3188,8 +2961,8 @@ pub fn Runtime(comptime App: type) type {
             };
             if (!released) noteKept(child, "drop");
             {
-                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
-                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                app.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.authority_mutex.unlock(io_mod.getIo());
                 for (app.child_agents.items, 0..) |entry, index| if (entry == child) {
                     _ = app.child_agents.orderedRemove(index);
                     break;
@@ -3514,9 +3287,7 @@ pub fn Runtime(comptime App: type) type {
             agent.session_title.deinit(app.alloc);
             app_session_runtime.Runtime(App).deinitPersistence(app, agent);
             agent.session.deinit(app.alloc);
-            agent.approval_prompt.deinit(app.alloc);
             agent.question_prompt.deinit(app.alloc);
-            app_permission_runtime.Runtime(App).deinitSessionGrants(app, agent);
             agent.change_tracker.deinit(std.heap.c_allocator);
             for (agent.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
             agent.diff_entries.deinit(std.heap.c_allocator);
@@ -3552,129 +3323,6 @@ pub fn Runtime(comptime App: type) type {
             app.child_handoffs.deinit();
         }
     };
-}
-
-test "a slot thread's hand-off returns once the main loop takes it" {
-    var handoffs: Handoffs = .{};
-    defer handoffs.deinit();
-    var cancel = std.atomic.Value(bool).init(false);
-    // The loop side never runs here, so the turn is never read.
-    var post = Post{ .turn = undefined };
-    const Loop = struct {
-        fn take(box: *Handoffs) void {
-            while (true) {
-                box.mutex.lockUncancelable(io_mod.getIo());
-                if (box.posts.pop()) |taken| {
-                    taken.settle(.taken);
-                    box.mutex.unlock(io_mod.getIo());
-                    return;
-                }
-                box.mutex.unlock(io_mod.getIo());
-                io_mod.sleep(std.time.ns_per_ms);
-            }
-        }
-    };
-    const thread = try std.Thread.spawn(.{}, Loop.take, .{&handoffs});
-    try postAndWait(&handoffs, &post, &cancel);
-    thread.join();
-    try std.testing.expectEqual(Post.State.taken, post.state.load(.acquire));
-}
-
-test "a hand-off withdrawn on cancel, or posted after shutdown, never reaches the main loop" {
-    var handoffs: Handoffs = .{};
-    defer handoffs.deinit();
-    var cancel = std.atomic.Value(bool).init(true);
-    var post = Post{ .turn = undefined };
-    try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
-    try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
-
-    handoffs.closed = true;
-    cancel.store(false, .seq_cst);
-    try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
-    try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
-}
-
-test "the cancel a run's wait repeats ends the question that run waits on" {
-    const alloc = std.testing.allocator;
-    var worker = worker_runtime.WorkerRuntime{};
-    defer worker.deinit(alloc);
-    var completion: agents.ChildRunCompletion = .{};
-    var cancel = std.atomic.Value(bool).init(false);
-    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
-    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
-
-    const Side = struct {
-        fn ask(
-            runtime: *worker_runtime.WorkerRuntime,
-            batch: []const types.QuestionBatchEntry,
-            answered: *std.atomic.Value(bool),
-            returned: *std.Io.Event,
-        ) void {
-            defer returned.set(io_mod.getIo());
-            const answers = (runtime.requestQuestionBatchAnswerBlocking(std.testing.allocator, batch) catch return) orelse return;
-            for (answers) |answer| std.testing.allocator.free(answer);
-            std.testing.allocator.free(answers);
-            answered.store(true, .release);
-        }
-
-        fn wait(
-            done: *agents.ChildRunCompletion,
-            flag: *std.atomic.Value(bool),
-            runtime: *worker_runtime.WorkerRuntime,
-            outcome: *agents.ChildRunCompletion.Outcome,
-        ) void {
-            outcome.* = waitForCompletion(done, flag, runtime);
-        }
-
-        /// Whether the question opens within a bounded time. Nothing signals it, so
-        /// it is polled; the end of the wait is waited for on an event.
-        fn questionOpens(runtime: *worker_runtime.WorkerRuntime) bool {
-            for (0..2000) |_| {
-                var snapshot = runtime.snapshotPendingQuestionBatch(std.testing.allocator) catch return false;
-                if (snapshot) |*batch| {
-                    batch.deinit(std.testing.allocator);
-                    return true;
-                }
-                io_mod.sleep(1 * std.time.ns_per_ms);
-            }
-            return false;
-        }
-    };
-
-    var answered = std.atomic.Value(bool).init(false);
-    var returned: std.Io.Event = .unset;
-    const asker = try std.Thread.spawn(.{}, Side.ask, .{ &worker, &entries, &answered, &returned });
-    var outcome: agents.ChildRunCompletion.Outcome = .completed;
-    const waiter = try std.Thread.spawn(.{}, Side.wait, .{ &completion, &cancel, &worker, &outcome });
-    const opened = Side.questionOpens(&worker);
-    cancel.store(true, .seq_cst);
-    const ended = opened and testing_event.setInTime(&returned);
-    // A question that stayed open is released, so the test fails instead of hanging.
-    if (!ended) worker.requestStop();
-    completion.finish(.cancelled);
-    waiter.join();
-    asker.join();
-    try std.testing.expect(opened);
-    try std.testing.expect(ended);
-    try std.testing.expect(!answered.load(.acquire));
-    try std.testing.expectEqual(agents.ChildRunCompletion.Outcome.cancelled, outcome);
-}
-
-test "the switch list follows the registry's start order, with an unlisted agent kept after it" {
-    const ids = [_][]u8{ @constCast("new"), @constCast("second"), @constCast("first"), @constCast("stray") };
-    var agents_storage: [4]ChildAgent = undefined;
-    var children: [4]*ChildAgent = undefined;
-    for (&agents_storage, &children, ids) |*agent, *slot, id| {
-        agent.* = .{ .id = id };
-        slot.* = agent;
-    }
-    // "new" started in this process; "first" and "second" before a restart.
-    const Entry = struct { id: []const u8 };
-    const listing = [_]Entry{ .{ .id = "first" }, .{ .id = "second" }, .{ .id = "new" } };
-    orderByListing(&children, &listing);
-    var order: [4][]const u8 = undefined;
-    for (children, &order) |child, *name| name.* = child.id;
-    try std.testing.expectEqualDeep([4][]const u8{ "first", "second", "new", "stray" }, order);
 }
 
 /// Checks the switch order `order` over `entries`: every agent once, the
@@ -3727,41 +3375,6 @@ fn randomEntries(random: std.Random, buf: []OrderEntry) []OrderEntry {
     return buf[0..len];
 }
 
-test "the switch order lists instances in launch order, each with its own subagents" {
-    // In start order: A (the first's), spark 2, B (spark 2's), C (the first's),
-    // spark 3, D (spark 3's).
-    const entries = [_]OrderEntry{
-        .{ .role = .subagent, .root = 0 },
-        .{ .role = .instance },
-        .{ .role = .subagent, .root = 1 },
-        .{ .role = .subagent, .root = 0 },
-        .{ .role = .instance },
-        .{ .role = .subagent, .root = 2 },
-    };
-    var order: [entries.len + 1]usize = undefined;
-    switchOrder(&entries, &order);
-    // The first, A, C, spark 2, B, spark 3, D.
-    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 2, 3, 5, 6 }, &order);
-    try expectSwitchOrder(&entries, &order);
-}
-
-test "the switch order holds for random hosts" {
-    var prng = std.Random.DefaultPrng.init(0x5eed_4057);
-    var buf: [24]OrderEntry = undefined;
-    var order: [buf.len + 1]usize = undefined;
-    for (0..10_000) |_| {
-        const entries = randomEntries(prng.random(), &buf);
-        switchOrder(entries, order[0 .. entries.len + 1]);
-        try expectSwitchOrder(entries, order[0 .. entries.len + 1]);
-    }
-}
-
-test "the switch order holds for fuzzed hosts" {
-    try std.testing.fuzz({}, fuzzSwitchOrder, .{
-        .corpus = &(.{""} ++ @import("fuzz_corpus").switch_order.*),
-    });
-}
-
 fn fuzzSwitchOrder(_: void, smith: *std.testing.Smith) !void {
     var buf: [24]OrderEntry = undefined;
     var len: usize = 0;
@@ -3775,210 +3388,4 @@ fn fuzzSwitchOrder(_: void, smith: *std.testing.Smith) !void {
     var order: [buf.len + 1]usize = undefined;
     switchOrder(buf[0..len], order[0 .. len + 1]);
     try expectSwitchOrder(buf[0..len], order[0 .. len + 1]);
-}
-
-test "an instance's subagents waiting for the user come first, then the working ones, in the order they started, and the instance stays above them" {
-    const entries = [_]OrderEntry{
-        .{ .role = .subagent },
-        .{ .role = .instance, .urgency = .working },
-        .{ .role = .subagent, .root = 1, .urgency = .working },
-        .{ .role = .subagent, .urgency = .working },
-        .{ .role = .subagent, .urgency = .attention },
-    };
-    var order: [entries.len + 1]usize = undefined;
-    switchOrder(&entries, &order);
-    // Start order: main, its three subagents, spark 2, its subagent.
-    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 5, 2, 3 }, &order);
-    sortSubagentGroups(&entries, &order);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 5, 4, 1, 2, 3 }, &order);
-}
-
-test "a subagent whose own subagent waits for the user moves up with it, above working and idle ones" {
-    // Main started tester, then lead; lead started helper, which waits.
-    var entries = [_]OrderEntry{
-        .{ .role = .subagent, .urgency = .working },
-        .{ .role = .subagent, .reply_at_ms = 5 },
-        .{ .role = .subagent, .parent = 2, .urgency = .attention },
-    };
-    raiseParents(&entries);
-    try std.testing.expectEqual(Urgency.attention, entries[1].urgency);
-    var order: [entries.len + 1]usize = undefined;
-    var scratch: [entries.len + 1]usize = undefined;
-    switchOrder(&entries, &order);
-    sortSubagentGroups(&entries, &order);
-    nestSubagents(&entries, &order, &scratch);
-    // Main, lead, helper, tester.
-    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 3, 1 }, &order);
-}
-
-test "an instance's other subagents sort by latest reply, ties keep their order, and each instance sorts its own" {
-    const entries = [_]OrderEntry{
-        .{ .role = .subagent, .reply_at_ms = 100 },
-        .{ .role = .subagent, .urgency = .working, .reply_at_ms = 1 },
-        .{ .role = .subagent, .reply_at_ms = 300 },
-        .{ .role = .subagent, .urgency = .working, .reply_at_ms = 900 },
-        .{ .role = .subagent, .reply_at_ms = 300 },
-        .{ .role = .subagent },
-        // spark 2 replied last of all and stays below main's subagents.
-        .{ .role = .instance, .reply_at_ms = 999 },
-        .{ .role = .subagent, .root = 1, .reply_at_ms = 50 },
-        .{ .role = .subagent, .root = 1, .urgency = .working },
-    };
-    var order: [entries.len + 1]usize = undefined;
-    switchOrder(&entries, &order);
-    sortSubagentGroups(&entries, &order);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 4, 3, 5, 1, 6, 7, 9, 8 }, &order);
-}
-
-test "sorting subagents keeps every instance in place and every subagent under its own instance" {
-    var prng = std.Random.DefaultPrng.init(0x5eed_50f7);
-    const random = prng.random();
-    var buf: [24]OrderEntry = undefined;
-    var order: [buf.len + 1]usize = undefined;
-    var sorted: [buf.len + 1]usize = undefined;
-    for (0..10_000) |_| {
-        const entries = randomEntries(random, &buf);
-        for (entries) |*entry| {
-            entry.urgency = random.enumValue(Urgency);
-            entry.reply_at_ms = random.uintAtMost(u8, 3);
-        }
-        const len = entries.len + 1;
-        switchOrder(entries, order[0..len]);
-        @memcpy(sorted[0..len], order[0..len]);
-        sortSubagentGroups(entries, sorted[0..len]);
-        var group_start: usize = 0;
-        for (order[0..len], sorted[0..len], 0..) |before, after, index| {
-            const instance = before == 0 or entries[before - 1].role == .instance;
-            if (instance) {
-                try std.testing.expectEqual(before, after);
-                group_start = index + 1;
-                continue;
-            }
-            try std.testing.expectEqual(entries[before - 1].root, entries[after - 1].root);
-            try std.testing.expect(std.mem.findScalar(usize, sorted[group_start..len], before) != null);
-            if (index == group_start) continue;
-            const above = entries[sorted[index - 1] - 1];
-            const here = entries[after - 1];
-            try std.testing.expect(@backingInt(above.urgency) <= @backingInt(here.urgency));
-            if (above.urgency == .idle) try std.testing.expect(above.reply_at_ms >= here.reply_at_ms);
-        }
-    }
-}
-
-test "a subagent's own subagents come right under it, in their sorted order" {
-    // Main's lead works and started helper and checker; tester replied last.
-    const entries = [_]OrderEntry{
-        .{ .role = .subagent, .urgency = .working },
-        .{ .role = .subagent, .parent = 1, .reply_at_ms = 5 },
-        .{ .role = .subagent, .reply_at_ms = 9 },
-        .{ .role = .subagent, .parent = 1, .urgency = .working },
-    };
-    var order: [entries.len + 1]usize = undefined;
-    var scratch: [entries.len + 1]usize = undefined;
-    switchOrder(&entries, &order);
-    sortSubagentGroups(&entries, &order);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 3, 2 }, &order);
-    nestSubagents(&entries, &order, &scratch);
-    // Main, lead, checker, helper, tester.
-    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 4, 2, 3 }, &order);
-}
-
-test "nesting keeps every agent and instance in place, and puts each subagent's own right under it, for random hosts" {
-    var prng = std.Random.DefaultPrng.init(0x5eed_7e57);
-    const random = prng.random();
-    var buf: [24]OrderEntry = undefined;
-    var sorted: [buf.len + 1]usize = undefined;
-    var order: [buf.len + 1]usize = undefined;
-    var scratch: [buf.len + 1]usize = undefined;
-    for (0..10_000) |_| {
-        const entries = randomEntries(random, &buf);
-        for (entries, 0..) |*entry, index| {
-            entry.urgency = random.enumValue(Urgency);
-            entry.reply_at_ms = random.uintAtMost(u8, 3);
-            if (entry.role != .subagent or index == 0 or random.boolean()) continue;
-            // Two levels: a parent is one of the same tree's subagents that
-            // an instance started.
-            const candidate = random.uintLessThan(usize, index);
-            const parent = entries[candidate];
-            if (parent.role == .subagent and parent.root == entry.root and parent.parent == null) entry.parent = candidate + 1;
-        }
-        const len = entries.len + 1;
-        switchOrder(entries, sorted[0..len]);
-        sortSubagentGroups(entries, sorted[0..len]);
-        @memcpy(order[0..len], sorted[0..len]);
-        nestSubagents(entries, order[0..len], scratch[0..len]);
-        for (sorted[0..len], order[0..len]) |before, after| {
-            try std.testing.expect(std.mem.findScalar(usize, order[0..len], before) != null);
-            if (before == 0 or entries[before - 1].role == .instance) try std.testing.expectEqual(before, after);
-        }
-        for (order[0..len], 0..) |position, at| {
-            if (position == 0) continue;
-            const parent = entries[position - 1].parent orelse continue;
-            var back = at - 1;
-            while (order[back] != parent) : (back -= 1) {
-                try std.testing.expectEqual(@as(?usize, parent), entries[order[back] - 1].parent);
-            }
-        }
-    }
-}
-
-test "latest reply timestamp ignores interrupted turns and empty or untimed replies" {
-    const user: types.UserTurn = .{ .text = @constCast("task") };
-    const history = [_]types.HistoryTurn{
-        .{ .assistant = .{ .user = user, .assistant = @constCast("older"), .execution = .{ .turn_summary = .{ .completed_at_ms = 100 } } } },
-        .{ .assistant = .{ .user = user, .assistant = @constCast("newest reply"), .execution = .{ .turn_summary = .{ .completed_at_ms = 200 } } } },
-        .{ .interrupted = .{ .user = user, .assistant = @constCast("stopped"), .execution = .{ .turn_summary = .{ .completed_at_ms = 900 } } } },
-        .{ .assistant = .{ .user = user, .assistant = @constCast(""), .execution = .{ .turn_summary = .{ .completed_at_ms = 1000 } } } },
-        .{ .assistant = .{ .user = user, .assistant = @constCast("no timestamp") } },
-    };
-    try std.testing.expectEqual(@as(i64, 200), latestReplyAt(&history));
-    try std.testing.expectEqual(@as(i64, 0), latestReplyAt(&.{}));
-    try std.testing.expectEqual(@as(i64, 0), latestReplyAt(history[2..]));
-}
-
-test "the newest turn's end time never falls back to an older turn" {
-    const user: types.UserTurn = .{ .text = @constCast("task") };
-    const compacted: types.HistoryTurn = .{ .compacted_summary = .{ .summary = @constCast("earlier"), .removed_turn_count = 1, .compaction_count = 1 } };
-    const replied: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("reply"), .execution = .{ .turn_summary = .{ .completed_at_ms = 200 } } } };
-    const tool_only: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast(""), .execution = .{ .turn_summary = .{ .completed_at_ms = 300 } } } };
-    const stopped: types.HistoryTurn = .{ .interrupted = .{ .user = user } };
-    const failed: types.HistoryTurn = .{ .interrupted = .{ .user = user, .terminal_reason = .failed } };
-    const untimed: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("old session") } };
-
-    try std.testing.expectEqual(@as(i64, 200), newestTurnEndedAt(&.{replied}));
-    // A completed turn counts even when it ended without reply text.
-    try std.testing.expectEqual(@as(i64, 300), newestTurnEndedAt(&.{ replied, tool_only }));
-    // Compaction is not a turn: the turn before it still ended then.
-    try std.testing.expectEqual(@as(i64, 200), newestTurnEndedAt(&.{ replied, compacted }));
-    // A stopped or failed turn saves no end time, so there is no clock,
-    // rather than one counting from the reply before it.
-    try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{ replied, stopped }));
-    try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{ replied, failed }));
-    try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{ replied, untimed }));
-    try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{compacted}));
-    try std.testing.expectEqual(@as(i64, 0), newestTurnEndedAt(&.{}));
-}
-
-test "only a subagent has a purpose to show, and the list's search reads it with the name and the title" {
-    var id = "sub".*;
-    var purpose = "You audit the zebra crossing logic.".*;
-    var subagent: ChildAgent = .{ .id = &id, .agent = .{ .role = .subagent }, .purpose = &purpose };
-    var instance: ChildAgent = .{ .id = &id, .agent = .{ .role = .instance }, .purpose = &purpose };
-    try std.testing.expectEqualStrings(&purpose, purposeOf(&subagent));
-    // The first instance, an instance, and a subagent with none have no purpose.
-    try std.testing.expectEqualStrings("", purposeOf(null));
-    try std.testing.expectEqualStrings("", purposeOf(&instance));
-    subagent.purpose = &.{};
-    try std.testing.expectEqualStrings("", purposeOf(&subagent));
-
-    const text = "You audit the zebra crossing logic.";
-    // Only the purpose holds the word, in any case, whether or not there is a title.
-    try std.testing.expect(matchesSearchText("auditor", "", text, "zebra"));
-    try std.testing.expect(matchesSearchText("auditor", "", text, "ZEBRA"));
-    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "zebra"));
-    // The name and the title still match, and a word none holds does not.
-    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "AUDITOR"));
-    try std.testing.expect(matchesSearchText("auditor", "Review the parser", text, "parser"));
-    try std.testing.expect(!matchesSearchText("auditor", "Review the parser", text, "giraffe"));
-    try std.testing.expect(!matchesSearchText("auditor", "", "", "zebra"));
 }

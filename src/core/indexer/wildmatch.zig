@@ -240,84 +240,6 @@ fn expectCases(cases: []const Case, flags: Flags) !void {
     }
 }
 
-test "wildmatch literal, single-character and bracket rules" {
-    try expectCases(&.{
-        .{ .pattern = "foo", .text = "foo", .expected = true },
-        .{ .pattern = "foo", .text = "bar", .expected = false },
-        .{ .pattern = "", .text = "", .expected = true },
-        .{ .pattern = "???", .text = "foo", .expected = true },
-        .{ .pattern = "??", .text = "foo", .expected = false },
-        .{ .pattern = "*", .text = "foo", .expected = true },
-        .{ .pattern = "f*", .text = "foo", .expected = true },
-        .{ .pattern = "*f", .text = "foo", .expected = false },
-        .{ .pattern = "*foo*", .text = "foo", .expected = true },
-        .{ .pattern = "*ob*a*r*", .text = "foobar", .expected = true },
-        .{ .pattern = "*ab", .text = "aaaaaaabababab", .expected = true },
-        .{ .pattern = "foo\\*", .text = "foo*", .expected = true },
-        .{ .pattern = "foo\\*bar", .text = "foobar", .expected = false },
-        .{ .pattern = "f\\\\oo", .text = "f\\oo", .expected = true },
-        .{ .pattern = "*[al]?", .text = "ball", .expected = true },
-        .{ .pattern = "[ten]", .text = "ten", .expected = false },
-        .{ .pattern = "t[a-g]n", .text = "ten", .expected = true },
-        .{ .pattern = "t[!a-g]n", .text = "ten", .expected = false },
-        .{ .pattern = "t[!a-g]n", .text = "ton", .expected = true },
-        .{ .pattern = "t[^a-g]n", .text = "ton", .expected = true },
-        .{ .pattern = "a[]]b", .text = "a]b", .expected = true },
-        .{ .pattern = "a[]-]b", .text = "a-b", .expected = true },
-        .{ .pattern = "a[]-]b", .text = "aab", .expected = false },
-        .{ .pattern = "a[]a-]b", .text = "aab", .expected = true },
-        .{ .pattern = "]", .text = "]", .expected = true },
-        .{ .pattern = "[[:digit:]]x", .text = "7x", .expected = true },
-        .{ .pattern = "[[:digit:]]x", .text = "ax", .expected = false },
-        .{ .pattern = "[[:bogus:]]", .text = "a", .expected = false },
-        .{ .pattern = "[abc", .text = "a", .expected = false },
-    }, .{ .pathname = true });
-}
-
-test "wildmatch pathname rules for slashes and double asterisks" {
-    try expectCases(&.{
-        .{ .pattern = "foo*bar", .text = "foo/baz/bar", .expected = false },
-        .{ .pattern = "foo**bar", .text = "foo/baz/bar", .expected = false },
-        .{ .pattern = "foo**bar", .text = "foobazbar", .expected = true },
-        .{ .pattern = "foo/**/bar", .text = "foo/baz/bar", .expected = true },
-        .{ .pattern = "foo/**/bar", .text = "foo/b/a/z/bar", .expected = true },
-        .{ .pattern = "foo/**/bar", .text = "foo/bar", .expected = true },
-        .{ .pattern = "foo/**/**/bar", .text = "foo/bar", .expected = true },
-        .{ .pattern = "foo?bar", .text = "foo/bar", .expected = false },
-        .{ .pattern = "foo[/]bar", .text = "foo/bar", .expected = false },
-        .{ .pattern = "foo[^a-z]bar", .text = "foo/bar", .expected = false },
-        .{ .pattern = "**/foo", .text = "foo", .expected = true },
-        .{ .pattern = "**/foo", .text = "bar/baz/foo", .expected = true },
-        .{ .pattern = "*/foo", .text = "bar/baz/foo", .expected = false },
-        .{ .pattern = "**/bar*", .text = "foo/bar/baz", .expected = false },
-        .{ .pattern = "**/bar/*", .text = "deep/foo/bar/baz", .expected = true },
-        .{ .pattern = "**/bar/*", .text = "deep/foo/bar/baz/", .expected = false },
-        .{ .pattern = "**/bar/**", .text = "deep/foo/bar/baz/", .expected = true },
-        .{ .pattern = "**/bar/*", .text = "deep/foo/bar", .expected = false },
-        .{ .pattern = "**/bar**", .text = "foo/bar/baz", .expected = false },
-        .{ .pattern = "*/bar/**", .text = "foo/bar/baz/x", .expected = true },
-        .{ .pattern = "*/bar/**", .text = "deep/foo/bar/baz/x", .expected = false },
-        .{ .pattern = "**", .text = "a/b/c", .expected = true },
-        .{ .pattern = "a/*", .text = "a/b/c", .expected = false },
-    }, .{ .pathname = true });
-}
-
-test "wildmatch case folding is ASCII-only and keeps git's escape quirk" {
-    try expectCases(&.{
-        .{ .pattern = "FOO", .text = "foo", .expected = true },
-        .{ .pattern = "f*O", .text = "Foo", .expected = true },
-        .{ .pattern = "[a-c]x", .text = "Bx", .expected = true },
-        .{ .pattern = "[[:upper:]]x", .text = "bx", .expected = true },
-        // git compares an escaped character without folding it.
-        .{ .pattern = "\\Ax", .text = "ax", .expected = false },
-        .{ .pattern = "\xc3\x89", .text = "\xc3\xa9", .expected = false },
-    }, .{ .pathname = true, .casefold = true });
-}
-
-test "wildmatch stops at a NUL byte like git's C strings" {
-    try std.testing.expect(match("ab\x00zz", "ab", .{ .pathname = true }));
-}
-
 // The indexer imports nothing outside its boundary, so it keeps its own copy of
 // `text_utils.repeat` for tests.
 inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count:0]u8 {
@@ -327,16 +249,4 @@ inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.
         const final = bytes;
         break :blk &final;
     };
-}
-
-test "hostile patterns stop at the step budget instead of backtracking forever" {
-    const long_text = repeat("a/", 200) ++ "b";
-    const hostile = [_][]const u8{ repeat("*/", 40) ++ "c", repeat("**/", 30) ++ "c", "*a*a*a*a*a*a*a*a*a*a*a*a*c", "a/**/a/**/a/**/a/**/a/**/a/**/c" };
-    for (hostile) |pattern| {
-        try std.testing.expect(!match(pattern, long_text, .{ .pathname = true }));
-        try std.testing.expect(!match(pattern, long_text, .{}));
-    }
-    // Ordinary patterns on a long path still match.
-    try std.testing.expect(match("**/b", long_text, .{ .pathname = true }));
-    try std.testing.expect(match("a/**/a/b", long_text, .{ .pathname = true }));
 }

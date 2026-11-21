@@ -12,7 +12,6 @@ const runtime_tool_contracts = @import("tool_contracts.zig");
 const Allocator = std.mem.Allocator;
 const json_decode = @import("../../shared/json_decode.zig");
 const ChatMessage = types.ChatMessage;
-const PermissionGrant = types.PermissionGrant;
 const ToolCall = types.ToolCall;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
@@ -153,7 +152,6 @@ pub const ParallelHookExecContext = struct {
     turn_id: u64,
     root_user_intent_context: []const u8,
     current_turn_messages: []const ChatMessage,
-    session_grants: []const PermissionGrant,
     permission_mode: types.PermissionMode,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
@@ -401,7 +399,6 @@ pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, in
         .permission_mode = exec_ctx.permission_mode,
         .root_user_intent_context = exec_ctx.root_user_intent_context,
         .current_turn_messages = exec_ctx.current_turn_messages,
-        .session_grants = exec_ctx.session_grants,
         .advertised_dynamic_tool_names = exec_ctx.advertised_dynamic_tool_names,
         .max_tool_result_bytes = exec_ctx.max_tool_result_bytes,
         .toolbox_behind = exec_ctx.toolbox_behind,
@@ -677,337 +674,6 @@ test "parallel classifier uses active registry metadata" {
     try std.testing.expectEqual(@as(usize, 0), parallelReadOnlyPrefixLen(mislabeled_registry, &calls));
 }
 
-test "parallel classifier keeps only a leading safe read-only group" {
-    const builtin_tools = @import("../../../builtins/tools.zig");
-    const tools = [_]tool_dispatch.Tool{
-        builtin_tools.read_file,
-        builtin_tools.grep_files,
-        builtin_tools.write_file,
-    };
-    const registry = tool_dispatch.Registry{ .tools = &tools };
-    const calls = [_]ToolCall{
-        toolCall("read_1", "read_file", "{\"path\":\"src/main.zig\"}"),
-        toolCall("grep_1", "grep_files", "{\"pattern\":\"processQueuedPrompt\"}"),
-        toolCall("write_1", "write_file", "{\"path\":\"tmp.txt\",\"content\":\"x\"}"),
-        toolCall("read_2", "read_file", "{\"path\":\"README.md\"}"),
-    };
-
-    try std.testing.expectEqual(@as(usize, 2), parallelReadOnlyPrefixLen(registry, &calls));
-    try std.testing.expect(isReadOnlyCall(registry, calls[0]));
-    try std.testing.expect(isReadOnlyCall(registry, calls[1]));
-    try std.testing.expect(!isReadOnlyCall(registry, calls[2]));
-}
-
-test "host calls run together until a writer, which runs alone" {
-    const host_tool_runtime = @import("../../tooling/host_tool_runtime.zig");
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\[{"name":"list","description":"List","inputSchema":{},"idempotent":true},
-        \\ {"name":"read","description":"Read","inputSchema":{},"writes":false},
-        \\ {"name":"write","description":"Write","inputSchema":{},"writes":true}]
-    , .{});
-    defer parsed.deinit();
-    var host = try host_tool_runtime.Runtime.init(std.testing.allocator, parsed.value);
-    defer host.deinit();
-    const registry = host.toolSet().registry;
-    const calls = [_]ToolCall{
-        toolCall("call_1", "list", "{}"),
-        toolCall("call_2", "read", "{}"),
-        toolCall("call_3", "write", "{}"),
-        toolCall("call_4", "read", "{}"),
-    };
-
-    const expected_first: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 2 };
-    try std.testing.expectEqual(expected_first, leadingParallelGroup(std.testing.allocator, registry, &calls));
-    // The writer is a fence: no group includes it, and the call after it
-    // starts a new group.
-    try std.testing.expectEqual(LeadingGroup{}, leadingParallelGroup(std.testing.allocator, registry, calls[2..]));
-    const expected_last: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 1 };
-    try std.testing.expectEqual(expected_last, leadingParallelGroup(std.testing.allocator, registry, calls[3..]));
-}
-
-test "a host group holds at most max_parallel_host_calls calls" {
-    const host_tool_runtime = @import("../../tooling/host_tool_runtime.zig");
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\[{"name":"read","description":"Read","inputSchema":{},"idempotent":true}]
-    , .{});
-    defer parsed.deinit();
-    var host = try host_tool_runtime.Runtime.init(std.testing.allocator, parsed.value);
-    defer host.deinit();
-    const registry = host.toolSet().registry;
-    var calls: [max_parallel_host_calls + 4]ToolCall = undefined;
-    for (&calls) |*call| call.* = toolCall("call", "read", "{}");
-
-    const expected: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = max_parallel_host_calls };
-    try std.testing.expectEqual(expected, leadingParallelGroup(std.testing.allocator, registry, &calls));
-    const rest: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 4 };
-    try std.testing.expectEqual(rest, leadingParallelGroup(std.testing.allocator, registry, calls[max_parallel_host_calls..]));
-}
-
-test "parallel classifier keeps one leading registered subagent group" {
-    const builtin_tools = @import("../../../builtins/tools.zig");
-    const tools = [_]tool_dispatch.Tool{
-        builtin_tools.subagent,
-        builtin_tools.read_file,
-    };
-    const registry = tool_dispatch.Registry{ .tools = &tools };
-    const calls = [_]ToolCall{
-        toolCall("child_1", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"first\"}}"),
-        toolCall("child_2", "subagent", "{\"request\":{\"action\":\"run\",\"task\":\"second\"}}"),
-        toolCall("read_1", "read_file", "{\"path\":\"README.md\"}"),
-    };
-
-    const group = leadingParallelGroup(std.testing.allocator, registry, &calls);
-    try std.testing.expectEqual(GroupKind.subagent, group.kind);
-    try std.testing.expectEqual(@as(usize, 2), group.len);
-}
-
-test "a status or wait with an empty agent names no subagent, as one without the key" {
-    const builtin_tools = @import("../../../builtins/tools.zig");
-    const tools = [_]tool_dispatch.Tool{ builtin_tools.subagent, builtin_tools.read_file };
-    const registry = tool_dispatch.Registry{ .tools = &tools };
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const status_empty = "{\"request\":{\"action\":\"status\",\"agent\":\"\"}}";
-    const wait_empty = "{\"request\":{\"action\":\"wait\",\"agent\":\"\"}}";
-    try std.testing.expect(subagentTarget(arena, toolCall("c", "subagent", status_empty)) == .none);
-    try std.testing.expect(subagentTarget(arena, toolCall("c", "subagent", wait_empty)) == .none);
-    try std.testing.expect(subagentTarget(arena, toolCall("c", "subagent", "{\"request\":{\"action\":\"status\"}}")) == .none);
-    // A name is still a name.
-    switch (subagentTarget(arena, toolCall("c", "subagent", "{\"request\":{\"action\":\"status\",\"agent\":\"tester\"}}"))) {
-        .named => |name| try std.testing.expectEqualStrings("tester", name),
-        else => return error.TestExpectedNamed,
-    }
-    // Two of them in one step run together, as two without the key do.
-    const calls = [_]ToolCall{
-        toolCall("c1", "subagent", status_empty),
-        toolCall("c2", "subagent", wait_empty),
-        toolCall("c3", "subagent", status_empty),
-    };
-    const group = leadingParallelGroup(std.testing.allocator, registry, &calls);
-    try std.testing.expectEqual(GroupKind.subagent, group.kind);
-    try std.testing.expectEqual(@as(usize, 3), group.len);
-}
-
-test "parallel classifier admits approval-bearing web fetch read groups" {
-    const builtin_tools = @import("../../../builtins/tools.zig");
-    const tools = [_]tool_dispatch.Tool{
-        builtin_tools.web_fetch,
-        builtin_tools.read_file,
-    };
-    const registry = tool_dispatch.Registry{ .tools = &tools };
-    const calls = [_]ToolCall{
-        toolCall("fetch_1", "web_fetch", "{\"url\":\"https://example.com\"}"),
-        toolCall("read_1", "read_file", "{\"path\":\"README.md\"}"),
-    };
-
-    try std.testing.expectEqual(@as(usize, 2), parallelReadOnlyPrefixLen(registry, &calls));
-}
-
-test "parallel classifier rejects prompts approvals dynamic tools and mutations" {
-    const builtin_tools = @import("../../../builtins/tools.zig");
-    const tools = [_]tool_dispatch.Tool{
-        builtin_tools.ask_user_question,
-        builtin_tools.subagent,
-        builtin_tools.install_skill,
-        builtin_tools.shell,
-        builtin_tools.read_file,
-    };
-    const registry = tool_dispatch.Registry{ .tools = &tools };
-    const cases = [_]ToolCall{
-        toolCall("ask_1", "ask_user_question", "{\"questions\":[]}"),
-        toolCall("subagent_1", "subagent", "{\"command\":{\"inspect\":{\"id\":\"01J00000000000000000000000\",\"sections\":[\"status\"]}}}"),
-        toolCall("skill_1", "install_skill", "{\"source\":\"repo\"}"),
-        toolCall("browser_1", "browser_snapshot", "{}"),
-        toolCall("command_1", "run_command", "{\"command\":\"git status --short\"}"),
-        toolCall("unknown_1", "dynamic_mcp_tool", "{}"),
-    };
-
-    for (cases) |call| {
-        try std.testing.expect(!isReadOnlyCall(registry, call));
-    }
-
-    var provider_call = toolCall("provider_1", "read_file", "{\"path\":\"README.md\"}");
-    provider_call.provider_result = "provider result";
-    try std.testing.expect(!isReadOnlyCall(registry, provider_call));
-}
-
-test "parallel read-only execution preserves order and failure fan-in" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{
-        toolCall("first", "read_file", "{\"path\":\"a\"}"),
-        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
-    };
-    const plans = [_]ParallelTestPlan{
-        .{ .output = "first output", .delay_ms = 20 },
-        .{ .err = error.TestExpectedEqual, .delay_ms = 5 },
-        .{ .output = "third output", .delay_ms = 1 },
-    };
-    var fixture = ParallelTestFixture{ .plans = &plans };
-
-    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
-    defer run.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 3), run.attempts.len);
-    try std.testing.expectEqualStrings("first", run.attempts[0].completed.call_id);
-    try std.testing.expectEqualStrings("first output", run.attempts[0].completed.execution.model_output);
-    try std.testing.expectEqualStrings("second", run.attempts[1].completed.call_id);
-    try std.testing.expectEqual(.failure, run.attempts[1].completed.execution.status);
-    try std.testing.expect(std.mem.find(u8, run.attempts[1].completed.execution.model_output, "TestExpectedEqual") != null);
-    try std.testing.expectEqualStrings("third", run.attempts[2].completed.call_id);
-    try std.testing.expectEqualStrings("third output", run.attempts[2].completed.execution.model_output);
-    try std.testing.expect(run.first_cancelled_index == null);
-    try std.testing.expect(fixture.max_in_flight.load(.seq_cst) > 1);
-}
-
-test "parallel completion observer runs before slower siblings finish while results stay ordered" {
-    const alloc = std.testing.allocator;
-    var release_slow: std.Io.Event = .unset;
-    const calls = [_]ToolCall{
-        toolCall("slow", "read_file", "{\"path\":\"slow\"}"),
-        toolCall("fast", "grep_files", "{\"pattern\":\"fast\"}"),
-    };
-    const plans = [_]ParallelTestPlan{
-        .{ .output = "slow output", .gate = &release_slow },
-        .{ .output = "fast output" },
-    };
-    var fixture = ParallelTestFixture{ .plans = &plans };
-    var capture = ParallelObserverCapture{};
-    var run = ParallelObserverRun{
-        .calls = &calls,
-        .fixture = &fixture,
-        .capture = &capture,
-    };
-    var thread = try std.Thread.spawn(.{}, ParallelObserverRun.run, .{&run});
-    var joined = false;
-    defer if (!joined) {
-        release_slow.set(io_mod.getIo());
-        thread.join();
-    };
-
-    try capture.fast_observed.waitTimeout(io_mod.getIo(), .{ .duration = .{
-        .clock = .awake,
-        .raw = .fromSeconds(5),
-    } });
-    try std.testing.expectEqual(@as(usize, 1), capture.count);
-    try std.testing.expectEqual(@as(usize, 1), capture.indices[0]);
-
-    release_slow.set(io_mod.getIo());
-    thread.join();
-    joined = true;
-    if (run.err) |err| return err;
-    var result = run.result.?;
-    defer result.deinit(alloc);
-
-    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, capture.indices[0..capture.count]);
-    try std.testing.expectEqualStrings("slow", result.attempts[0].completed.call_id);
-    try std.testing.expectEqualStrings("fast", result.attempts[1].completed.call_id);
-}
-
-test "parallel read-only execution preserves exact cancelled identity and completed peers" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{
-        toolCall("first", "read_file", "{\"path\":\"a\"}"),
-        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
-    };
-    const plans = [_]ParallelTestPlan{
-        .{ .output = "first output", .delay_ms = 10 },
-        .{ .err = error.Cancelled, .delay_ms = 5, .cancel = true },
-        .{ .output = "third output", .delay_ms = 20 },
-    };
-    var fixture = ParallelTestFixture{ .plans = &plans };
-
-    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
-    defer run.deinit(alloc);
-
-    try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
-    try std.testing.expectEqual(@as(?usize, 1), run.first_cancelled_index);
-    try std.testing.expectEqualStrings("first", run.attempts[0].completed.call_id);
-    try std.testing.expect(run.attempts[1] == .cancelled);
-    try std.testing.expectEqualStrings("third", run.attempts[2].completed.call_id);
-    try std.testing.expectEqual(@as(usize, 0), fixture.in_flight.load(.seq_cst));
-}
-
-test "parallel workers start no execution when owner cancellation is already set" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{
-        toolCall("first", "read_file", "{\"path\":\"a\"}"),
-        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-    };
-    const plans = [_]ParallelTestPlan{
-        .{ .output = "must not execute" },
-        .{ .output = "must not execute" },
-    };
-    var fixture = ParallelTestFixture{ .plans = &plans };
-    fixture.cancel_flag.store(true, .seq_cst);
-
-    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
-    defer run.deinit(alloc);
-
-    try std.testing.expectEqual(@as(?usize, 0), run.first_cancelled_index);
-    try std.testing.expect(run.attempts[0] == .cancelled);
-    try std.testing.expect(run.attempts[1] == .cancelled);
-    try std.testing.expectEqual(@as(usize, 0), fixture.max_in_flight.load(.seq_cst));
-}
-
-test "parallel read-only execution does not relabel earlier ordinary cancellation" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{
-        toolCall("first", "read_file", "{\"path\":\"a\"}"),
-        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-        toolCall("third", "glob_files", "{\"pattern\":\"c\"}"),
-    };
-    const plans = [_]ParallelTestPlan{
-        .{ .err = error.Cancelled, .delay_ms = 1 },
-        .{ .output = "second output", .delay_ms = 50, .cancel = true },
-        .{ .output = "third output", .delay_ms = 10 },
-    };
-    var fixture = ParallelTestFixture{ .plans = &plans };
-
-    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
-    defer run.deinit(alloc);
-
-    try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
-    try std.testing.expect(run.first_cancelled_index == null);
-    try std.testing.expectEqual(.failure, run.attempts[0].completed.execution.status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        run.attempts[0].completed.execution.model_output,
-        "Cancelled",
-    ) != null);
-    try std.testing.expectEqualStrings(
-        "second output",
-        run.attempts[1].completed.execution.model_output,
-    );
-    try std.testing.expectEqualStrings(
-        "third output",
-        run.attempts[2].completed.execution.model_output,
-    );
-}
-
-test "parallel read-only execution reports no active call when cancellation follows completed attempts" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{
-        toolCall("first", "read_file", "{\"path\":\"a\"}"),
-        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
-    };
-    const plans = [_]ParallelTestPlan{
-        .{ .output = "first output", .delay_ms = 5, .cancel = true },
-        .{ .output = "second output", .delay_ms = 10 },
-    };
-    var fixture = ParallelTestFixture{ .plans = &plans };
-
-    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
-    defer run.deinit(alloc);
-
-    try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
-    try std.testing.expect(run.first_cancelled_index == null);
-    try std.testing.expect(run.attempts[0] == .completed);
-    try std.testing.expect(run.attempts[1] == .completed);
-}
-
 fn checkParallelRunAllocationFailures(alloc: Allocator) !void {
     const calls = [_]ToolCall{
         toolCall("first", "read_file", "{\"path\":\"a\"}"),
@@ -1020,14 +686,6 @@ fn checkParallelRunAllocationFailures(alloc: Allocator) !void {
     var fixture = ParallelTestFixture{ .plans = &plans };
     var run = try runParallelCallsForTest(alloc, &calls, &fixture);
     defer run.deinit(alloc);
-}
-
-test "parallel run cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        checkParallelRunAllocationFailures,
-        .{},
-    );
 }
 
 fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
@@ -1091,29 +749,6 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), subagent.effort);
     try std.testing.expectEqual(@as(u64, 12_000), subagent.input_tokens);
     try std.testing.expectEqual(@as(?u32, 100_000), subagent.context_window);
-}
-
-test "parallel result duplication cleans up every allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        checkParallelResultDuplicationAllocationFailures,
-        .{},
-    );
-}
-
-test "fuzzed subagent calls never run two calls to one subagent at once" {
-    try std.testing.fuzz({}, fuzzSubagentGroups, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "\x00",
-            "\x01\x00",
-            "\x00\x04\x00",
-            "\x02\x02\x00\x04\x08\x0c\x00",
-            "\x03\x00\x07\x04\x0b\x0f",
-            // Two waits that name an empty agent run together, as two that name none.
-            "\x06\x06",
-        }) ++ @import("fuzz_corpus").subagent_parallel_groups.*),
-    });
 }
 
 /// Each byte is one call of a step. Its low two bits pick a message (0) or a

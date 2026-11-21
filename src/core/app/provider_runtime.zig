@@ -11,7 +11,7 @@ pub const Runtime = struct {
     const Self = @This();
 
     alloc: Allocator,
-    active_provider: model_provider.ProviderId = .gateway,
+    active_provider: model_provider.ProviderId = .none,
     model: std.ArrayList(u8) = .empty,
     definitions: @import("../config/configured_provider.zig").Registry = .{},
     model_requests_blocked: bool = false,
@@ -160,7 +160,7 @@ pub fn providerOf(app: anytype, agent: anytype) model_provider.ProviderId {
         return app.selected_provider;
     }
     if (comptime builtin.is_test and @hasField(App, "selected_model")) {
-        return .gateway;
+        return .none;
     }
     @compileError("app must own provider_selection");
 }
@@ -206,46 +206,4 @@ pub fn replaceSelection(
         return replaceModel(app, value);
     }
     @compileError("app must own provider_selection");
-}
-
-test "runsProcessModel holds only while the agent runs the run's model" {
-    const alloc = std.testing.allocator;
-    const TestAgent = struct {
-        session_persistence: struct { process_model_override: ?[]u8 = null } = .{},
-    };
-    const TestApp = struct {
-        main_agent: TestAgent = .{},
-        selected_model: std.ArrayList(u8) = .empty,
-    };
-    var app = TestApp{};
-    defer app.selected_model.deinit(alloc);
-    try app.selected_model.appendSlice(alloc, "run/model");
-    try std.testing.expect(!runsProcessModel(&app, &app.main_agent));
-
-    var override = "run/model".*;
-    app.main_agent.session_persistence.process_model_override = &override;
-    try std.testing.expect(runsProcessModel(&app, &app.main_agent));
-
-    // A model picked since with /model is the user's own.
-    app.selected_model.clearRetainingCapacity();
-    try app.selected_model.appendSlice(alloc, "chosen/model");
-    try std.testing.expect(!runsProcessModel(&app, &app.main_agent));
-}
-
-test "provider runtime adopts an owned selection without a fallible publication" {
-    const alloc = std.testing.allocator;
-    var runtime = Runtime.init(alloc);
-    defer runtime.deinit();
-
-    var gateway_model = try alloc.dupe(u8, "gateway/model");
-    runtime.adoptOwned(.gateway, &gateway_model);
-    try std.testing.expectEqual(@as(usize, 0), gateway_model.len);
-    try std.testing.expectEqual(model_provider.ProviderId.gateway, runtime.selection().provider);
-    try std.testing.expectEqualStrings("gateway/model", runtime.selection().model);
-
-    var codex_model = try alloc.dupe(u8, "gpt-model");
-    runtime.adoptOwned(.codex, &codex_model);
-    try std.testing.expectEqual(@as(usize, 0), codex_model.len);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, runtime.selection().provider);
-    try std.testing.expectEqualStrings("gpt-model", runtime.selection().model);
 }

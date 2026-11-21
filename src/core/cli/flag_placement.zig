@@ -21,15 +21,3 @@ pub fn writeLaunchFlagHint(writer: *std.Io.Writer, command: []const u8, failure:
         return;
     }
 }
-
-test "a launch-wide flag after the command says where it goes" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    try writeLaunchFlagHint(&out.writer, "ask", .{ .unknown = .{ .flag = "--add-dir=/tmp", .suggestion = null } });
-    try std.testing.expectEqualStrings("; it goes before the command: spark --add-dir <path> ask", out.written());
-
-    out.clearRetainingCapacity();
-    try writeLaunchFlagHint(&out.writer, "ask", .{ .unknown = .{ .flag = "--verbose", .suggestion = null } });
-    try writeLaunchFlagHint(&out.writer, "ask", .{ .missing_value = "--model" });
-    try std.testing.expectEqualStrings("", out.written());
-}

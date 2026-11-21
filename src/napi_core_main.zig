@@ -2,7 +2,6 @@ const std = @import("std");
 const build_options = @import("build_options");
 const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
-const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
 const stream_provider = @import("core/agent/stream_provider.zig");
 const agent_steps = @import("core/config/agent_steps.zig");
@@ -12,17 +11,10 @@ const host_attachments = @import("core/hosts/host_attachments.zig");
 const agent_checkpoint = @import("core/agent/runtime/checkpoint.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
-const http_config = @import("core/mcp/http_config.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
-const host_openai_codex = @import("gateway/host_openai_codex.zig");
-const openai_codex = @import("gateway/openai_codex.zig");
-const host_xai_grok = @import("gateway/host_xai_grok.zig");
 const host_chat_completions = @import("gateway/host_chat_completions.zig");
 const configured_provider = @import("core/config/configured_provider.zig");
-const provider_catalog = @import("core/auth/provider_catalog.zig");
 const model_provider = @import("core/config/model_provider.zig");
-const oauth_transport = @import("core/auth/oauth_transport.zig");
-const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
 
 const c = @import("node_api");
@@ -35,8 +27,8 @@ const max_output_message_bytes = 64 * 1024 * 1024;
 const max_fetch_request_bytes = 8 * 1024 * 1024;
 /// The largest request body a provider sends over the fetch bridge: its
 /// budget less room for the request's method, URL, and headers, which hold
-/// at most the URL and API key this addon accepts and the other headers.
-const max_bridge_request_body_bytes = max_fetch_request_bytes - (max_url_bytes + max_api_key_bytes + 64 * 1024);
+/// at most the URL this addon accepts and the other headers.
+const max_bridge_request_body_bytes = max_fetch_request_bytes - (max_url_bytes + 64 * 1024);
 
 /// `provider` with its requests fit to the fetch bridge, so they leave out
 /// their oldest images instead of failing.
@@ -58,7 +50,6 @@ const max_inbound_attachments = 8;
 const max_inbound_attachment_bytes = 8 * 1024 * 1024;
 const max_outbound_attachments = 4;
 const max_outbound_attachment_bytes = 8 * 1024 * 1024;
-const max_api_key_bytes = 64 * 1024;
 const max_model_bytes = 1024;
 // Matches types.ReasoningEffort.max_name_bytes.
 const max_effort_bytes = 64;
@@ -673,15 +664,12 @@ const Runtime = struct {
     alloc: Allocator,
     fetch: FetchBridge = .{},
     attachments: AttachmentTable = .{},
-    stream_context: host_stream_provider.ProviderContext = undefined,
-    codex_context: host_openai_codex.Context = undefined,
-    grok_context: host_xai_grok.Context = undefined,
+    /// The fetch bridge's transport, shared by the configured provider's requests.
+    transport: host_stream_provider.Transport = undefined,
     /// The app's configured provider, when `provider` names one.
     custom_context: ?host_chat_completions.Context = null,
     input: InputQueue = .{},
     output: OutputQueue = .{},
-    /// The Gateway API key; null for an agent that only uses a subscription.
-    credential: ?[]u8,
     provider: ?model_provider.ProviderId,
     /// The settings-style providers object behind `custom_context`.
     configured_providers: ?[]u8,
@@ -691,7 +679,6 @@ const Runtime = struct {
     ultrafast: ?bool,
     home: []u8,
     workspace_root: []u8,
-    gateway_chat_url: []u8,
     ready: ReadyNotifier,
     thread: std.Thread,
     exited: std.atomic.Value(bool) = .init(false),
@@ -716,44 +703,17 @@ const Runtime = struct {
     }
 
     fn run(self: *Runtime) void {
-        const provider = gateway_provider.Provider{
-            .oauth_transport = oauth_transport.unavailable_provider,
-            .chat_url = builtin_gateway.provider.chat_url,
-        };
-        var providers = provider_set.gateway_only(.{
-            .capabilities = .{ .gateway_prompt_caching = true },
-            .presentation = builtin_gateway.provider_bundle.presentation,
-            .auth_strategy = .vercel,
-            .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
-            .agent_stream = bridgeBound(host_stream_provider.provider(&self.stream_context)),
-            .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
-        });
-        providers.codex = .{
-            .capabilities = openai_codex.bundle_capabilities,
-            .presentation = provider_catalog.find(.codex),
-            .auth_strategy = .chatgpt,
-            .agent_stream = bridgeBound(host_openai_codex.provider(&self.codex_context)),
-            .model_catalog = host_openai_codex.modelCatalogProvider(&self.codex_context),
-        };
-        providers.grok = .{
-            .presentation = provider_catalog.find(.grok),
-            .auth_strategy = .grok,
-            .agent_stream = bridgeBound(host_xai_grok.provider(&self.grok_context)),
-            .model_catalog = host_xai_grok.modelCatalogProvider(&self.grok_context),
-        };
+        var providers: provider_set.Set = .{};
         if (self.custom_context) |*context| {
+            providers.definitions = context.registry.definitions;
             providers.configured_fn = configuredBridgeBundle;
             providers.configured_context = context;
         }
         acp_server.runWithTransport(
             self.alloc,
             .{
-                .default_model = builtin_gateway.default_model,
+                .default_model = "",
                 .default_agent_step_limit = agent_steps.default_max_agent_steps,
-                .gateway_retry_count = 0,
-                .gateway_chat_url = self.gateway_chat_url,
-                .gateway_models_path = builtin_gateway.models_path,
-                .gateway_provider = provider,
                 .provider_set = providers,
                 .secret_store = host.unavailable_secret_store,
                 .prompt_policy = .{ .system_prompt = "" },
@@ -767,7 +727,6 @@ const Runtime = struct {
                 .max_history_turns = 100,
                 .context_registry = .{ .default_provider = context_contract.empty_provider },
                 .mode_registry = builtin_modes.registry,
-                .credential_override = self.credential,
                 .provider_override = self.provider,
                 // The JS host adds provider credentials at its fetch edge.
                 .provider_auth_mode = .host_managed,
@@ -811,14 +770,12 @@ const Runtime = struct {
         self.attachments.deinit();
         self.input.deinit(self.alloc);
         self.output.deinit(self.alloc);
-        if (self.credential) |value| self.alloc.free(value);
         if (self.custom_context) |*context| context.deinit(self.alloc);
         if (self.configured_providers) |json| self.alloc.free(json);
         if (self.model) |model| self.alloc.free(model);
         if (self.effort) |effort| self.alloc.free(effort);
         self.alloc.free(self.home);
         self.alloc.free(self.workspace_root);
-        self.alloc.free(self.gateway_chat_url);
         self.alloc.destroy(self);
         releaseRuntimeSlot();
     }
@@ -972,7 +929,6 @@ fn exceptionPending(env: c.napi_env) bool {
 const CreateError = error{
     JavaScriptException,
     TooManyRuntimes,
-    InvalidApiKey,
     InvalidProvider,
     InvalidConfiguredProvider,
     InvalidModel,
@@ -981,7 +937,6 @@ const CreateError = error{
     InvalidUltrafast,
     InvalidHome,
     InvalidWorkspaceRoot,
-    InvalidGatewayUrl,
     OutOfMemory,
     ThreadFailed,
     ReadyChannelFailed,
@@ -990,8 +945,8 @@ const CreateError = error{
 const max_provider_bytes = configured_provider.max_id_bytes;
 const max_configured_providers_bytes = 1024 * 1024;
 
-/// Reads the optional `provider` option: "gateway", "codex", "grok", or the name
-/// of the provider that the `configuredProviders` option defines.
+/// Reads the optional `provider` option: the name of the provider that the
+/// `configuredProviders` option defines.
 fn getProvider(env: c.napi_env, options: c.napi_value) CreateError!?model_provider.ProviderId {
     const alloc = std.heap.c_allocator;
     const raw = (getNamedString(env, options, "provider", alloc, max_provider_bytes) catch |err| switch (err) {
@@ -1000,9 +955,6 @@ fn getProvider(env: c.napi_env, options: c.napi_value) CreateError!?model_provid
         else => return error.InvalidProvider,
     }) orelse return null;
     defer alloc.free(raw);
-    if (std.mem.eql(u8, raw, "gateway")) return .gateway;
-    if (std.mem.eql(u8, raw, "codex")) return .codex;
-    if (std.mem.eql(u8, raw, "grok")) return .grok;
     const configured = model_provider.parse(raw) orelse return error.InvalidProvider;
     if (configured != .configured) return error.InvalidProvider;
     return configured;
@@ -1021,15 +973,6 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     errdefer if (configured_providers) |json| alloc.free(json);
     const configured = if (provider) |value| value == .configured else false;
     if (configured != (configured_providers != null)) return error.InvalidConfiguredProvider;
-    const api_key = getNamedString(env, options, "apiKey", alloc, max_api_key_bytes) catch |err| switch (err) {
-        error.JavaScriptException => return error.JavaScriptException,
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidApiKey,
-    };
-    errdefer if (api_key) |value| alloc.free(value);
-    // The host authorizes every provider but Gateway, which needs its API key.
-    const host_authorized = if (provider) |value| value != .gateway else false;
-    if (api_key == null and !host_authorized) return error.InvalidApiKey;
     const model = getNamedString(env, options, "model", alloc, max_model_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
         error.OutOfMemory => return error.OutOfMemory,
@@ -1062,25 +1005,12 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         else => return error.InvalidWorkspaceRoot,
     }) orelse return error.InvalidWorkspaceRoot;
     errdefer alloc.free(workspace_root);
-    const gateway_chat_url = (getNamedString(env, options, "gatewayChatUrl", alloc, max_url_bytes) catch |err| switch (err) {
-        error.JavaScriptException => return error.JavaScriptException,
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidGatewayUrl,
-    }) orelse (alloc.dupe(u8, builtin_gateway.default_chat_url) catch return error.OutOfMemory);
-    errdefer alloc.free(gateway_chat_url);
-    http_config.validateEndpoint(gateway_chat_url) catch return error.InvalidGatewayUrl;
-    if (!std.mem.eql(u8, gateway_chat_url, builtin_gateway.default_chat_url)) {
-        const uri = std.Uri.parse(gateway_chat_url) catch return error.InvalidGatewayUrl;
-        if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InvalidGatewayUrl;
-    }
-
     const runtime = alloc.create(Runtime) catch return error.OutOfMemory;
     errdefer alloc.destroy(runtime);
     var ready = try ReadyNotifier.init();
     errdefer ready.deinit();
     runtime.* = .{
         .alloc = alloc,
-        .credential = api_key,
         .provider = provider,
         .configured_providers = configured_providers,
         .model = model,
@@ -1089,13 +1019,12 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .ultrafast = ultrafast,
         .home = home,
         .workspace_root = workspace_root,
-        .gateway_chat_url = gateway_chat_url,
         .ready = ready,
         .thread = undefined,
     };
     runtime.fetch.ready = &runtime.ready;
     runtime.output.ready = &runtime.ready;
-    runtime.stream_context = host_stream_provider.initContext(builtin_gateway.buildAgentRequest, .{ .fixed = runtime.gateway_chat_url }, .{
+    runtime.transport = .{
         .context = &runtime.fetch,
         .open_fn = FetchBridge.open,
         .status_fn = FetchBridge.statusFn,
@@ -1103,11 +1032,9 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .close_fn = FetchBridge.close,
         .consumed_fn = FetchBridge.markConsumed,
         .retry_after_fn = FetchBridge.retryAfterFn,
-    });
-    runtime.codex_context = .{ .transport = runtime.stream_context.transport };
-    runtime.grok_context = .{ .transport = runtime.stream_context.transport };
+    };
     if (configured_providers) |json| {
-        var context = host_chat_completions.Context.init(alloc, runtime.stream_context.transport, json) catch |err| switch (err) {
+        var context = host_chat_completions.Context.init(alloc, runtime.transport, json) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidConfiguredProvider,
         };
@@ -1125,8 +1052,7 @@ fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
     return switch (err) {
         error.JavaScriptException => null,
         error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", "too many active native runtimes"),
-        error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
-        error.InvalidProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "provider must be \"gateway\", \"codex\", \"grok\" or a configured provider's name"),
+        error.InvalidProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "provider must be a configured provider's name"),
         error.InvalidConfiguredProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "configuredProviders must validly define the selected provider, without credentials"),
         error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),
         error.InvalidEffort => throw(env, "LIBFX_INVALID_ARGUMENT", "effort must be a bounded string"),
@@ -1134,7 +1060,6 @@ fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
         error.InvalidUltrafast => throw(env, "LIBFX_INVALID_ARGUMENT", "ultrafast must be a boolean"),
         error.InvalidHome => throw(env, "LIBFX_INVALID_ARGUMENT", "home is required and must be a bounded string"),
         error.InvalidWorkspaceRoot => throw(env, "LIBFX_INVALID_ARGUMENT", "workspaceRoot is required and must be a bounded string"),
-        error.InvalidGatewayUrl => throw(env, "LIBFX_INVALID_ARGUMENT", "gatewayChatUrl must be a bounded string"),
         error.OutOfMemory => throw(env, "LIBFX_NATIVE_OOM", "could not allocate native runtime"),
         error.ThreadFailed => throw(env, "LIBFX_NATIVE_THREAD", "could not start native runtime thread"),
         error.ReadyChannelFailed => throw(env, "LIBFX_NATIVE_IO", "could not create native readiness channel"),
@@ -1547,12 +1472,6 @@ export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callco
     var supports_ultrafast: c.napi_value = undefined;
     if (!statusOk(env, c.napi_get_boolean(env, true, &supports_ultrafast), "could not create ultrafast capability")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsUltrafast", supports_ultrafast), "could not export ultrafast capability")) return null;
-    var supports_codex: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_get_boolean(env, true, &supports_codex), "could not create Codex capability")) return null;
-    if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsCodex", supports_codex), "could not export Codex capability")) return null;
-    var supports_grok: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_get_boolean(env, true, &supports_grok), "could not create Grok capability")) return null;
-    if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsGrok", supports_grok), "could not export Grok capability")) return null;
     var supports_configured: c.napi_value = undefined;
     if (!statusOk(env, c.napi_get_boolean(env, true, &supports_configured), "could not create configured provider capability")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "supportsConfiguredProvider", supports_configured), "could not export configured provider capability")) return null;

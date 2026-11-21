@@ -6,7 +6,6 @@ const agent_stream_provider = @import("../stream_provider.zig");
 const auth_runtime = @import("../../auth/auth_runtime.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
-const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_catalog = @import("../../gateway/model_catalog.zig");
 const types = @import("../../shared/types.zig");
@@ -21,7 +20,6 @@ const compaction_activity = @import("../../output/compaction_activity.zig");
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;
-const PermissionGrant = types.PermissionGrant;
 const PermissionMode = types.PermissionMode;
 const ToolCall = types.ToolCall;
 const WorkerEvent = worker_runtime.WorkerEvent;
@@ -163,7 +161,8 @@ pub const OutOfCreditsChoice = enum {
     cancel,
 };
 
-pub const CredentialRefreshMode = auth_runtime.CredentialRefreshMode;
+/// How a renewal hook rereads a rejected credential.
+pub const CredentialRefreshMode = enum { if_needed, force, reload, stored };
 
 /// Ordered text emitted by the agent runtime. Payloads are borrowed for the
 /// duration of the callback.
@@ -253,9 +252,9 @@ pub const AgentRuntimeDeps = struct {
     /// the call runs under the normal MCP validation and permission path.
     resolve_unselected_mcp_tool: ?*const fn (ctx: *anyopaque, arena: Allocator, name: []const u8) anyerror!?@import("../../tooling/tool_mcp_runtime.zig").SelectedTool = null,
     check_tool_availability: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
-    request_tool_permission: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, revalidation: ?tool_contracts.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) anyerror!command_admission.PermissionOutcome,
+    request_tool_permission: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, live_authority: ?LiveToolAuthority, revalidation: ?command_admission.ToolExecutionAuthority, advertised_dynamic_tool_names: []const []const u8) anyerror!command_admission.PermissionOutcome,
     /// Admission consumes `prepared`; callers must not retry the same value through the raw callback.
-    request_prepared_file_mutation_permission: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) anyerror!command_admission.PermissionOutcome = null,
+    request_prepared_file_mutation_permission: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, live_authority: ?LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) anyerror!command_admission.PermissionOutcome = null,
     resolve_tool_action_display_target: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
     describe_tool_action: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     describe_tool_action_completed: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
@@ -314,7 +313,6 @@ pub const AgentRuntimeDeps = struct {
     /// session after a main-model completion and before its tool calls run.
     /// Another process may have taken the session over.
     confirm_session_writer: ?*const fn (ctx: *anyopaque) anyerror!void = null,
-    propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,
     push_reasoning_delta: ?*const fn (ctx: *anyopaque, delta: []const u8) anyerror!void = null,
@@ -412,12 +410,4 @@ fn reachedDirectory(authority: command_admission.ToolExecutionAuthority) ?[]cons
 
 fn terminalLeaseCleanupUnavailable(_: *anyopaque, _: []const u8) !void {
     return error.TerminalLeaseCleanupUnavailable;
-}
-
-test "a reached directory comes only from a command's or a mutation's typed authority" {
-    const fingerprint: command_admission.AdmissionFingerprint = .{ .command = "make", .resolved_cwd = "/repo/sub", .target_os = .linux };
-    try std.testing.expectEqualStrings("/repo/sub", reachedDirectory(.{ .run_command = .{ .direct_only = fingerprint } }).?);
-    try std.testing.expectEqualStrings("/repo/sub", reachedDirectory(.{ .run_command = .{ .shell_allowed = .{ .fingerprint = fingerprint, .source = .auto_mode } } }).?);
-    try std.testing.expect(reachedDirectory(.ordinary) == null);
-    try std.testing.expect(reachedDirectory(.{ .vision_paths = .{ .targets = &.{} } }) == null);
 }

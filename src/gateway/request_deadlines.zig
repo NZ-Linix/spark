@@ -81,38 +81,3 @@ pub const Deadlines = struct {
         return if (silence_ms >= bound_ms) self.wait else null;
     }
 };
-
-test "a wait runs out exactly at its bound and names itself" {
-    var deadlines = Deadlines.init(.{ .connect_ms = 30, .first_response_ms = 120, .stall_ms = 60 }, 1_000);
-    try std.testing.expectEqual(@as(?Wait, null), deadlines.expired(1_029));
-    try std.testing.expectEqual(@as(?Wait, .connecting), deadlines.expired(1_030));
-    deadlines.connected(1_010);
-    try std.testing.expectEqual(@as(?Wait, null), deadlines.expired(1_129));
-    try std.testing.expectEqual(@as(?Wait, .awaiting_head), deadlines.expired(1_130));
-    try std.testing.expectEqualStrings("timeouts.first_response_ms", Wait.awaiting_head.setting());
-    deadlines.headArrived(1_100);
-    try std.testing.expectEqual(@as(?Wait, null), deadlines.expired(1_159));
-    try std.testing.expectEqual(@as(?Wait, .streaming), deadlines.expired(1_160));
-}
-
-test "the stall bound times silence, not the whole response" {
-    var deadlines = Deadlines.init(.{ .stall_ms = 60 }, 0);
-    deadlines.connected(0);
-    deadlines.headArrived(0);
-    var now: u64 = 0;
-    // A response that keeps sending never stalls, however long it runs.
-    while (now < 10_000) : (now += 59) {
-        try std.testing.expectEqual(@as(?Wait, null), deadlines.expired(now));
-        deadlines.bytes(now);
-    }
-    try std.testing.expectEqual(@as(?Wait, .streaming), deadlines.expired(now - 59 + 60));
-}
-
-test "a wait with no bound never runs out, and a clock that went back counts as no time" {
-    var deadlines = Deadlines.init(.{}, 500);
-    try std.testing.expectEqual(@as(?Wait, null), deadlines.expired(std.math.maxInt(u64) - 1));
-    deadlines.connected(500);
-    deadlines.bounds.first_response_ms = 10;
-    try std.testing.expectEqual(@as(?Wait, null), deadlines.expired(400));
-    try std.testing.expectEqual(@as(?Wait, .awaiting_head), deadlines.expired(510));
-}

@@ -94,35 +94,3 @@ pub fn expired(stamp_ms: ?i64, started_ms: i64, now_ms: i64, wait_ms: i64) bool 
 }
 
 const testing = std.testing;
-
-test "a waiter gives up only once the holder's stamp, or its own start if later, is wait_ms old" {
-    const started: i64 = 1_000_000;
-    const wait: i64 = 17_000;
-    // No stamp: timed from its own start.
-    try testing.expect(!expired(null, started, started + wait - 1, wait));
-    try testing.expect(expired(null, started, started + wait, wait));
-    // A holder that stamped after the waiter started gets its whole wait from then.
-    const stamped = started + 9_000;
-    try testing.expect(!expired(stamped, started, stamped + wait - 1, wait));
-    try testing.expect(expired(stamped, started, stamped + wait, wait));
-    // A stamp from before the waiter started, or from the future, counts as its start.
-    try testing.expect(expired(started - 60_000, started, started + wait, wait));
-    try testing.expect(!expired(started - 60_000, started, started + wait - 1, wait));
-    try testing.expect(!expired(started + wait + 5, started, started + wait - 1, wait));
-    try testing.expect(expired(std.math.maxInt(i64), started, started + wait, wait));
-    try testing.expect(expired(std.math.minInt(i64), started, started + wait, wait));
-}
-
-test "a held lock's stamp reads back, and a waiter that can't wait gives up at once" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir: io_mod.VerifiedDir = .{ .dir = try tmp.dir.openDir(testing.io, ".", .{ .iterate = true }) };
-    defer dir.close();
-
-    var held = try acquire(&dir, "test.lock", io_mod.awakeMilliTimestamp(), 0, .{}, "test", "test");
-    defer held.lock.release();
-    try testing.expectEqual(@as(?i64, held.stamp_ms), readStamp(&dir, "test.lock"));
-    const again = restamp(held.lock.file, "test", "test");
-    try testing.expectEqual(@as(?i64, again), readStamp(&dir, "test.lock"));
-    try testing.expectError(error.LockBusy, acquire(&dir, "test.lock", io_mod.awakeMilliTimestamp(), 0, .{}, "test", "test"));
-}

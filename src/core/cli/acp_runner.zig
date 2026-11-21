@@ -1,7 +1,6 @@
 const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
 const process_provider = @import("../execution/process_provider.zig");
-const gateway_provider = @import("../gateway/gateway_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_attachments = @import("../hosts/host_attachments.zig");
@@ -21,7 +20,6 @@ pub const Config = struct {
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     gateway_models_path: []const u8,
-    gateway_provider: gateway_provider.Provider,
     provider_set: provider_set.Set,
     process_provider: process_provider.Provider = process_provider.unavailable_provider,
     secret_store: host.SecretStore,

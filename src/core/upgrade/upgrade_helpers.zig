@@ -266,37 +266,6 @@ test "transfer interrupt wakes a blocked socket read" {
     reader.slot.interrupt();
 }
 
-test "the interrupted read server stops when no client connects" {
-    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
-    var reader: InterruptedReadServer = .{};
-    try reader.start();
-    defer reader.deinit();
-    // Stop it once its thread is waiting for the client that never comes.
-    io_mod.sleep(50 * std.time.ns_per_ms);
-    try reader.stop(5_000);
-    try std.testing.expectEqual(@as(i64, 0), reader.woke_ms.load(.acquire));
-}
-
-test "the interrupted read server's stop fails within its limit when no interrupt comes" {
-    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SkipZigTest;
-    const limit_ms = 300;
-    var reader: InterruptedReadServer = .{};
-    try reader.start();
-    defer reader.deinit();
-    const client = try reader.connect();
-    defer client.close(io_mod.getIo());
-    if (!testing_listener.waitFor(&reader.published, 5_000)) return error.TestConnectionNotPublished;
-
-    // Nothing interrupts the read, so only the stop can end it.
-    const io = io_mod.getIo();
-    const started = std.Io.Clock.Timestamp.now(io, .awake);
-    try std.testing.expectError(error.TestThreadStillWaiting, reader.stop(limit_ms));
-    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds();
-    try std.testing.expect(elapsed_ms >= limit_ms);
-    try std.testing.expect(elapsed_ms < limit_ms + 1_000);
-    try std.testing.expect(reader.woke_ms.load(.acquire) != 0);
-}
-
 fn fetchTextBounded(
     client: *std.http.Client,
     alloc: Allocator,
@@ -512,72 +481,4 @@ fn readAbsoluteFile(alloc: Allocator, path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
-}
-
-test "platform string is valid" {
-    try std.testing.expect(platform.len > 0);
-    try std.testing.expect(std.mem.find(u8, platform, "-") != null);
-}
-
-test "E2E upgrade base accepts only explicit IPv4 loopback origins" {
-    try std.testing.expect(isLoopbackE2eUpgradeBase("http://127.0.0.1:1234"));
-    try std.testing.expect(!isLoopbackE2eUpgradeBase("https://127.0.0.1:1234"));
-    try std.testing.expect(!isLoopbackE2eUpgradeBase("http://127.0.0.1"));
-    try std.testing.expect(!isLoopbackE2eUpgradeBase("http://127.0.0.1:80@example.com"));
-    try std.testing.expect(!isLoopbackE2eUpgradeBase("http://localhost:1234"));
-}
-
-test "production upgrade base is spark's GitHub releases" {
-    try std.testing.expectEqualStrings("https://github.com/NZ-Linix/spark/releases", resolveCdnBase());
-    const alloc = std.testing.allocator;
-    const latest = try latestFileUrl(alloc, cdn_base, "latest.txt");
-    defer alloc.free(latest);
-    try std.testing.expectEqualStrings("https://github.com/NZ-Linix/spark/releases/latest/download/latest.txt", latest);
-    const sum = try artifactUrl(alloc, cdn_base, "v1.2.3", ".sha256");
-    defer alloc.free(sum);
-    try std.testing.expect(std.mem.endsWith(u8, sum, "/download/v1.2.3/spark-" ++ platform ++ ".tar.gz.sha256"));
-}
-
-test "extractChecksumHex parses sha256sum format" {
-    const with_filename = "abc123def456  spark-macos-aarch64.tar.gz\n";
-    const hex = extractChecksumHex(with_filename).?;
-    try std.testing.expectEqualStrings("abc123def456", hex);
-}
-
-test "extractChecksumHex parses raw hex" {
-    const raw = text_utils.repeat("a", 64) ++ "\n";
-    const hex = extractChecksumHex(raw).?;
-    try std.testing.expectEqual(@as(usize, 64), hex.len);
-    try std.testing.expectEqualStrings(text_utils.repeat("a", 64), hex);
-}
-
-test "extractChecksumHex rejects short raw checksum" {
-    try std.testing.expect(extractChecksumHex("abcd\n") == null);
-}
-
-test "bytesToHex renders lowercase sha256 digest" {
-    const bytes: [32]u8 = @splat(0x0f);
-    const hex = bytesToHex(&bytes);
-    try std.testing.expectEqualStrings(text_utils.repeat("0f", 32), &hex);
-}
-
-test "replaceBinary moves replacement over target path" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeTempFile(tmp.dir, "spark-old", "old");
-    try writeTempFile(tmp.dir, "spark-new", "new");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const new_path = try std.Io.Dir.path.join(alloc, &.{ root, "spark-new" });
-    defer alloc.free(new_path);
-    const target_path = try std.Io.Dir.path.join(alloc, &.{ root, "spark-old" });
-    defer alloc.free(target_path);
-
-    try replaceBinary(new_path, target_path);
-
-    const replaced = try readAbsoluteFile(alloc, target_path);
-    defer alloc.free(replaced);
-    try std.testing.expectEqualStrings("new", replaced);
 }

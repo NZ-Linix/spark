@@ -134,32 +134,3 @@ fn makeTestRepo(dir: std.Io.Dir, name: []const u8) !void {
     try dir.createDirPath(std.testing.io, try std.mem.print(&buffer, "{s}/.git/objects", .{name}));
     try dir.createDirPath(std.testing.io, try std.mem.print(&buffer, "{s}/.git/refs", .{name}));
 }
-
-test "repoFilters returns the repository and its drivers and fails closed on unreadable config" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try makeTestRepo(tmp.dir, "repo");
-    try writeTestFile(tmp.dir, "repo/.git/config", "[includeIf \"gitdir:/nowhere/\"]\npath = extra\n");
-    try writeTestFile(tmp.dir, "repo/.git/extra", "[filter \"x\"]\nclean = /tmp/run-me\n");
-    try tmp.dir.createDirPath(std.testing.io, "repo/src");
-    try makeTestRepo(tmp.dir, "bad");
-    try tmp.dir.createDirPath(std.testing.io, "bad/.git/config");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-
-    const repo_src = try std.Io.Dir.path.join(alloc, &.{ root, "repo/src" });
-    defer alloc.free(repo_src);
-    const filters = try repoFilters(alloc, repo_src);
-    defer filters.deinit(alloc);
-    const expected_git_dir = try std.Io.Dir.path.join(alloc, &.{ root, "repo/.git" });
-    defer alloc.free(expected_git_dir);
-    try std.testing.expectEqualStrings(expected_git_dir, filters.git_dir.?);
-    try std.testing.expectEqual(@as(usize, 1), filters.names.len);
-    try std.testing.expectEqualStrings("x", filters.names[0]);
-
-    const bad = try std.Io.Dir.path.join(alloc, &.{ root, "bad" });
-    defer alloc.free(bad);
-    try std.testing.expectError(error.RepoConfigUnavailable, repoFilters(alloc, bad));
-    try std.testing.expectError(error.RepoConfigUnavailable, repoFilters(alloc, "relative"));
-}

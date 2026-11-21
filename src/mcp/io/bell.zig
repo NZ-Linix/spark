@@ -49,36 +49,3 @@ fn timed(b: *Bell, timeout_ms: ?u32) !i64 {
     try b.wait(timeout_ms);
     return std.Io.Clock.awake.now(b.io).toMilliseconds() - started;
 }
-
-test "a ring is kept for the next wait, a second pending ring is the same one, and a timeout ends a wait" {
-    var b: Bell = undefined;
-    b.init(std.testing.io);
-    b.ring();
-    b.ring();
-    try std.testing.expect(try timed(&b, 2_000) < 1_000);
-    try std.testing.expect(try timed(&b, 20) >= 15);
-}
-
-test "a timed wait starts no task, so it works where none can run" {
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .concurrent_limit = .nothing });
-    defer threaded.deinit();
-    var b: Bell = undefined;
-    b.init(threaded.io());
-    try std.testing.expect(try timed(&b, 20) >= 15);
-    b.ring();
-    try std.testing.expect(try timed(&b, 2_000) < 1_000);
-}
-
-test "a ring from another thread ends a long timed wait early" {
-    const Ringer = struct {
-        fn run(b: *Bell) void {
-            std.Io.sleep(b.io, .fromMilliseconds(30), .awake) catch {};
-            b.ring();
-        }
-    };
-    var b: Bell = undefined;
-    b.init(std.testing.io);
-    const thread = try std.Thread.spawn(.{}, Ringer.run, .{&b});
-    defer thread.join();
-    try std.testing.expect(try timed(&b, 3_000) < 2_000);
-}

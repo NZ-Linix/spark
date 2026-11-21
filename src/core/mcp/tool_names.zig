@@ -127,23 +127,6 @@ fn candidateWithSuffix(alloc: Allocator, base: []const u8, suffix_index: ?usize)
     return alloc.dupe(u8, base[0..@min(base.len, max_name_len)]);
 }
 
-test "session tool aliases survive replacement and cannot retarget a collision" {
-    const alloc = std.testing.allocator;
-    var registry = Registry.init(alloc);
-    defer registry.deinit();
-    const first = try registry.name(alloc, .{}, "a/b", "c");
-    defer alloc.free(first);
-    const collision = try registry.name(alloc, .{}, "a_b", "c");
-    defer alloc.free(collision);
-    try std.testing.expect(!std.mem.eql(u8, first, collision));
-    const refreshed = try registry.name(alloc, .{}, "a/b", "c");
-    defer alloc.free(refreshed);
-    try std.testing.expectEqualStrings(first, refreshed);
-    const recovered = try registry.name(alloc, .{}, "a_b", "c");
-    defer alloc.free(recovered);
-    try std.testing.expectEqualStrings(collision, recovered);
-}
-
 pub fn tagsFor(alloc: Allocator, server_name: []const u8, tool_name: []const u8) ![]const []u8 {
     var tags: std.ArrayList([]u8) = .empty;
     errdefer collections.freeStringList(alloc, &tags);

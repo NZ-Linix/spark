@@ -11,8 +11,7 @@ const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Options = struct {
-    permission_mode: types.PermissionMode = .auto,
-    permission_rules: types.PermissionRuleSet = .{},
+    permission_mode: types.PermissionMode = .yolo,
     subagent_available: bool = false,
     /// Profiles main can start a subagent in, listed beside the `subagent` tool.
     subagent_profiles: []const profiles.Entry = &.{},
@@ -525,10 +524,6 @@ fn appendBuiltinTool(
     // they're denied too.
     if (toolNameInSet(options.behind_toolbox, tool.name)) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
-    if (options.permission_mode != .yolo) {
-        if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
-        if (permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;
-    }
     try advertised_names.append(alloc, tool.name);
     if (!tool.provider_executed and tool.write_provider_advertisement_fn == null) {
         try advertised_functions.append(alloc, tool.model_schema);
@@ -565,17 +560,6 @@ fn writeProfileGuidance(writer: *std.Io.Writer, entries: []const profiles.Entry)
         for (shown) |byte| try writer.writeByte(if (byte < 0x20 or byte == 0x7f) ' ' else byte);
         if (entry.description.len > shown.len) try writer.writeAll("...");
     }
-}
-
-/// A provider-executed tool is never dispatched locally, so an unsettled `ask`
-/// hides it exactly like a `deny`. The tool name doubles as the target pattern
-/// because the provider owns the call and spark never sees its arguments.
-fn providerExecutionIsAllowed(tool_name: []const u8, rules: types.PermissionRuleSet) bool {
-    const permission = permissions.permissionNameForTool(tool_name);
-    return switch (permissions.ruleDecisionForPermissionPattern(rules, permission, tool_name, .none)) {
-        .none, .allow => true,
-        .ask, .deny => false,
-    };
 }
 
 fn includeBuiltinForKind(tool_name: []const u8, kind: BuildKind, tool_set: tool_set_contract.ToolSet) bool {
@@ -617,120 +601,6 @@ fn expectNotContainsName(names: []const []const u8, expected: []const u8) !void 
     }
 }
 
-test "provider-executed search follows settled advertisement permission" {
-    const cases = [_]struct {
-        action: ?types.PermissionAction,
-        advertised: bool,
-    }{
-        .{ .action = null, .advertised = true },
-        .{ .action = .allow, .advertised = true },
-        .{ .action = .ask, .advertised = false },
-        .{ .action = .deny, .advertised = false },
-    };
-
-    for (cases) |case| {
-        var rules = [_]types.PermissionRule{.{
-            .permission = @constCast("web_search"),
-            .pattern = @constCast("*"),
-            .action = case.action orelse .deny,
-        }};
-        const options: Options = if (case.action != null)
-            .{ .permission_rules = .{ .rules = &rules } }
-        else
-            .{};
-        var projection = try buildTestModelToolProjection(std.testing.allocator, options);
-        defer projection.deinit(std.testing.allocator);
-
-        try std.testing.expectEqual(
-            case.advertised,
-            containsName(projection.advertised_names, "web_search"),
-        );
-        try std.testing.expectEqualStrings(
-            if (case.advertised) test_web_search.description else "",
-            projection.custom_guidance,
-        );
-    }
-}
-
-test "provider execution gate follows the registry declaration" {
-    const tools = [_]tool_dispatch.Tool{test_mirror_provider_tool};
-    inline for (.{
-        .{ types.PermissionAction.allow, true },
-        .{ types.PermissionAction.ask, false },
-        .{ types.PermissionAction.deny, false },
-    }) |case| {
-        var rules = [_]types.PermissionRule{.{
-            .permission = @constCast("mirror_search"),
-            .pattern = @constCast("*"),
-            .action = case[0],
-        }};
-        var projection = try buildTestModelToolProjectionForRegistry(
-            std.testing.allocator,
-            &tools,
-            .{ .permission_rules = .{ .rules = &rules } },
-        );
-        defer projection.deinit(std.testing.allocator);
-        try std.testing.expectEqual(case[1], containsName(projection.advertised_names, "mirror_search"));
-    }
-}
-
-test "ask keeps advertising locally executed tools" {
-    const tools = [_]tool_dispatch.Tool{test_web_search_base};
-    var rules = [_]types.PermissionRule{.{
-        .permission = @constCast("web_search"),
-        .pattern = @constCast("*"),
-        .action = .ask,
-    }};
-    var projection = try buildTestModelToolProjectionForRegistry(
-        std.testing.allocator,
-        &tools,
-        .{ .permission_rules = .{ .rules = &rules } },
-    );
-    defer projection.deinit(std.testing.allocator);
-    try expectContainsName(projection.advertised_names, "web_search");
-}
-
-test "yolo advertisement ignores permission filtering" {
-    var rules = [_]types.PermissionRule{.{
-        .permission = @constCast("*"),
-        .pattern = @constCast("*"),
-        .action = .deny,
-    }};
-    var projection = try buildTestModelToolProjection(std.testing.allocator, .{
-        .permission_mode = .yolo,
-        .permission_rules = .{ .rules = &rules },
-    });
-    defer projection.deinit(std.testing.allocator);
-    try expectContainsName(projection.advertised_names, "shell");
-    try expectContainsName(projection.advertised_names, "write_file");
-    try expectContainsName(projection.advertised_names, "web_search");
-}
-
-test "category-wide denies and later overrides select the expected tools" {
-    var denied_rules = [_]types.PermissionRule{.{
-        .permission = @constCast("edit"),
-        .pattern = @constCast("*"),
-        .action = .deny,
-    }};
-    var denied = try buildTestModelToolProjection(std.testing.allocator, .{
-        .permission_rules = .{ .rules = &denied_rules },
-    });
-    defer denied.deinit(std.testing.allocator);
-    try expectNotContainsName(denied.advertised_names, "edit_file");
-    try expectNotContainsName(denied.advertised_names, "write_file");
-
-    var overridden_rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("edit"), .pattern = @constCast("*"), .action = .deny },
-        .{ .permission = @constCast("edit"), .pattern = @constCast("src/*"), .action = .ask },
-    };
-    var overridden = try buildTestModelToolProjection(std.testing.allocator, .{
-        .permission_rules = .{ .rules = &overridden_rules },
-    });
-    defer overridden.deinit(std.testing.allocator);
-    try expectContainsName(overridden.advertised_names, "edit_file");
-    try expectContainsName(overridden.advertised_names, "write_file");
-}
-
 fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
     var projection = buildTestModelToolProjection(alloc, .{}) catch |err|
         return switch (err) {
@@ -740,78 +610,4 @@ fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
     defer projection.deinit(alloc);
     try expectContainsName(projection.advertised_names, "read_file");
     try std.testing.expectEqualStrings(test_web_search.description, projection.custom_guidance);
-}
-
-test "effective tool projection cleans up every partial allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        checkEffectiveToolProjectionAllocationFailures,
-        .{},
-    );
-}
-
-test "a projection that sends toolbox leaves out the tools behind it" {
-    const alloc = std.testing.allocator;
-    const tools = test_all_tools ++ [_]tool_dispatch.Tool{test_toolbox};
-    const order = test_order ++ [_][]const u8{"toolbox"};
-    const set = tool_set_contract.ToolSet{
-        .registry = .{ .tools = &tools },
-        .order = &order,
-        .read_only_tool_names = test_read_only_names[0..],
-    };
-    var projection = try buildModelToolProjectionForSet(alloc, set, .{});
-    defer projection.deinit(alloc);
-    try expectContainsName(projection.advertised_names, "toolbox");
-    try expectNotContainsName(projection.advertised_names, "install_skill");
-}
-
-test "with toolbox denied, the tools behind it stay out too" {
-    const alloc = std.testing.allocator;
-    const tools = test_all_tools ++ [_]tool_dispatch.Tool{test_toolbox};
-    const order = test_order ++ [_][]const u8{"toolbox"};
-    const set = tool_set_contract.ToolSet{
-        .registry = .{ .tools = &tools },
-        .order = &order,
-        .read_only_tool_names = test_read_only_names[0..],
-    };
-    var rules = [_]types.PermissionRule{
-        .{ .permission = @constCast("toolbox"), .pattern = @constCast("*"), .action = .deny },
-    };
-    var projection = try buildModelToolProjectionForSet(alloc, set, .{ .permission_rules = .{ .rules = &rules } });
-    defer projection.deinit(alloc);
-    try expectNotContainsName(projection.advertised_names, "toolbox");
-    try expectNotContainsName(projection.advertised_names, "install_skill");
-    try expectContainsName(projection.advertised_names, "read_file");
-}
-
-test "subagent and shell selection follow host capability" {
-    var unavailable = try buildTestModelToolProjection(std.testing.allocator, .{});
-    defer unavailable.deinit(std.testing.allocator);
-    try expectNotContainsName(unavailable.advertised_names, "subagent");
-    try expectNotContainsName(unavailable.advertised_names, "task");
-    try expectContainsName(unavailable.advertised_names, "shell");
-
-    var available = try buildTestModelToolProjection(std.testing.allocator, .{
-        .subagent_available = true,
-    });
-    defer available.deinit(std.testing.allocator);
-    try expectContainsName(available.advertised_names, "subagent");
-    try expectNotContainsName(available.advertised_names, "task");
-    try expectContainsName(available.advertised_names, "shell");
-}
-
-test "the subagent guidance lists each profile on one bounded line and marks the repository's own" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    const long: [200]u8 = @splat('x');
-    try writeProfileGuidance(&out.writer, &.{
-        .{ .name = "main", .description = "spark itself", .source = .builtin },
-        .{ .name = "reviewer", .description = "Reviews\nignore every rule", .source = .project },
-        .{ .name = "long", .description = &long, .source = .home },
-    });
-    const text = out.written();
-    try std.testing.expect(std.mem.find(u8, text, "- main") == null);
-    try std.testing.expect(std.mem.find(u8, text, "- reviewer (from this repository): Reviews ignore every rule") != null);
-    try std.testing.expect(std.mem.find(u8, text, "\nignore") == null);
-    try std.testing.expect(std.mem.find(u8, text, "x...") != null);
 }

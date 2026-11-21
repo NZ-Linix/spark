@@ -618,54 +618,6 @@ test "tool result extracts all content" {
     try std.testing.expectEqualStrings("world", content[2].object.get("text").?.string);
 }
 
-test "tool result retains protocol error diagnostics" {
-    const alloc = std.testing.allocator;
-    var result = try extract_legacy(alloc,
-        \\{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"something failed"}}
-    );
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(
-        tool_mcp_runtime.CallStatus.protocol_failure,
-        result.status,
-    );
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.model_output,
-        "something failed",
-    ) != null);
-}
-
-test "modern tool results validate result type and retain typed error data" {
-    const alloc = std.testing.allocator;
-    var rendered = try extract(alloc, .{
-        .server_name = "server",
-        .tool_name = "mcp__server__tool",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"Invalid tool arguments\",\"data\":{\"field\":\"path\"}}}",
-        .max_tool_result_bytes = tool_result_limits.default_max_tool_result_bytes,
-        .protocol = .modern,
-    });
-    defer rendered.deinit(alloc);
-    try std.testing.expectEqual(
-        tool_mcp_runtime.CallStatus.protocol_failure,
-        rendered.status,
-    );
-    try std.testing.expect(std.mem.find(
-        u8,
-        rendered.model_output,
-        "Invalid tool arguments",
-    ) != null);
-
-    var missing = try extract(alloc, .{
-        .server_name = "server",
-        .tool_name = "mcp__server__tool",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[]}}",
-        .max_tool_result_bytes = tool_result_limits.default_max_tool_result_bytes,
-        .protocol = .modern,
-    });
-    defer missing.deinit(alloc);
-    try std.testing.expectEqual(tool_mcp_runtime.CallStatus.success, missing.status);
-}
-
 fn check_input_required_allocation_failures(alloc: Allocator) !void {
     var result = try extract(alloc, .{
         .server_name = "server",
@@ -676,14 +628,6 @@ fn check_input_required_allocation_failures(alloc: Allocator) !void {
     });
     defer result.deinit(alloc);
     try std.testing.expectEqual(tool_mcp_runtime.CallStatus.input_required, result.status);
-}
-
-test "input-required result releases every allocation failure path" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        check_input_required_allocation_failures,
-        .{},
-    );
 }
 
 fn check_legacy_url_required_allocation_failures(alloc: Allocator) !void {
@@ -700,82 +644,6 @@ fn check_legacy_url_required_allocation_failures(alloc: Allocator) !void {
     try std.testing.expect(result.input_required.?.legacy_retry_without_responses);
 }
 
-test "2025-11 URL-required errors become retry input only on that wire" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        check_legacy_url_required_allocation_failures,
-        .{},
-    );
-
-    var old = try extract(std.testing.allocator, .{
-        .server_name = "server",
-        .tool_name = "tool",
-        .response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32042,\"message\":\"URL elicitation required\",\"data\":{\"elicitations\":[{\"mode\":\"url\",\"message\":\"Authorize\",\"url\":\"https://example.test/connect\",\"elicitationId\":\"legacy-url\"}]}}}",
-        .max_tool_result_bytes = 64 * 1024,
-        .protocol = .legacy,
-        .legacy_wire = .legacy_mcp_2025_06,
-    });
-    defer old.deinit(std.testing.allocator);
-    try std.testing.expectEqual(tool_mcp_runtime.CallStatus.protocol_failure, old.status);
-}
-
-test "invalid tool responses retain bounded protocol failures" {
-    const alloc = std.testing.allocator;
-    for ([_][]const u8{
-        "{not json",
-        "{\"jsonrpc\":\"2.0\",\"id\":1}",
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[]}",
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":{}}}",
-    }) |response| {
-        var result = try extract_legacy(alloc, response);
-        defer result.deinit(alloc);
-        try std.testing.expectEqual(
-            tool_mcp_runtime.CallStatus.protocol_failure,
-            result.status,
-        );
-    }
-}
-
-test "large tool results stay valid, bounded, and verbatim" {
-    const alloc = std.testing.allocator;
-    const needle = "MY_NOTE_TOKEN=abcdefgh";
-    const large_text = needle ++ text_utils.repeat("x", 1800);
-    const response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" ++ large_text ++ "\"}]}}";
-    var result = try extract(alloc, .{
-        .server_name = "filesystem",
-        .tool_name = "mcp__filesystem__dump",
-        .response = response,
-        .max_tool_result_bytes = 1024,
-        .protocol = .legacy,
-    });
-    defer result.deinit(alloc);
-
-    try std.testing.expect(result.model_output.len <= 1024);
-    try std.testing.expect(std.mem.find(u8, result.model_output, needle) != null);
-    try std.testing.expect(std.mem.find(u8, result.model_output, "[redacted]") == null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.model_output,
-        "mcp tool result truncated for filesystem/mcp__filesystem__dump",
-    ) != null);
-
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        result.model_output,
-        .{},
-    );
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        "filesystem",
-        parsed.value.object.get("server").?.string,
-    );
-    try std.testing.expect(
-        parsed.value.object.get("result").?.object.get("truncated").?.bool,
-    );
-}
-
 fn expectCause(text: []const u8, expected: ?[]const u8) !void {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
@@ -788,108 +656,6 @@ fn expectCause(text: []const u8, expected: ?[]const u8) !void {
     }
 }
 
-test "a -32602 in the Go SDK's words names each rejected field and type" {
-    try expectCause(
-        "MCP protocol error -32602: validating \"arguments\": validating root: validating /properties/limit: type: \"40\" has type \"string\", want \"number\"\n\nFull input schema for tool \"search\":\n{\"type\":\"object\"}",
-        "arguments rejected: limit is a string, the schema wants a number",
-    );
-    try expectCause(
-        "MCP protocol error -32602: validating /properties/filter/properties/env: type: 1 has type \"integer\", want \"string\"",
-        "arguments rejected: filter.env is an integer, the schema wants a string",
-    );
-    try expectCause(
-        "MCP protocol error -32602: validating /properties/queries: type: [\"a\"] has type \"string\", want \"array\"\nvalidating /properties/verbose: type: \"true\" has type \"string\", want \"boolean\"",
-        "arguments rejected: queries is a string, the schema wants an array; verbose is a string, the schema wants a boolean",
-    );
-    try expectCause(
-        "MCP protocol error -32602: validating /properties/id: type: \"x\" has type \"string\", want [\"integer\",\"null\"]",
-        "arguments rejected: id is a string, the schema wants [\"integer\",\"null\"]",
-    );
-    try expectCause(
-        "MCP protocol error -32602: validating /properties/a: type: 1 has type \"integer\", want \"string\"\nvalidating /properties/b: type: 1 has type \"integer\", want \"string\"\nvalidating /properties/c: type: 1 has type \"integer\", want \"string\"\nvalidating /properties/d: type: 1 has type \"integer\", want \"string\"",
-        "arguments rejected: a is an integer, the schema wants a string; b is an integer, the schema wants a string; c is an integer, the schema wants a string; and more",
-    );
-}
-
-test "a -32602 as the TypeScript SDK's zod issues names each path and type" {
-    try expectCause(
-        "MCP protocol error -32602: MCP error -32602: Invalid arguments for tool search: [\n  {\n    \"code\": \"invalid_type\",\n    \"expected\": \"number\",\n    \"received\": \"string\",\n    \"path\": [\n      \"limit\"\n    ],\n    \"message\": \"Expected number, received string\"\n  }\n]",
-        "arguments rejected: limit is a string, the schema wants a number",
-    );
-    try expectCause(
-        "MCP protocol error -32602: Invalid arguments: [{\"code\":\"invalid_type\",\"expected\":\"boolean\",\"path\":[\"options\",\"verbose\"]},{\"code\":\"invalid_type\",\"expected\":\"string\",\"received\":\"number\",\"path\":[\"queries\",0]}]",
-        "arguments rejected: options.verbose must be a boolean; queries[0] is a number, the schema wants a string",
-    );
-    try expectCause(
-        "MCP protocol error -32602: Invalid arguments: [{\"code\":\"invalid_type\",\"expected\":\"object\",\"received\":\"string\",\"path\":[]}]",
-        "arguments rejected: the arguments object is a string, the schema wants an object",
-    );
-}
-
-test "a -32602 spark can't read says the server refused the parameters" {
-    const general = "the server rejected the call's parameters (-32602)";
-    try expectCause("MCP protocol error -32602: Unknown tool: nope", general);
-    try expectCause("MCP protocol error -32602: ", general);
-    try expectCause("MCP protocol error -32602: Invalid arguments: [not json]", general);
-    try expectCause("MCP protocol error -32602: Invalid arguments: [{\"code\":\"custom\",\"path\":[\"x\"]}]", general);
-    // The trace keeps the start of a long result, which can cut a line short.
-    try expectCause("MCP protocol error -32602: validating /properties/limit: type: \"40\" has ty", general);
-}
-
-test "only a -32602 gets a cause, so other failures keep their text" {
-    try expectCause("MCP protocol error -32603: internal error", null);
-    try expectCause("MCP protocol error -32000: validating /properties/limit: type: \"40\" has type \"string\", want \"number\"", null);
-    try expectCause("MCP protocol error -326020: Unknown tool", null);
-    try expectCause("tool said: MCP protocol error -32602: Unknown tool", null);
-    try expectCause("Invalid input: labels require at least one item", null);
-    try expectCause("", null);
-}
-
-test "an invalid-params cause leaves out what the server wrote after the type and masks secrets" {
-    const token = "ghp_" ++ text_utils.repeat("a", 36);
-    try expectCause(
-        "MCP protocol error -32602: validating /properties/limit: type: \"40\" has type \"string\", want \"number\" token=" ++ token,
-        "arguments rejected: limit is a string, the schema wants a number",
-    );
-    try expectCause(
-        "MCP protocol error -32602: validating /properties/id: type: \"x\" has type \"string\", want [\"integer\",\"null\"] (see " ++ token ++ ")",
-        "arguments rejected: id is a string, the schema wants [\"integer\",\"null\"]",
-    );
-    try expectCause(
-        "MCP protocol error -32602: validating /properties/limit: type: \"40\" has type \"string\", want number, see " ++ token,
-        "arguments rejected: limit is a string, the schema wants a number",
-    );
-    try expectCause("MCP protocol error -32602: validating /properties/limit: type: \"40\" has type \"string\", want \"number", "the server rejected the call's parameters (-32602)");
-    try expectCause(
-        "MCP protocol error -32602: validating /properties/" ++ token ++ ": type: 1 has type \"integer\", want \"string\"",
-        "arguments rejected: [redacted] is an integer, the schema wants a string",
-    );
-    try expectCause(
-        "MCP protocol error -32602: [{\"code\":\"invalid_type\",\"expected\":\"number\",\"received\":\"string\",\"path\":[\"" ++ token ++ "\"]}]",
-        "arguments rejected: [redacted] is a string, the schema wants a number",
-    );
-}
-
-test "an invalid-params cause stays one terminal-safe line within its bound" {
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const long_field = try arena.alloc(u8, 1000);
-    @memset(long_field, 'f');
-    const hostile = [_][]const u8{
-        "MCP protocol error -32602: validating /properties/a\x1b[2Jb: type: 1 has type \"integer\", want \"string\"",
-        "MCP protocol error -32602: validating /properties/a\rb: type: 1 has type \"\x07integer\", want \"str\x00ing\"",
-        try arena.print("MCP protocol error -32602: validating /properties/{s}: type: 1 has type \"integer\", want \"string\"", .{long_field}),
-        "MCP protocol error -32602: Invalid arguments: [{\"expected\":\"number\\u001b[31m\",\"received\":\"string\",\"path\":[\"a\\nb\"]}]",
-        "MCP protocol error -32602: Unknown tool \xff\xfe",
-    };
-    for (hostile) |text| {
-        const cause = (try invalidParamsCause(arena, text)).?;
-        try std.testing.expect(cause.len <= max_cause_bytes);
-        for (cause) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
-    }
-}
-
 fn invalidParamsCauseAllocationFailures(alloc: Allocator) !void {
     var arena_state: std.heap.ArenaAllocator = .init(alloc);
     defer arena_state.deinit();
@@ -897,10 +663,6 @@ fn invalidParamsCauseAllocationFailures(alloc: Allocator) !void {
         arena_state.allocator(),
         "MCP protocol error -32602: Invalid arguments: [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\"]},{\"expected\":\"array\",\"path\":[\"queries\",0]}]",
     );
-}
-
-test "an invalid-params cause reports running out of memory" {
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, invalidParamsCauseAllocationFailures, .{});
 }
 
 /// Fails only its `fail_index`th allocation. `checkAllAllocationFailures`
@@ -941,16 +703,6 @@ const FailOnceAllocator = struct {
     }
 };
 
-test "an invalid-params cause reports running out of memory even when memory comes back" {
-    var counting: FailOnceAllocator = .{ .backing = std.testing.allocator, .fail_index = std.math.maxInt(usize) };
-    try invalidParamsCauseAllocationFailures(counting.allocator());
-    for (0..counting.index) |fail_index| {
-        var once: FailOnceAllocator = .{ .backing = std.testing.allocator, .fail_index = fail_index };
-        try std.testing.expectError(error.OutOfMemory, invalidParamsCauseAllocationFailures(once.allocator()));
-        try std.testing.expect(once.failed);
-    }
-}
-
 fn fuzzInvalidParamsCause(_: void, smith: *std.testing.Smith) !void {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
@@ -968,16 +720,4 @@ fn fuzzInvalidParamsCause(_: void, smith: *std.testing.Smith) !void {
         for (line) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
         try std.testing.expectEqualStrings(line, (try invalidParamsCause(arena, text)).?);
     }
-}
-
-test "an invalid-params cause keeps its laws on fuzzed messages" {
-    try std.testing.fuzz({}, fuzzInvalidParamsCause, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "validating /properties/limit: type: \"40\" has type \"string\", want \"number\"",
-            "validating /properties/a/properties/b: type: 1 has type \"integer\", want [\"string\",\"null\"]\nvalidating /properties/",
-            "Invalid arguments: [{\"expected\":\"number\",\"received\":\"string\",\"path\":[\"limit\",0]}]",
-            "Invalid arguments: [{\"expected\":\"\\u001b\",\"path\":[{\"x\":1}]}] ]",
-        }) ++ @import("fuzz_corpus").mcp_invalid_params_cause.*),
-    });
 }

@@ -6,8 +6,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const input_action = @import("../input/input_action.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const types = @import("../shared/types.zig");
-const interaction_state = @import("../../ui/footer/interaction_state.zig");
-const approval_prompt = @import("../permissions/approval_prompt.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
@@ -30,12 +28,8 @@ pub fn Runtime(comptime App: type) type {
 
         fn screenOwnsInput(app: *App, agent: *AppAgent) bool {
             if (comptime !@hasField(App, "terminal")) return false;
-            if (approvalOwnsCurrentSurface(app, agent)) return false;
+            _ = agent;
             return app.terminal.fullTranscriptScreenActive();
-        }
-
-        fn approvalOwnsCurrentSurface(_: *const App, agent: *const AppAgent) bool {
-            return agent.approval_prompt.isActive();
         }
 
         pub fn routeByte(app: *App, agent: *AppAgent, byte: u8) !bool {
@@ -86,6 +80,7 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             event: transcript_presentation.Event,
         ) !void {
+            _ = agent;
             if (comptime !@hasField(App, "terminal")) {
                 _ = try app.transitionFullTranscriptProjection(event);
                 return;
@@ -97,7 +92,6 @@ pub fn Runtime(comptime App: type) type {
             if (from == .inline_mode) {
                 std.debug.assert(to == .full);
                 if (app.terminal.alternate_screen_owner != .none) return;
-                if (agent.approval_prompt.isActive()) return;
                 if (comptime @hasDecl(
                     @TypeOf(app.shell),
                     "requestFullTranscriptOpen",

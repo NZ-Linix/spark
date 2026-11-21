@@ -2,7 +2,6 @@ const std = @import("std");
 const profile_paths = @import("../shared/profile_paths.zig");
 const agents = @import("../agents/agents.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
-const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
@@ -10,10 +9,6 @@ const io_mod = @import("../shared/io.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
-const credits_lookup = @import("credits_lookup.zig");
-const gateway_provider = @import("../gateway/gateway_provider.zig");
-const token_pass = @import("../gateway/token_pass.zig");
-const token_pass_check = @import("token_pass_check.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
 const command_router = @import("../slash_commands/command_router.zig");
@@ -31,17 +26,13 @@ const app_mcp_runtime = @import("app_mcp_runtime.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
-const session_permission_state = @import("../permissions/session_permission_state.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const firecrawl = @import("../../tools/web/firecrawl.zig");
 const prompts = @import("../prompts/prompts.zig");
 const trace_report = @import("trace_report.zig");
 const session_commands = @import("../session/session_commands.zig");
 const info_panel = @import("../input/info_panel.zig");
-const usage = @import("../../usage/usage.zig");
-const usage_host = @import("usage_host.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
@@ -234,43 +225,6 @@ fn handlePromptCommand(app: anytype, rest: []const u8) !void {
     }
 }
 
-/// `/search`: shows or sets the web search provider. Bare `/search` opens a
-/// picker.
-fn handleSearchCommand(app: anytype, rest: []const u8) !void {
-    var arena_state = std.heap.ArenaAllocator.init(app.alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const current = firecrawl.load(arena);
-    const arg = std.mem.trim(u8, rest, " \t");
-    if (arg.len == 0) {
-        if (comptime @hasField(@TypeOf(app.*), "input_runtime")) {
-            if (comptime @hasField(@TypeOf(app.input_runtime), "list_picker")) {
-                const list_picker = @import("../input/list_picker.zig");
-                var items: [3]list_picker.Item = undefined;
-                for (std.enums.values(firecrawl.Mode), 0..) |mode, i| items[i] = .{
-                    .label = mode.label(),
-                    .detail = switch (mode) {
-                        .vercel => "ai-gateway.vercel.sh, needs the gateway provider",
-                        .firecrawl => current.url,
-                        .auto => "Firecrawl first; Vercel after an error or 15s",
-                    },
-                    .value = @tagName(mode),
-                    .marked = mode == current.mode,
-                };
-                try app.input_runtime.list_picker.open(app.alloc, .search, "Web search provider", &items);
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-        }
-        return promptNotice(app, .neutral, "Web search uses {s}. Change it with /search vercel, firecrawl, or auto.", .{current.mode.label()});
-    }
-    const mode = firecrawl.Mode.parse(arg) orelse
-        return app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /search [vercel|firecrawl|auto]" }, true);
-    firecrawl.saveMode(app.alloc, mode) catch |err|
-        return promptNotice(app, .@"error", "Could not save the web search provider: {s}", .{@errorName(err)});
-    try app.writeDomainNotice(.{ .topic = "search", .tone = .neutral, .body = try arena.print("Web search now uses {s}.", .{mode.label()}) }, true);
-}
-
 /// Opens `/prompt`'s picker: spark's own prompt, every prompt in the
 /// folders, then adding and removing folders.
 pub fn openPromptPicker(app: anytype) !void {
@@ -361,14 +315,6 @@ pub fn promptPickerToggleStar(app: anytype) !void {
 /// line, the folder typed.
 pub fn promptPickerEnter(app: anytype) !void {
     const picker = &app.input_runtime.list_picker;
-    if (picker.purpose == .search) {
-        const item = picker.selectedItem() orelse return;
-        var buf: [16]u8 = undefined;
-        const value = buf[0..@min(buf.len, item.value.len)];
-        @memcpy(value, item.value[0..value.len]);
-        picker.close(app.alloc);
-        return handleSearchCommand(app, value);
-    }
     const home = io_mod.homeDir() orelse return picker.close(app.alloc);
     var arena_state = std.heap.ArenaAllocator.init(app.alloc);
     defer arena_state.deinit();
@@ -531,18 +477,13 @@ pub fn Handlers(comptime App: type) type {
                 .fork_session = commandForkSession,
 
                 .show_help = commandShowHelp,
-                .connect = commandConnect,
                 .provider = commandProvider,
-                .setup_alias = commandSetupAlias,
                 .show_status = commandShowStatus,
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
                 .handle_effort = commandHandleEffort,
-                .handle_permissions = commandHandlePermissions,
-                .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
-                .show_usage = commandShowUsage,
                 .undo_last = commandUndoLast,
                 .handle_mcp = commandHandleMcp,
                 .handle_skills = commandHandleSkills,
@@ -551,7 +492,6 @@ pub fn Handlers(comptime App: type) type {
                 .create_trace = commandCreateTrace,
                 .compact_history = commandCompactHistory,
                 .handle_settings = commandHandleSettings,
-                .show_credits = commandShowCredits,
                 .paste_clipboard = commandPasteClipboard,
                 .handle_fast = commandHandleFast,
                 .handle_ultrafast = commandHandleUltrafast,
@@ -561,7 +501,6 @@ pub fn Handlers(comptime App: type) type {
                 .handle_workspace = commandHandleWorkspace,
                 .handle_shell = commandHandleShell,
                 .handle_prompt = commandHandlePrompt,
-                .handle_search = commandHandleSearch,
                 .show_version = commandShowVersion,
                 .check_update = commandCheckUpdate,
                 .unknown = commandUnknown,
@@ -748,19 +687,15 @@ pub fn Handlers(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        /// `/setup` is the deprecated alias of `/provider`.
-        fn commandSetupAlias(ctx: *anyopaque) !void {
-            try commandConnect(ctx);
-        }
-
-        /// `/connect` opens the form that adds a custom connection.
-        fn commandConnect(ctx: *anyopaque) !void {
+        /// `/provider` opens the form that adds, edits, or removes an
+        /// OpenAI-compatible endpoint.
+        fn commandProvider(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !@hasField(App, "input_runtime") or !@hasDecl(App, "saveConnection")) {
                 try app.writeDomainNotice(.{
-                    .topic = "connect",
+                    .topic = "provider",
                     .tone = .@"error",
-                    .body = "/connect is not available in this runtime",
+                    .body = "/provider is not available in this runtime",
                 }, true);
                 return;
             }
@@ -770,17 +705,11 @@ pub fn Handlers(comptime App: type) type {
             app.input_runtime.settings_menu.close();
             app.input_runtime.effort_menu.close(app.alloc);
             closeInlineCommandMenusIfPresent(app);
-            try @import("app_connect_runtime.zig").Runtime(App).open(app);
+            try @import("app_provider_menu_runtime.zig").Runtime(App).open(app);
             app.shell.render_requests.request(.footer);
         }
 
-        /// Bare `/provider` opens `/connect`: spark has no built-in providers
-        /// to pick from.
-        fn commandProvider(ctx: *anyopaque) !void {
-            try commandConnect(ctx);
-        }
-
-        /// `/status` opens its panel in the footer, like `/usage`, and
+        /// `/status` opens its panel in the footer, and
         /// writes nothing to the transcript.
         fn commandShowStatus(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
@@ -794,7 +723,7 @@ pub fn Handlers(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        /// Rebuilds the open `/status` or `/permissions` panel when a running
+        /// Rebuilds the open `/status` panel when a running
         /// turn changed what it shows. Returns whether it did, so the footer
         /// repaints.
         pub fn collectInfoPanelFacts(app: *App) !bool {
@@ -805,7 +734,6 @@ pub fn Handlers(comptime App: type) type {
             const agent = agents.screenAgentOf(app);
             const next = (switch (shown.kind()) {
                 .status => try session_commands.Commands(App).refreshedStatusSnapshot(app, agent, shown),
-                .permissions => try session_commands.Commands(App).refreshedPermissionsSnapshot(app, agent, shown),
             }) orelse return false;
             panel.replace(next);
             return true;
@@ -848,213 +776,6 @@ pub fn Handlers(comptime App: type) type {
 
         /// Bare `/permissions` opens its panel and writes nothing to the
         /// transcript; a subcommand changes the mode or a saved-session rule.
-        fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            const agent = agents.screenAgentOf(app);
-            if (std.mem.trim(u8, rest, " \t").len == 0) {
-                openInfoPanel(app, try session_commands.Commands(App).openPermissionsSnapshot(app, agent));
-                return;
-            }
-            if (try handlePermissionRuleManagement(app, agent, rest)) return;
-            try session_commands.Commands(App).handlePermissions(app, agent, rest);
-        }
-
-        fn handlePermissionRuleManagement(app: *App, agent: *AppAgent, rest: []const u8) !bool {
-            if (comptime !agents.hasAgentField(App, "approval_prompt") or
-                !agents.hasAgentField(App, "session_persistence") or
-                !@hasDecl(App, "preparePermissionStateAction"))
-            {
-                return false;
-            } else {
-                const trimmed = std.mem.trim(u8, rest, " \t");
-                const action = splitPermissionWord(trimmed) orelse return false;
-                const remember = std.ascii.eqlIgnoreCase(action.word, "remember");
-                const revoke = std.ascii.eqlIgnoreCase(action.word, "revoke");
-                if (!remember and !revoke) return false;
-                debug_trace.logf("permission", "event=rule_management_begin action={s}", .{action.word});
-                if (app_session_runtime.Runtime(App).activeSessionId(agent) == null) {
-                    try writePermissionManagementNotice(
-                        app,
-                        .@"error",
-                        "saved-session permission rules require an active saved session",
-                    );
-                    return true;
-                }
-                debug_trace.logf("permission", "event=rule_management_session_ready", .{});
-                if (agent.approval_prompt.isActive()) {
-                    try writePermissionManagementNotice(
-                        app,
-                        .warning,
-                        "finish the active permission prompt before managing saved-session rules",
-                    );
-                    return true;
-                }
-
-                debug_trace.logf("permission", "event=rule_management_snapshot_start", .{});
-                var snapshot = try agent.session.snapshotPermissionState(app.alloc);
-                defer snapshot.deinit(app.alloc);
-                debug_trace.logf("permission", "event=rule_management_snapshot_done rules={d}", .{snapshot.rules.items.len});
-                if (remember) {
-                    const decision_word = splitPermissionWord(action.rest) orelse {
-                        try writePermissionManagementUsage(app);
-                        return true;
-                    };
-                    const decision: session_permission_state.Decision =
-                        if (std.ascii.eqlIgnoreCase(decision_word.word, "allow"))
-                            .allow
-                        else if (std.ascii.eqlIgnoreCase(decision_word.word, "deny"))
-                            .deny
-                        else {
-                            try writePermissionManagementUsage(app);
-                            return true;
-                        };
-                    const tool_word = splitPermissionWord(decision_word.rest) orelse {
-                        try writePermissionManagementUsage(app);
-                        return true;
-                    };
-                    if (tool_word.rest.len == 0) {
-                        try writePermissionManagementUsage(app);
-                        return true;
-                    }
-                    var arena_state = std.heap.ArenaAllocator.init(app.alloc);
-                    defer arena_state.deinit();
-                    debug_trace.logf("permission", "event=rule_management_prepare_start tool={s}", .{tool_word.word});
-                    const prepared = app.preparePermissionStateAction(
-                        agent,
-                        arena_state.allocator(),
-                        .{
-                            .id = "permission-rule-management",
-                            .name = tool_word.word,
-                            .arguments_json = tool_word.rest,
-                        },
-                    ) catch {
-                        try writePermissionManagementNotice(
-                            app,
-                            .@"error",
-                            "could not prepare that exact permission action without executing it",
-                        );
-                        return true;
-                    };
-                    debug_trace.logf("permission", "event=rule_management_prepare_done kind={s}", .{@tagName(prepared.key.kind)});
-                    const existing = session_permission_state.ruleForKey(
-                        snapshot,
-                        prepared.key,
-                    );
-                    try agent.approval_prompt.syncRuleManagement(
-                        app.alloc,
-                        .{
-                            .id = debug_trace.nextStepId(),
-                            .label = if (decision == .allow)
-                                "Remember allow for this saved session"
-                            else
-                                "Remember deny for this saved session",
-                            .explanation = if (existing == null)
-                                "Confirm this exact saved-session permission rule. The action will not run."
-                            else
-                                "Confirm replacement of the existing exact saved-session rule. The action will not run.",
-                            .command = prepared.display_identity,
-                            .amendment_allowed = false,
-                            .confirmation_only = true,
-                        },
-                        .{ .set = .{
-                            .key = prepared.key,
-                            .display_identity = prepared.display_identity,
-                            .decision = decision,
-                            .expected_generation = if (existing) |rule|
-                                rule.generation
-                            else
-                                null,
-                        } },
-                    );
-                    debug_trace.logf("permission", "event=rule_management_prompt_published", .{});
-                    app.shell.render_requests.request(.footer);
-                    return true;
-                }
-
-                const id_word = splitPermissionWord(action.rest) orelse {
-                    try writePermissionManagementUsage(app);
-                    return true;
-                };
-                if (id_word.rest.len != 0) {
-                    try writePermissionManagementUsage(app);
-                    return true;
-                }
-                const raw_id = std.fmt.parseUnsigned(u64, id_word.word, 10) catch {
-                    try writePermissionManagementUsage(app);
-                    return true;
-                };
-                const rule = session_permission_state.ruleForId(
-                    snapshot,
-                    .{ .value = raw_id },
-                ) orelse {
-                    try writePermissionManagementNotice(
-                        app,
-                        .warning,
-                        "saved-session permission rule not found",
-                    );
-                    return true;
-                };
-                try agent.approval_prompt.syncRuleManagement(
-                    app.alloc,
-                    .{
-                        .id = debug_trace.nextStepId(),
-                        .label = "Revoke saved-session permission rule",
-                        .explanation = "Confirm revocation of this stored rule. No current action will be prepared or run.",
-                        .command = rule.display_identity,
-                        .amendment_allowed = false,
-                        .confirmation_only = true,
-                    },
-                    .{ .revoke = .{
-                        .id = rule.id,
-                        .expected_generation = rule.generation,
-                    } },
-                );
-                app.shell.render_requests.request(.footer);
-                return true;
-            }
-        }
-
-        const PermissionWord = struct {
-            word: []const u8,
-            rest: []const u8,
-        };
-
-        fn splitPermissionWord(value: []const u8) ?PermissionWord {
-            const trimmed = std.mem.trim(u8, value, " \t");
-            if (trimmed.len == 0) return null;
-            const end = std.mem.findAny(u8, trimmed, " \t") orelse trimmed.len;
-            return .{
-                .word = trimmed[0..end],
-                .rest = std.mem.trim(u8, trimmed[end..], " \t"),
-            };
-        }
-
-        fn writePermissionManagementUsage(app: *App) !void {
-            // Usage lines name the command; a topic tag would repeat it.
-            try app.writeDomainNotice(.{
-                .topic = "",
-                .tone = .@"error",
-                .body = "usage: /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>",
-            }, true);
-        }
-
-        fn writePermissionManagementNotice(
-            app: *App,
-            tone: types.NoticeTone,
-            body: []const u8,
-        ) !void {
-            try app.writeDomainNotice(.{
-                .topic = "permissions",
-                .tone = tone,
-                .body = body,
-            }, true);
-        }
-
-        fn commandHandleAllowlist(ctx: *anyopaque, rest: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try session_commands.Commands(App).handleAllowlist(app, agents.screenAgentOf(app), rest);
-        }
-
         fn commandShowStats(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             var buf: [256]u8 = undefined;
@@ -1068,75 +789,6 @@ pub fn Handlers(comptime App: type) type {
                 .tone = .neutral,
                 .body = body,
             }, true);
-        }
-
-        fn commandShowUsage(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime !@hasField(App, "usage_dashboard")) {
-                try app.writeDomainNotice(.{
-                    .topic = "usage",
-                    .tone = .neutral,
-                    .body = "Usage is not available in this host.",
-                }, true);
-                return;
-            }
-            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
-            closeHelpMenuIfPresent(app);
-            app.input_runtime.settings_menu.close();
-            closeInlineCommandMenusIfPresent(app);
-            var label_buf: usage_host.LabelBuffer = undefined;
-            if (usage_host.credential(&app.auth, &label_buf)) |credential| {
-                app.usage_dashboard.open(credential);
-            } else {
-                app.usage_dashboard.openUnavailable(usage_host.missingReason(&app.auth));
-            }
-            try installUsageSnapshot(app);
-        }
-
-        /// Tab and ←→: lists `period` in the model table; never fetches.
-        pub fn refreshUsageMenu(app: *App, period: usage.Period) !void {
-            if (comptime !@hasField(App, "usage_dashboard")) return;
-            if (app.input_runtime.usage_menu.setPeriod(period)) app.shell.render_requests.request(.footer);
-        }
-
-        /// `r`: fetches unless a fetch is already running, then redraws.
-        pub fn reloadUsageMenu(app: *App, period: usage.Period) !void {
-            if (comptime !@hasField(App, "usage_dashboard")) return;
-            _ = period;
-            _ = app.usage_dashboard.refresh();
-            try installUsageSnapshot(app);
-        }
-
-        /// Runs on every event-loop pass while `/usage` is open: starts the
-        /// periodic refresh when due, and redraws when the dashboard changed
-        /// or the minute turned ("updated 2m ago", and today at midnight).
-        pub fn collectUsageDashboardFacts(app: *App) !bool {
-            if (comptime !@hasField(App, "usage_dashboard")) return false;
-            const menu = &app.input_runtime.usage_menu;
-            if (!menu.active) return false;
-            app.usage_dashboard.tick();
-            const changed = app.usage_dashboard.generationCount() != menu.generation;
-            const shown_minute = if (menu.snapshot) |*s| @divFloor(s.now_ms, std.time.ms_per_min) else 0;
-            const minute_turned = @divFloor(app.usage_dashboard.nowMs(), std.time.ms_per_min) != shown_minute;
-            if (!changed and !minute_turned) return false;
-            try installUsageSnapshot(app);
-            return true;
-        }
-
-        pub fn closeUsageMenu(app: *App) void {
-            app.input_runtime.usage_menu.close();
-            if (comptime @hasField(App, "usage_dashboard")) app.usage_dashboard.close();
-        }
-
-        fn installUsageSnapshot(app: *App) !void {
-            // Read the generation first, so a fetch finishing in between
-            // still triggers a redraw.
-            const generation = app.usage_dashboard.generationCount();
-            const snapshot = try app.usage_dashboard.snapshot(app.alloc);
-            const menu = &app.input_runtime.usage_menu;
-            if (menu.active) menu.replace(snapshot, generation) else menu.open(snapshot, generation);
-            app.shell.render_requests.request(.footer);
         }
 
         fn commandUndoLast(ctx: *anyopaque) !void {
@@ -1455,7 +1107,6 @@ pub fn Handlers(comptime App: type) type {
             const InputRuntime = @TypeOf(app.input_runtime);
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
             if (comptime @hasField(InputRuntime, "info_panel")) app.input_runtime.info_panel.close();
-            if (comptime @hasField(InputRuntime, "usage_menu")) closeUsageMenu(app);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
             if (comptime @hasField(InputRuntime, "effort_menu")) app.input_runtime.effort_menu.close(app.alloc);
         }
@@ -1529,137 +1180,6 @@ pub fn Handlers(comptime App: type) type {
             try session_commands.Commands(App).handleSettings(app, rest);
         }
 
-        fn commandShowCredits(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            // The lookup runs in a `std.Io` task so a slow Gateway or issuer
-            // never holds the input loop; `collectCreditsFacts` writes its result.
-            if (comptime @hasField(App, "credits_lookup") and !@import("builtin").single_threaded) {
-                return startCreditsLookup(app);
-            }
-            const input: gateway_provider.CreditsLookupInput = .{
-                .credential = app.auth.apiKey(),
-                .credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
-                    app.auth.credentialSource()
-                else
-                    null,
-                .tenant = app.auth.gatewayTeam(),
-            };
-            var snapshot = app.creditsProvider().fetch(app.alloc, input);
-            defer snapshot.deinit(app.alloc);
-            try writeCreditsNotice(app, snapshot, .current_credential);
-        }
-
-        const CreditsLookupArgs = struct {
-            input: gateway_provider.CreditsLookupInput,
-            renewal: ?credits_lookup.Renewal,
-        };
-
-        fn creditsLookupArgs(app: *App) CreditsLookupArgs {
-            // A due token still names the session; the task renews it before
-            // asking for credits.
-            const queued = app.auth.queuedPromptCredential();
-            const source = app.auth.credentialSource();
-            const renewal: ?credits_lookup.Renewal = if (source) |active|
-                if (credentials.sourceRefreshable(active) and app.auth.credentialNeedsRefresh())
-                    .{ .transport = app.auth.oauthTransport(), .source = active, .account_id = app.auth.accountId() }
-                else
-                    null
-            else
-                null;
-            return .{
-                .input = .{
-                    .credential = if (queued) |credential| credential.api_key else null,
-                    .credential_source = source,
-                    .tenant = if (queued) |credential| credential.gateway_team else null,
-                },
-                .renewal = renewal,
-            };
-        }
-
-        fn startCreditsLookup(app: *App) !void {
-            const args = creditsLookupArgs(app);
-            const started = app.credits_lookup.start(app.creditsProvider(), args.input, args.renewal, tokenPassEpoch(app)) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                debug_trace.logf("credits", "lookup start failed err={s}", .{@errorName(err)});
-                return app.writeDomainNotice(.{
-                    .topic = "credits",
-                    .tone = .@"error",
-                    .body = "spark could not start a background task to check credits. Try again.",
-                }, true);
-            };
-            try app.writeDomainNotice(.{
-                .topic = "credits",
-                .tone = .neutral,
-                .body = switch (started) {
-                    .started => "Checking credits…",
-                    .busy => "Credits are still loading.",
-                },
-            }, true);
-        }
-
-        /// Writes the `/credits` result once its background lookup finishes,
-        /// after adopting a credential the lookup renewed.
-        pub fn collectCreditsFacts(app: *App) !void {
-            if (comptime !@hasField(App, "credits_lookup")) return;
-            var result = app.credits_lookup.take() orelse return;
-            defer result.deinit();
-            if (result.renewed) |*renewed| try app.adoptRenewedCredential(renewed);
-            // A reply that started before the credential changed says
-            // nothing about the current team's Token Pass.
-            const current = result.epoch == tokenPassEpoch(app);
-            if (!current) debug_trace.logf("credits", "token pass reply ignored reason=credential_changed", .{});
-            try writeCreditsNotice(app, result.snapshot, if (current) .current_credential else .earlier_credential);
-        }
-
-        fn tokenPassEpoch(app: *App) u32 {
-            if (comptime !@hasField(App, "model_cache")) return 0;
-            return app.model_cache.token_pass_epoch;
-        }
-
-        /// Which credential a credits reply belongs to.
-        const ReplyFor = enum {
-            /// The credential spark uses now: the reply may update Token Pass state.
-            current_credential,
-            /// An earlier credential: show the reply, but it says nothing
-            /// about the current team.
-            earlier_credential,
-        };
-
-        /// Writes the credits notice, and records what it says about Token
-        /// Pass when it belongs to the current credential.
-        fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot, reply_for: ReplyFor) !void {
-            const text = snapshot.renderInteractiveBody(app.alloc) catch {
-                try app.writeDomainNotice(.{
-                    .topic = "credits",
-                    .tone = .@"error",
-                    .body = "Failed to render credits.",
-                }, true);
-                return;
-            };
-            defer app.alloc.free(text);
-            try app.writeDomainNotice(.{
-                .topic = "credits",
-                .tone = if (snapshot.err_message == null) .neutral else .@"error",
-                .body = text,
-            }, true);
-            if (reply_for == .earlier_credential) return;
-            if (comptime @hasField(App, "model_cache")) {
-                if (snapshot.err_message == null) {
-                    if (token_pass_check.answerOf(snapshot)) |answer| {
-                        token_pass_check.Runtime(App).record(app, answer, "credits");
-                    } else if (app.model_cache.tokenPassStatus() == .active) {
-                        // The team uses Token Pass, but this reply does not
-                        // mention Token Pass: point at the tab that has it.
-                        try app.writeDomainNotice(.{
-                            .topic = "credits",
-                            .tone = .neutral,
-                            .body = "Token Pass credit is a separate balance. See it in the Token Pass tab: " ++ token_pass.dashboard_url,
-                        }, true);
-                    }
-                }
-            }
-        }
-
         fn commandPasteClipboard(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try image_commands.Commands(App).attachClipboard(app);
@@ -1703,11 +1223,6 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandlePrompt(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handlePromptCommand(app, rest);
-        }
-
-        fn commandHandleSearch(ctx: *anyopaque, rest: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try handleSearchCommand(app, rest);
         }
 
         fn commandHandleWorkspace(ctx: *anyopaque, rest: []const u8) !void {
@@ -1794,145 +1309,6 @@ test "workspace slash parser preserves paths with spaces and rejects incomplete 
     try std.testing.expectError(error.InvalidWorkspaceCommand, parseWorkspaceCommand("add"));
     try std.testing.expectError(error.InvalidWorkspaceCommand, parseWorkspaceCommand("remove"));
     try std.testing.expectError(error.InvalidWorkspaceCommand, parseWorkspaceCommand("unknown"));
-}
-
-test "workspace mutation admission rejects queue-zero processing gap" {
-    const alloc = std.testing.allocator;
-    var app = struct {
-        main_agent: struct {
-            stream: struct { active: bool = false } = .{},
-            worker: worker_runtime.WorkerRuntime = .{},
-        } = .{},
-
-        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
-            return &self.main_agent;
-        }
-    }{};
-    defer app.agent().worker.deinit(alloc);
-
-    try app.agent().worker.enqueuePrompt(alloc, .{
-        .prompt = try alloc.dupe(u8, "active turn"),
-        .images = &.{},
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "test-key"),
-        .permission_mode = .auto,
-        .history = try alloc.alloc(types.HistoryTurn, 0),
-        .grants = try alloc.alloc(types.PermissionGrant, 0),
-    });
-    const active = (try app.agent().worker.waitAndTakeNextPrompt(alloc)).?;
-    defer worker_runtime.freeQueuedPrompt(alloc, active);
-
-    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.queuedPromptCount());
-    try std.testing.expect(!tryBeginWorkspaceMutation(&app));
-
-    app.agent().worker.finishProcessing();
-    try std.testing.expect(tryBeginWorkspaceMutation(&app));
-    app.agent().worker.releaseTurnStartHold();
-}
-
-test "workspace list refresh waits for an idle turn" {
-    const alloc = std.testing.allocator;
-    const TestApp = struct {
-        main_agent: struct {
-            stream: struct { active: bool = false } = .{},
-            worker: worker_runtime.WorkerRuntime = .{},
-        } = .{},
-        available: bool = true,
-        active: bool = true,
-        index_refresh_count: usize = 0,
-
-        pub fn refreshWorkspaceAccess(self: *@This()) !bool {
-            self.available = false;
-            self.active = false;
-            self.index_refresh_count += 1;
-            return true;
-        }
-
-        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
-            return &self.main_agent;
-        }
-    };
-    var app = TestApp{};
-    defer app.agent().worker.deinit(alloc);
-
-    app.agent().stream.active = true;
-    try refreshWorkspaceAvailabilityForList(&app);
-    try std.testing.expect(app.available);
-    try std.testing.expect(app.active);
-    try std.testing.expectEqual(@as(usize, 0), app.index_refresh_count);
-
-    app.agent().stream.active = false;
-    try app.agent().worker.enqueuePrompt(alloc, .{
-        .prompt = try alloc.dupe(u8, "active turn"),
-        .images = &.{},
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "test-key"),
-        .permission_mode = .auto,
-        .history = try alloc.alloc(types.HistoryTurn, 0),
-        .grants = try alloc.alloc(types.PermissionGrant, 0),
-    });
-    const queued = (try app.agent().worker.waitAndTakeNextPrompt(alloc)).?;
-    defer worker_runtime.freeQueuedPrompt(alloc, queued);
-
-    try refreshWorkspaceAvailabilityForList(&app);
-    try std.testing.expect(app.available);
-    try std.testing.expect(app.active);
-    try std.testing.expectEqual(@as(usize, 0), app.index_refresh_count);
-
-    app.agent().worker.finishProcessing();
-    try refreshWorkspaceAvailabilityForList(&app);
-    try std.testing.expect(!app.available);
-    try std.testing.expect(!app.active);
-    try std.testing.expectEqual(@as(usize, 1), app.index_refresh_count);
-}
-
-test "workspace list reports refresh rejection without replacing access" {
-    const alloc = std.testing.allocator;
-    const Access = @import("../workspace/workspace_access.zig").WorkspaceAccess;
-    const TestApp = struct {
-        alloc: std.mem.Allocator,
-        workspace_root: []const u8 = "/tmp/workspace",
-        main_agent: struct {
-            stream: struct { active: bool = false } = .{},
-            worker: worker_runtime.WorkerRuntime = .{},
-        } = .{},
-        access: Access = .{},
-        transcript: std.ArrayList(u8) = .empty,
-        last_tone: ?types.NoticeTone = null,
-
-        fn deinit(self: *@This()) void {
-            self.agent().worker.deinit(self.alloc);
-            self.transcript.deinit(self.alloc);
-        }
-
-        pub fn refreshWorkspaceAccess(_: *@This()) !bool {
-            return error.TooManyDirectories;
-        }
-
-        pub fn workspaceAccess(self: *@This()) *const Access {
-            return &self.access;
-        }
-
-        fn installWorkspaceAccess(_: *@This(), _: *Access) bool {
-            return false;
-        }
-
-        noinline fn writeDomainNotice(self: *@This(), notice: types.SemanticNotice, _: bool) !void {
-            self.last_tone = notice.tone;
-            try self.transcript.appendSlice(self.alloc, notice.body);
-        }
-
-        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
-            return &self.main_agent;
-        }
-    };
-
-    var app = TestApp{ .alloc = alloc };
-    defer app.deinit();
-    try handleWorkspaceCommand(&app, "");
-    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Workspace refresh rejected: additional directory limit reached") != null);
-    try std.testing.expectEqual(@as(usize, 0), app.access.entries.len);
 }
 
 fn handleRenameCommand(app: anytype, rest: []const u8) !void {
@@ -2183,7 +1559,6 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
         snapshot.supports_fast_mode = capabilities.supports_fast_mode;
         snapshot.supports_ultrafast_mode = capabilities.supports_ultrafast_mode;
     }
-    if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app_permission_runtime.Runtime(App).viewOf(app, agents.screenAgentOf(app)).mode);
     if (comptime @hasField(App, "input_runtime")) {
         snapshot.startup_scrollback = app.input_runtime.settings_menu.startup_scrollback;
         if (comptime @hasField(@TypeOf(app.input_runtime), "slash_menu_categories")) {
@@ -2331,7 +1706,6 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 );
             }
         },
-        .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, agents.screenAgentOf(app), change.value),
         .sound_level => try handleNotificationsCommand(app, change.value),
         .startup_scrollback => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
@@ -2354,69 +1728,6 @@ fn parseOnOff(value: []const u8) ?bool {
 }
 
 const SurfaceOnlyApp = struct {};
-
-const CreditsCommandFakeApp = struct {
-    const FakeAuth = struct {
-        fn apiKey(_: *const FakeAuth) ?[]const u8 {
-            return "credential";
-        }
-
-        fn gatewayTeam(_: *const FakeAuth) ?[]const u8 {
-            return "tenant";
-        }
-    };
-
-    alloc: std.mem.Allocator,
-    auth: FakeAuth = .{},
-    calls: usize = 0,
-    saw_expected_input: bool = false,
-    notice_body: std.ArrayList(u8) = .empty,
-    notice_topic: ?[]const u8 = null,
-    notice_tone: ?types.NoticeTone = null,
-
-    fn deinit(self: *CreditsCommandFakeApp) void {
-        self.notice_body.deinit(self.alloc);
-    }
-
-    fn creditsProvider(self: *CreditsCommandFakeApp) gateway_provider.CreditsProvider {
-        return .{
-            .context = self,
-            .fetch_fn = fetchCredits,
-        };
-    }
-
-    fn fetchCredits(
-        raw: ?*anyopaque,
-        alloc: std.mem.Allocator,
-        input: gateway_provider.CreditsLookupInput,
-    ) output_contracts.CreditsSnapshot {
-        const self: *CreditsCommandFakeApp = @ptrCast(@alignCast(raw.?));
-        self.calls += 1;
-        self.saw_expected_input =
-            std.mem.eql(u8, input.credential orelse "", "credential") and
-            std.mem.eql(u8, input.tenant orelse "", "tenant");
-        return .{ .balance = alloc.dupe(u8, "10") catch null };
-    }
-
-    noinline fn writeDomainNotice(
-        self: *CreditsCommandFakeApp,
-        notice: types.SemanticNotice,
-        _: bool,
-    ) !void {
-        self.notice_topic = notice.topic;
-        self.notice_tone = notice.tone;
-        try self.notice_body.appendSlice(self.alloc, notice.body);
-    }
-};
-
-test "sound command parses toggle and off/on/max levels" {
-    try std.testing.expectEqual(ParsedSoundCommand.toggle, parseSoundCommand("  \t"));
-    try std.testing.expectEqual(ParsedSoundCommand{ .set = .on }, parseSoundCommand("on"));
-    try std.testing.expectEqual(ParsedSoundCommand{ .set = .off }, parseSoundCommand("off"));
-    try std.testing.expectEqual(ParsedSoundCommand{ .set = .max }, parseSoundCommand("max"));
-    try std.testing.expectEqual(ParsedSoundCommand.invalid, parseSoundCommand("turn-end"));
-    try std.testing.expectEqual(ParsedSoundCommand.invalid, parseSoundCommand("max extra"));
-}
 
 const ClearCommandFakeApp = struct {
     main_agent: struct {} = .{},
@@ -2450,19 +1761,6 @@ const QuitCommandFakeApp = struct {
         return &self.main_agent;
     }
 };
-
-test "quit command requests resume handoff before exit" {
-    var app = QuitCommandFakeApp{};
-    defer app.agent().session_persistence.deinit(std.testing.allocator);
-
-    requestResumeExit(&app);
-
-    try std.testing.expect(app.should_exit);
-    try std.testing.expectEqual(
-        app_session_runtime.ResumeHandoffIntent.requested,
-        app.agent().session_persistence.resume_handoff_intent,
-    );
-}
 
 const ClipboardCommandFakeApp = struct {
     const CopyOutcome = enum {
@@ -2614,457 +1912,4 @@ fn writeTempSkillFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: [
 
 test {
     _ = trace_report;
-}
-
-test "trace notice distinguishes file outcomes without a feedback CTA" {
-    const report_path = "/tmp/trace.jsonl";
-    const cases = [_]struct {
-        disposition: TraceReportDisposition,
-        expected: []const u8,
-    }{
-        .{
-            .disposition = .{ .copied_file = report_path },
-            .expected = "Trace copied to clipboard. Review and redact it before sharing.",
-        },
-        .{
-            .disposition = .{ .copy_failed = report_path },
-            .expected = "Clipboard copy failed. Trace saved at /tmp/trace.jsonl. Review and redact it before sharing.",
-        },
-        .{
-            .disposition = .{ .saved = report_path },
-            .expected = "Trace saved at /tmp/trace.jsonl. Review and redact it before sharing.",
-        },
-        .{
-            .disposition = .unavailable,
-            .expected = "Could not create trace.",
-        },
-    };
-
-    for (cases) |case| {
-        const body = try format_trace_notice(std.testing.allocator, case.disposition);
-        defer std.testing.allocator.free(body);
-        try std.testing.expectEqualStrings(case.expected, body);
-        try std.testing.expect(std.mem.find(u8, body, "feedback") == null);
-        try std.testing.expect(std.mem.find(u8, body, "Report issue") == null);
-    }
-}
-
-test "app_commands exposes active handler API surface" {
-    const HandlerSurface = Handlers(SurfaceOnlyApp);
-
-    const route_info = @typeInfo(@TypeOf(HandlerSurface.route)).@"fn";
-    try std.testing.expectEqual(@as(usize, 2), route_info.param_types.len);
-    try std.testing.expect(route_info.param_types[0].? == *SurfaceOnlyApp);
-    try std.testing.expect(route_info.param_types[1].? == []const u8);
-
-    const handlers_info = @typeInfo(@TypeOf(HandlerSurface.commandHandlers)).@"fn";
-    try std.testing.expectEqual(@as(usize, 1), handlers_info.param_types.len);
-    try std.testing.expect(handlers_info.param_types[0].? == *SurfaceOnlyApp);
-    try std.testing.expect(handlers_info.return_type.? == command_router.CommandHandlers);
-}
-
-test "credits command renders through the composed provider" {
-    var app = CreditsCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try Handlers(CreditsCommandFakeApp).commandShowCredits(@ptrCast(&app));
-
-    try std.testing.expectEqual(@as(usize, 1), app.calls);
-    try std.testing.expect(app.saw_expected_input);
-    try std.testing.expectEqualStrings("credits", app.notice_topic.?);
-    try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
-    try std.testing.expectEqualStrings("balance=10", app.notice_body.items);
-}
-
-/// An app whose `/credits` lookup answers that the team has Token Pass, for
-/// the credential epoch in `collectCreditsFacts`.
-const TokenPassReplyFakeApp = struct {
-    const FakeModelCache = struct {
-        token_pass_epoch: u32 = 0,
-        status: token_pass.Status = .unknown,
-
-        fn tokenPassStatus(self: *const FakeModelCache) token_pass.Status {
-            return self.status;
-        }
-
-        pub fn observeTokenPassAnswer(self: *FakeModelCache, answer: token_pass.Answer, _: []const u8) void {
-            self.status = if (answer == .has_pass) .active else .unknown;
-        }
-    };
-
-    alloc: std.mem.Allocator,
-    credits_lookup: credits_lookup.Lookup = .{},
-    model_cache: FakeModelCache = .{},
-    fetches: std.atomic.Value(usize) = .init(0),
-    notices: usize = 0,
-
-    fn deinit(self: *TokenPassReplyFakeApp) void {
-        self.credits_lookup.deinit();
-    }
-
-    fn creditsProvider(self: *TokenPassReplyFakeApp) gateway_provider.CreditsProvider {
-        return .{ .context = self, .fetch_fn = fetchCredits };
-    }
-
-    fn fetchCredits(
-        raw: ?*anyopaque,
-        alloc: std.mem.Allocator,
-        _: gateway_provider.CreditsLookupInput,
-    ) output_contracts.CreditsSnapshot {
-        const self: *TokenPassReplyFakeApp = @ptrCast(@alignCast(raw.?));
-        _ = self.fetches.fetchAdd(1, .seq_cst);
-        return .{
-            .balance = alloc.dupe(u8, "10") catch null,
-            .token_pass = .{ .remaining = alloc.dupe(u8, "79.9") catch "" },
-        };
-    }
-
-    fn adoptRenewedCredential(_: *TokenPassReplyFakeApp, _: *const credentials.Credential) !void {}
-
-    fn writeDomainNotice(self: *TokenPassReplyFakeApp, _: types.SemanticNotice, _: bool) !void {
-        self.notices += 1;
-    }
-
-    /// Starts a `/credits` lookup for the current credential.
-    fn startLookup(self: *TokenPassReplyFakeApp) !void {
-        try std.testing.expectEqual(credits_lookup.Start.started, try self.credits_lookup.start(
-            self.creditsProvider(),
-            .{ .credential = null, .tenant = null },
-            null,
-            self.model_cache.token_pass_epoch,
-        ));
-    }
-
-    /// Runs the event loop's credits step until the lookup's reply is taken.
-    fn collectReply(self: *TokenPassReplyFakeApp) !void {
-        while (self.credits_lookup.task != null) {
-            try Handlers(TokenPassReplyFakeApp).collectCreditsFacts(self);
-            std.Thread.yield() catch {};
-        }
-    }
-};
-
-test "a Token Pass reply for an earlier credential does not speak for the current one" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-    var app = TokenPassReplyFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try app.startLookup();
-    // A login or team change while the lookup runs moves to a new epoch.
-    app.model_cache.token_pass_epoch += 1;
-    try app.collectReply();
-
-    // The reply still shows, but it records nothing for the new team.
-    try std.testing.expectEqual(token_pass.Status.unknown, app.model_cache.tokenPassStatus());
-    try std.testing.expect(app.notices >= 1);
-    try std.testing.expectEqual(@as(usize, 1), app.fetches.load(.seq_cst));
-}
-
-test "a Token Pass reply for the current credential records that the team has Token Pass" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-    var app = TokenPassReplyFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try app.startLookup();
-    try app.collectReply();
-
-    try std.testing.expectEqual(token_pass.Status.active, app.model_cache.tokenPassStatus());
-    try std.testing.expectEqual(@as(usize, 1), app.fetches.load(.seq_cst));
-}
-
-test "app_commands routes clear through carry-forward session reset" {
-    var app = ClearCommandFakeApp{};
-
-    try clearSessionForClearCommand(&app);
-
-    try std.testing.expectEqual(@as(usize, 1), app.clear_count);
-    try std.testing.expectEqual(@as(usize, 0), app.reset_count);
-}
-
-test "copy command routes exact reply bytes through the host clipboard" {
-    var app = ClipboardCommandFakeApp{
-        .main_agent = .{ .session = .{ .reply = "reply\nwith exact bytes" } },
-    };
-
-    try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
-
-    try std.testing.expectEqual(@as(usize, 1), app.copy_calls);
-    try std.testing.expectEqualStrings("reply\nwith exact bytes", app.copied_text.?);
-    try std.testing.expectEqualStrings("clipboard", app.last_topic.?);
-    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expectEqualStrings("Copied to clipboard.", app.last_body.?);
-}
-
-test "copy command reports missing replies and host failures" {
-    var app = ClipboardCommandFakeApp{};
-
-    try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
-    try std.testing.expectEqual(@as(usize, 0), app.copy_calls);
-    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expectEqualStrings("No assistant reply to copy.", app.last_body.?);
-
-    app.agent().session.reply = "reply";
-    for ([_]ClipboardCommandFakeApp.CopyOutcome{ .unavailable, .failed }) |outcome| {
-        app.copy_outcome = outcome;
-        app.last_tone = null;
-        app.last_body = null;
-
-        try Handlers(ClipboardCommandFakeApp).commandCopyLast(@ptrCast(&app));
-
-        try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
-        try std.testing.expectEqualStrings("Failed to copy to clipboard.", app.last_body.?);
-    }
-    try std.testing.expectEqual(@as(usize, 2), app.copy_calls);
-}
-
-test "skills install groups command notice fragments for entry replay" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeTempSkillFile(&tmp, "pack/SKILL.md", "---\nname: root-skill\ndescription: root\n---\n\nbody\n");
-    try writeTempSkillFile(&tmp, "pack/nested/SKILL.md", "---\nname: nested-skill\ndescription: nested\n---\n\nbody\n");
-    try tmp.dir.createDirPath(io_mod.getIo(), "dest");
-
-    const pack_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "pack");
-    defer alloc.free(pack_dir);
-    const dest_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "dest");
-    defer alloc.free(dest_dir);
-
-    var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .dir = dest_dir } };
-    defer app.deinit();
-
-    const args = try alloc.print("install {s}", .{pack_dir});
-    defer alloc.free(args);
-    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), args);
-
-    try std.testing.expectEqual(@as(usize, 2), app.shell.notebook.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 2), app.write_count);
-    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
-    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expect(app.shell.notebook.entries.items[0] == .semantic_notice);
-    try std.testing.expect(app.shell.notebook.entries.items[1] == .semantic_notice);
-    try std.testing.expectEqualStrings("skills", app.shell.notebook.entries.items[0].semantic_notice.topic);
-    const installing_body = try alloc.print("Installing from {s}...", .{pack_dir});
-    defer alloc.free(installing_body);
-    try std.testing.expectEqualStrings(installing_body, app.shell.notebook.entries.items[0].semantic_notice.body);
-    try std.testing.expectEqualStrings(
-        "Installed: root-skill\nInstalled: nested-skill",
-        app.shell.notebook.entries.items[1].semantic_notice.body,
-    );
-
-    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
-    defer alloc.free(rendered);
-    try std.testing.expect(std.mem.startsWith(u8, rendered, "* skills: Installing from "));
-    try std.testing.expect(std.mem.find(u8, rendered, "\n\n* skills: Installed: root-skill") != null);
-    try std.testing.expect(std.mem.endsWith(u8, rendered, "  Installed: nested-skill"));
-}
-
-test "help command opens the catalog without writing transcript output" {
-    const alloc = std.testing.allocator;
-    var app = SkillsInstallReplayApp{ .alloc = alloc };
-    defer app.deinit();
-    app.skills.openMenu();
-
-    try Handlers(SkillsInstallReplayApp).commandShowHelp(@ptrCast(&app));
-
-    try std.testing.expect(!app.skills.menu.active);
-    try std.testing.expect(app.input_runtime.help_menu.active);
-    try std.testing.expectEqual(@as(usize, 0), app.write_count);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.notebook.entries.items.len);
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-}
-
-test "skills list opens menu without transcript inventory" {
-    const alloc = std.testing.allocator;
-    const skills = [_]skill_runtime.Skill{
-        .{
-            .name = "managed",
-            .description = "managed skill",
-            .path = "/tmp/managed/SKILL.md",
-            .source = .global_spark,
-        },
-        .{
-            .name = "workspace",
-            .description = "workspace skill",
-            .path = "/tmp/workspace/skills/workspace/SKILL.md",
-            .source = .workspace_shared,
-        },
-    };
-    var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .items = @constCast(&skills) } };
-    defer app.deinit();
-
-    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "list");
-
-    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
-    try std.testing.expectEqual(@as(usize, 0), app.write_count);
-    try std.testing.expect(app.skills.menu.active);
-    try std.testing.expectEqual(@as(usize, 0), app.skills.menu.selected_index);
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-
-    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
-    defer alloc.free(rendered);
-    try std.testing.expect(std.mem.find(u8, rendered, "Visible skills (") == null);
-}
-
-test "skills list keeps a bounded discovery warning in the full transcript only" {
-    const alloc = std.testing.allocator;
-    const skill_diagnostics = [_]skill_runtime.SkillDiagnostic{.{
-        .path = "/tmp/hostile\npath/body-sentinel",
-        .source = .workspace_shared,
-        .scope = .candidate,
-        .cause = .{ .invalid_metadata = .missing_name },
-    }};
-    var app = SkillsInstallReplayApp{
-        .alloc = alloc,
-        .skills = .{ .diagnostics = @constCast(&skill_diagnostics) },
-    };
-    defer app.deinit();
-
-    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "list");
-
-    try std.testing.expectEqual(@as(usize, 1), app.write_count);
-    try std.testing.expectEqual(@as(usize, 1), app.shell.notebook.entries.items.len);
-    try std.testing.expect(app.shell.notebook.entries.items[0] == .semantic_notice);
-    const notice = app.shell.notebook.entries.items[0].semantic_notice;
-    try std.testing.expectEqualStrings("skills", notice.topic);
-    try std.testing.expectEqual(types.NoticeTone.warning, notice.tone);
-    try std.testing.expectEqual(types.NoticeVisibility.full_only, notice.visibility);
-    try std.testing.expect(std.mem.find(u8, notice.body, "skill discovery warning:") != null);
-    try std.testing.expect(std.mem.find(u8, notice.body, "hostile&#x0a;path/body-sentinel") != null);
-    try std.testing.expect(std.mem.find(u8, notice.body, "metadata is invalid (missing_name)") != null);
-    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
-    defer alloc.free(rendered);
-    try std.testing.expect(std.mem.find(u8, rendered, "skill discovery warning:") == null);
-}
-
-test "skills show focuses matching menu row without transcript body" {
-    const alloc = std.testing.allocator;
-    const skills = [_]skill_runtime.Skill{
-        .{
-            .name = "managed",
-            .description = "managed skill",
-            .path = "/tmp/managed/SKILL.md",
-            .source = .global_spark,
-        },
-        .{
-            .name = "workspace",
-            .description = "workspace skill",
-            .path = "/tmp/workspace/skills/workspace/SKILL.md",
-            .source = .workspace_shared,
-        },
-    };
-    var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .items = @constCast(&skills) } };
-    defer app.deinit();
-
-    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "show workspace");
-
-    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
-    try std.testing.expectEqual(@as(usize, 0), app.write_count);
-    try std.testing.expect(app.skills.menu.active);
-    try std.testing.expectEqual(skill_runtime.SkillMenuSourceFilter.workspace, app.skills.menu.source_filter);
-    try std.testing.expectEqual(@as(usize, 0), app.skills.menu.selected_index);
-    try std.testing.expectEqualStrings("workspace", app.skills.selectedMenuSkill().?.name);
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-}
-
-test "skills show exposes duplicate rows without focusing a precedence winner" {
-    const alloc = std.testing.allocator;
-    const skills = [_]skill_runtime.Skill{
-        .{
-            .name = "review",
-            .description = "managed review",
-            .path = "/tmp/managed/review",
-            .source = .global_spark,
-        },
-        .{
-            .name = "review",
-            .description = "workspace review",
-            .path = "/tmp/workspace/skills/review",
-            .source = .workspace_shared,
-        },
-    };
-    var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .items = @constCast(&skills) } };
-    defer app.deinit();
-
-    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "show review");
-
-    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
-    try std.testing.expectEqual(@as(usize, 0), app.write_count);
-    try std.testing.expect(app.skills.menu.active);
-    try std.testing.expectEqualStrings("review", app.skills.menu.query());
-    try std.testing.expectEqualStrings("review", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        app.skills.menu.filteredItemCount(app.skills.items),
-    );
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-}
-
-test "skills remove prefers a managed match after a workspace duplicate" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try writeTempSkillFile(&tmp, "home/.spark/skills/review/SKILL.md", "---\nname: review\n---\nmanaged body\n");
-    try writeTempSkillFile(&tmp, "home/workspace/.agents/skills/review/SKILL.md", "---\nname: review\n---\nworkspace body\n");
-
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.spark/skills");
-    defer alloc.free(managed_root);
-    const managed_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.spark/skills/review");
-    defer alloc.free(managed_skill);
-    const workspace_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace/.agents/skills/review");
-    defer alloc.free(workspace_skill);
-    const skills = [_]skill_runtime.Skill{
-        .{
-            .name = "review",
-            .description = "workspace review",
-            .path = workspace_skill,
-            .source = .workspace_agents,
-        },
-        .{
-            .name = "review",
-            .description = "managed review",
-            .path = managed_skill,
-            .source = .global_spark,
-        },
-    };
-    var app = SkillsInstallReplayApp{
-        .alloc = alloc,
-        .skills = .{ .dir = managed_root, .items = @constCast(&skills) },
-    };
-    defer app.deinit();
-
-    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "remove review");
-
-    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
-    defer alloc.free(rendered);
-    try std.testing.expect(std.mem.find(u8, rendered, "Removed skill 'review'.") != null);
-    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.access(io_mod.getIo(), "home/.spark/skills/review", .{}),
-    );
-    try tmp.dir.access(io_mod.getIo(), "home/workspace/.agents/skills/review/SKILL.md", .{});
-}
-
-test "skills show missing name keeps not found notice" {
-    const alloc = std.testing.allocator;
-    const skills = [_]skill_runtime.Skill{.{
-        .name = "managed",
-        .description = "managed skill",
-        .path = "/tmp/managed/SKILL.md",
-        .source = .global_spark,
-    }};
-    var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .items = @constCast(&skills) } };
-    defer app.deinit();
-
-    try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), "show missing");
-
-    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
-    try std.testing.expectEqual(@as(usize, 1), app.write_count);
-    try std.testing.expect(!app.skills.menu.active);
-    const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.notebook.entries.items, 80, .{});
-    defer alloc.free(rendered);
-    try std.testing.expect(std.mem.find(u8, rendered, "Skill 'missing' not found.") != null);
 }

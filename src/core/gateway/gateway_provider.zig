@@ -1,16 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const credentials = @import("../auth/credentials.zig");
-const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
-const output_contracts = @import("../output/output_contracts.zig");
 const model_catalog = @import("model_catalog.zig");
 const model_catalog_metadata = @import("model_catalog_metadata.zig");
-const token_pass_team = @import("token_pass_team.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -27,7 +24,7 @@ pub const ChatUrlProvider = struct {
 };
 
 pub const CliModelCatalogInput = struct {
-    access: credentials.CatalogAccess = .{ .public_only = .no_credential },
+    access: credentials.CatalogAccess = .public_only,
     endpoint: []const u8,
     cancel_flag: ?*std.atomic.Value(bool) = null,
 };
@@ -66,92 +63,6 @@ pub const CliModelCatalogProvider = struct {
         return self.fetch_fn(self.context, alloc, input);
     }
 };
-
-pub const CreditsLookupInput = struct {
-    credential: ?[]const u8,
-    credential_source: ?credentials.Source = null,
-    tenant: ?[]const u8,
-    /// Setting it ends an in-flight lookup early with an error snapshot.
-    cancel_flag: ?*std.atomic.Value(bool) = null,
-};
-
-pub const FetchCreditsFn = *const fn (
-    ?*anyopaque,
-    Allocator,
-    CreditsLookupInput,
-) output_contracts.CreditsSnapshot;
-
-pub const CreditsProvider = struct {
-    /// When set, context must remain valid until every in-flight `fetch` returns.
-    context: ?*anyopaque = null,
-    fetch_fn: FetchCreditsFn,
-
-    /// The returned snapshot owns its populated provider fields. The caller
-    /// must call `CreditsSnapshot.deinit`.
-    pub fn fetch(
-        self: CreditsProvider,
-        alloc: Allocator,
-        input: CreditsLookupInput,
-    ) output_contracts.CreditsSnapshot {
-        return self.fetch_fn(self.context, alloc, input);
-    }
-};
-
-fn fetchCreditsUnavailable(
-    _: ?*anyopaque,
-    alloc: Allocator,
-    _: CreditsLookupInput,
-) output_contracts.CreditsSnapshot {
-    return .{
-        .err_message = alloc.dupe(u8, "Credits are unavailable for the selected provider.") catch null,
-    };
-}
-
-pub const unavailable_credits_provider = CreditsProvider{
-    .fetch_fn = fetchCreditsUnavailable,
-};
-
-pub const Provider = struct {
-    oauth_transport: oauth_transport.Provider,
-    chat_url: ChatUrlProvider,
-};
-
-test "credits lookup dispatches through the injected provider" {
-    const Fake = struct {
-        calls: usize = 0,
-        saw_expected_input: bool = false,
-
-        fn fetch(
-            raw: ?*anyopaque,
-            alloc: Allocator,
-            input: CreditsLookupInput,
-        ) output_contracts.CreditsSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.calls += 1;
-            self.saw_expected_input =
-                std.mem.eql(u8, input.credential orelse "", "credential") and
-                std.mem.eql(u8, input.tenant orelse "", "tenant");
-            return .{
-                .balance = alloc.dupe(u8, "10") catch null,
-            };
-        }
-    };
-
-    var fake: Fake = .{};
-    const provider = CreditsProvider{
-        .context = &fake,
-        .fetch_fn = Fake.fetch,
-    };
-    var snapshot = provider.fetch(std.testing.allocator, .{
-        .credential = "credential",
-        .tenant = "tenant",
-    });
-    defer snapshot.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expect(fake.saw_expected_input);
-    try std.testing.expectEqualStrings("10", snapshot.balance.?);
-}
 
 const CapabilityResolverState = enum {
     idle,
@@ -219,7 +130,7 @@ pub const CapabilityResolver = struct {
         const requested = model_catalog.AccessMetadata.init(input.access);
         if (!self.loadDue(provider, requested, now)) return;
 
-        try self.adopt(alloc, provider, requested, now, model_catalog.fetchWithPublicFallback(provider, alloc, input));
+        try self.adopt(alloc, provider, requested, now, model_catalog.fetchTraced(provider, alloc, input));
     }
 
     /// Whether the catalog needs a load for `requested` access at `now`: it
@@ -269,7 +180,6 @@ pub const CapabilityResolver = struct {
                     if (self.catalog.items.len > 0) debug_trace.logf("gateway", "dropping model catalog after access changed entries={d}", .{self.catalog.items.len});
                     model_catalog.freeModelCatalog(alloc, &self.catalog);
                     self.catalog = .empty;
-                    publishTokenPassModels(provider, self.catalog.items);
                 }
                 if (self.catalog.items.len == 0) self.state = .failed;
                 debug_trace.logf("gateway", "model catalog refresh failed category={t} retained={}", .{ failed.failure.category, self.state == .ready });
@@ -278,7 +188,6 @@ pub const CapabilityResolver = struct {
         };
         model_catalog.freeModelCatalog(alloc, &self.catalog);
         self.catalog = loaded.catalog;
-        publishTokenPassModels(provider, self.catalog.items);
         self.state = .ready;
         self.last_attempt_ms = attempt_ms;
         self.requested_access = requested;
@@ -364,7 +273,6 @@ pub const CapabilityResolver = struct {
                 const requested = model_catalog.AccessMetadata.init(load.input.access);
                 return self.adopt(alloc, provider, requested, load.started_ms, .{ .failed = .{
                     .access = requested,
-                    .anonymous_fallback_used = false,
                     .failure = .{ .category = .transport },
                 } });
             }
@@ -462,21 +370,12 @@ pub const CapabilityResolver = struct {
         model_catalog.freeModelCatalog(alloc, &self.catalog);
         self.catalog = owned_catalog.*;
         owned_catalog.* = .empty;
-        publishTokenPassModels(provider, self.catalog.items);
         self.state = .ready;
         self.last_attempt_ms = model_catalog.clockMs();
         self.requested_access = .init(access);
         self.provider_id = provider.provider_id;
     }
 };
-
-/// Hands an AI Gateway catalog's Token Pass marks to `token_pass_team`, for
-/// `spark ask` and ACP, which resolve models through this catalog. Another
-/// provider's catalog says nothing about the AI Gateway team.
-fn publishTokenPassModels(provider: model_catalog.Provider, entries: []const model_catalog.ModelCatalogEntry) void {
-    if (provider.provider_id != .gateway) return;
-    token_pass_team.publishCatalog(entries);
-}
 
 /// How long a request waits for a model catalog load to connect, for
 /// `CapabilityResolver.resolveWithin` and `refreshWithin`. A healthy network
@@ -511,8 +410,7 @@ const CatalogLoad = struct {
         errdefer alloc.destroy(load);
         const endpoint = try alloc.dupe(u8, input.endpoint);
         errdefer alloc.free(endpoint);
-        const access = try dupeCatalogAccess(alloc, input.access);
-        errdefer freeCatalogAccess(alloc, access);
+        const access = input.access;
         load.* = .{
             .provider = provider,
             .input = .{
@@ -529,7 +427,7 @@ const CatalogLoad = struct {
     }
 
     fn run(self: *CatalogLoad, alloc: Allocator) void {
-        self.result = model_catalog.fetchWithPublicFallback(self.provider, alloc, self.input);
+        self.result = model_catalog.fetchTraced(self.provider, alloc, self.input);
         self.finished.store(true, .release);
     }
 
@@ -557,40 +455,10 @@ const CatalogLoad = struct {
     }
 
     fn destroy(self: *CatalogLoad, alloc: Allocator) void {
-        freeCatalogAccess(alloc, self.input.access);
         alloc.free(self.input.endpoint);
         alloc.destroy(self);
     }
 };
-
-/// Returns `access` with its credential, team, and account copied; free it
-/// with `freeCatalogAccess`.
-fn dupeCatalogAccess(alloc: Allocator, access: credentials.CatalogAccess) Allocator.Error!credentials.CatalogAccess {
-    var owned = switch (access) {
-        .public_only, .host_managed => return access,
-        .authenticated => |borrowed| borrowed,
-    };
-    const credential = try alloc.dupe(u8, owned.credential);
-    errdefer secret.zeroAndFree(alloc, credential);
-    const team_context = if (owned.team_context) |team| try alloc.dupe(u8, team) else null;
-    errdefer if (team_context) |team| alloc.free(team);
-    const account_id = if (owned.account_id) |account| try alloc.dupe(u8, account) else null;
-    owned.credential = credential;
-    owned.team_context = team_context;
-    owned.account_id = account_id;
-    return .{ .authenticated = owned };
-}
-
-fn freeCatalogAccess(alloc: Allocator, access: credentials.CatalogAccess) void {
-    switch (access) {
-        .public_only, .host_managed => {},
-        .authenticated => |owned| {
-            secret.zeroAndFree(alloc, @constCast(owned.credential));
-            if (owned.team_context) |team| alloc.free(team);
-            if (owned.account_id) |account| alloc.free(account);
-        },
-    }
-}
 
 inline fn failCapabilities(err: anytype) @TypeOf(err)!model_capabilities.Capabilities {
     return @errorCast(failCapabilitiesDynamic(err));
@@ -612,37 +480,20 @@ const FakeCatalog = struct {
     outcome: enum {
         cancelled,
         unavailable,
-        authenticated_rejected_then_ready,
         ready,
     },
     calls: usize = 0,
-    saw_authenticated_access: bool = false,
-    saw_public_retry: bool = false,
 
     fn fetch(
         raw: ?*anyopaque,
         alloc: Allocator,
-        input: model_catalog.FetchInput,
+        _: model_catalog.FetchInput,
     ) Allocator.Error!model_catalog.ProviderResult {
         const self: *FakeCatalog = @ptrCast(@alignCast(raw.?));
         self.calls += 1;
-        if (self.outcome == .authenticated_rejected_then_ready) {
-            if (self.calls == 1) {
-                self.saw_authenticated_access =
-                    std.mem.eql(u8, input.access.authorizationCredential() orelse "", "test-key") and
-                    std.mem.eql(u8, input.access.teamContext() orelse "", "team_123");
-                return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-            }
-            self.saw_public_retry =
-                input.access.authorizationCredential() == null and
-                input.access.teamContext() == null and
-                input.access.publicOnlyReason() == .authenticated_credential_rejected;
-            self.outcome = .ready;
-        }
         switch (self.outcome) {
             .cancelled => return .{ .failure = .{ .category = .cancellation } },
             .unavailable => return .{ .failure = .{ .category = .transport } },
-            .authenticated_rejected_then_ready => unreachable,
             .ready => {
                 var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
                 errdefer model_catalog.freeModelCatalog(alloc, &entries);
@@ -685,127 +536,6 @@ fn testCatalogOf(alloc: Allocator, ids: []const []const u8) !std.ArrayList(model
     return entries;
 }
 
-test "a snapshot of the capability resolver keeps its catalog when the resolver adopts another" {
-    const alloc = std.testing.allocator;
-    var fake = FakeCatalog{ .outcome = .ready };
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-    var first = try testCatalogOf(alloc, &.{ "provider/old", "provider/other" });
-    resolver.adoptOwnedCatalog(alloc, fake.provider(), .host_managed, &first);
-
-    var copy = try resolver.snapshot(alloc);
-    defer copy.deinit(alloc);
-    // A switch of the provider adopts another catalog and frees the old entries.
-    var second = try testCatalogOf(alloc, &.{"provider/new"});
-    resolver.adoptOwnedCatalog(alloc, fake.provider(), .host_managed, &second);
-    try std.testing.expectEqual(@as(usize, 1), resolver.catalogEntries().?.len);
-
-    // The copy has what the resolver held when it was taken, in memory of its own.
-    const entries = copy.catalogEntries().?;
-    try std.testing.expectEqual(@as(usize, 2), entries.len);
-    try std.testing.expectEqualStrings("provider/old", entries[0].id);
-    try std.testing.expectEqualStrings("provider/other", entries[1].id);
-    try std.testing.expect(copy.available("provider/old", .{}).supports_vision);
-    try std.testing.expect(!copy.available("provider/new", .{}).supports_vision);
-    try std.testing.expect(copy.downFailure() == null);
-    // A snapshot of a resolver that never loaded has nothing, and is as idle as the resolver.
-    var idle: CapabilityResolver = .{};
-    var idle_copy = try idle.snapshot(alloc);
-    defer idle_copy.deinit(alloc);
-    try std.testing.expectEqual(CapabilityResolverState.idle, idle_copy.state);
-}
-
-test "capability resolver refreshes expired snapshots at the owner boundary and retains a usable catalog" {
-    const alloc = std.testing.allocator;
-    var fake = FakeCatalog{ .outcome = .unavailable };
-    var provider = fake.provider();
-    provider.refresh_interval_ms = 60_000;
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-    const input = model_catalog.FetchInput{ .endpoint = "https://example.invalid" };
-    try std.testing.expect(resolver.downFailure() == null);
-    try resolver.refreshIfDue(alloc, provider, input);
-    try std.testing.expect(resolver.catalogEntries() == null);
-    try std.testing.expectEqual(model_catalog.FailureCategory.transport, resolver.downFailure().?);
-    fake.outcome = .ready;
-    try resolver.refreshIfDue(alloc, provider, input);
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    resolver.last_attempt_ms -= 60_000;
-    // Worker capability reads keep the established snapshot until its owner refreshes.
-    _ = try resolver.resolve(alloc, provider, input, "provider/model", .{});
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try resolver.refreshIfDue(alloc, provider, input);
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expectEqual(@as(usize, 1), resolver.catalogEntries().?.len);
-    try std.testing.expect(resolver.downFailure() == null);
-    fake.outcome = .unavailable;
-    resolver.last_attempt_ms -= 60_000;
-    try resolver.refreshIfDue(alloc, provider, input);
-    try std.testing.expectEqual(@as(usize, 3), fake.calls);
-    try std.testing.expectEqualStrings("provider/model", resolver.catalogEntries().?[0].id);
-    // A failed refresh that keeps the earlier catalog leaves it up.
-    try std.testing.expect(resolver.downFailure() == null);
-}
-
-test "capability refresh does not retain a catalog for changed access" {
-    const alloc = std.testing.allocator;
-    var fake = FakeCatalog{ .outcome = .ready };
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-    try resolver.refreshIfDue(alloc, fake.provider(), .{ .endpoint = "https://example.invalid" });
-    fake.outcome = .unavailable;
-    try resolver.refreshIfDue(alloc, fake.provider(), .{
-        .endpoint = "https://example.invalid",
-        .access = .host_managed,
-    });
-    try std.testing.expect(resolver.catalogEntries() == null);
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
-}
-
-test "capability refresh keys host-managed catalogs by provider" {
-    const alloc = std.testing.allocator;
-    var fake = FakeCatalog{ .outcome = .ready };
-    var provider = fake.provider();
-    provider.refresh_interval_ms = 60_000;
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-    const input = model_catalog.FetchInput{ .endpoint = "https://example.invalid", .access = .host_managed };
-    try resolver.refreshIfDue(alloc, provider, input);
-    provider.provider_id = .codex;
-    try resolver.refreshIfDue(alloc, provider, input);
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    fake.outcome = .unavailable;
-    provider.provider_id = .grok;
-    try resolver.refreshIfDue(alloc, provider, input);
-    try std.testing.expectEqual(@as(usize, 3), fake.calls);
-    try std.testing.expect(resolver.catalogEntries() == null);
-}
-
-test "available capabilities never fetch and use a completed catalog snapshot" {
-    const alloc = std.testing.allocator;
-    var fake = FakeCatalog{ .outcome = .ready };
-    const provider = model_catalog.Provider{ .context = &fake, .fetch_fn = FakeCatalog.fetch };
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-
-    const cold = resolver.available("provider/model", .{});
-    try std.testing.expectEqual(@as(usize, 0), fake.calls);
-    try std.testing.expectEqual(@as(?u32, null), cold.context_window);
-    try std.testing.expectEqual(@as(?u32, null), cold.max_output_tokens);
-
-    _ = try resolver.resolve(
-        alloc,
-        provider,
-        .{ .endpoint = "https://example.invalid" },
-        "provider/model",
-        .{},
-    );
-    const warm = resolver.available("provider/model", .{});
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(?u32, 256_000), warm.context_window);
-    try std.testing.expectEqual(@as(?u32, 32_000), warm.max_output_tokens);
-}
-
 const FakeChatUrl = struct {
     resolved: []const u8,
 
@@ -815,151 +545,6 @@ const FakeChatUrl = struct {
         return self.resolved;
     }
 };
-
-test "gateway provider resolves chat url through the injected policy" {
-    var fake = FakeChatUrl{ .resolved = "http://127.0.0.1:43123/chat" };
-    const provider = ChatUrlProvider{
-        .context = &fake,
-        .resolve_fn = FakeChatUrl.resolve,
-    };
-
-    try std.testing.expectEqualStrings(
-        fake.resolved,
-        provider.resolve("https://fallback.test/chat"),
-    );
-}
-
-test "capability resolver leaves a cancelled catalog fetch retryable" {
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(std.testing.allocator);
-    var fake = FakeCatalog{ .outcome = .cancelled };
-    var cancel_flag = std.atomic.Value(bool).init(true);
-
-    try std.testing.expectError(
-        error.Cancelled,
-        resolver.resolve(
-            std.testing.allocator,
-            fake.provider(),
-            .{
-                .endpoint = "http://127.0.0.1:1/v1/models",
-                .cancel_flag = &cancel_flag,
-            },
-            "provider/model",
-            .{},
-        ),
-    );
-    try std.testing.expectEqual(CapabilityResolverState.idle, resolver.state);
-
-    fake.outcome = .ready;
-    cancel_flag.store(false, .seq_cst);
-    const capabilities = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .endpoint = "http://127.0.0.1:1/v1/models",
-            .cancel_flag = &cancel_flag,
-        },
-        "provider/model",
-        .{},
-    );
-    try std.testing.expect(capabilities.supports_vision);
-}
-
-test "capability resolver uses provider catalog metadata" {
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(std.testing.allocator);
-    var fake = FakeCatalog{ .outcome = .ready };
-    var cancel_flag = std.atomic.Value(bool).init(false);
-
-    const capabilities = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", "team_123"),
-            .endpoint = "/v1/models",
-            .cancel_flag = &cancel_flag,
-        },
-        "provider/model",
-        .{},
-    );
-
-    try std.testing.expect(capabilities.supports_vision);
-    try std.testing.expect(capabilities.supports_file_input);
-    try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, capabilities.image_input_support);
-    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
-    try std.testing.expectEqual(@as(?u32, 32_000), capabilities.max_output_tokens);
-
-    const missing = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .endpoint = "/v1/models",
-            .cancel_flag = &cancel_flag,
-        },
-        "zai/glm-4.6",
-        .{},
-    );
-    try std.testing.expect(!missing.supports_fast_mode);
-    try std.testing.expect(!missing.supports_vision);
-    try std.testing.expectEqual(model_capabilities.ImageInputSupport.unknown, missing.image_input_support);
-}
-
-test "capability resolver retries rejected authenticated catalog access anonymously" {
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(std.testing.allocator);
-    var fake = FakeCatalog{ .outcome = .authenticated_rejected_then_ready };
-
-    const capabilities = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", "team_123"),
-            .endpoint = "/v1/models",
-        },
-        "provider/model",
-        .{},
-    );
-
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expect(fake.saw_authenticated_access);
-    try std.testing.expect(fake.saw_public_retry);
-    try std.testing.expect(capabilities.supports_vision);
-}
-
-test "capability resolver degrades terminal catalog failures to local capabilities" {
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(std.testing.allocator);
-    var fake = FakeCatalog{ .outcome = .unavailable };
-    var cancel_flag = std.atomic.Value(bool).init(false);
-
-    const capabilities = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .endpoint = "/v1/models",
-            .cancel_flag = &cancel_flag,
-        },
-        "zai/glm-4.6",
-        .{},
-    );
-    try std.testing.expect(!capabilities.supports_fast_mode);
-    try std.testing.expectEqual(model_capabilities.ImageInputSupport.unknown, capabilities.image_input_support);
-
-    fake.outcome = .ready;
-    const cached_failure = try resolver.resolve(
-        std.testing.allocator,
-        fake.provider(),
-        .{
-            .endpoint = "/v1/models",
-            .cancel_flag = &cancel_flag,
-        },
-        "provider/model",
-        .{},
-    );
-    try std.testing.expect(!cached_failure.supports_vision);
-    try std.testing.expectEqual(model_capabilities.ImageInputSupport.unknown, cached_failure.image_input_support);
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-}
 
 /// A catalog that answers like `FakeCatalog.ready` once released, and fails
 /// as cancelled once its fetch is cancelled, like a lookup on a dead network.
@@ -983,7 +568,7 @@ const GatedCatalog = struct {
         const self: *GatedCatalog = @ptrCast(@alignCast(raw.?));
         _ = self.calls.fetchAdd(1, .seq_cst);
         if (self.connects) input.connected.?.store(true, .release);
-        if (std.mem.eql(u8, input.access.authorizationCredential() orelse "", "test-key")) {
+        if (input.access == .host_managed) {
             self.saw_credential.store(true, .seq_cst);
         }
         while (!self.released.load(.seq_cst)) {
@@ -1019,132 +604,6 @@ fn reportingProvider(fake: *FakeCatalog) model_catalog.Provider {
     return provider;
 }
 
-test "a first catalog load that never connects answers from the fallback after its wait and is never adopted" {
-    const alloc = std.testing.allocator;
-    var gated: GatedCatalog = .{};
-    var resolver: CapabilityResolver = .{};
-    const input = model_catalog.FetchInput{
-        .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", "team_123"),
-        .endpoint = "/v1/models",
-    };
-
-    // The catalog's request never connects, so the lookup returns the fallback.
-    const capabilities = try resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{ .context_window = 1_000 }, 20);
-    try std.testing.expectEqual(@as(?u32, 1_000), capabilities.context_window);
-    try std.testing.expectEqual(CapabilityResolverState.failed, resolver.state);
-    // A load given up on before it connected is down for a connection spark
-    // could not make.
-    try std.testing.expectEqual(model_catalog.FailureCategory.transport, resolver.downFailure().?);
-
-    // A later lookup neither waits nor fetches again.
-    const later = try resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{}, 60_000);
-    try std.testing.expectEqual(@as(?u32, null), later.context_window);
-    try std.testing.expect(resolver.catalogEntries() == null);
-
-    resolver.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), gated.calls.load(.seq_cst));
-    try std.testing.expect(gated.saw_credential.load(.seq_cst));
-    try std.testing.expect(gated.saw_cancel.load(.seq_cst));
-}
-
-test "a first catalog load that connected is waited for past the wait and adopted" {
-    const alloc = std.testing.allocator;
-    var gated: GatedCatalog = .{ .connects = true };
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-
-    // The request connects at once and the catalog answers well after the wait.
-    const releaser = try gated.releaseAfter(600);
-    defer releaser.join();
-    const capabilities = try resolver.resolveWithin(alloc, gated.provider(), .{ .endpoint = "/v1/models" }, "provider/model", .{ .context_window = 1_000 }, 150);
-    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
-    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
-    try std.testing.expect(!gated.saw_cancel.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 1), gated.calls.load(.seq_cst));
-}
-
-test "a first catalog load from a provider that does not report its connection is waited for" {
-    const alloc = std.testing.allocator;
-    var gated: GatedCatalog = .{ .reports_connection = false };
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-
-    const releaser = try gated.releaseAfter(200);
-    defer releaser.join();
-    const capabilities = try resolver.resolveWithin(alloc, gated.provider(), .{ .endpoint = "/v1/models" }, "provider/model", .{}, 20);
-    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
-    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
-    // It loads on the caller's thread, as `resolve` does.
-    try std.testing.expect(resolver.pending_load == null);
-}
-
-test "a catalog that answers after its wait ended is freed, not adopted" {
-    const alloc = std.testing.allocator;
-    var gated: GatedCatalog = .{ .honors_cancel = false };
-    var resolver: CapabilityResolver = .{};
-    const input = model_catalog.FetchInput{ .endpoint = "/v1/models" };
-
-    _ = try resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{}, 20);
-    try std.testing.expectEqual(CapabilityResolverState.failed, resolver.state);
-    gated.released.store(true, .seq_cst);
-    while (!resolver.abandoned_loads.?.finished.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
-
-    const later = try resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{}, 60_000);
-    try std.testing.expectEqual(@as(?u32, null), later.context_window);
-    try std.testing.expect(resolver.catalogEntries() == null);
-    // The testing allocator fails the test if the late catalog leaks.
-    resolver.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), gated.calls.load(.seq_cst));
-}
-
-test "a first catalog load that finishes within its wait is adopted" {
-    const alloc = std.testing.allocator;
-    var fake = FakeCatalog{ .outcome = .ready };
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-
-    const capabilities = try resolver.resolveWithin(alloc, reportingProvider(&fake), .{ .endpoint = "/v1/models" }, "provider/model", .{}, 60_000);
-    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
-    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
-    try std.testing.expect(resolver.pending_load == null);
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-}
-
-test "a first catalog load keeps the public retry after a rejected credential" {
-    const alloc = std.testing.allocator;
-    var fake = FakeCatalog{ .outcome = .authenticated_rejected_then_ready };
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-
-    const capabilities = try resolver.resolveWithin(alloc, reportingProvider(&fake), .{
-        .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "test-key", "team_123"),
-        .endpoint = "/v1/models",
-    }, "provider/model", .{}, 60_000);
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
-    try std.testing.expect(fake.saw_authenticated_access);
-    try std.testing.expect(fake.saw_public_retry);
-    try std.testing.expect(capabilities.supports_vision);
-}
-
-test "a cancelled wait for a first catalog load leaves the load for the next lookup" {
-    const alloc = std.testing.allocator;
-    var gated: GatedCatalog = .{};
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-    var cancel_flag = std.atomic.Value(bool).init(true);
-    const input = model_catalog.FetchInput{ .endpoint = "/v1/models", .cancel_flag = &cancel_flag };
-
-    try std.testing.expectError(error.Cancelled, resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{}, 60_000));
-    try std.testing.expectEqual(CapabilityResolverState.idle, resolver.state);
-
-    cancel_flag.store(false, .seq_cst);
-    gated.released.store(true, .seq_cst);
-    const capabilities = try resolver.resolveWithin(alloc, gated.provider(), input, "provider/model", .{}, 60_000);
-    try std.testing.expectEqual(@as(?u32, 256_000), capabilities.context_window);
-    try std.testing.expectEqual(@as(usize, 1), gated.calls.load(.seq_cst));
-    try std.testing.expect(!gated.saw_cancel.load(.seq_cst));
-}
-
 /// Loads `gated`'s catalog once through a provider with a refresh interval,
 /// then lets the interval pass, so the next `refreshWithin` is due.
 fn loadRefreshableCatalogForTest(
@@ -1161,61 +620,4 @@ fn loadRefreshableCatalogForTest(
     gated.released.store(false, .seq_cst);
     resolver.last_attempt_ms -= 60_000;
     return provider;
-}
-
-test "a due catalog refresh that never connects keeps the catalog after its wait" {
-    const alloc = std.testing.allocator;
-    var gated: GatedCatalog = .{};
-    var resolver: CapabilityResolver = .{};
-    const provider = try loadRefreshableCatalogForTest(alloc, &resolver, &gated);
-    gated.connects = false;
-
-    try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 20);
-    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
-    try std.testing.expectEqualStrings("provider/model", resolver.catalogEntries().?[0].id);
-    try std.testing.expect(resolver.downFailure() == null);
-
-    // The refresh given up on counts as this interval's attempt.
-    try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 60_000);
-    resolver.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), gated.calls.load(.seq_cst));
-    try std.testing.expect(gated.saw_cancel.load(.seq_cst));
-}
-
-test "a due catalog refresh that connected is waited for past the wait and adopted" {
-    const alloc = std.testing.allocator;
-    var gated: GatedCatalog = .{};
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-    const provider = try loadRefreshableCatalogForTest(alloc, &resolver, &gated);
-    const due_since_ms = resolver.last_attempt_ms;
-
-    // The request connects at once and the catalog answers well after the wait.
-    const releaser = try gated.releaseAfter(300);
-    defer releaser.join();
-    try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 50);
-    try std.testing.expectEqual(CapabilityResolverState.ready, resolver.state);
-    try std.testing.expect(resolver.last_attempt_ms > due_since_ms);
-    try std.testing.expect(!gated.saw_cancel.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 2), gated.calls.load(.seq_cst));
-}
-
-test "a catalog refresh after one given up on starts its own load and frees the one that ended" {
-    const alloc = std.testing.allocator;
-    var gated: GatedCatalog = .{};
-    var resolver: CapabilityResolver = .{};
-    defer resolver.deinit(alloc);
-    const provider = try loadRefreshableCatalogForTest(alloc, &resolver, &gated);
-    gated.connects = false;
-
-    try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 20);
-    while (!resolver.abandoned_loads.?.finished.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
-
-    resolver.last_attempt_ms -= 60_000;
-    try resolver.refreshWithin(alloc, provider, .{ .endpoint = "/v1/models" }, 20);
-    // Only the second load is left; the testing allocator fails the test if
-    // the first leaks.
-    try std.testing.expect(resolver.abandoned_loads.?.next == null);
-    try std.testing.expectEqual(@as(usize, 3), gated.calls.load(.seq_cst));
-    try std.testing.expectEqualStrings("provider/model", resolver.catalogEntries().?[0].id);
 }

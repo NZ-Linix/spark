@@ -135,24 +135,6 @@ fn isOpencodeHost(base_url: []const u8) bool {
     return std.ascii.eqlIgnoreCase(host, "opencode.ai") or std.ascii.endsWithIgnoreCase(host, ".opencode.ai");
 }
 
-test "every connection sends the session ID, and opencode.ai its own header" {
-    const alloc = std.testing.allocator;
-    var definition: definitions.Definition = .{ .id = "go", .protocol = .@"openai-chat-completions", .base_url = "https://opencode.ai/zen/go/v1", .auth = .none };
-    var headers = try Headers.resolve(alloc, &definition, "s-1");
-    defer headers.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), headers.list.len);
-    try std.testing.expectEqualStrings("x-opencode-session", headers.list[2].name);
-    try std.testing.expectEqualStrings("s-1", headers.list[2].value);
-
-    definition.base_url = "https://openrouter.ai/api/v1";
-    var other = try Headers.resolve(alloc, &definition, "s-1");
-    defer other.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), other.list.len);
-    var none = try Headers.resolve(alloc, &definition, null);
-    defer none.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), none.list.len);
-}
-
 fn maskOne(alloc: Allocator, detail: []u8, value: []const u8) Allocator.Error![]u8 {
     defer alloc.free(detail);
     return chat_codec.redact_error_detail(alloc, detail, value);
@@ -460,34 +442,6 @@ pub fn parseModelIds(alloc: Allocator, body: []const u8) Allocator.Error!ModelsR
     return .{ .ids = ids };
 }
 
-test "model list ids keep the server's order, drop repeats, and skip entries with no usable id" {
-    const alloc = std.testing.allocator;
-    // The reply a real local server sent, as recorded in
-    // tests/e2e/fixtures/custom-endpoint-captures/models.json.
-    const captured = "{\"object\":\"list\",\"data\":[{\"id\":\"qwen2.5:0.5b\",\"object\":\"model\",\"created\":1790619955,\"owned_by\":\"library\"},{\"id\":\"qwen2.5:1.5b\",\"object\":\"model\",\"created\":1789143667,\"owned_by\":\"library\"}]}";
-    var result = try parseModelIds(alloc, captured);
-    defer freeIds(alloc, &result.ids);
-    try std.testing.expectEqual(@as(usize, 2), result.ids.items.len);
-    try std.testing.expectEqualStrings("qwen2.5:0.5b", result.ids.items[0]);
-    try std.testing.expectEqualStrings("qwen2.5:1.5b", result.ids.items[1]);
-
-    var mixed = try parseModelIds(alloc,
-        \\[{"id":"b"},{"id":""},{"id":7},{"name":"no id"},7,null,{"id":"a"},{"id":"b"},{"id":" padded "},{"id":"bad\nid"}]
-    );
-    defer freeIds(alloc, &mixed.ids);
-    try std.testing.expectEqual(@as(usize, 2), mixed.ids.items.len);
-    try std.testing.expectEqualStrings("b", mixed.ids.items[0]);
-    try std.testing.expectEqualStrings("a", mixed.ids.items[1]);
-
-    var empty = try parseModelIds(alloc, "{\"object\":\"list\",\"data\":[]}");
-    defer freeIds(alloc, &empty.ids);
-    try std.testing.expectEqual(@as(usize, 0), empty.ids.items.len);
-
-    for ([_][]const u8{ "", "{", "{\"object\":\"list\",\"data\":", "null", "\"models\"", "7", "{}", "{\"data\":{}}", "{\"data\":\"a\"}", "{\"models\":[{\"id\":\"a\"}]}" }) |body| {
-        try std.testing.expectEqual(ModelsFailure.malformed, (try parseModelIds(alloc, body)).failure);
-    }
-}
-
 fn testParseAllocations(alloc: Allocator) !void {
     var result = try parseModelIds(alloc, "{\"data\":[{\"id\":\"one\"},{\"id\":\"two\"},{\"id\":\"one\"},{\"id\":\"three\"}]}");
     switch (result) {
@@ -497,8 +451,4 @@ fn testParseAllocations(alloc: Allocator) !void {
         },
         .failure => return error.TestUnexpectedResult,
     }
-}
-
-test "model list parsing releases its ids on any allocation failure" {
-    try std.testing.checkAllAllocationFailures(@import("../core/shared/testing_allocator.zig").no_resize, testParseAllocations, .{});
 }

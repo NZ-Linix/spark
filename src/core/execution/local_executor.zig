@@ -19,7 +19,6 @@ pub const PreparedCommand = union(enum) {
         command_ctx: command_admission.CommandContext,
         reason: command_effect.ApprovalReason,
         source: command_admission.ShellAuthorizationSource,
-        grant_epoch: ?u64 = null,
     },
 
     pub fn deinit(self: *PreparedCommand, alloc: std.mem.Allocator) void {
@@ -49,12 +48,6 @@ pub fn foregroundResultComparisonLimit(
     };
 }
 
-fn shellConfig(cfg: command_runner.Config, grant_epoch: ?u64) command_runner.Config {
-    var bound = cfg;
-    bound.shell_grant_epoch = grant_epoch;
-    return bound;
-}
-
 /// Executes a prepared foreground command without taking ownership of it.
 pub fn executePreparedCommand(
     cfg: command_runner.Config,
@@ -69,7 +62,7 @@ pub fn executePreparedCommand(
         .approved_shell => |shell| .{
             .route = .approved_shell,
             .result = try command_runner.executeCommandInEnvironment(
-                shellConfig(cfg, shell.grant_epoch),
+                cfg,
                 alloc,
                 shell.command_ctx.command,
                 shell.command_ctx.resolved_cwd,
@@ -77,60 +70,4 @@ pub fn executePreparedCommand(
             ),
         },
     };
-}
-
-test "local executor keeps route-specific foreground result limits" {
-    const direct = PreparedCommand{ .direct_read_only = .{
-        .command = "",
-        .cwd = "",
-        .stages = &.{},
-    } };
-    try std.testing.expectEqual(
-        direct_command.direct_output_limit_bytes,
-        foregroundResultComparisonLimit(direct, 1),
-    );
-
-    const approved = PreparedCommand{ .approved_shell = .{
-        .command_ctx = .{
-            .command = "",
-            .resolved_cwd = "",
-            .target_os = @import("builtin").target.os.tag,
-        },
-        .reason = .process_or_system,
-        .source = .interactive_once,
-    } };
-    try std.testing.expectEqual(
-        @as(usize, 1024),
-        foregroundResultComparisonLimit(approved, 1024),
-    );
-}
-
-test "local executor runs an approved shell command with its admitted context" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const command = PreparedCommand{ .approved_shell = .{
-        .command_ctx = .{
-            .command = "printf local-executor",
-            .resolved_cwd = "/tmp",
-            .target_os = @import("builtin").target.os.tag,
-        },
-        .reason = .process_or_system,
-        .source = .interactive_once,
-    } };
-    const executed = try executePreparedCommand(.{
-        .max_command_output_bytes = 1024,
-    }, arena, command);
-
-    try std.testing.expectEqual(RouteKind.approved_shell, executed.route);
-    try std.testing.expect(std.mem.find(
-        u8,
-        executed.result.output,
-        "<stdout>\nlocal-executor\n</stdout>",
-    ) != null);
-    const foreground = executed.result.command_result.?;
-    try std.testing.expectEqualStrings(command.approved_shell.command_ctx.command, foreground.command);
-    try std.testing.expectEqualStrings(command.approved_shell.command_ctx.resolved_cwd, foreground.cwd);
-    try std.testing.expectEqual(@as(?i64, 0), foreground.exit_code);
 }

@@ -18,11 +18,10 @@ const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const secret = @import("../core/auth/secret.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
+const oauth_transport = @import("../core/auth/oauth_transport.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
-const token_pass = @import("../core/gateway/token_pass.zig");
-const token_pass_check = @import("../core/app/token_pass_check.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
@@ -64,9 +63,7 @@ const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
 const legacy_url_completion_timeout_ms: i64 = 10 * 60 * 1000;
-const libfx_provider_tools = [_]tool_dispatch.Tool{
-    host_tool_runtime.providerProjection(builtin_tools.web_search),
-};
+const libfx_provider_tools = [_]tool_dispatch.Tool{};
 const libfx_provider_tool_registry = tool_dispatch.Registry{ .tools = &libfx_provider_tools };
 
 const AcpMethod = enum {
@@ -244,13 +241,11 @@ pub const ActiveSessionState = struct {
     /// `usize` keeps it atomic on wasm32.
     context_used: std.atomic.Value(usize) = .init(0),
     model: []u8,
-    provider: model_provider.ProviderId = .gateway,
+    provider: model_provider.ProviderId = .none,
     mode: []const u8,
     workspace_root: []const u8,
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
-    credential_refresh_after_ms: ?i64 = null,
-    account_id: ?[]const u8 = null,
     agent_step_limit: usize,
     max_tool_result_bytes: usize,
     fast_mode: bool,
@@ -258,10 +253,6 @@ pub const ActiveSessionState = struct {
     effort: types.ReasoningEffort,
     first_call_tool_choice: types.ToolChoice,
     permission_mode: types.PermissionMode,
-    permission_rules: types.PermissionRuleSet,
-    /// Runtime-only "allow for this session" grants. Never persisted to
-    /// profile or project configuration.
-    session_grants: []types.PermissionGrant = &.{},
     session_rt: session_runtime.SessionRuntime,
     title_task: ?*session_title_generation.Task = null,
     /// The session's MCP servers; null when it has none.
@@ -290,25 +281,6 @@ pub const ActiveSessionState = struct {
     /// prompt, and what a running session held must reopen.
     staging_needed: StagedTotals = .{},
 
-    pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
-        for (self.session_grants) |grant| {
-            if (std.mem.eql(u8, grant.tool_name, tool_name) and
-                std.mem.eql(u8, grant.target_path, target_path)) return;
-        }
-
-        const name_copy = try alloc.dupe(u8, tool_name);
-        errdefer alloc.free(name_copy);
-        const target_copy = try alloc.dupe(u8, target_path);
-        errdefer alloc.free(target_copy);
-        const next = try alloc.alloc(types.PermissionGrant, self.session_grants.len + 1);
-        errdefer alloc.free(next);
-        if (self.session_grants.len > 0) {
-            @memmove(next[0..self.session_grants.len], self.session_grants);
-            alloc.free(self.session_grants);
-        }
-        next[next.len - 1] = .{ .tool_name = name_copy, .target_path = target_copy };
-        self.session_grants = next;
-    }
 };
 
 const ActivePrompt = struct {
@@ -344,22 +316,12 @@ pub const ServerState = struct {
     workspace_access: workspace_access.WorkspaceAccess = .{},
     api_key: []u8 = &.{},
     credential_source: ?types.CredentialSource = null,
-    gateway_source_preference: ?types.CredentialSource = null,
-    credential_refresh_after_ms: ?i64 = null,
-    account_id: ?[]u8 = null,
-    gateway_team: ?[]u8 = null,
     selected_model: []u8 = &.{},
-    provider: model_provider.ProviderId = .gateway,
+    provider: model_provider.ProviderId = .none,
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
-    /// Whether the credential's team has Token Pass: the check that asks.
-    token_pass_run: ?token_pass_check.Check = null,
-    /// The profile's speeds, kept while nothing chose the model, so new
-    /// sessions follow the team's start model (`token_pass.startModel`).
-    token_pass_start: ?struct { fast_mode: bool, ultrafast_mode: bool } = null,
     process_provider_override: bool = false,
     permission_mode: types.PermissionMode = .yolo,
-    permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
@@ -413,7 +375,6 @@ pub const ServerState = struct {
     pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
     pub fn deinit(self: *ServerState) void {
-        if (self.token_pass_run) |*check| check.finish(self.alloc, "shutdown");
         // Terminals end with this process. Ending them first also releases
         // an active prompt waiting on one.
         self.terminal_client.closeOwnedTerminals();
@@ -442,11 +403,8 @@ pub const ServerState = struct {
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
-        if (self.gateway_team) |team| self.alloc.free(team);
-        if (self.account_id) |account_id| self.alloc.free(account_id);
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
-        self.permission_rules.deinit(self.alloc);
         self.skills.deinit(self.alloc);
         self.context_snapshot.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
@@ -469,83 +427,29 @@ pub const ServerState = struct {
     }
 };
 
-fn credentialMatchesProvider(
-    source: ?types.CredentialSource,
-    provider: model_provider.ProviderId,
-) bool {
-    return model_provider.authorizesCredential(provider, source);
+/// A tokenless credential that marks a route as authorized by the host.
+fn hostManagedCredential() credentials.Credential {
+    return .{ .token = &.{}, .source = .host_managed };
 }
 
-fn credentialReadyAt(
-    source: ?types.CredentialSource,
-    token: []const u8,
-    refresh_after_ms: ?i64,
-    now_ms: i64,
-) bool {
-    if (source == null or (token.len == 0 and source != .configured)) return false;
-    if (credentials.sourceRefreshable(source.?) and
-        refresh_after_ms != null and refresh_after_ms.? <= now_ms)
-    {
-        return false;
-    }
-    return true;
+/// True when requests on a configured provider's route carry no credential from
+/// this server because the host authorizes them at its fetch edge.
+fn hostManagesRoute(cfg: Config, provider: model_provider.ProviderId) bool {
+    return provider == .configured and cfg.provider_auth_mode == .host_managed;
 }
 
-/// Transfers credential storage after the caller has stopped its prior borrowers.
-/// Makes `credential` the server's and the active session's. It frees the
-/// credential it replaces, which a subagent's turn reads from its own copy
-/// (`ModelRoute`); call it with `subagent_authority_mutex` held.
-pub fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
-    const previous_key = state.api_key;
-    const previous_team = state.gateway_team;
-    const previous_account = state.account_id;
-    if (state.active_session) |*active| active.api_key = &.{};
-
-    state.api_key = credential.token;
-    credential.token = &.{};
-    state.credential_source = credential.source;
-    state.credential_refresh_after_ms = credential.refresh_after_ms;
-    state.account_id = credential.account_id;
-    credential.account_id = null;
-    state.gateway_team = if (credential.team_id) |team| team else credential.team_slug;
-    if (credential.team_id != null) {
-        credential.team_id = null;
-        if (credential.team_slug) |slug| state.alloc.free(slug);
-        credential.team_slug = null;
-    } else {
-        credential.team_slug = null;
-    }
-    if (state.active_session) |*active| {
-        active.api_key = state.api_key;
-        active.credential_source = state.credential_source;
-        active.credential_refresh_after_ms = state.credential_refresh_after_ms;
-        active.account_id = state.account_id;
-    }
-    // The web search runtime borrows the key and the team, so it points at the new ones first.
-    pointWebSearchAtSession(state);
-    if (previous_key.len > 0) secret.zeroAndFree(state.alloc, previous_key);
-    if (previous_team) |team| state.alloc.free(team);
-    if (previous_account) |account_id| state.alloc.free(account_id);
+/// Stages the credential `provider`'s requests carry without changing any
+/// in-flight credential storage. The caller owns a non-null credential; null
+/// means the host authorizes every request of this process.
+pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provider.ProviderId) !?credentials.Credential {
+    if (state.cfg.auth_mode == .host_managed) return null;
+    if (hostManagesRoute(state.cfg, provider)) return hostManagedCredential();
+    const credential = (try auth_runtime.prepareCredential(state.alloc, provider)) orelse return error.ProviderCredentialUnavailable;
+    return credential;
 }
 
-/// Points the web search runtime at the active session's credential and
-/// worker model again. The runtime borrows them, and a switch of the model or
-/// of the credential frees what it borrowed. Call with
-/// `subagent_authority_mutex` held.
-fn pointWebSearchAtSession(state: *ServerState) void {
-    const session = if (state.active_session) |*active| active else return;
-    state.web_search_runtime.configure(.{
-        .api_key = session.api_key,
-        .credential_source = session.credential_source,
-        .gateway_team = state.gateway_team,
-        .worker_model = session.model,
-        .gateway_retry_count = state.cfg.gateway_retry_count,
-        .gateway_chat_url = state.cfg.gateway_chat_url,
-    });
-}
-
-/// Ensures the process and active ACP session use a credential authorized for
-/// the final model route. Returns false when that route has no credential.
+/// Ensures the process and active ACP session use the credential `provider`
+/// needs. Returns false when that provider has no credential spark can read.
 pub fn selectCredentialForProvider(
     state: *ServerState,
     provider: model_provider.ProviderId,
@@ -554,14 +458,9 @@ pub fn selectCredentialForProvider(
         state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
         defer state.subagent_authority_mutex.unlock(io_mod.getIo());
         state.credential_source = .host_managed;
-        state.credential_refresh_after_ms = null;
-        state.account_id = null;
-        state.gateway_team = null;
         if (state.active_session) |*active| {
             active.credential_source = .host_managed;
-            active.credential_refresh_after_ms = null;
             active.api_key = &.{};
-            active.account_id = null;
         }
         return true;
     }
@@ -578,128 +477,50 @@ pub fn selectCredentialForProvider(
     return true;
 }
 
-/// True when requests on the provider's route carry no credential from this
-/// server because the host authorizes them at its fetch edge.
-fn hostManagesRoute(cfg: Config, provider: model_provider.ProviderId) bool {
-    return provider != .gateway and cfg.provider_auth_mode == .host_managed;
-}
+/// Transfers credential storage after the caller has stopped its prior borrowers.
+/// Makes `credential` the server's and the active session's. It frees the
+/// credential it replaces, which a subagent's turn reads from its own copy
+/// (`ModelRoute` in prompt.zig); call it with `subagent_authority_mutex` held.
+pub fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
+    const previous_key = state.api_key;
+    if (state.active_session) |*active| active.api_key = &.{};
 
-/// A tokenless credential that marks a route as authorized by the host.
-fn hostManagedCredential() credentials.Credential {
-    return .{ .token = &.{}, .source = .host_managed };
-}
-
-/// Stages authorization without changing any in-flight credential storage.
-/// The caller owns a non-null credential; null retains the current authorization.
-pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provider.ProviderId) !?credentials.Credential {
-    if (state.cfg.auth_mode == .host_managed) return null;
-    if (hostManagesRoute(state.cfg, provider)) return hostManagedCredential();
-    const now_ms = io_mod.milliTimestamp();
-    {
-        // The credential in use is read under the lock a subagent's refresh publishes under.
-        state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-        defer state.subagent_authority_mutex.unlock(io_mod.getIo());
-        if (state.active_session) |active| {
-            if (provider != .configured and credentialMatchesProvider(active.credential_source, provider) and
-                credentialReadyAt(
-                    active.credential_source,
-                    active.api_key,
-                    active.credential_refresh_after_ms,
-                    now_ms,
-                )) return null;
-        }
-        if (provider != .configured and credentialMatchesProvider(state.credential_source, provider) and
-            credentialReadyAt(
-                state.credential_source,
-                state.api_key,
-                state.credential_refresh_after_ms,
-                now_ms,
-            )) return null;
+    state.api_key = credential.token;
+    credential.token = &.{};
+    state.credential_source = credential.source;
+    if (state.active_session) |*active| {
+        active.api_key = state.api_key;
+        active.credential_source = state.credential_source;
     }
-
-    return if (provider == .gateway and state.cfg.credential_override != null)
-        credentials.Credential{
-            .token = try state.alloc.dupe(u8, state.cfg.credential_override.?),
-            .source = .ai_gateway_api_key,
-        }
-    else blk: {
-        break :blk (try auth_runtime.prepareCredential(
-            state.alloc,
-            state.cfg.gateway_provider.oauth_transport,
-            state.cfg.secret_store,
-            provider,
-            if (provider == .gateway) state.gateway_source_preference else state.credential_source,
-        )) orelse return error.ProviderCredentialUnavailable;
-    };
+    if (previous_key.len > 0) secret.zeroAndFree(state.alloc, previous_key);
 }
 
-test "ACP credential preparation preserves the existing borrowed credential" {
-    const alloc = std.testing.allocator;
-    var state: ServerState = undefined;
-    state.alloc = alloc;
-    state.subagent_authority_mutex = .init;
-    state.cfg.auth_mode = .local;
-    state.cfg.credential_override = "next-token";
-    state.active_session = null;
-    state.credential_source = .configured;
-    state.api_key = try alloc.dupe(u8, "active-token");
-    defer secret.zeroAndFree(alloc, state.api_key);
-    const borrowed = state.api_key;
-    var prepared = (try prepareCredentialForProvider(&state, .gateway)).?;
-    defer prepared.deinit(alloc);
-    try std.testing.expectEqualStrings("next-token", prepared.token);
-    try std.testing.expectEqualStrings("active-token", borrowed);
-    try std.testing.expect(state.api_key.ptr == borrowed.ptr);
-    try std.testing.expectEqual(types.CredentialSource.configured, state.credential_source.?);
-}
-
-test "ACP provider routes are host-managed only when configured and never leak into Gateway" {
+test "ACP provider routes are host-managed only for configured providers under host policy" {
     const alloc = std.testing.allocator;
     var state: ServerState = undefined;
     state.alloc = alloc;
     state.subagent_authority_mutex = .init;
     state.cfg.auth_mode = .local;
     state.cfg.provider_auth_mode = .host_managed;
-    state.cfg.credential_override = "gateway-key";
     state.active_session = null;
     state.api_key = &.{};
-    state.credential_refresh_after_ms = null;
-    state.account_id = null;
-    state.gateway_team = null;
 
-    // A Codex turn leaves the process host-managed with no token.
-    var codex = (try prepareCredentialForProvider(&state, .codex)).?;
-    try std.testing.expectEqual(types.CredentialSource.host_managed, codex.source);
-    try std.testing.expectEqual(@as(usize, 0), codex.token.len);
-    adoptServerCredential(&state, &codex);
-    codex.deinit(alloc);
-    try std.testing.expectEqual(types.CredentialSource.host_managed, state.credential_source.?);
-
-    // The next Gateway turn gets its own key, not the host-managed source.
-    var gateway = (try prepareCredentialForProvider(&state, .gateway)).?;
-    defer gateway.deinit(alloc);
-    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.source);
-    try std.testing.expectEqualStrings("gateway-key", gateway.token);
-
-    // A Grok turn is host-managed the same way.
-    var grok = (try prepareCredentialForProvider(&state, .grok)).?;
-    defer grok.deinit(alloc);
-    try std.testing.expectEqual(types.CredentialSource.host_managed, grok.source);
-    try std.testing.expectEqual(@as(usize, 0), grok.token.len);
-
-    // So is a configured provider: the host adds its API key, if any.
+    // The host adds the configured provider's key, if any, so the process
+    // holds no token of its own.
     const configured = model_provider.parse("local").?;
     var custom = (try prepareCredentialForProvider(&state, configured)).?;
     defer custom.deinit(alloc);
     try std.testing.expectEqual(types.CredentialSource.host_managed, custom.source);
     try std.testing.expectEqual(@as(usize, 0), custom.token.len);
+    adoptServerCredential(&state, &custom);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, state.credential_source.?);
 
-    // Without the policy each provider needs its own credential.
+    // A process with no chosen provider has no route, even under host policy.
+    try std.testing.expectError(error.ProviderCredentialUnavailable, prepareCredentialForProvider(&state, .none));
+
+    // Without the policy a configured provider needs its own credential.
     state.cfg.provider_auth_mode = .local;
-    try std.testing.expect(!hostManagesRoute(state.cfg, .codex));
-    try std.testing.expect(!hostManagesRoute(state.cfg, .grok));
     try std.testing.expect(!hostManagesRoute(state.cfg, configured));
-    try std.testing.expect(!hostManagesRoute(state.cfg, .gateway));
 }
 
 pub fn streamProviderFor(
@@ -714,97 +535,6 @@ pub fn catalogProviderFor(
     provider: model_provider.ProviderId,
 ) ?@import("../core/gateway/model_catalog.zig").Provider {
     return state.cfg.provider_set.select(provider).model_catalog;
-}
-
-pub fn refreshModelCredential(
-    raw: *anyopaque,
-    alloc: Allocator,
-    source: types.CredentialSource,
-    mode: auth_runtime.CredentialRefreshMode,
-    expected_account_id: ?[]const u8,
-    rejected_token: ?[]const u8,
-) !?[]u8 {
-    const state: *ServerState = @ptrCast(@alignCast(raw));
-    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
-        debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
-        return null;
-    }
-    var refreshed = (try auth_runtime.refreshCredentialForAccount(
-        state.cfg.gateway_provider.oauth_transport,
-        state.alloc,
-        source,
-        mode,
-        expected_account_id,
-        rejected_token,
-    )) orelse return null;
-    defer refreshed.deinit(state.alloc);
-
-    const worker_token = try alloc.dupe(u8, refreshed.token);
-    errdefer secret.zeroAndFree(alloc, worker_token);
-    try publishRefreshedCredential(
-        state,
-        &refreshed,
-        expected_account_id,
-        source == .spark_login,
-    );
-    return worker_token;
-}
-
-fn publishRefreshedCredential(
-    state: *ServerState,
-    refreshed: *credentials.Credential,
-    expected_account_id: ?[]const u8,
-    check_team: bool,
-) !void {
-    // A subagent's turn refreshes from its own thread, and the server's credential, team and
-    // account are what a switch of the provider replaces, so the checks, the reads of the team
-    // included, and the adoption are one step under the lock.
-    state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
-    defer state.subagent_authority_mutex.unlock(io_mod.getIo());
-    if (state.credential_source != refreshed.source) {
-        debug_trace.logf("auth", "ACP credential publication rejected stage=state_source", .{});
-        return error.CredentialAuthorityChanged;
-    }
-    if (expected_account_id) |expected| {
-        const refreshed_account = refreshed.accountId() orelse {
-            debug_trace.logf("auth", "ACP credential publication rejected stage=refreshed_account_missing", .{});
-            return error.ChatGptAccountChanged;
-        };
-        const state_account = state.account_id orelse {
-            debug_trace.logf("auth", "ACP credential publication rejected stage=state_account_missing", .{});
-            return error.ChatGptAccountChanged;
-        };
-        if (!std.mem.eql(u8, expected, refreshed_account)) {
-            debug_trace.logf("auth", "ACP credential publication rejected stage=refreshed_account_changed", .{});
-            return error.ChatGptAccountChanged;
-        }
-        if (!std.mem.eql(u8, expected, state_account)) {
-            debug_trace.logf("auth", "ACP credential publication rejected stage=state_account_changed", .{});
-            return error.ChatGptAccountChanged;
-        }
-    }
-    if (check_team) {
-        const refreshed_team = refreshed.gatewayTeam() orelse return error.CredentialAuthorityChanged;
-        const state_team = state.gateway_team orelse return error.CredentialAuthorityChanged;
-        if (!std.mem.eql(u8, state_team, refreshed_team)) return error.CredentialAuthorityChanged;
-    }
-    if (state.active_session) |active| {
-        if (active.credential_source != refreshed.source) {
-            debug_trace.logf("auth", "ACP credential publication rejected stage=active_source", .{});
-            return error.CredentialAuthorityChanged;
-        }
-        if (expected_account_id) |expected| {
-            const active_account = active.account_id orelse {
-                debug_trace.logf("auth", "ACP credential publication rejected stage=active_account_missing", .{});
-                return error.ChatGptAccountChanged;
-            };
-            if (!std.mem.eql(u8, expected, active_account)) {
-                debug_trace.logf("auth", "ACP credential publication rejected stage=active_account_changed", .{});
-                return error.ChatGptAccountChanged;
-            }
-        }
-    }
-    adoptServerCredential(state, refreshed);
 }
 
 /// The native session store; null when it could not open (no `HOME`). The
@@ -929,7 +659,6 @@ fn destroyActiveSession(state: *ServerState) void {
     active.steering.deinit(state.alloc);
     if (active.journal) |*journal| journal.deinit(state.alloc);
     active.staged_images.deinit(state.alloc);
-    types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
         if (active.mcp_host) |h| h.destroy();
     }
@@ -1002,9 +731,8 @@ fn postAcpReport(
         .images = &.{},
         .model = &.{},
         .api_key = &.{},
-        .permission_mode = .ask,
+        .permission_mode = .yolo,
         .history = &.{},
-        .grants = &.{},
         .author = .child,
         .mail = if (delivery == .report) .report else .message,
     }) catch |err| {
@@ -1091,11 +819,6 @@ fn resolveSubagentAuthority(
     else
         null;
     defer if (mcp_view) |*view| view.deinit(alloc);
-    var permission_state = active.session_rt.snapshotPermissionState(alloc) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.HostAuthorityUnavailable,
-    };
-    defer permission_state.deinit(alloc);
     return subagent_tool_host.captureHostAuthorityWithMcpView(
         alloc,
         .{
@@ -1108,9 +831,6 @@ fn resolveSubagentAuthority(
             },
         },
         owned_integrations,
-        active.permission_rules,
-        active.session_grants,
-        permission_state,
         if (mcp_view) |*view| view else null,
     );
 }
@@ -1149,9 +869,7 @@ pub fn runWithTransport(
         .alloc = alloc,
         .cfg = cfg,
         .writer = writer_value,
-        .web_search_runtime = web_search_runtime.Runtime.init(.{
-            .provider = cfg.provider_set.gateway.spark_search,
-        }),
+        .web_search_runtime = web_search_runtime.Runtime.init(.{}),
         .terminal_client = terminal_client_runtime.Runtime.init(
             cfg.process_provider,
         ),
@@ -1210,10 +928,13 @@ pub fn runWithTransport(
         }
 
         dispatch(&state, alloc, &msg) catch |err| {
-            const auth_notice = auth_runtime.preparationFailureNotice(err);
+            const credential_notice: ?[]const u8 = if (err == error.ProviderCredentialUnavailable)
+                auth_runtime.missingCredentialText(state.provider)
+            else
+                null;
             state.writer.writeError(alloc, msg.id, .{
-                .code = if (auth_notice != null) ErrorCode.invalid_request else ErrorCode.internal_error,
-                .message = auth_notice orelse @errorName(err),
+                .code = if (credential_notice != null) ErrorCode.invalid_request else ErrorCode.internal_error,
+                .message = credential_notice orelse @errorName(err),
             }) catch break;
         };
         if (state.terminate_connection) break;
@@ -1649,7 +1370,6 @@ fn dispatchNotification(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mes
 
 fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     reapActivePrompt(state, false);
-    pollTokenPass(state);
     const method = AcpMethod.parse(msg.method);
 
     if (method == .initialize) {
@@ -2937,100 +2657,6 @@ fn parseInitializeRequest(
     return request;
 }
 
-test "ACP initialize owns libfx tools and instructions" {
-    const alloc = std.testing.allocator;
-    var request = try parseInitializeRequest(
-        alloc,
-        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"tools":[{"name":"lookup","description":"Lookup","inputSchema":{"type":"object"}}],"instructions":"Be concise."}}}
-    ,
-        true,
-    );
-    defer request.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
-    try std.testing.expectEqualStrings("lookup", request.host_tools.tools[0].name);
-    try std.testing.expectEqualStrings("Be concise.", request.host_instructions);
-}
-
-test "ACP initialize accepts registered provider-executed libfx tools" {
-    const alloc = std.testing.allocator;
-    var request = try parseInitializeRequest(
-        alloc,
-        \\{"protocolVersion":1,"clientCapabilities":{"libfx":{"tools":[{"name":"web_search","providerExecuted":true}]}}}
-    ,
-        true,
-    );
-    defer request.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), request.host_tools.tools.len);
-    try std.testing.expectEqual(@as(usize, 0), request.host_tools.dynamic_tools.len);
-    try std.testing.expect(request.host_tools.tools[0].provider_executed);
-    try std.testing.expect(request.host_tools.tools[0].write_provider_advertisement_fn != null);
-}
-
-test "ordinary ACP ignores private libfx capabilities" {
-    const alloc = std.testing.allocator;
-    var request = try parseInitializeRequest(
-        alloc,
-        \\{"protocolVersion":1,"clientCapabilities":{"libfx":"ignored"}}
-    ,
-        false,
-    );
-    defer request.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), request.host_tools.tools.len);
-    try std.testing.expectEqual(@as(usize, 0), request.host_instructions.len);
-}
-
-/// Asks whether the credential's team has Token Pass. A team with Token Pass
-/// starts new sessions on the Token Pass default when nothing chose the
-/// model. The check waits here only when spark has no saved answer, and
-/// `pollTokenPass` takes a later answer.
-fn startTokenPassCheck(state: *ServerState, alloc: Allocator, model_source: config_runtime.ModelSource) void {
-    if (state.provider != .gateway) return;
-    const source = state.credential_source orelse return;
-    const api_key: ?[]const u8 = if (state.api_key.len > 0) state.api_key else null;
-    // A client that sends `initialize` again replaces the earlier check.
-    if (state.token_pass_run) |*earlier| earlier.finish(alloc, "initialize_retried");
-    state.token_pass_run = null;
-    state.token_pass_start = null;
-    const named = token_pass_check.name(alloc, source, api_key, state.account_id, state.gateway_team) orelse return;
-    state.token_pass_run = .{ .named = named, .home = state.cfg.home_override orelse io_mod.homeDir() };
-    state.token_pass_run.?.begin(
-        alloc,
-        state.cfg.provider_set.select(.gateway).credits orelse gateway_provider.unavailable_credits_provider,
-        .{ .credential = api_key, .credential_source = source, .tenant = state.gateway_team },
-        token_pass_check.first_prompt_wait_ms,
-    );
-    if (model_source != .compiled_default or state.process_model_override) return;
-    state.token_pass_start = .{ .fast_mode = state.fast_mode, .ultrafast_mode = state.ultrafast_mode };
-    applyTokenPassStartModel(state);
-}
-
-fn pollTokenPass(state: *ServerState) void {
-    const check = if (state.token_pass_run) |*value| value else return;
-    const before = check.has_pass;
-    if (check.lookup.task != null) check.poll(state.alloc);
-    _ = check.observeCatalog(state.alloc);
-    if (check.has_pass != before) applyTokenPassStartModel(state);
-}
-
-/// Puts new sessions on the team's start model, unless a client chose
-/// another model since. Token Pass credit pays only for standard speed.
-fn applyTokenPassStartModel(state: *ServerState) void {
-    const profile = state.token_pass_start orelse return;
-    const has_pass = if (state.token_pass_run) |check| check.has_pass else false;
-    const target = token_pass.startModelFor(state.selected_model, state.configured_model, has_pass) orelse return;
-    if (!std.mem.eql(u8, state.selected_model, target)) {
-        const owned = state.alloc.dupe(u8, target) catch |err| {
-            debug_trace.logf("token_pass", "start model not applied err={s}", .{@errorName(err)});
-            return;
-        };
-        if (state.selected_model.len > 0) state.alloc.free(state.selected_model);
-        state.selected_model = owned;
-        debug_trace.logf("token_pass", "start model={s}", .{target});
-    }
-    state.fast_mode = if (has_pass) false else profile.fast_mode;
-    state.ultrafast_mode = if (has_pass) false else profile.ultrafast_mode;
-}
-
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
     if (state.cfg.minimal_kernel) {
         var startup = try app_lifecycle.loadLibfxStartupState(
@@ -3061,7 +2687,7 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
     }
     return app_lifecycle.loadStartupStateForRun(
         alloc,
-        state.cfg.gateway_provider.oauth_transport,
+        oauth_transport.unavailable_provider,
         state.cfg.secret_store,
         state.cfg.default_model,
         state.cfg.default_agent_step_limit,
@@ -3107,13 +2733,6 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
     defer startup.deinit(alloc);
-    if (state.cfg.auth_mode == .local and startup.credential == null and
-        !(startup.provider == .gateway and state.cfg.credential_override != null))
-    {
-        if (startup.credential_load_failure) |failure| {
-            if (auth_runtime.preparationError(auth_runtime.classifyCredentialFailure(failure.source, failure.err))) |err| return err;
-        }
-    }
     if (!state.cfg.minimal_kernel) {
         try app_lifecycle.applyWorkspaceLaunch(
             &startup,
@@ -3158,71 +2777,23 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.configured_providers = startup.configured_providers;
     startup.configured_providers = .{};
     state.cfg.provider_set.definitions = state.configured_providers.definitions;
-    state.gateway_source_preference = startup.credential_source_preference;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
     if (state.cfg.auth_mode == .host_managed or hostManagesRoute(state.cfg, state.provider)) {
         state.api_key = &.{};
         state.credential_source = .host_managed;
-        state.credential_refresh_after_ms = null;
-        state.account_id = null;
-        state.gateway_team = null;
-    } else {
-        var startup_credential = startup.takeCredential();
-        defer if (startup_credential) |*credential| credential.deinit(alloc);
-        var routed_credential: ?credentials.Credential = null;
-        defer if (routed_credential) |*credential| credential.deinit(alloc);
-        const startup_matches_model = if (startup_credential) |credential|
-            credentialMatchesProvider(credential.source, state.provider)
-        else
-            false;
-        const startup_credential_is_final = startup_matches_model and
-            !credentials.sourceRefreshable(startup_credential.?.source);
-        const credential: *credentials.Credential = if (state.provider == .gateway and state.cfg.credential_override != null) override: {
-            routed_credential = .{
-                .token = try alloc.dupe(u8, state.cfg.credential_override.?),
-                .source = .ai_gateway_api_key,
-            };
-            break :override &routed_credential.?;
-        } else if (startup_credential_is_final)
-            &startup_credential.?
-        else routed: {
-            routed_credential = try auth_runtime.prepareCredential(
-                alloc,
-                state.cfg.gateway_provider.oauth_transport,
-                state.cfg.secret_store,
-                state.provider,
-                if (state.provider == .gateway) startup.credential_source_preference else null,
-            );
-            if (routed_credential == null) {
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = if (state.provider == .codex)
-                        credentials.missing_chatgpt_credential_message
-                    else if (state.provider == .grok)
-                        credentials.missing_grok_credential_message
-                    else
-                        credentials.missing_credential_message,
-                });
-            }
-            break :routed &routed_credential.?;
-        };
-        if (credential.token.len == 0 and credential.source != .configured) {
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_request,
-                .message = if (state.provider == .codex)
-                    credentials.missing_chatgpt_credential_message
-                else if (state.provider == .grok)
-                    credentials.missing_grok_credential_message
-                else
-                    credentials.missing_credential_message,
-            });
-        }
-        adoptServerCredential(state, credential);
+    } else if (state.provider == .none) {
+        // Nothing can answer until a provider is added with /provider.
+        state.api_key = &.{};
+        state.credential_source = null;
+    } else if (!try selectCredentialForProvider(state, state.provider)) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = auth_runtime.missingCredentialText(state.provider),
+        });
     }
 
     state.permission_mode = startup.permission_mode;
-    state.permission_rules = startup.takePermissionRules();
     state.agent_step_limit = startup.agent_step_limit;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.auto_compact_percent = startup.auto_compact_percent;
@@ -3232,9 +2803,6 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     configureUltrafastStartup(state, &startup);
-    if (comptime !host_target.is_wasm) {
-        if (!state.cfg.minimal_kernel) startTokenPassCheck(state, alloc, startup.model_source);
-    }
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
@@ -3252,16 +2820,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         }
     }
 
-    if (!state.cfg.minimal_kernel) {
+    if (!state.cfg.minimal_kernel and state.provider != .none) {
         const startup_catalog = catalogProviderFor(state, state.provider) orelse
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
                 .message = "Selected provider is unavailable in this host",
             });
         _ = try resolveSelectedModelCapabilities(state, startup_catalog);
-        // The catalog just loaded; its Token Pass marks can answer for the
-        // team when the credits check could not.
-        if (comptime !host_target.is_wasm) pollTokenPass(state);
     }
 
     if (state.cfg.effort_override) |raw| {
@@ -3328,13 +2893,8 @@ fn resolveSelectedModelCapabilities(
             .access = if (state.cfg.auth_mode == .host_managed)
                 .host_managed
             else
-                credentials.catalogAccessForCredentialAndAccount(
-                    state.credential_source,
-                    state.api_key,
-                    state.gateway_team,
-                    state.account_id,
-                ),
-            .endpoint = state.cfg.gateway_models_path,
+                credentials.catalogAccessFor(state.credential_source),
+            .endpoint = "",
             .cancel_flag = &cancel_flag,
         },
         state.selected_model,
@@ -3415,40 +2975,6 @@ fn effortOverrideRejection(
     );
 }
 
-test "effortOverrideRejection accepts default and advertised efforts" {
-    const alloc = std.testing.allocator;
-    const capabilities = model_capabilities.Capabilities{
-        .reasoning_efforts = .fromSlice(&.{
-            types.ReasoningEffort.literal("low"),
-            types.ReasoningEffort.literal("high"),
-        }),
-    };
-    try std.testing.expectEqual(@as(?[]u8, null), try effortOverrideRejection(alloc, capabilities, .auto, "provider/model"));
-    try std.testing.expectEqual(@as(?[]u8, null), try effortOverrideRejection(alloc, capabilities, .literal("high"), "provider/model"));
-}
-
-test "effortOverrideRejection names the advertised set" {
-    const alloc = std.testing.allocator;
-    const capabilities = model_capabilities.Capabilities{
-        .reasoning_efforts = .fromSlice(&.{
-            types.ReasoningEffort.literal("low"),
-            types.ReasoningEffort.literal("high"),
-        }),
-    };
-    const rejection = (try effortOverrideRejection(alloc, capabilities, .literal("max"), "provider/model")).?;
-    defer alloc.free(rejection);
-    try std.testing.expect(std.mem.find(u8, rejection, "\"max\"") != null);
-    try std.testing.expect(std.mem.find(u8, rejection, "provider/model") != null);
-    try std.testing.expect(std.mem.find(u8, rejection, "low, high") != null);
-}
-
-test "effortOverrideRejection reports models without advertised efforts" {
-    const alloc = std.testing.allocator;
-    const rejection = (try effortOverrideRejection(alloc, .{}, .literal("high"), "provider/plain")).?;
-    defer alloc.free(rejection);
-    try std.testing.expectEqualStrings("Reasoning effort is unavailable for the active model", rejection);
-}
-
 /// Applies a host-supplied fast-lane override to sessions created after
 /// initialize. Enabling fast mode requires the selected model to offer a fast
 /// path whenever the catalog resolves; a catalog outage leaves the override in
@@ -3509,19 +3035,6 @@ fn fastOverrideRejection(
     return try alloc.print("Fast mode is not available for model \"{s}\"", .{model});
 }
 
-test "fastOverrideRejection accepts models with a fast path" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(?[]u8, null), try fastOverrideRejection(alloc, .{ .supports_fast_mode = true }, "provider/model"));
-    try std.testing.expectEqual(@as(?[]u8, null), try fastOverrideRejection(alloc, .{ .intrinsic_fast = true }, "provider/model-fast"));
-}
-
-test "fastOverrideRejection names models without a fast path" {
-    const alloc = std.testing.allocator;
-    const rejection = (try fastOverrideRejection(alloc, .{}, "provider/plain")).?;
-    defer alloc.free(rejection);
-    try std.testing.expectEqualStrings("Fast mode is not available for model \"provider/plain\"", rejection);
-}
-
 /// Applies a host-supplied ultrafast override before session creation. Unlike
 /// fast mode, enabling it requires a verified Gateway catalog capability; a
 /// catalog failure cannot silently send an unverified ultrafast request.
@@ -3530,16 +3043,13 @@ fn applyUltrafastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.M
         state.ultrafast_mode = false;
         return true;
     }
-    if (state.provider != .gateway) {
-        return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode is unavailable for the selected provider");
-    }
     const catalog_provider = catalogProviderFor(state, state.provider) orelse
         return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode is unavailable for the selected provider");
     const capabilities = try resolveSelectedModelCapabilities(state, catalog_provider);
     if (state.capability_resolver.state == .failed) {
-        return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode requires a verified Gateway model catalog");
+        return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode requires a verified model catalog");
     }
-    const rejection = try ultrafastOverrideRejection(alloc, state.provider, capabilities, state.selected_model);
+    const rejection = try ultrafastOverrideRejection(alloc, capabilities, state.selected_model);
     if (rejection) |message| {
         defer alloc.free(message);
         return writeUltrafastOverrideFailure(state, alloc, msg, message);
@@ -3561,154 +3071,26 @@ fn writeUltrafastOverrideFailure(state: *ServerState, alloc: Allocator, msg: *js
     return false;
 }
 
-/// Pure capability policy: ultrafast is an opt-in Gateway OpenAI catalog lane.
+/// Pure capability policy: ultrafast needs a model whose catalog offers it.
 /// Caller frees a non-null rejection message.
 fn ultrafastOverrideRejection(
     alloc: Allocator,
-    provider: model_provider.ProviderId,
     capabilities: model_capabilities.Capabilities,
     model: []const u8,
 ) Allocator.Error!?[]u8 {
-    if (provider == .gateway and capabilities.supports_ultrafast_mode) return null;
+    if (capabilities.supports_ultrafast_mode) return null;
     return try alloc.print("Ultrafast mode is not available for model \"{s}\"", .{model});
 }
 
-test "ultrafastOverrideRejection accepts only Gateway models with the catalog capability" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(?[]u8, null), try ultrafastOverrideRejection(alloc, .gateway, .{ .supports_ultrafast_mode = true }, "openai/model"));
-    const rejection = (try ultrafastOverrideRejection(alloc, .codex, .{ .supports_ultrafast_mode = true }, "openai/model")).?;
-    defer alloc.free(rejection);
-    try std.testing.expect(std.mem.find(u8, rejection, "openai/model") != null);
-    const unavailable = (try ultrafastOverrideRejection(alloc, .gateway, .{}, "openai/model")).?;
-    defer alloc.free(unavailable);
-}
+const provider_set = @import("../core/gateway/provider_set.zig");
+const configured_provider = @import("../core/config/configured_provider.zig");
+const catalog_test_provider_json = "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{\"type\":\"none\"}}}";
 
-test "ACP answers an ultrafast override without waiting out a model catalog that cannot connect" {
-    // A Gateway catalog on a dead network: its request never connects, and
-    // it fails only when cancelled or once a stalled DNS lookup would give up.
-    const UnconnectableCatalog = struct {
-        give_up_ms: i64 = 6_000,
-
-        fn fetch(raw: ?*anyopaque, _: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            const started_ms = model_catalog.clockMs();
-            while (model_catalog.clockMs() - started_ms < self.give_up_ms) {
-                if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) {
-                    return .{ .failure = .{ .category = .cancellation } };
-                };
-                io_mod.sleep(std.time.ns_per_ms);
-            }
-            return .{ .failure = .{ .category = .transport } };
-        }
-    };
-    const Capture = struct {
-        saw_catalog_failure: bool = false,
-
-        fn write(raw: ?*anyopaque, frame: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            if (std.mem.find(u8, frame, "requires a verified Gateway model catalog") != null) {
-                self.saw_catalog_failure = true;
-            }
-        }
-    };
-    var catalog = UnconnectableCatalog{};
-    var capture = Capture{};
-    var model = "openai/gpt-5.5".*;
-    var state = ServerState{
-        .alloc = std.testing.allocator,
-        .cfg = undefined,
-        .writer = jsonrpc.Writer.initCallback(&capture, Capture.write),
-        .selected_model = &model,
-    };
-    defer state.capability_resolver.deinit(state.alloc);
-    state.cfg.auth_mode = .host_managed;
-    state.cfg.gateway_models_path = "/v1/models";
-    state.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(.{
-        .model_catalog = .{ .context = &catalog, .fetch_fn = UnconnectableCatalog.fetch, .reports_connection = true },
-    });
-    var msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .method = "initialize" };
-
-    const started_ms = model_catalog.clockMs();
-    try std.testing.expect(!try applyUltrafastOverride(&state, std.testing.allocator, &msg, true));
-    const elapsed_ms = model_catalog.clockMs() - started_ms;
-
-    // The override fails as on any catalog outage, after the first load's wait
-    // rather than after the lookup gives up.
-    try std.testing.expect(elapsed_ms < 5_000);
-    try std.testing.expect(capture.saw_catalog_failure);
-    try std.testing.expect(!state.ultrafast_mode);
-}
-
-test "ACP keeps its model catalog when a due refresh cannot connect" {
-    // A Gateway catalog that answers, then goes behind a dead network: its
-    // request never connects, and it fails only when cancelled or once a
-    // stalled DNS lookup would give up.
-    const RefreshingCatalog = struct {
-        answers: std.atomic.Value(bool) = .init(true),
-        give_up_ms: i64 = 6_000,
-
-        fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            if (self.answers.load(.seq_cst)) {
-                if (input.connected) |connected| connected.store(true, .release);
-                var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
-                errdefer model_catalog.freeModelCatalog(alloc, &entries);
-                const id = try alloc.dupe(u8, "openai/gpt-5.5");
-                errdefer alloc.free(id);
-                const model_type = try alloc.dupe(u8, "language");
-                errdefer alloc.free(model_type);
-                try entries.append(alloc, .{ .id = id, .model_type = model_type });
-                return .{ .catalog = entries };
-            }
-            const started_ms = model_catalog.clockMs();
-            while (model_catalog.clockMs() - started_ms < self.give_up_ms) {
-                if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) {
-                    return .{ .failure = .{ .category = .cancellation } };
-                };
-                io_mod.sleep(std.time.ns_per_ms);
-            }
-            return .{ .failure = .{ .category = .transport } };
-        }
-    };
-    var catalog = RefreshingCatalog{};
-    var model = "openai/gpt-5.5".*;
-    var state = ServerState{
-        .alloc = std.testing.allocator,
-        .cfg = undefined,
-        .writer = jsonrpc.Writer.init(),
-        .selected_model = &model,
-    };
-    defer state.capability_resolver.deinit(state.alloc);
-    state.cfg.minimal_kernel = false;
-    state.cfg.auth_mode = .host_managed;
-    state.cfg.gateway_models_path = "/v1/models";
-    state.cfg.provider_set = @import("../core/gateway/provider_set.zig").gateway_only(.{
-        .model_catalog = .{
-            .context = &catalog,
-            .fetch_fn = RefreshingCatalog.fetch,
-            .reports_connection = true,
-            .refresh_interval_ms = 60_000,
-        },
-    });
-    var active: ActiveSessionState = undefined;
-    active.provider = .gateway;
-    state.active_session = active;
-
-    try refreshModelCatalogForOptions(&state);
-    try std.testing.expectEqual(@as(usize, 1), state.capability_resolver.catalogEntries().?.len);
-
-    // The refresh interval passes while the network is down.
-    state.capability_resolver.last_attempt_ms -= 60_000;
-    catalog.answers.store(false, .seq_cst);
-    const started_ms = model_catalog.clockMs();
-    try refreshModelCatalogForOptions(&state);
-    const elapsed_ms = model_catalog.clockMs() - started_ms;
-
-    // The refresh fails as on any catalog outage, after the wait for its
-    // connection rather than after the lookup gives up, and the models the
-    // catalog already listed stay in use.
-    try std.testing.expect(elapsed_ms < 5_000);
-    try std.testing.expectEqualStrings("openai/gpt-5.5", state.capability_resolver.catalogEntries().?[0].id);
+/// A provider set whose only configured provider serves `configured_context`,
+/// a `model_catalog.Provider`, as its catalog.
+fn catalogOnlyBundle(raw: ?*anyopaque, _: *const @import("../core/config/configured_provider.zig").Definition) provider_set.Bundle {
+    const catalog: *const model_catalog.Provider = @ptrCast(@alignCast(raw.?));
+    return .{ .model_catalog = catalog.* };
 }
 
 fn handleCancel(state: *ServerState, notify_client: bool) void {
@@ -3823,34 +3205,11 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .message = "Invalid session model",
             });
         if (comptime !host_target.is_wasm) {
-            if (session.provider != .gateway) {
-                if (session.provider != .configured) {
-                    try refreshModelCatalogForOptions(state);
-                    var model_available = false;
-                    if (state.capability_resolver.catalogEntries()) |entries| {
-                        for (entries) |entry| {
-                            if (std.mem.eql(u8, entry.id, value)) {
-                                model_available = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!model_available) {
-                        return state.writer.writeError(alloc, msg.id, .{
-                            .code = ErrorCode.invalid_params,
-                            .message = "Model is not available for the active provider",
-                        });
-                    }
-                }
+            if (session.provider != .none) {
                 if (!try selectCredentialForProvider(state, session.provider)) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
-                        .message = if (session.provider == .codex)
-                            credentials.missing_chatgpt_credential_message
-                        else if (session.provider == .grok)
-                            credentials.missing_grok_credential_message
-                        else
-                            "Configured provider authentication is unavailable",
+                        .message = auth_runtime.missingCredentialText(session.provider),
                     });
                 }
             }
@@ -3891,7 +3250,6 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     "Failed to persist session model",
             });
         };
-        pointWebSearchAtSession(state);
         if (!try dropUnsupportedSpeeds(state, alloc, msg, session)) return;
     } else if (std.mem.eql(u8, config_id, "provider")) {
         const parsed_provider = model_provider.parse(value) orelse
@@ -3909,35 +3267,15 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             if (host_target.is_wasm and !hostManagesRoute(state.cfg, target)) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
-                    .message = "Subscription provider switching is unavailable in this WASM runtime",
+                    .message = "Provider switching is unavailable in this WASM runtime",
                 });
             }
-            var staged_credential: ?credentials.Credential = if (state.cfg.auth_mode == .host_managed)
-                null
-            else if (hostManagesRoute(state.cfg, target))
-                hostManagedCredential()
-            else if (target == .gateway and state.cfg.credential_override != null)
-                credentials.Credential{
-                    .token = try alloc.dupe(u8, state.cfg.credential_override.?),
-                    .source = .ai_gateway_api_key,
-                }
-            else credential: {
-                break :credential (try auth_runtime.prepareCredential(
-                    alloc,
-                    state.cfg.gateway_provider.oauth_transport,
-                    state.cfg.secret_store,
-                    target,
-                    if (target == .gateway) state.gateway_source_preference else null,
-                )) orelse
-                    return state.writer.writeError(alloc, msg.id, .{
-                        .code = ErrorCode.invalid_request,
-                        .message = if (target == .codex)
-                            credentials.missing_chatgpt_credential_message
-                        else if (target == .grok)
-                            credentials.missing_grok_credential_message
-                        else
-                            credentials.missing_credential_message,
-                    });
+            var staged_credential: ?credentials.Credential = prepareCredentialForProvider(state, target) catch |err| switch (err) {
+                error.ProviderCredentialUnavailable => return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = auth_runtime.missingCredentialText(target),
+                }),
+                else => return err,
             };
             defer if (staged_credential) |*credential| credential.deinit(alloc);
             if (staged_credential) |credential| if (!model_provider.authorizesCredential(target, credential.source)) {
@@ -3954,17 +3292,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             const access: credentials.CatalogAccess = if (state.cfg.auth_mode == .host_managed)
                 .host_managed
             else
-                credentials.catalogAccessForCredentialAndAccount(
-                    staged_credential.?.source,
-                    staged_credential.?.token,
-                    staged_credential.?.gatewayTeam(),
-                    staged_credential.?.accountId(),
-                );
+                credentials.catalogAccessFor(staged_credential.?.source);
             // Provider selection is independent of earlier prompt cancellation.
             var catalog_cancel_flag = std.atomic.Value(bool).init(false);
             const fetched = try catalog_provider.fetch(alloc, .{
                 .access = access,
-                .endpoint = state.cfg.gateway_models_path,
+                .endpoint = "",
                 .cancel_flag = &catalog_cancel_flag,
                 .view = .picker,
             });
@@ -3976,30 +3309,13 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 }),
             };
             defer model_catalog.freeModelCatalog(alloc, &catalog);
-            if (target != .configured and catalog.items.len == 0) {
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = "Provider returned no supported models",
-                });
-            }
             var settings = if (state.cfg.home_override) |home|
                 try config_runtime.loadMergedSettingsFromHome(alloc, home, state.workspace_root)
             else
                 try config_runtime.loadMergedSettings(alloc, state.workspace_root);
             defer settings.deinit(alloc);
-            const saved_model = settings.models.get(target);
-            var selected_model = if (target == .configured)
-                saved_model orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_request, .message = "Configure a model for the selected provider" })
-            else
-                catalog.items[0].id;
-            if (target != .configured) if (saved_model) |saved| {
-                for (catalog.items) |entry| {
-                    if (std.mem.eql(u8, entry.id, saved)) {
-                        selected_model = entry.id;
-                        break;
-                    }
-                }
-            };
+            const selected_model = settings.models.get(target) orelse
+                return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_request, .message = "Configure a model for the selected provider" });
             // A subagent's turn copies the session's model route under this lock when it starts,
             // so what the switch frees here is nobody's but the server's.
             state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
@@ -4022,9 +3338,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 state.credential_source = .host_managed;
                 session.credential_source = .host_managed;
                 session.api_key = &.{};
-                session.account_id = null;
             }
-            pointWebSearchAtSession(state);
             if (!try dropUnsupportedSpeeds(state, alloc, msg, session)) return;
         }
     } else if (std.mem.eql(u8, config_id, "mode")) {
@@ -4163,13 +3477,8 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
         .access = if (state.cfg.auth_mode == .host_managed)
             .host_managed
         else
-            credentials.catalogAccessForCredentialAndAccount(
-                active.credential_source,
-                active.api_key,
-                state.gateway_team,
-                active.account_id,
-            ),
-        .endpoint = state.cfg.gateway_models_path,
+            credentials.catalogAccessFor(active.credential_source),
+        .endpoint = "",
         .cancel_flag = &cancel_flag,
     }, gateway_provider.catalog_connect_wait_ms);
 }
@@ -4271,7 +3580,7 @@ fn applyActiveSessionUltrafast(
             session.model,
             bundle.fallbackModelCapabilities(session.model),
         );
-        const rejection = try ultrafastOverrideRejection(alloc, session.provider, capabilities, session.model);
+        const rejection = try ultrafastOverrideRejection(alloc, capabilities, session.model);
         if (rejection) |message| {
             defer alloc.free(message);
             try state.writer.writeError(alloc, msg.id, .{
@@ -4398,30 +3707,15 @@ const SessionSpeed = struct {
 };
 
 /// Pure policy: the lanes a session keeps after switching to a model with
-/// `capabilities` under `provider`. Ultrafast is a Gateway-only lane.
+/// `capabilities`.
 fn speedSupportedBy(
     speed: SessionSpeed,
-    provider: model_provider.ProviderId,
     capabilities: model_capabilities.Capabilities,
 ) SessionSpeed {
     return .{
         .fast = speed.fast and capabilities.supports_fast_mode,
-        .ultrafast = speed.ultrafast and provider == .gateway and capabilities.supports_ultrafast_mode,
+        .ultrafast = speed.ultrafast and capabilities.supports_ultrafast_mode,
     };
-}
-
-test "speedSupportedBy keeps only the lanes the new model offers" {
-    const both = model_capabilities.Capabilities{ .supports_fast_mode = true, .supports_ultrafast_mode = true };
-    const fast_only = model_capabilities.Capabilities{ .supports_fast_mode = true };
-    const plain = model_capabilities.Capabilities{};
-    const on: SessionSpeed = .{ .fast = true, .ultrafast = true };
-
-    try std.testing.expectEqual(on, speedSupportedBy(on, .gateway, both));
-    try std.testing.expectEqual(SessionSpeed{ .fast = true, .ultrafast = false }, speedSupportedBy(on, .gateway, fast_only));
-    try std.testing.expectEqual(SessionSpeed{ .fast = false, .ultrafast = false }, speedSupportedBy(on, .gateway, plain));
-    try std.testing.expectEqual(SessionSpeed{ .fast = true, .ultrafast = false }, speedSupportedBy(on, .codex, both));
-    const standard: SessionSpeed = .{ .fast = false, .ultrafast = false };
-    try std.testing.expectEqual(standard, speedSupportedBy(standard, .gateway, both));
 }
 
 /// After a model or provider switch, turns off any lane the new model lacks,
@@ -4436,7 +3730,6 @@ fn dropUnsupportedSpeeds(
 ) !bool {
     const kept = speedSupportedBy(
         .{ .fast = session.fast_mode, .ultrafast = session.ultrafast_mode },
-        session.provider,
         activeSessionCapabilities(state, session),
     );
     if (session.ultrafast_mode and !kept.ultrafast) {
@@ -4448,26 +3741,6 @@ fn dropUnsupportedSpeeds(
         if (!try storeSessionFast(state, alloc, msg, session, false)) return false;
     }
     return true;
-}
-
-test "ACP ultrafast disable applies to volatile SDK sessions without a durable store" {
-    var state = ServerState{
-        .alloc = std.testing.allocator,
-        .cfg = undefined,
-        .writer = jsonrpc.Writer.init(),
-        .configured_ultrafast_mode = true,
-        .process_ultrafast_override = true,
-    };
-    state.cfg.minimal_kernel = true;
-    var active: ActiveSessionState = undefined;
-    active.v2 = null;
-    active.wasm_state = null;
-    active.ultrafast_mode = true;
-    var msg = jsonrpc.Message{ .id = .{ .integer = 1 }, .method = "session/set_config_option" };
-    try std.testing.expect(try applyActiveSessionUltrafast(&state, std.testing.allocator, &msg, &active, false));
-    try std.testing.expect(!active.ultrafast_mode);
-    try std.testing.expect(state.configured_ultrafast_mode);
-    try std.testing.expectEqual(@as(?bool, true), state.process_ultrafast_override);
 }
 
 fn commitActiveSessionUltrafast(
@@ -4600,721 +3873,4 @@ pub fn loadStartingMode(state: *ServerState, alloc: Allocator) StartingMode {
         .id = state.cfg.mode_registry.startingModeId(state.permission_mode),
         .permission_mode = state.permission_mode,
     };
-}
-
-test "applySessionMode uses registered mode policy and ignores unknown modes" {
-    const mode_specs = [_]mode_registry.ModeSpec{
-        .{ .id = "inspect", .name = "Inspect", .permission_mode = .ask },
-        .{ .id = "apply", .name = "Apply", .permission_mode = .auto },
-    };
-    const registry = mode_registry.Registry{
-        .default_mode_id = "inspect",
-        .modes = mode_specs[0..],
-    };
-    var session = ActiveSessionState{
-        .session_id = @constCast("session"),
-        .model = @constCast("model"),
-        .mode = registry.default_mode_id,
-        .workspace_root = "/tmp/workspace",
-        .api_key = "",
-        .agent_step_limit = 0,
-        .max_tool_result_bytes = 0,
-        .fast_mode = false,
-        .effort = .auto,
-        .first_call_tool_choice = .auto,
-        .permission_mode = .ask,
-        .permission_rules = .{},
-        .session_rt = .{ .max_history_turns = 0 },
-        .cancel_flag = std.atomic.Value(bool).init(false),
-        .pending_prompt_id = null,
-    };
-
-    try std.testing.expectEqualStrings("apply", applySessionMode(registry, &session, "apply").?.id);
-    try std.testing.expectEqualStrings("apply", session.mode);
-    try std.testing.expectEqual(types.PermissionMode.auto, session.permission_mode);
-
-    _ = applySessionMode(registry, &session, "inspect");
-    try std.testing.expectEqualStrings("inspect", session.mode);
-    try std.testing.expectEqual(types.PermissionMode.ask, session.permission_mode);
-
-    try std.testing.expect(applySessionMode(registry, &session, "unknown") == null);
-    try std.testing.expectEqualStrings("inspect", session.mode);
-    try std.testing.expectEqual(types.PermissionMode.ask, session.permission_mode);
-
-    _ = applySessionMode(registry, &session, "apply");
-    try std.testing.expectEqual(types.PermissionMode.auto, session.permission_mode);
-    _ = applySessionMode(registry, &session, "inspect");
-    try std.testing.expectEqual(types.PermissionMode.ask, session.permission_mode);
-}
-
-test "ACP notifications with absent id are not response targets" {
-    const alloc = std.testing.allocator;
-    var notification = try jsonrpc.parseMessage(
-        alloc,
-        "{\"jsonrpc\":\"2.0\",\"method\":\"unknown/notification\",\"params\":{}}",
-    );
-    defer jsonrpc.freeMessage(alloc, &notification);
-    try std.testing.expect(!shouldRespondToMessage(&notification));
-
-    var null_id_request = try jsonrpc.parseMessage(
-        alloc,
-        "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"unknown/request\",\"params\":{}}",
-    );
-    defer jsonrpc.freeMessage(alloc, &null_id_request);
-    try std.testing.expect(shouldRespondToMessage(&null_id_request));
-}
-
-test "ACP method parser classifies request dispatch methods" {
-    try std.testing.expectEqual(AcpMethod.initialize, AcpMethod.parse("initialize"));
-    try std.testing.expectEqual(AcpMethod.session_cancel, AcpMethod.parse("session/cancel"));
-    try std.testing.expectEqual(AcpMethod.session_new, AcpMethod.parse("session/new"));
-    try std.testing.expectEqual(AcpMethod.session_load, AcpMethod.parse("session/load"));
-    try std.testing.expectEqual(AcpMethod.session_resume, AcpMethod.parse("session/resume"));
-    try std.testing.expectEqual(AcpMethod.session_close, AcpMethod.parse("session/close"));
-    try std.testing.expectEqual(AcpMethod.session_list, AcpMethod.parse("session/list"));
-    try std.testing.expectEqual(AcpMethod.session_prompt, AcpMethod.parse("session/prompt"));
-    try std.testing.expectEqual(AcpMethod.session_set_config_option, AcpMethod.parse("session/set_config_option"));
-    try std.testing.expectEqual(AcpMethod.session_set_mode, AcpMethod.parse("session/set_mode"));
-    try std.testing.expectEqual(AcpMethod.libfx_checkpoint, AcpMethod.parse("libfx/checkpoint"));
-    try std.testing.expectEqual(AcpMethod.libfx_restore, AcpMethod.parse("libfx/restore"));
-    try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("libfx/new"));
-    try std.testing.expectEqual(AcpMethod.libfx_steer, AcpMethod.parse("libfx/steer"));
-    try std.testing.expectEqual(AcpMethod.libfx_handoff, AcpMethod.parse("libfx/handoff"));
-    try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("workspace/unknown"));
-    try std.testing.expect(AcpMethod.libfx_checkpoint.isLibfx());
-    try std.testing.expect(AcpMethod.libfx_restore.isLibfx());
-    try std.testing.expect(AcpMethod.libfx_new.isLibfx());
-    try std.testing.expect(AcpMethod.libfx_steer.isLibfx());
-    try std.testing.expect(AcpMethod.libfx_handoff.isLibfx());
-    try std.testing.expect(!AcpMethod.libfx_handoff.waitsForActivePrompt());
-    try std.testing.expect(!AcpMethod.session_new.isLibfx());
-}
-
-test "ACP prompt gate policy keeps lifecycle interruption responsive" {
-    try std.testing.expect(!AcpMethod.initialize.waitsForActivePrompt());
-    try std.testing.expect(!AcpMethod.session_cancel.waitsForActivePrompt());
-    try std.testing.expect(!AcpMethod.session_new.waitsForActivePrompt());
-    try std.testing.expect(!AcpMethod.session_load.waitsForActivePrompt());
-    try std.testing.expect(!AcpMethod.session_resume.waitsForActivePrompt());
-    try std.testing.expect(!AcpMethod.session_close.waitsForActivePrompt());
-    try std.testing.expect(AcpMethod.session_list.waitsForActivePrompt());
-    try std.testing.expect(AcpMethod.session_prompt.waitsForActivePrompt());
-    try std.testing.expect(AcpMethod.session_set_config_option.waitsForActivePrompt());
-    try std.testing.expect(!AcpMethod.session_set_mode.waitsForActivePrompt());
-    try std.testing.expect(!AcpMethod.libfx_steer.waitsForActivePrompt());
-    try std.testing.expect(AcpMethod.unknown.waitsForActivePrompt());
-}
-
-test "ACP initialize request validation requires a uint16 protocol version" {
-    const alloc = std.testing.allocator;
-    const valid = try parseInitializeRequest(
-        alloc,
-        "{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true},\"terminal\":true}}",
-        false,
-    );
-    try std.testing.expect(valid.client_fs_read);
-    try std.testing.expect(!valid.client_fs_write);
-    try std.testing.expect(valid.client_terminal);
-
-    _ = try parseInitializeRequest(alloc, "{\"protocolVersion\":0}", false);
-    _ = try parseInitializeRequest(alloc, "{\"protocolVersion\":2}", false);
-    _ = try parseInitializeRequest(alloc, "{\"protocolVersion\":65535}", false);
-
-    const cases = [_]struct {
-        params: ?[]const u8,
-        expected: anyerror,
-    }{
-        .{ .params = null, .expected = error.InvalidInitializeParams },
-        .{ .params = "{}", .expected = error.InvalidInitializeParams },
-        .{ .params = "[]", .expected = error.InvalidInitializeParams },
-        .{ .params = "{\"protocolVersion\":\"one\"}", .expected = error.InvalidInitializeParams },
-        .{ .params = "{\"protocolVersion\":-1}", .expected = error.InvalidInitializeParams },
-        .{ .params = "{\"protocolVersion\":70000}", .expected = error.InvalidInitializeParams },
-    };
-    for (cases) |case| {
-        try std.testing.expectError(
-            case.expected,
-            parseInitializeRequest(alloc, case.params, false),
-        );
-    }
-}
-
-test "ACP initialize reads session.notices as advertised only for an object" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct { capabilities: []const u8, advertised: bool }{
-        .{ .capabilities = "{\"session\":{\"notices\":{}}}", .advertised = true },
-        .{ .capabilities = "{\"session\":{\"notices\":{\"_meta\":{}}}}", .advertised = true },
-        .{ .capabilities = "{}", .advertised = false },
-        .{ .capabilities = "{\"session\":null}", .advertised = false },
-        .{ .capabilities = "{\"session\":{}}", .advertised = false },
-        .{ .capabilities = "{\"session\":{\"notices\":null}}", .advertised = false },
-        .{ .capabilities = "{\"session\":{\"notices\":false}}", .advertised = false },
-        .{ .capabilities = "{\"session\":{\"notices\":true}}", .advertised = false },
-        .{ .capabilities = "{\"session\":{\"notices\":\"yes\"}}", .advertised = false },
-        .{ .capabilities = "{\"session\":{\"notices\":[]}}", .advertised = false },
-    };
-    for (cases) |case| {
-        const params = try alloc.print("{{\"protocolVersion\":1,\"clientCapabilities\":{s}}}", .{case.capabilities});
-        defer alloc.free(params);
-        const request = try parseInitializeRequest(alloc, params, false);
-        std.testing.expectEqual(case.advertised, request.client_notices) catch |err| {
-            std.debug.print("capabilities: {s}\n", .{case.capabilities});
-            return err;
-        };
-    }
-}
-
-test "ACP permission responses map canonical option ids" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct { json: []const u8, expected: types.ToolPermissionDecision }{
-        .{ .json = "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_once\"}}", .expected = .once },
-        .{ .json = "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_always\"}}", .expected = .always },
-        .{ .json = "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"reject_once\"}}", .expected = .deny },
-        .{ .json = "{\"outcome\":{\"outcome\":\"cancelled\"}}", .expected = .deny },
-    };
-    for (cases) |case| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
-        defer parsed.deinit();
-        try std.testing.expectEqual(case.expected, parsePermissionDecision(parsed.value).?);
-    }
-    const malformed_cases = [_][]const u8{
-        "{\"outcome\":{\"outcome\":\"selected\"}}",
-        "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow_forever\"}}",
-        "{\"outcome\":{\"outcome\":\"granted\"}}",
-        "{\"outcome\":\"selected\"}",
-        "{}",
-        "[]",
-    };
-    for (malformed_cases) |json| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
-        defer parsed.deinit();
-        try std.testing.expect(parsePermissionDecision(parsed.value) == null);
-    }
-}
-
-test "an ACP steer that cuts the reply short is no turn cancel, and the client's cancel is" {
-    const alloc = std.testing.allocator;
-    const Discard = struct {
-        fn write(_: ?*anyopaque, _: []const u8) !void {}
-    };
-    var state = ServerState{
-        .alloc = alloc,
-        .cfg = undefined,
-        .writer = jsonrpc.Writer.initCallback(null, Discard.write),
-    };
-    state.cfg.minimal_kernel = true;
-    defer state.pending_outbound.deinit(alloc);
-    state.active_session = .{
-        .session_id = @constCast("session"),
-        .model = @constCast("model"),
-        .mode = "default",
-        .workspace_root = "/tmp/workspace",
-        .api_key = "",
-        .agent_step_limit = 0,
-        .max_tool_result_bytes = 0,
-        .fast_mode = false,
-        .effort = .auto,
-        .first_call_tool_choice = .auto,
-        .permission_mode = .ask,
-        .permission_rules = .{},
-        .session_rt = .{ .max_history_turns = 0 },
-        .cancel_flag = std.atomic.Value(bool).init(false),
-        .pending_prompt_id = null,
-    };
-    const session = &state.active_session.?;
-    session.steering.open(alloc);
-    defer session.steering.deinit(alloc);
-    _ = session.steering.notePhase(1, .reply, &session.cancel_flag);
-    try session.steering.enqueue(alloc, "use tabs");
-    try std.testing.expect(session.steering.claimInterrupt(&session.cancel_flag));
-    try std.testing.expect(session.cancel_flag.load(.seq_cst));
-    // The turn's workspace captures keep running (D98).
-    try std.testing.expect(!session.turn_cancel.load(.seq_cst));
-    handleCancel(&state, false);
-    try std.testing.expect(session.turn_cancel.load(.seq_cst));
-}
-
-test "ACP outbound waiters resolve to deny on cancellation" {
-    const Capture = struct {
-        saw_request_cancellation: bool = false,
-
-        fn write(raw: ?*anyopaque, frame: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            if (std.mem.find(u8, frame, "\"method\":\"$/cancel_request\"") != null and
-                std.mem.find(u8, frame, "\"requestId\":3") != null)
-            {
-                self.saw_request_cancellation = true;
-            }
-        }
-    };
-    var capture = Capture{};
-    var state = ServerState{
-        .alloc = std.testing.allocator,
-        .cfg = undefined,
-        .writer = jsonrpc.Writer.initCallback(&capture, Capture.write),
-    };
-    defer state.pending_outbound.deinit(state.alloc);
-
-    const id = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
-    const concurrent = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
-
-    cancelPendingOutbound(&state, false);
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, id));
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, concurrent));
-    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
-
-    const second = beginPermissionRequest(&state) orelse return error.TestExpectedEqual;
-    try std.testing.expect(second != id);
-    cancelPermissionRequest(&state, second);
-    try std.testing.expectEqual(types.ToolPermissionDecision.deny, awaitPermissionDecision(&state, second));
-    try std.testing.expect(capture.saw_request_cancellation);
-}
-
-test "ACP outbound responses correlate out of order and ignore unknown ids" {
-    const alloc = std.testing.allocator;
-    var state = ServerState{
-        .alloc = alloc,
-        .cfg = undefined,
-        .writer = jsonrpc.Writer.init(),
-    };
-    defer state.pending_outbound.deinit(alloc);
-
-    const first = (try beginOutboundRequest(&state, .elicitation)).?;
-    const second = (try beginOutboundRequest(&state, .elicitation)).?;
-    handleClientResponse(&state, alloc, &.{
-        .id = .{ .integer = @intCast(second) },
-        .result_raw = "{\"action\":\"decline\"}",
-    });
-    handleClientResponse(&state, alloc, &.{
-        .id = .{ .integer = 9999 },
-        .result_raw = "{\"action\":\"accept\"}",
-    });
-    handleClientResponse(&state, alloc, &.{
-        .id = .{ .integer = @intCast(first) },
-        .result_raw = "{\"action\":\"cancel\"}",
-    });
-
-    var second_response = awaitOutboundResponse(&state, second, .elicitation).?;
-    defer second_response.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"action\":\"decline\"}", second_response.result_json.?);
-    var first_response = awaitOutboundResponse(&state, first, .elicitation).?;
-    defer first_response.deinit(alloc);
-    try std.testing.expectEqualStrings("{\"action\":\"cancel\"}", first_response.result_json.?);
-    try std.testing.expectEqual(@as(usize, 0), state.pending_outbound.count());
-}
-
-test "ACP legacy URL publication owns partial allocations" {
-    const Case = struct {
-        fn run(alloc: Allocator) !void {
-            var state = ServerState{
-                .alloc = alloc,
-                .cfg = undefined,
-                .writer = jsonrpc.Writer.init(),
-            };
-            defer {
-                clearPendingLegacyUrls(&state);
-                state.pending_legacy_urls.deinit(alloc);
-            }
-            const reserved = try reserveLegacyUrl(
-                &state,
-                .{
-                    .wire = .legacy_mcp_2025_11,
-                    .server_name = "fixture",
-                    .operation = .{ .tools_call = "echo" },
-                    .connection_generation = 1,
-                    .client_generation = 1,
-                    .catalog_generation = 1,
-                    .request_generation = 1,
-                    .auth_generation = 1,
-                    .deadline_ms = 1,
-                },
-                "legacy-id",
-                "acp-id",
-                "session-id",
-                "tool-call-id",
-            );
-            try std.testing.expect(reserved);
-        }
-    };
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
-}
-
-test "ACP legacy URL state requires consent and completion" {
-    const alloc = std.testing.allocator;
-    var state = ServerState{
-        .alloc = alloc,
-        .cfg = undefined,
-        .writer = jsonrpc.Writer.init(),
-    };
-    defer {
-        clearPendingLegacyUrls(&state);
-        state.pending_legacy_urls.deinit(alloc);
-    }
-    const origin = tool_mcp_runtime.InputOrigin{
-        .wire = .legacy_mcp_2025_11,
-        .server_name = "fixture",
-        .operation = .{ .tools_call = "echo" },
-        .runtime_generation = 1,
-        .connection_generation = 1,
-        .client_generation = 2,
-        .catalog_generation = 3,
-        .request_generation = 4,
-        .auth_generation = 5,
-        .deadline_ms = std.math.maxInt(i64),
-    };
-    try std.testing.expect(try reserveLegacyUrl(
-        &state,
-        origin,
-        "early",
-        "acp-early",
-        "session",
-        "call",
-    ));
-    const sink = legacyUrlCompletionSink(&state);
-    _ = sink.consume(sink.context, .{
-        .server_name = "fixture",
-        .elicitation_id = "early",
-        .runtime_generation = 1,
-        .connection_generation = 0,
-        .client_generation = 1,
-        .auth_generation = 4,
-    });
-    try std.testing.expectEqual(@as(usize, 1), state.pending_legacy_urls.items.len);
-    try std.testing.expect(!state.pending_legacy_urls.items[0].completed);
-    _ = sink.consume(sink.context, .{
-        .server_name = "fixture",
-        .elicitation_id = "early",
-        .runtime_generation = 2,
-        .connection_generation = 1,
-        .client_generation = 2,
-        .auth_generation = 5,
-    });
-    try std.testing.expectEqual(@as(usize, 1), state.pending_legacy_urls.items.len);
-    try std.testing.expect(!state.pending_legacy_urls.items[0].completed);
-    _ = sink.consume(sink.context, .{
-        .server_name = "fixture",
-        .elicitation_id = "early",
-        .runtime_generation = 1,
-        .connection_generation = 1,
-        .client_generation = 2,
-        .auth_generation = 5,
-    });
-    try std.testing.expectEqual(@as(usize, 1), state.pending_legacy_urls.items.len);
-    try std.testing.expect(state.pending_legacy_urls.items[0].completed);
-    try std.testing.expect(!state.pending_legacy_urls.items[0].accepted);
-    removeLegacyUrl(&state, "acp-early");
-    try std.testing.expectEqual(@as(usize, 0), state.pending_legacy_urls.items.len);
-
-    try std.testing.expect(try reserveLegacyUrl(
-        &state,
-        origin,
-        "late",
-        "acp-late",
-        "session",
-        "call",
-    ));
-    try std.testing.expectEqual(
-        tool_mcp_runtime.LegacyUrlAcceptTransition.awaiting_completion,
-        acceptLegacyUrl(&state, origin, "acp-late"),
-    );
-    try std.testing.expect(state.pending_legacy_urls.items[0].accepted);
-    try std.testing.expect(!state.pending_legacy_urls.items[0].completed);
-    removeLegacyUrl(&state, "acp-late");
-
-    try std.testing.expect(try reserveLegacyUrl(
-        &state,
-        origin,
-        "publish",
-        "acp-publish",
-        "session",
-        "call",
-    ));
-    try std.testing.expectEqual(
-        tool_mcp_runtime.LegacyUrlAcceptTransition.awaiting_completion,
-        acceptLegacyUrl(&state, origin, "acp-publish"),
-    );
-    const publication = sink.consume(sink.context, .{
-        .server_name = "fixture",
-        .elicitation_id = "publish",
-        .runtime_generation = 1,
-        .connection_generation = 1,
-        .client_generation = 2,
-        .auth_generation = 5,
-    }).consumed.?;
-    defer alloc.free(publication);
-    try std.testing.expectEqualStrings("acp-publish", publication);
-    try std.testing.expectEqual(@as(usize, 0), state.pending_legacy_urls.items.len);
-
-    try std.testing.expect(try reserveLegacyUrl(
-        &state,
-        origin,
-        "old-a",
-        "acp-old-a",
-        "session",
-        "call",
-    ));
-    try std.testing.expect(try reserveLegacyUrl(
-        &state,
-        origin,
-        "old-b",
-        "acp-old-b",
-        "session",
-        "call",
-    ));
-    var refreshed_catalog = origin;
-    refreshed_catalog.catalog_generation = 4;
-    try std.testing.expect(!try reserveLegacyUrl(
-        &state,
-        refreshed_catalog,
-        "old-a",
-        "acp-old-a-refresh",
-        "session",
-        "call",
-    ));
-    try std.testing.expectEqual(@as(usize, 2), state.pending_legacy_urls.items.len);
-    var recovered = origin;
-    recovered.runtime_generation = 2;
-    recovered.catalog_generation = 4;
-    try std.testing.expect(try reserveLegacyUrl(
-        &state,
-        recovered,
-        "old-a",
-        "acp-new",
-        "session",
-        "call",
-    ));
-    try std.testing.expectEqual(@as(usize, 1), state.pending_legacy_urls.items.len);
-    try std.testing.expectEqual(@as(u64, 2), state.pending_legacy_urls.items[0].binding.runtime_generation);
-    try std.testing.expectEqual(@as(u64, 1), state.pending_legacy_urls.items[0].binding.connection_generation);
-    removeLegacyUrl(&state, "acp-old-a");
-    try std.testing.expectEqual(@as(usize, 1), state.pending_legacy_urls.items.len);
-    try std.testing.expectEqualStrings("acp-new", state.pending_legacy_urls.items[0].acp_id);
-    removeLegacyUrl(&state, "acp-new");
-}
-
-test "ACP ultrafast writes preserve v2 baselines across other preference changes" {
-    const alloc = testing_allocator.no_resize;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var store = try session_adapter.Store.open(alloc, home);
-    defer store.deinit(alloc);
-    const v2 = try session_adapter.Session.create(alloc, &store, home, .acp, .{
-        .preferences = .{ .model = @constCast("old-model"), .effort = .auto, .fast_mode = false },
-        .language = types.ConversationLanguage.default(),
-        .permission_state = .{},
-    });
-    defer v2.close();
-    var active: ActiveSessionState = undefined;
-    active.session_write_mutex = .init;
-    active.wasm_state = null;
-    active.v2 = v2;
-    active.model = try alloc.dupe(u8, "old-model");
-    defer alloc.free(active.model);
-    active.provider = .gateway;
-    active.effort = .auto;
-    active.fast_mode = false;
-    active.ultrafast_mode = false;
-    try commitActiveSessionUltrafast(alloc, &active, true);
-    try std.testing.expect(active.ultrafast_mode);
-    active.ultrafast_mode = false;
-    try commitActiveSessionModel(alloc, &active, "new-model");
-    try commitActiveSessionProvider(alloc, &active, .codex, "child-model");
-    try commitActiveSessionEffort(alloc, &active, .literal("high"));
-    {
-        var preferences = try v2.currentPreferences(alloc);
-        defer preferences.deinit(alloc);
-        try std.testing.expect(preferences.ultrafast_mode);
-        try std.testing.expectEqualStrings("child-model", preferences.model);
-        try std.testing.expectEqual(model_provider.ProviderId.codex, preferences.provider);
-        try std.testing.expectEqualStrings("high", preferences.effort.label());
-    }
-    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, commitActiveSessionUltrafast(failing.allocator(), &active, false));
-    try std.testing.expect(!active.ultrafast_mode);
-    {
-        var preferences = try v2.currentPreferences(alloc);
-        defer preferences.deinit(alloc);
-        try std.testing.expect(preferences.ultrafast_mode);
-    }
-    try commitActiveSessionUltrafast(alloc, &active, false);
-    var preferences = try v2.currentPreferences(alloc);
-    defer preferences.deinit(alloc);
-    try std.testing.expect(!preferences.ultrafast_mode);
-    try std.testing.expect(!active.ultrafast_mode);
-}
-
-test "ACP model commits honor the active session write boundary" {
-    const alloc = std.testing.allocator;
-    var active: ActiveSessionState = undefined;
-    active.v2 = null;
-    active.session_write_mutex = .init;
-    active.model = try alloc.dupe(u8, "old-model");
-    defer alloc.free(active.model);
-
-    const Worker = struct {
-        alloc: Allocator,
-        active: *ActiveSessionState,
-        started: std.atomic.Value(bool) = .init(false),
-        done: std.atomic.Value(bool) = .init(false),
-        failure: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            self.started.store(true, .seq_cst);
-            commitActiveSessionModel(
-                self.alloc,
-                self.active,
-                "new-model",
-            ) catch |err| {
-                self.failure = err;
-            };
-            self.done.store(true, .seq_cst);
-        }
-    };
-    var worker = Worker{
-        .alloc = alloc,
-        .active = &active,
-    };
-    active.session_write_mutex.lockUncancelable(io_mod.getIo());
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
-    while (!worker.started.load(.seq_cst)) std.Thread.yield() catch {};
-    for (0..100) |_| std.Thread.yield() catch {};
-    const blocked_at_boundary = !worker.done.load(.seq_cst);
-    active.session_write_mutex.unlock(io_mod.getIo());
-    thread.join();
-
-    try std.testing.expect(blocked_at_boundary);
-    try std.testing.expect(worker.done.load(.seq_cst));
-    try std.testing.expectEqual(
-        error.SessionPersistenceUnavailable,
-        worker.failure.?,
-    );
-}
-
-test "ACP publishes an account-bound refreshed Codex token for later prompts" {
-    const alloc = std.testing.allocator;
-    var state: ServerState = undefined;
-    state.alloc = alloc;
-    state.subagent_authority_mutex = .init;
-    state.web_search_runtime = web_search_runtime.Runtime.init(.{});
-    state.cfg.gateway_retry_count = 0;
-    state.cfg.gateway_chat_url = "";
-    state.api_key = try alloc.dupe(u8, "stale-token");
-    state.account_id = try alloc.dupe(u8, "acct-1");
-    state.credential_source = .chatgpt_subscription;
-    state.credential_refresh_after_ms = 1;
-    state.gateway_team = null;
-    var active: ActiveSessionState = undefined;
-    active.v2 = null;
-    active.api_key = state.api_key;
-    active.account_id = state.account_id;
-    active.credential_source = .chatgpt_subscription;
-    active.credential_refresh_after_ms = 1;
-    active.model = &.{};
-    active.session_rt = .{ .max_history_turns = 8 };
-    state.active_session = active;
-    defer {
-        state.active_session.?.session_rt.deinit(alloc);
-        secret.zeroAndFree(alloc, state.api_key);
-        alloc.free(state.account_id.?);
-    }
-
-    var refreshed = credentials.Credential{
-        .token = try alloc.dupe(u8, "fresh-token"),
-        .source = .chatgpt_subscription,
-        .account_id = try alloc.dupe(u8, "acct-1"),
-        .refresh_after_ms = 100,
-    };
-    defer refreshed.deinit(alloc);
-    try publishRefreshedCredential(&state, &refreshed, "acct-1", false);
-
-    try std.testing.expectEqualStrings("fresh-token", state.api_key);
-    try std.testing.expectEqualStrings("fresh-token", state.active_session.?.api_key);
-    try std.testing.expectEqualStrings("acct-1", state.account_id.?);
-    try std.testing.expectEqualStrings("acct-1", state.active_session.?.account_id.?);
-    try std.testing.expectEqual(@as(?i64, 100), state.credential_refresh_after_ms);
-    try std.testing.expectEqual(@as(?i64, 100), state.active_session.?.credential_refresh_after_ms);
-}
-
-test "ACP credential readiness rejects refresh-due access tokens" {
-    try std.testing.expect(credentialReadyAt(.chatgpt_subscription, "token", 11, 10));
-    try std.testing.expect(!credentialReadyAt(.chatgpt_subscription, "token", 10, 10));
-    try std.testing.expect(!credentialReadyAt(.grok_subscription, "token", 1, 10));
-    try std.testing.expect(credentialReadyAt(.ai_gateway_api_key, "token", null, 10));
-    try std.testing.expect(!credentialReadyAt(.ai_gateway_api_key, "", null, 10));
-}
-
-test "ACP rejects a refreshed Gateway login for another team and takes one for the same team" {
-    const alloc = std.testing.allocator;
-    var state: ServerState = undefined;
-    state.alloc = alloc;
-    state.subagent_authority_mutex = .init;
-    state.web_search_runtime = web_search_runtime.Runtime.init(.{});
-    state.cfg.gateway_retry_count = 0;
-    state.cfg.gateway_chat_url = "";
-    state.api_key = try alloc.dupe(u8, "stale-token");
-    state.account_id = null;
-    state.credential_source = .spark_login;
-    state.credential_refresh_after_ms = 1;
-    state.gateway_team = try alloc.dupe(u8, "team-a");
-    state.active_session = null;
-    defer {
-        secret.zeroAndFree(alloc, state.api_key);
-        if (state.gateway_team) |team| alloc.free(team);
-    }
-
-    var other_team = credentials.Credential{
-        .token = try alloc.dupe(u8, "other-token"),
-        .source = .spark_login,
-        .team_id = try alloc.dupe(u8, "team-b"),
-        .refresh_after_ms = 100,
-    };
-    defer other_team.deinit(alloc);
-    try std.testing.expectError(error.CredentialAuthorityChanged, publishRefreshedCredential(&state, &other_team, null, true));
-    try std.testing.expectEqualStrings("stale-token", state.api_key);
-    try std.testing.expectEqualStrings("team-a", state.gateway_team.?);
-
-    var same_team = credentials.Credential{
-        .token = try alloc.dupe(u8, "fresh-token"),
-        .source = .spark_login,
-        .team_id = try alloc.dupe(u8, "team-a"),
-        .refresh_after_ms = 100,
-    };
-    defer same_team.deinit(alloc);
-    try publishRefreshedCredential(&state, &same_team, null, true);
-    try std.testing.expectEqualStrings("fresh-token", state.api_key);
-    try std.testing.expectEqualStrings("team-a", state.gateway_team.?);
-}
-
-test "ACP rejects refreshed Codex tokens for another account" {
-    const alloc = std.testing.allocator;
-    var state: ServerState = undefined;
-    state.alloc = alloc;
-    state.subagent_authority_mutex = .init;
-    state.api_key = try alloc.dupe(u8, "stale-token");
-    state.account_id = try alloc.dupe(u8, "acct-1");
-    state.credential_source = .chatgpt_subscription;
-    state.credential_refresh_after_ms = 1;
-    state.gateway_team = null;
-    state.active_session = null;
-    defer {
-        secret.zeroAndFree(alloc, state.api_key);
-        alloc.free(state.account_id.?);
-    }
-
-    var refreshed = credentials.Credential{
-        .token = try alloc.dupe(u8, "wrong-token"),
-        .source = .chatgpt_subscription,
-        .account_id = try alloc.dupe(u8, "acct-2"),
-        .refresh_after_ms = 100,
-    };
-    defer refreshed.deinit(alloc);
-    try std.testing.expectError(error.ChatGptAccountChanged, publishRefreshedCredential(
-        &state,
-        &refreshed,
-        "acct-2",
-        false,
-    ));
-    try std.testing.expectEqualStrings("stale-token", state.api_key);
 }

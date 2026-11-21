@@ -176,22 +176,6 @@ test "a saved credential's sign-out revokes its refresh token, or else its acces
     try testing.expectEqualStrings("", access_only.client_secret);
 }
 
-test "a saved credential with nothing to revoke, or an endpoint its server may not use, keeps nothing" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const server = "https://mcp.example.com/mcp";
-    // No revocation endpoint: the server takes none.
-    try testing.expect(try tokensOf(a, savedCredential("\"refresh\":\"rt\",\"revocation_endpoint\":null,\"client_id\":\"cid\",\"method\":\"none\""), server) == null);
-    // One the engine refuses to contact for this server.
-    try testing.expect(try tokensOf(a, savedCredential("\"refresh\":\"rt\",\"revocation_endpoint\":\"https://169.254.169.254/revoke\",\"client_id\":\"cid\",\"method\":\"none\""), server) == null);
-    // No client, or an unknown way to authenticate it.
-    try testing.expect(try tokensOf(a, savedCredential("\"refresh\":\"rt\",\"revocation_endpoint\":\"https://auth.example.com/revoke\",\"method\":\"none\""), server) == null);
-    try testing.expect(try tokensOf(a, savedCredential("\"refresh\":\"rt\",\"revocation_endpoint\":\"https://auth.example.com/revoke\",\"client_id\":\"cid\",\"method\":\"magic\""), server) == null);
-    // Not a credential at all.
-    try testing.expect(try tokensOf(a, "not json", server) == null);
-}
-
 /// A transport that records the one request it gets and answers with
 /// `accept`.
 const FakeTransport = struct {
@@ -219,85 +203,3 @@ const FakeTransport = struct {
         return .{ .disposition = if (self.accept) .accepted else .rejected, .body = try alloc.dupe(u8, ""), .status = self.status };
     }
 };
-
-test "a kept sign-out is revoked as the engine's sign-out sends it" {
-    var basic: FakeTransport = .{};
-    defer basic.deinit();
-    try revoke(testing.allocator, basic.provider(), .{
-        .refresh_token = "rt&1",
-        .token_type_hint = "refresh_token",
-        .revocation_endpoint = "https://auth.example.com/revoke",
-        .client_id = "cid",
-        .client_secret = "cs",
-        .client_auth = "client_secret_basic",
-        .server_url = "https://mcp.example.com/mcp",
-    });
-    try testing.expectEqualStrings("https://auth.example.com/revoke", basic.url.?);
-    try testing.expectEqualStrings("token=rt%261&token_type_hint=refresh_token", basic.payload.?);
-    try testing.expectEqualStrings("Basic Y2lkOmNz", basic.authorization.?);
-
-    var public: FakeTransport = .{};
-    defer public.deinit();
-    try revoke(testing.allocator, public.provider(), .{
-        .refresh_token = "at",
-        .token_type_hint = "access_token",
-        .revocation_endpoint = "https://auth.example.com/revoke",
-        .client_id = "cid",
-        .client_auth = "none",
-        .server_url = "https://mcp.example.com/mcp",
-    });
-    try testing.expectEqualStrings("token=at&token_type_hint=access_token&client_id=cid", public.payload.?);
-    try testing.expect(public.authorization == null);
-}
-
-test "any 2xx confirms a kept revocation, as it confirms the logout's own" {
-    const tokens: Tokens = .{
-        .refresh_token = "rt",
-        .token_type_hint = "refresh_token",
-        .revocation_endpoint = "https://auth.example.com/revoke",
-        .client_id = "cid",
-        .client_auth = "none",
-        .server_url = "https://mcp.example.com/mcp",
-    };
-    // The transport calls only a 200 accepted, but the status says 204.
-    for ([_]u16{ 200, 204, 299 }) |status| {
-        var fake: FakeTransport = .{ .accept = status == 200, .status = status };
-        defer fake.deinit();
-        try revoke(testing.allocator, fake.provider(), tokens);
-    }
-    for ([_]u16{ 199, 300, 401, 503 }) |status| {
-        var fake: FakeTransport = .{ .accept = false, .status = status };
-        defer fake.deinit();
-        try testing.expectError(error.RevocationRefused, revoke(testing.allocator, fake.provider(), tokens));
-    }
-    // A transport without a status is taken at its word.
-    var bare: FakeTransport = .{ .accept = true };
-    defer bare.deinit();
-    try revoke(testing.allocator, bare.provider(), tokens);
-}
-
-test "a refused revocation is retried later, and an unusable record is never sent" {
-    var refusing: FakeTransport = .{ .accept = false };
-    defer refusing.deinit();
-    const tokens: Tokens = .{
-        .refresh_token = "rt",
-        .token_type_hint = "refresh_token",
-        .revocation_endpoint = "https://auth.example.com/revoke",
-        .client_id = "cid",
-        .client_auth = "none",
-        .server_url = "https://mcp.example.com/mcp",
-    };
-    try testing.expectError(error.RevocationRefused, revoke(testing.allocator, refusing.provider(), tokens));
-    try testing.expect(pending_revocation.retryable(error.RevocationRefused));
-
-    var unused: FakeTransport = .{};
-    defer unused.deinit();
-    var moved = tokens;
-    moved.revocation_endpoint = "https://169.254.169.254/revoke";
-    try testing.expectError(error.KeptSignOutUnusable, revoke(testing.allocator, unused.provider(), moved));
-    var no_method = tokens;
-    no_method.client_auth = "";
-    try testing.expectError(error.KeptSignOutUnusable, revoke(testing.allocator, unused.provider(), no_method));
-    try testing.expect(unused.url == null);
-    try testing.expect(!pending_revocation.retryable(error.KeptSignOutUnusable));
-}

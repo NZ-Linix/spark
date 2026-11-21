@@ -13,23 +13,9 @@ pub const ModelPickerStage = enum {
     fast,
 };
 
-/// Columns of the `/provider` picker, left to right. Each stage owns one
-/// whitespace-free token in the composer, so the next column anchors under the
-/// argument it belongs to.
-pub const ProviderPickerStage = enum {
-    provider,
-    method,
-    team,
-    /// Which detected key to use, or `new` to paste one.
-    key_source,
-    /// Not a list: the column is the masked API key field.
-    api_key,
-};
-
 pub const InlinePickerKind = enum {
     slash,
     model,
-    provider,
     file,
     skill,
 };
@@ -51,15 +37,6 @@ pub const model_picker_speed_options = [_][]const u8{ "normal", "fast", "ultrafa
 /// The composer text that opens the effort column for the current model.
 pub const effort_prefix = "/effort ";
 
-/// `/login` and `/setup` are aliases of `/provider`: all open the same
-/// columnar picker. Typed text keeps whichever spelling the user wrote;
-/// executing the bare command reseeds the composer with the canonical
-/// `/provider ` prefix.
-pub const provider_prefix = "/provider ";
-pub const login_prefix = "/login ";
-const setup_prefix = "/setup ";
-pub const provider_picker_prefixes = [_][]const u8{ provider_prefix, login_prefix, setup_prefix };
-
 /// The command a model picker query belongs to. `/effort ` opens the effort
 /// column of `/model` on its own, for the current model.
 pub const ModelPickerCommand = enum { model, effort };
@@ -69,15 +46,6 @@ pub const ModelPickerQuery = struct {
     query: []const u8,
     token_start: usize,
     command: ModelPickerCommand = .model,
-};
-
-pub const ProviderPickerQuery = struct {
-    stage: ProviderPickerStage,
-    /// The `/provider ` or `/login ` the user typed, kept verbatim so rewriting
-    /// the composer does not swap one alias for the other.
-    prefix: []const u8,
-    query: []const u8,
-    token_start: usize,
 };
 
 pub const FilePickerQuery = file_picker_path.Query;
@@ -153,17 +121,6 @@ pub const State = struct {
     model_picker_effort_window_start: usize = 0,
     model_picker_fast_index: usize = 0,
     model_picker_fast_window_start: usize = 0,
-    provider_picker_stage: ProviderPickerStage = .provider,
-    provider_picker_pending_provider: std.ArrayList(u8) = .empty,
-    provider_picker_pending_method: std.ArrayList(u8) = .empty,
-    provider_column_index: usize = 0,
-    provider_column_window_start: usize = 0,
-    method_column_index: usize = 0,
-    method_column_window_start: usize = 0,
-    team_column_index: usize = 0,
-    team_column_window_start: usize = 0,
-    key_source_column_index: usize = 0,
-    key_source_column_window_start: usize = 0,
     file_completion: file_completion_state.State = .{},
     // The ordinal is meaningful only within file_completion's presented rows.
     file_completion_index: usize = 0,
@@ -183,8 +140,6 @@ pub const State = struct {
     pub fn deinit(self: *State, alloc: Allocator) void {
         self.file_completion.deinit(alloc);
         self.model_picker_pending_model.deinit(alloc);
-        self.provider_picker_pending_provider.deinit(alloc);
-        self.provider_picker_pending_method.deinit(alloc);
         const state_info = @typeInfo(State).@"struct";
         inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
             // The child's owner already restored its defaults.
@@ -228,22 +183,10 @@ pub const State = struct {
     pub fn reconcileInlinePickerAfterEdit(self: *State, editor: *const editor_state.State) void {
         self.slash_completion_index = 0;
         self.slash_completion_window_start = 0;
-        self.reconcileProviderPickerAfterEdit(editor);
         self.inline_picker_suppression = suppressionAfterEdit(
             self.inline_picker_suppression,
             self.inlinePickerTriggerKind(editor),
         );
-    }
-
-    /// An edit that breaks the committed provider or method token orphans the
-    /// later columns: the text no longer names the choice they refine. Degrade
-    /// to the provider column so the picker follows the text instead of dying.
-    fn reconcileProviderPickerAfterEdit(self: *State, editor: *const editor_state.State) void {
-        if (self.provider_picker_stage == .provider) return;
-        if (self.rawProviderPickerQuery(editor) != null) return;
-        const trimmed = editor.input.items[leadingWhitespaceLen(editor.input.items)..];
-        if (providerPickerPrefixLen(trimmed) == null) return;
-        self.clearProviderPickerFlow();
     }
 
     pub fn resetFilePickerIndex(self: *State) void {
@@ -261,11 +204,6 @@ pub const State = struct {
         return self.rawModelPickerQuery(editor);
     }
 
-    pub fn activeProviderPickerQuery(self: *const State, editor: *const editor_state.State) ?ProviderPickerQuery {
-        if (self.isInlinePickerDismissed(.provider)) return null;
-        return self.rawProviderPickerQuery(editor);
-    }
-
     pub fn activeInlineSkillQuery(self: *const State, editor: *const editor_state.State) ?InlineSkillQuery {
         if (self.isInlinePickerSuppressed(.skill)) return null;
         return findInlineSkillQuery(editor.input.items, editor.cursor);
@@ -278,7 +216,6 @@ pub const State = struct {
 
     fn rawFilePickerQuery(self: *const State, editor: *const editor_state.State) ?FilePickerQuery {
         if (self.rawModelPickerQuery(editor) != null) return null;
-        if (self.rawProviderPickerQuery(editor) != null) return null;
         const command_text = std.mem.trimStart(u8, editor.input.items, " \t\r\n");
         if (tokenMatchesAt(command_text, 0, "/mcp")) return null;
         return findFilePickerQuery(editor.input.items, editor.cursor);
@@ -286,7 +223,6 @@ pub const State = struct {
 
     pub fn inlinePickerTriggerKind(self: *const State, editor: *const editor_state.State) ?InlinePickerKind {
         if (self.rawModelPickerQuery(editor) != null) return .model;
-        if (self.rawProviderPickerQuery(editor) != null) return .provider;
         if (self.rawFilePickerQuery(editor) != null) return .file;
         if (findInlineSkillQuery(editor.input.items, editor.cursor) != null) return .skill;
         if (findInlineSlashQuery(editor.input.items, editor.cursor) != null) return .slash;
@@ -333,106 +269,10 @@ pub const State = struct {
         }
     }
 
-    fn rawProviderPickerQuery(self: *const State, editor: *const editor_state.State) ?ProviderPickerQuery {
-        const items = editor.input.items;
-        const trim_start = leadingWhitespaceLen(items);
-        const trimmed = items[trim_start..];
-        const prefix_len = providerPickerPrefixLen(trimmed) orelse return null;
-
-        const stage = self.provider_picker_stage;
-        if (stage == .provider) return .{
-            .stage = .provider,
-            .prefix = trimmed[0..prefix_len],
-            .query = trimmed[prefix_len..],
-            .token_start = trim_start + prefix_len,
-        };
-
-        const method: ?[]const u8 = switch (stage) {
-            .team, .key_source, .api_key => self.provider_picker_pending_method.items,
-            .provider, .method => null,
-        };
-        const token_start = providerPickerTokenStart(
-            trimmed,
-            prefix_len,
-            self.provider_picker_pending_provider.items,
-            method,
-        ) orelse return null;
-        return .{
-            .stage = stage,
-            .prefix = trimmed[0..prefix_len],
-            .query = trimmed[token_start..],
-            .token_start = trim_start + token_start,
-        };
-    }
-
     /// The composer text changed, so whichever column is open no longer has a
     /// trustworthy highlighted row.
     pub fn resetActiveCompletionIndex(self: *State) void {
         self.resetActiveModelPickerIndex();
-        self.resetActiveProviderPickerIndex();
-    }
-
-    fn resetActiveProviderPickerIndex(self: *State) void {
-        switch (self.provider_picker_stage) {
-            .provider => {
-                self.provider_column_index = 0;
-                self.provider_column_window_start = 0;
-            },
-            .method => {
-                self.method_column_index = 0;
-                self.method_column_window_start = 0;
-            },
-            .team => {
-                self.team_column_index = 0;
-                self.team_column_window_start = 0;
-            },
-            .key_source => {
-                self.key_source_column_index = 0;
-                self.key_source_column_window_start = 0;
-            },
-            .api_key => {},
-        }
-    }
-
-    /// Records the tokens already committed to the composer so the later
-    /// columns can anchor under their own argument. Leaves prior state intact
-    /// when the copy fails.
-    pub fn beginProviderPickerFlow(
-        self: *State,
-        alloc: Allocator,
-        provider: []const u8,
-        method: []const u8,
-        stage: ProviderPickerStage,
-    ) Allocator.Error!void {
-        const stable_provider = try alloc.dupe(u8, provider);
-        defer alloc.free(stable_provider);
-        const stable_method = try alloc.dupe(u8, method);
-        defer alloc.free(stable_method);
-
-        try self.provider_picker_pending_provider.ensureTotalCapacity(alloc, stable_provider.len);
-        try self.provider_picker_pending_method.ensureTotalCapacity(alloc, stable_method.len);
-        self.provider_picker_pending_provider.clearRetainingCapacity();
-        self.provider_picker_pending_provider.appendSliceAssumeCapacity(stable_provider);
-        self.provider_picker_pending_method.clearRetainingCapacity();
-        self.provider_picker_pending_method.appendSliceAssumeCapacity(stable_method);
-        self.provider_picker_stage = stage;
-        // A column is entered with nothing typed, so a highlight left over from
-        // an earlier visit would point at an unrelated row.
-        self.resetActiveProviderPickerIndex();
-    }
-
-    pub fn clearProviderPickerFlow(self: *State) void {
-        self.provider_picker_stage = .provider;
-        self.provider_picker_pending_provider.clearRetainingCapacity();
-        self.provider_picker_pending_method.clearRetainingCapacity();
-        self.provider_column_index = 0;
-        self.provider_column_window_start = 0;
-        self.method_column_index = 0;
-        self.method_column_window_start = 0;
-        self.team_column_index = 0;
-        self.team_column_window_start = 0;
-        self.key_source_column_index = 0;
-        self.key_source_column_window_start = 0;
     }
 
     pub fn isModelShapedInput(self: *const State, editor: *const editor_state.State) bool {
@@ -644,37 +484,7 @@ fn modelPickerTokenStart(trimmed: []const u8, model: []const u8, stage: ModelPic
     return skipPickerSpaces(trimmed, effort_end);
 }
 
-fn providerPickerPrefixLen(trimmed: []const u8) ?usize {
-    for (provider_picker_prefixes) |prefix| {
-        if (trimmed.len < prefix.len) continue;
-        if (std.ascii.eqlIgnoreCase(trimmed[0..prefix.len], prefix)) return prefix.len;
-    }
-    return null;
-}
-
-/// Walks past the tokens the picker already committed. Matching them verbatim
-/// rather than scanning for whitespace keeps the anchor correct even when an
-/// option label is not a single word.
-fn providerPickerTokenStart(
-    trimmed: []const u8,
-    prefix_len: usize,
-    provider: []const u8,
-    method: ?[]const u8,
-) ?usize {
-    if (provider.len == 0) return null;
-    const after_prefix = trimmed[prefix_len..];
-    if (!tokenMatchesAt(after_prefix, 0, provider)) return null;
-
-    const cursor = skipPickerSpaces(trimmed, prefix_len + provider.len);
-    const wanted_method = method orelse return cursor;
-    if (wanted_method.len == 0) return null;
-    if (!tokenMatchesAt(trimmed, cursor, wanted_method)) return null;
-    return skipPickerSpaces(trimmed, cursor + wanted_method.len);
-}
-
-/// True when `token` sits at `start` as a whole word. Without the boundary
-/// check a committed `vercel` would also claim `vercelfoo`, re-anchoring the
-/// picker mid-token in text that no longer names the choice.
+/// True when `token` sits at `start` as a whole word.
 fn tokenMatchesAt(bytes: []const u8, start: usize, token: []const u8) bool {
     if (bytes.len - start < token.len) return false;
     if (!std.mem.eql(u8, bytes[start..][0..token.len], token)) return false;
@@ -693,10 +503,7 @@ test "picker deinit releases owned text and restores declared defaults" {
     var state: State = .{};
     defer state.deinit(alloc);
     try state.model_picker_pending_model.appendSlice(alloc, "model");
-    try state.provider_picker_pending_provider.appendSlice(alloc, "provider");
-    try state.provider_picker_pending_method.appendSlice(alloc, "method");
     state.model_picker_stage = .fast;
-    state.provider_picker_stage = .api_key;
     state.slash_completion_index = 7;
     state.inline_picker_suppression = .history_slash_recall_until_edit;
     state.file_completion.active = true;
@@ -715,400 +522,4 @@ test "picker deinit releases owned text and restores declared defaults" {
         }
     }
     state.deinit(alloc);
-}
-
-test "picker state resolves model file skill and slash queries" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try editor.setText(alloc, "/model gpt");
-    const model_query = state.activeModelPickerQuery(&editor).?;
-    try std.testing.expectEqual(ModelPickerStage.model, model_query.stage);
-    try std.testing.expectEqualStrings("gpt", model_query.query);
-
-    try editor.setText(alloc, "open (@src/main.zig");
-    const file_query = state.activeFilePickerQuery(&editor).?;
-    try std.testing.expectEqualStrings("src/main.zig", file_query.query);
-
-    try editor.setText(alloc, "use $blueprint");
-    try std.testing.expectEqualStrings("blueprint", state.activeInlineSkillQuery(&editor).?.query);
-
-    try editor.setText(alloc, "then /help");
-    try std.testing.expectEqualStrings("/help", state.activeInlineSlashQuery(&editor).?.prefix);
-}
-
-test "skill query binds the nearest dollar anywhere at the cursor" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    const cases = [_]struct {
-        input: []const u8,
-        query: []const u8,
-        dollar_offset: usize,
-    }{
-        .{ .input = "$", .query = "", .dollar_offset = 0 },
-        .{ .input = "$blue", .query = "blue", .dollar_offset = 0 },
-        .{ .input = "use $", .query = "", .dollar_offset = "use ".len },
-        .{ .input = "price$100", .query = "100", .dollar_offset = "price".len },
-        .{ .input = "one$two$three", .query = "three", .dollar_offset = "one$two".len },
-    };
-
-    for (cases) |case| {
-        try editor.setText(alloc, case.input);
-        const maybe_query = state.activeInlineSkillQuery(&editor);
-        try std.testing.expect(maybe_query != null);
-        const query = maybe_query.?;
-        try std.testing.expectEqualStrings(case.query, query.query);
-        try std.testing.expectEqual(case.dollar_offset, query.dollar_offset);
-        try std.testing.expectEqual(case.dollar_offset + 1, query.token_start);
-    }
-
-    try editor.setText(alloc, "price$100 tail");
-    try std.testing.expect(state.activeInlineSkillQuery(&editor) == null);
-    _ = editor.setCursor("price$10".len);
-    try std.testing.expect(state.activeInlineSkillQuery(&editor) == null);
-}
-
-test "model picker query takes precedence over file syntax" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try editor.setText(alloc, "/model @provider");
-    try std.testing.expect(state.activeModelPickerQuery(&editor) != null);
-    try std.testing.expectEqual(@as(?FilePickerQuery, null), state.activeFilePickerQuery(&editor));
-}
-
-test "MCP arguments stay literal while ordinary file queries remain eligible" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    const literal_inputs = [_][]const u8{
-        "/mcp add memory npx -y @modelcontextprotocol/server-memory@2026.8.31",
-        " \t/mcp\tadd memory npx @scope/package",
-        "\n/mcp add memory npx @scope/package",
-    };
-    for (literal_inputs) |input| {
-        try editor.setText(alloc, input);
-        try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
-        try std.testing.expect(state.inlinePickerTriggerKind(&editor) != .file);
-        _ = editor.setCursor(input.len - 1);
-        try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
-    }
-
-    const file_inputs = [_][]const u8{
-        "read @src/main.zig",
-        "/mcpx @src/main.zig",
-        "explain /mcp @src/main.zig",
-        "/review @src/main.zig",
-    };
-    for (file_inputs) |input| {
-        try editor.setText(alloc, input);
-        try std.testing.expectEqualStrings("src/main.zig", state.activeFilePickerQuery(&editor).?.query);
-        try std.testing.expectEqual(InlinePickerKind.file, state.inlinePickerTriggerKind(&editor).?);
-    }
-}
-
-test "MCP argument edits and history do not retain file picker ownership" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try editor.setText(alloc, "read @scope/package");
-    state.dismissInlinePicker(.file);
-    try editor.setText(alloc, "/mcp add memory npx @scope/package");
-    state.reconcileInlinePickerAfterEdit(&editor);
-    try std.testing.expect(!state.isInlinePickerSuppressed(.file));
-    state.resetInlinePickerForHistoryRecall(&editor);
-    try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
-    try std.testing.expect(state.inlinePickerTriggerKind(&editor) != .file);
-
-    try editor.setText(alloc, "read @scope/package");
-    state.reconcileInlinePickerAfterEdit(&editor);
-    try std.testing.expectEqualStrings("scope/package", state.activeFilePickerQuery(&editor).?.query);
-}
-
-test "picker dismissal lasts for one trigger episode" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try editor.setText(alloc, "use $blueprint");
-    state.dismissInlinePicker(.skill);
-    try std.testing.expect(state.activeInlineSkillQuery(&editor) == null);
-
-    try editor.setText(alloc, "use $blueprintx");
-    state.reconcileInlinePickerAfterEdit(&editor);
-    try std.testing.expect(state.isInlinePickerDismissed(.skill));
-
-    try editor.setText(alloc, "use blueprint ");
-    state.reconcileInlinePickerAfterEdit(&editor);
-    try std.testing.expect(!state.isInlinePickerDismissed(.skill));
-}
-
-test "file picker state transitions activation dismissal and recovery" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try editor.setText(alloc, "plain text");
-    try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
-
-    try editor.setText(alloc, "@");
-    try std.testing.expectEqualStrings("", state.activeFilePickerQuery(&editor).?.query);
-
-    try editor.setText(alloc, "@./scoped/@types");
-    try std.testing.expectEqualStrings("./scoped/@types", state.activeFilePickerQuery(&editor).?.query);
-
-    try editor.setText(alloc, "@\"./space dir/item");
-    const quoted = state.activeFilePickerQuery(&editor).?;
-    try std.testing.expect(quoted.quoted);
-    try std.testing.expectEqualStrings("./space dir/item", quoted.query);
-
-    state.dismissInlinePicker(.file);
-    try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
-
-    try editor.setText(alloc, "@\"./space dir/item.txt");
-    state.reconcileInlinePickerAfterEdit(&editor);
-    try std.testing.expect(state.isInlinePickerDismissed(.file));
-
-    try editor.setText(alloc, "plain text");
-    state.reconcileInlinePickerAfterEdit(&editor);
-    try std.testing.expect(!state.isInlinePickerDismissed(.file));
-
-    try editor.setText(alloc, "@~/Downloads");
-    try std.testing.expectEqualStrings("~/Downloads", state.activeFilePickerQuery(&editor).?.query);
-
-    try editor.setText(alloc, "@~/Downloads/file.txt ");
-    try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
-}
-
-test "model picker flow accepts aliased pending model input" {
-    const alloc = std.testing.allocator;
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try state.beginModelPickerFlow(alloc, "openai/gpt-5", 2, false, false, .effort);
-    const aliased_model = state.model_picker_pending_model.items;
-    try state.beginModelPickerFlow(alloc, aliased_model, 3, true, false, .fast);
-
-    try std.testing.expectEqual(ModelPickerStage.fast, state.model_picker_stage);
-    try std.testing.expectEqualStrings("openai/gpt-5", state.model_picker_pending_model.items);
-    try std.testing.expectEqual(@as(usize, 3), state.selectedModelPickerEffortIndex());
-    try std.testing.expectEqualStrings("fast", state.selectedModelPickerSpeed());
-    try state.beginModelPickerFlow(alloc, aliased_model, 3, false, true, .fast);
-    try std.testing.expectEqualStrings("ultrafast", state.selectedModelPickerSpeed());
-}
-
-test "model picker flow preserves state when allocation fails" {
-    const alloc = testing_allocator.no_resize;
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try state.beginModelPickerFlow(alloc, "old", 2, false, false, .effort);
-
-    var failing = std.testing.FailingAllocator.init(alloc, .{
-        .fail_index = 1,
-        .resize_fail_index = 0,
-    });
-    var large_model: [4096]u8 = undefined;
-    @memset(&large_model, 'x');
-    try std.testing.expectError(
-        error.OutOfMemory,
-        state.beginModelPickerFlow(
-            failing.allocator(),
-            &large_model,
-            5,
-            true,
-            false,
-            .fast,
-        ),
-    );
-
-    try std.testing.expectEqual(ModelPickerStage.effort, state.model_picker_stage);
-    try std.testing.expectEqualStrings("old", state.model_picker_pending_model.items);
-    try std.testing.expectEqual(@as(usize, 2), state.model_picker_effort_index);
-    try std.testing.expect(!state.selectedModelPickerFast());
-}
-
-test "completion label filtering is trimmed and case insensitive" {
-    const options = [_][]const u8{ "High", "xhigh", "max" };
-    var matches: [options.len][]const u8 = undefined;
-    const count = filterCompletionLabels(" H ", &options, &matches);
-
-    try std.testing.expectEqual(@as(usize, 2), count);
-    try std.testing.expectEqualStrings("High", matches[0]);
-    try std.testing.expectEqualStrings("xhigh", matches[1]);
-}
-
-test "provider picker opens on both command aliases and keeps the typed one" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    for (provider_picker_prefixes) |prefix| {
-        try editor.setText(alloc, prefix);
-        const query = state.activeProviderPickerQuery(&editor).?;
-        try std.testing.expectEqual(ProviderPickerStage.provider, query.stage);
-        try std.testing.expectEqualStrings(prefix, query.prefix);
-        try std.testing.expectEqualStrings("", query.query);
-        try std.testing.expectEqual(prefix.len, query.token_start);
-        try std.testing.expectEqual(InlinePickerKind.provider, state.inlinePickerTriggerKind(&editor).?);
-    }
-
-    try editor.setText(alloc, "/provider gro");
-    try std.testing.expectEqualStrings("gro", state.activeProviderPickerQuery(&editor).?.query);
-}
-
-test "provider picker columns anchor under the argument they belong to" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try state.beginProviderPickerFlow(alloc, "vercel", "", .method);
-    try editor.setText(alloc, "/provider vercel ");
-    const method = state.activeProviderPickerQuery(&editor).?;
-    try std.testing.expectEqual(ProviderPickerStage.method, method.stage);
-    try std.testing.expectEqual("/provider vercel ".len, method.token_start);
-    try std.testing.expectEqualStrings("", method.query);
-
-    try state.beginProviderPickerFlow(alloc, "vercel", "account", .team);
-    try editor.setText(alloc, "/provider vercel account acme");
-    const team = state.activeProviderPickerQuery(&editor).?;
-    try std.testing.expectEqual(ProviderPickerStage.team, team.stage);
-    try std.testing.expectEqual("/provider vercel account ".len, team.token_start);
-    try std.testing.expectEqualStrings("acme", team.query);
-
-    // Editing away the committed token retires the column instead of anchoring
-    // the list under text that no longer names the choice.
-    try editor.setText(alloc, "/provider codex account acme");
-    try std.testing.expect(state.activeProviderPickerQuery(&editor) == null);
-}
-
-test "provider picker takes the composer back from the file and slash pickers" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try editor.setText(alloc, "/provider @vercel");
-    try std.testing.expect(state.activeProviderPickerQuery(&editor) != null);
-    try std.testing.expect(state.activeFilePickerQuery(&editor) == null);
-
-    state.dismissInlinePicker(.provider);
-    try std.testing.expect(state.activeProviderPickerQuery(&editor) == null);
-}
-
-test "clearing the provider picker flow returns the picker to the provider column" {
-    const alloc = std.testing.allocator;
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try state.beginProviderPickerFlow(alloc, "vercel", "account", .team);
-    state.team_column_index = 3;
-    try std.testing.expect(state.provider_picker_pending_provider.items.len > 0);
-
-    state.clearProviderPickerFlow();
-    try std.testing.expectEqual(ProviderPickerStage.provider, state.provider_picker_stage);
-    try std.testing.expectEqual(@as(usize, 0), state.team_column_index);
-    try std.testing.expect(state.provider_picker_pending_provider.items.len == 0);
-}
-
-test "annotation filtering keeps labels and annotations aligned" {
-    var labels = [_][]const u8{ "vercel", "codex", "grok" };
-    var annotations = [_][]const u8{ "current", "", "" };
-
-    try std.testing.expectEqual(@as(usize, 3), filterAnnotatedLabels("", &labels, &annotations, 3));
-
-    const count = filterAnnotatedLabels("ok", &labels, &annotations, 3);
-    try std.testing.expectEqual(@as(usize, 1), count);
-    try std.testing.expectEqualStrings("grok", labels[0]);
-    try std.testing.expectEqualStrings("", annotations[0]);
-}
-
-test "editing a committed token degrades the provider picker to the provider column" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try state.beginProviderPickerFlow(alloc, "vercel", "", .method);
-    try editor.setText(alloc, "/provider verc");
-    state.reconcileInlinePickerAfterEdit(&editor);
-
-    const query = state.activeProviderPickerQuery(&editor).?;
-    try std.testing.expectEqual(ProviderPickerStage.provider, query.stage);
-    try std.testing.expectEqualStrings("verc", query.query);
-
-    // Unrelated text leaves the flow alone; clearing the composer resets it
-    // through clearCurrent instead.
-    try state.beginProviderPickerFlow(alloc, "vercel", "", .method);
-    try editor.setText(alloc, "hello world");
-    state.reconcileInlinePickerAfterEdit(&editor);
-    try std.testing.expectEqual(ProviderPickerStage.method, state.provider_picker_stage);
-}
-
-test "committed tokens only match at word boundaries" {
-    const alloc = std.testing.allocator;
-    var editor: editor_state.State = .{};
-    defer editor.deinit(alloc);
-    var state: State = .{};
-    defer state.deinit(alloc);
-
-    try state.beginProviderPickerFlow(alloc, "vercel", "", .method);
-    try editor.setText(alloc, "/provider vercelfoo bar");
-    try std.testing.expect(state.rawProviderPickerQuery(&editor) == null);
-
-    state.reconcileInlinePickerAfterEdit(&editor);
-    try std.testing.expectEqual(ProviderPickerStage.provider, state.provider_picker_stage);
-}
-
-test "folder listing wait spans one tick and is skipped after a slow listing" {
-    var wait: FileListingWait = .{};
-    try std.testing.expect(!wait.hold(false, 100));
-    // Keystrokes during one listing share the first keystroke's wait.
-    try std.testing.expect(wait.hold(true, 100));
-    try std.testing.expect(wait.hold(true, 100 + FileListingWait.hold_ms - 1));
-    try std.testing.expect(wait.active(100 + FileListingWait.hold_ms - 1));
-    // A listing that outlasts the wait paints at once from then on.
-    try std.testing.expect(!wait.hold(true, 100 + FileListingWait.hold_ms));
-    try std.testing.expect(!wait.hold(true, 140));
-    try std.testing.expect(!wait.active(140));
-    try std.testing.expect(!wait.hold(false, 141));
-    // The folder was slow, so the next keystroke does not wait for it, but
-    // the listing is still watched for its first tick.
-    try std.testing.expect(!wait.hold(true, 200));
-    try std.testing.expect(!wait.active(200));
-    try std.testing.expect(wait.measuring(200 + FileListingWait.hold_ms - 1));
-    try std.testing.expect(!wait.measuring(200 + FileListingWait.hold_ms));
-    // A listing that finishes within the wait turns waiting back on.
-    try std.testing.expect(!wait.hold(false, 202));
-    try std.testing.expect(wait.hold(true, 300));
-    try std.testing.expect(!wait.hold(false, 301));
-    try std.testing.expect(wait.hold(true, 400));
-    // A clock that steps backwards ends the wait.
-    try std.testing.expect(!wait.hold(true, 350));
 }

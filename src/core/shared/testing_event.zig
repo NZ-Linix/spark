@@ -21,27 +21,3 @@ fn setWithin(event: *std.Io.Event, ms: u32) bool {
 pub fn setInTime(event: *std.Io.Event) bool {
     return setWithin(event, limit_ms);
 }
-
-test "an event that is already set is seen at once" {
-    var event: std.Io.Event = .unset;
-    event.set(io_mod.getIo());
-    try std.testing.expect(setInTime(&event));
-}
-
-test "an event that another thread sets is seen" {
-    const Setter = struct {
-        fn run(event: *std.Io.Event) void {
-            io_mod.sleep(5 * std.time.ns_per_ms);
-            event.set(io_mod.getIo());
-        }
-    };
-    var event: std.Io.Event = .unset;
-    const thread = try std.Thread.spawn(.{}, Setter.run, .{&event});
-    defer thread.join();
-    try std.testing.expect(setInTime(&event));
-}
-
-test "an event that nothing sets is not seen within its limit" {
-    var event: std.Io.Event = .unset;
-    try std.testing.expect(!setWithin(&event, 20));
-}

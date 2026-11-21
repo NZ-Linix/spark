@@ -1,5 +1,5 @@
-//! The `web_search` tool's other backend: a Firecrawl server's `/v2/search`.
-//! `/search` picks the backend and saves it in `~/.spark/web_search.json`.
+//! The `web_search` tool's backend: a Firecrawl server's `/v2/search`. The
+//! server's URL can be set in `~/.spark/web_search.json` as `firecrawl_url`.
 //! Requests run through `curl` so each one has a hard time limit.
 
 const std = @import("std");
@@ -14,41 +14,14 @@ pub const default_url = "https://firecrawl.nzlinix.com";
 pub const config_file_name = "web_search.json";
 const max_results = 8;
 const max_response_bytes = 4 * 1024 * 1024;
-/// Firecrawl alone waits this long; with Vercel behind it, much less.
-pub const timeout_alone_s = 60;
-pub const timeout_with_fallback_s = 15;
-
-pub const Mode = enum {
-    /// The Vercel AI Gateway's search, spark's original backend.
-    vercel,
-    /// Firecrawl only.
-    firecrawl,
-    /// Firecrawl, then Vercel when Firecrawl fails or is slow.
-    auto,
-
-    pub fn parse(raw: []const u8) ?Mode {
-        if (std.ascii.eqlIgnoreCase(raw, "vercel") or std.ascii.eqlIgnoreCase(raw, "gateway")) return .vercel;
-        if (std.ascii.eqlIgnoreCase(raw, "firecrawl")) return .firecrawl;
-        if (std.ascii.eqlIgnoreCase(raw, "auto") or std.ascii.eqlIgnoreCase(raw, "fallback")) return .auto;
-        return null;
-    }
-
-    pub fn label(self: Mode) []const u8 {
-        return switch (self) {
-            .vercel => "Vercel AI Gateway",
-            .firecrawl => "Firecrawl",
-            .auto => "Firecrawl, Vercel as fallback",
-        };
-    }
-};
+/// How long one search may take.
+pub const search_timeout_s = 60;
 
 pub const Config = struct {
-    mode: Mode = .vercel,
     url: []const u8 = default_url,
 };
 
 const FileShape = struct {
-    provider: ?[]const u8 = null,
     firecrawl_url: ?[]const u8 = null,
 };
 
@@ -62,27 +35,10 @@ pub fn load(arena: Allocator) Config {
     const text = io_mod.readFileToEnd(arena, &file, 64 * 1024) catch return .{};
     const shape = json_decode.parseFromSliceLeaky(FileShape, arena, text, .{ .ignore_unknown_fields = true }) catch return .{};
     var config: Config = .{};
-    if (shape.provider) |raw| config.mode = Mode.parse(raw) orelse .vercel;
     if (shape.firecrawl_url) |url| if (url.len > 0) {
         config.url = url;
     };
     return config;
-}
-
-/// Saves `mode`, keeping the Firecrawl URL.
-pub fn saveMode(alloc: Allocator, mode: Mode) !void {
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const home = io_mod.homeDir() orelse return error.NoHome;
-    const current = load(arena);
-    const root = try profile_paths.rootDir(arena, home);
-    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), root);
-    const path = try profile_paths.rootPath(arena, home, &.{config_file_name});
-    var out: std.Io.Writer.Allocating = .init(arena);
-    try std.json.Stringify.value(.{ .provider = @tagName(mode), .firecrawl_url = current.url }, .{ .whitespace = .indent_2 }, &out.writer);
-    try out.writer.writeByte('\n');
-    try io_mod.writeFileAtomic(arena, path, out.written());
 }
 
 const Hit = struct {
@@ -97,8 +53,8 @@ const ResponseShape = struct {
     data: ?std.json.Value = null,
 };
 
-/// Searches Firecrawl and returns the results in the shape the Vercel
-/// backend returns them. Everything lives in `arena`.
+/// Searches Firecrawl and returns the results in the web search contract's
+/// shape. Everything lives in `arena`.
 pub fn search(
     arena: Allocator,
     base_url: []const u8,
@@ -165,11 +121,4 @@ pub fn search(
         .duration_ms = @intCast(@max(0, io_mod.milliTimestamp() - started)),
         .web_search_requests = 1,
     };
-}
-
-test "Mode parses the names /search takes" {
-    try std.testing.expectEqual(Mode.auto, Mode.parse("fallback").?);
-    try std.testing.expectEqual(Mode.firecrawl, Mode.parse("Firecrawl").?);
-    try std.testing.expectEqual(Mode.vercel, Mode.parse("gateway").?);
-    try std.testing.expect(Mode.parse("bing") == null);
 }

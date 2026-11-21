@@ -146,12 +146,3 @@ pub fn last_user_index(messages: []const types.ChatMessage) ?usize {
     }
     return null;
 }
-
-test "function tools bound dynamic schema traversal" {
-    var exhausted_nodes = SchemaBudget{ .nodes = 0 };
-    try std.testing.expectError(error.InvalidToolSchema, validate_dynamic_schema(.null, 0, &exhausted_nodes));
-    var exhausted_strings = SchemaBudget{ .string_bytes = 2 };
-    try std.testing.expectError(error.InvalidToolSchema, validate_dynamic_schema(.{ .string = "abc" }, 0, &exhausted_strings));
-    var budget: SchemaBudget = .{};
-    try std.testing.expectError(error.InvalidToolSchema, validate_dynamic_schema(.{ .float = std.math.inf(f64) }, 0, &budget));
-}

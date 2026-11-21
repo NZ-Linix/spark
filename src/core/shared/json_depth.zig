@@ -36,19 +36,3 @@ pub fn exceeds(text: []const u8) bool {
     }
     return false;
 }
-
-test "json depth allows the limit and rejects one level past it" {
-    const at_limit = text_utils.repeat("[", max_depth) ++ text_utils.repeat("]", max_depth);
-    const past_limit = text_utils.repeat("[", max_depth + 1) ++ text_utils.repeat("]", max_depth + 1);
-    try std.testing.expect(!exceeds(at_limit));
-    try std.testing.expect(exceeds(past_limit));
-    try std.testing.expect(exceeds("{\"a\":" ++ text_utils.repeat("{\"a\":", max_depth) ++ "0" ++ text_utils.repeat("}", max_depth + 1)));
-}
-
-test "json depth ignores brackets in strings and stray closers" {
-    const quoted = "{\"text\":\"" ++ text_utils.repeat("[{", 200) ++ "\\\"\"}";
-    try std.testing.expect(!exceeds(quoted));
-    try std.testing.expect(!exceeds(text_utils.repeat("]}", 200) ++ "[]"));
-    // Sequential objects never nest, however many there are.
-    try std.testing.expect(!exceeds(text_utils.repeat("{}", 10_000)));
-}

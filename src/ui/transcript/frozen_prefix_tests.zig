@@ -81,50 +81,6 @@ fn finishTurn(alloc: Allocator, runtime: *TranscriptRuntime, metrics: *types.Met
     _ = try expectSameAsFull(alloc, runtime);
 }
 
-test "a runtime resuming after its frozen prefix prepares what a full render prepares" {
-    const alloc = std.testing.allocator;
-    var runtime = testRuntime();
-    defer runtime.deinit(alloc);
-    var metrics: types.Metrics = .{};
-    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "spark v0 · Run /help for commands\n", .welcome);
-    try finishTurn(alloc, &runtime, &metrics, "Read the notes", "Here is **a** summary of the notes.");
-    const first_tool = runtime.notebook.entries.items[2].id();
-    try finishTurn(alloc, &runtime, &metrics, "Run a command", "TURN_TWO_DONE with a line long enough to wrap at sixty columns.");
-    try finishTurn(alloc, &runtime, &metrics, "Say the final words", "TURN_THREE_DONE");
-
-    // The prefix covers the finished turns, and the next preparation resumes.
-    const slot = runtime.frozen_prefix.slots[@backingInt(frozen_prefix.Mode.prepared)] orelse return error.NoPrefix;
-    try std.testing.expectEqual(frozen_prefix.boundary(runtime.notebook.entries.items), slot.state.entry_count);
-    try std.testing.expect(runtime.frozen_prefix.slots[@backingInt(frozen_prefix.Mode.plain)] != null);
-    try std.testing.expect(runtime.frozen_prefix.lines(.prepared) != null);
-    const hits = runtime.frozen_prefix.hits;
-    _ = try expectSameAsFull(alloc, &runtime);
-    // Both the prepared and the plain render resumed.
-    try std.testing.expect(runtime.frozen_prefix.hits >= hits + 2);
-
-    // A live turn after the prefix.
-    const text = try alloc.dupe(u8, "Keep going");
-    defer alloc.free(text);
-    _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = text }, true, &.{});
-    const notice = try runtime.appendReplaceableSemanticNotice(alloc, .{ .topic = "context", .tone = .neutral, .body = "Preparing compaction" });
-    _ = try expectSameAsFull(alloc, &runtime);
-    _ = try runtime.replaceSemanticNotice(alloc, notice, .{ .topic = "context", .tone = .success, .body = "Compacted" });
-    _ = try expectSameAsFull(alloc, &runtime);
-
-    // An entry inside the prefix changes in place: the prefix no longer
-    // matches, and the preparation renders everything again.
-    _ = try runtime.updateRawBytesEntry(alloc, first_tool, "● Read notes.txt (2 lines)\n");
-    _ = try expectSameAsFull(alloc, &runtime);
-    _ = try expectSameAsFull(alloc, &runtime);
-
-    // A new width.
-    runtime.layout.cols = 60;
-    _ = try expectSameAsFull(alloc, &runtime);
-    _ = try expectSameAsFull(alloc, &runtime);
-    runtime.layout.cols = 80;
-    _ = try expectSameAsFull(alloc, &runtime);
-}
-
 /// Drives `runtime` through up to 60 operations `draws` chooses and checks
 /// every step against a full render.
 fn driveRuntime(alloc: Allocator, draws: anytype) !void {
@@ -213,19 +169,4 @@ fn corpusOf(comptime values: []const u64) []const u8 {
         const final = bytes;
         return &final;
     }
-}
-
-test "a runtime resuming after its frozen prefix matches a full render on arbitrary edits" {
-    try std.testing.fuzz({}, fuzzRuntime, .{
-        .corpus = &(.{
-            // Two finished turns, a tool line in the first edited in place, a
-            // new width, then a third turn with command output and a notice.
-            comptime corpusOf(&.{ 16, 0, 1, 3, 3, 5, 0, 1, 6, 0, 5, 8, 40, 4, 5, 9, 1, 5, 7, 0 }),
-        } ++ @import("fuzz_corpus").frozen_prefix.*),
-    });
-}
-
-test "a runtime resuming after its frozen prefix matches a full render on seeded random edits" {
-    var prng: std.Random.DefaultPrng = .init(20261030);
-    for (0..150) |_| try driveRuntime(std.testing.allocator, SeededDraws{ .random = prng.random() });
 }

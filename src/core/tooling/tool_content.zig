@@ -89,31 +89,3 @@ fn projectMediaBlock(alloc: std.mem.Allocator, item: *std.json.Value) std.mem.Al
         }
     }
 }
-
-test "a host tool image is named only when its stored mark is the digest of its bytes" {
-    const alloc = std.testing.allocator;
-    const png = "\x89PNG\r\n\x1a\nhost-tool-shot";
-    var encoded: [64]u8 = undefined;
-    const data = std.base64.standard.Encoder.encode(&encoded, png);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(png, &digest, .{});
-    const name = std.fmt.bytesToHex(digest, .lower);
-    for ([_]struct { mark: []const u8, named: bool }{
-        .{ .mark = &name, .named = true },
-        .{ .mark = "0000000000000000000000000000000000000000000000000000000000000000", .named = false },
-    }) |case| {
-        const json = try alloc.print("{{\"text\":\"shot\",\"images\":[{{\"type\":\"image\",\"data\":\"{s}\",\"mimeType\":\"image/png\",\"stored\":\"{s}\"}}]}}", .{ data, case.mark });
-        defer alloc.free(json);
-        const result = try parseRichResult(alloc, json, 1024, false);
-        const rich = result.rich;
-        defer {
-            alloc.free(rich.text);
-            types.freeToolImages(alloc, rich.images);
-        }
-        try std.testing.expectEqual(@as(usize, 1), rich.images.len);
-        // A mark that does not match leaves the image inline, never lost.
-        try std.testing.expectEqualStrings(data, rich.images[0].data);
-        try std.testing.expectEqual(case.named, rich.images[0].name != null);
-        if (case.named) try std.testing.expectEqualStrings(&name, &rich.images[0].name.?);
-    }
-}

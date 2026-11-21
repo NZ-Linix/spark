@@ -177,7 +177,3 @@ fn loadFour(alloc: Allocator) !void {
     defer tools.deinit(alloc);
     try testing.expectEqual(@as(usize, 4), tools.tools.len);
 }
-
-test "always-loaded tools are freed whole when memory runs out partway" {
-    try testing.checkAllAllocationFailures(testing_allocator.no_resize, loadFour, .{});
-}

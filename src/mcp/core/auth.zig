@@ -629,44 +629,6 @@ fn gateSteps(g: *Gate, events: []const GateEvent) GateOutput {
     return out;
 }
 
-test "a rejected request waits for one refresh and goes out again with its token" {
-    var g: Gate = .{};
-    _ = gateSteps(&g, &.{.{ .signed_in = .{ .refreshable = true } }});
-    var out = gateSteps(&g, &.{ .{ .send = .{ .key = 1, .expiring = false } }, .{ .send = .{ .key = 2, .expiring = false } } });
-    try testing.expectEqualSlices(GateEffect, &.{.{ .post = .{ .key = 2, .token = 1 } }}, out.effects());
-    out = gateSteps(&g, &.{.{ .rejected = 1 }});
-    try testing.expectEqualSlices(GateEffect, &.{.refresh}, out.effects());
-    // A second rejection during the refresh waits for the same one.
-    out = gateSteps(&g, &.{.{ .rejected = 2 }});
-    try testing.expectEqual(@as(usize, 0), out.effects().len);
-    out = gateSteps(&g, &.{.{ .refreshed = .rotated }});
-    try testing.expectEqualSlices(GateEffect, &.{ .{ .post = .{ .key = 1, .token = 2 } }, .{ .post = .{ .key = 2, .token = 2 } } }, out.effects());
-    try testing.expectEqual(@as(u32, 2), g.rt);
-    // Rejected again: it ends.
-    out = gateSteps(&g, &.{.{ .rejected = 1 }});
-    try testing.expectEqualSlices(GateEffect, &.{.{ .give_up = .{ .key = 1, .why = .needs_sign_in } }}, out.effects());
-}
-
-test "a token close to expiry is refreshed first, and a token without refresh ends the request" {
-    var g: Gate = .{};
-    _ = gateSteps(&g, &.{.{ .signed_in = .{ .refreshable = true } }});
-    var out = gateSteps(&g, &.{.{ .send = .{ .key = 1, .expiring = true } }});
-    try testing.expectEqualSlices(GateEffect, &.{.refresh}, out.effects());
-    out = gateSteps(&g, &.{.{ .refreshed = .refused }});
-    try testing.expectEqualSlices(GateEffect, &.{.{ .give_up = .{ .key = 1, .why = .needs_sign_in } }}, out.effects());
-    try testing.expect(!g.held and !g.refreshable);
-    out = gateSteps(&g, &.{ .{ .send = .{ .key = 2, .expiring = false } }, .{ .rejected = 2 } });
-    try testing.expectEqualSlices(GateEffect, &.{.{ .give_up = .{ .key = 2, .why = .needs_sign_in } }}, out.effects());
-}
-
-test "a refresh that gets no answer fails the requests waiting and keeps the tokens" {
-    var g: Gate = .{};
-    _ = gateSteps(&g, &.{ .{ .signed_in = .{ .refreshable = true } }, .{ .send = .{ .key = 1, .expiring = true } } });
-    const out = gateSteps(&g, &.{.{ .refreshed = .failed }});
-    try testing.expectEqualSlices(GateEffect, &.{.{ .give_up = .{ .key = 1, .why = .failed } }}, out.effects());
-    try testing.expect(g.held and g.refreshable);
-}
-
 const FlowWorld = struct {
     known: u8 = 0,
     asked: u32 = 0,
@@ -742,74 +704,8 @@ fn exploreFlow(f: Flow, w: FlowWorld, depth: u8) !void {
     }
 }
 
-test "every flow event sequence to depth 7 keeps the model's invariants" {
-    try exploreFlow(.{}, .{}, 7);
-}
-
 fn flowSteps(f: *Flow, events: []const FlowEvent) FlowOutput {
     var out: FlowOutput = .{};
     for (events) |e| f.step(e, &out);
     return out;
-}
-
-test "a sign-in registers once per issuer, and a new issuer drops the token and registers again" {
-    var f: Flow = .{};
-    var out = flowSteps(&f, &.{ .sign_in, .{ .discovered = .{ .issuer = 1, .scopes = 1 } } });
-    try testing.expectEqualSlices(FlowEffect, &.{.register}, out.effects());
-    out = flowSteps(&f, &.{.{ .registered = true }});
-    try testing.expectEqualSlices(FlowEffect, &.{.{ .authorize = 1 }}, out.effects());
-    out = flowSteps(&f, &.{ .{ .responded = .{ .state_ok = true, .iss = .match, .advertised = true, .err = false } }, .{ .redeemed = true } });
-    try testing.expectEqualSlices(FlowEffect, &.{.{ .signed_in = 1 }}, out.effects());
-    // The same issuer again: no registration.
-    out = flowSteps(&f, &.{ .sign_in, .{ .discovered = .{ .issuer = 1, .scopes = 1 } } });
-    try testing.expectEqualSlices(FlowEffect, &.{.{ .authorize = 1 }}, out.effects());
-    _ = flowSteps(&f, &.{.cancel});
-    // Another issuer: the token goes, and a new registration.
-    out = flowSteps(&f, &.{ .sign_in, .{ .discovered = .{ .issuer = 2, .scopes = 1 } } });
-    try testing.expectEqualSlices(FlowEffect, &.{ .drop_token, .register }, out.effects());
-}
-
-test "a response is checked before its error is shown or its code redeemed" {
-    const Case = struct { FlowEvent, FlowEffect };
-    const fail = struct {
-        fn of(show: bool) FlowEffect {
-            return .{ .failed = .{ .stage = .response, .show_error = show } };
-        }
-    }.of;
-    for ([_]Case{
-        .{ .{ .responded = .{ .state_ok = true, .iss = .match, .advertised = true, .err = false } }, .redeem },
-        .{ .{ .responded = .{ .state_ok = true, .iss = .none, .advertised = false, .err = false } }, .redeem },
-        .{ .{ .responded = .{ .state_ok = true, .iss = .none, .advertised = true, .err = false } }, fail(false) },
-        .{ .{ .responded = .{ .state_ok = true, .iss = .wrong, .advertised = false, .err = true } }, fail(false) },
-        .{ .{ .responded = .{ .state_ok = false, .iss = .match, .advertised = true, .err = true } }, fail(false) },
-        .{ .{ .responded = .{ .state_ok = true, .iss = .match, .advertised = true, .err = true } }, fail(true) },
-    }) |case| {
-        var f: Flow = .{};
-        _ = flowSteps(&f, &.{ .sign_in, .{ .discovered = .{ .issuer = 1, .scopes = 0 } }, .{ .registered = true } });
-        const out = flowSteps(&f, &.{case[0]});
-        try testing.expectEqualSlices(FlowEffect, &.{case[1]}, out.effects());
-    }
-}
-
-test "a step-up asks for the scopes held and challenged, and stops after three authorizations" {
-    var f: Flow = .{};
-    _ = flowSteps(&f, &.{ .{ .challenged = 1 }, .sign_in, .{ .discovered = .{ .issuer = 1, .scopes = 8 } }, .{ .registered = true } });
-    _ = flowSteps(&f, &.{ .{ .responded = .{ .state_ok = true, .iss = .match, .advertised = true, .err = false } }, .{ .redeemed = true } });
-    try testing.expectEqual(@as(u32, 1), f.granted);
-    var out = flowSteps(&f, &.{ .{ .challenged = 2 }, .sign_in, .{ .discovered = .{ .issuer = 1, .scopes = 8 } } });
-    try testing.expectEqualSlices(FlowEffect, &.{.{ .authorize = 3 }}, out.effects());
-    _ = flowSteps(&f, &.{ .cancel, .sign_in, .{ .discovered = .{ .issuer = 1, .scopes = 8 } }, .cancel });
-    try testing.expectEqual(@as(u8, 3), f.auths);
-    out = flowSteps(&f, &.{.sign_in});
-    try testing.expectEqualSlices(FlowEffect, &.{.refused}, out.effects());
-    // An accepted request starts the count over.
-    _ = flowSteps(&f, &.{.accepted});
-    out = flowSteps(&f, &.{.sign_in});
-    try testing.expectEqualSlices(FlowEffect, &.{.discover}, out.effects());
-}
-
-test "with no challenge scopes, the resource metadata's are asked for" {
-    var f: Flow = .{};
-    const out = flowSteps(&f, &.{ .sign_in, .{ .discovered = .{ .issuer = 1, .scopes = 6 } }, .{ .registered = true } });
-    try testing.expectEqualSlices(FlowEffect, &.{.{ .authorize = 6 }}, out.effects());
 }

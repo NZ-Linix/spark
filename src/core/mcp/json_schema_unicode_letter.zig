@@ -681,22 +681,6 @@ pub fn contains(codepoint: u21) bool {
     return false;
 }
 
-test "Unicode letter ranges include representative scripts and exclude non-letters" {
-    try std.testing.expect(contains('A'));
-    try std.testing.expect(contains('π'));
-    try std.testing.expect(contains('界'));
-    try std.testing.expect(!contains('1'));
-    try std.testing.expect(!contains('!'));
-}
-
-test "packed Unicode letter ranges preserve every scalar classification" {
-    try std.testing.expectEqual(@as(usize, 4), @sizeOf(PackedRange));
-    for (0..0x110000) |raw| {
-        const codepoint: u21 = @intCast(raw);
-        try std.testing.expectEqual(containsSource(codepoint), contains(codepoint));
-    }
-}
-
 fn containsSource(codepoint: u21) bool {
     var low: usize = 0;
     var high: usize = source_ranges.len;

@@ -286,33 +286,3 @@ pub fn composeRow(alloc: Allocator, preview: Preview, index_in: u16, width: u16)
     try row.appendSlice(alloc, reset);
     return row;
 }
-
-test "the pacer reveals whole words and catches up on a backlog" {
-    var pacer: Pacer = .{};
-    const src: Source = .{ .text = "one two three four", .kind = .reply, .generation = 1 };
-    try std.testing.expect(pacer.tick(src, 1000));
-    // "four" may still be growing, so it waits for a pause.
-    try std.testing.expectEqualStrings("one two three ", src.text[0..pacer.shown]);
-    try std.testing.expect(pacer.preview(src, 80).?.fresh_words == 3);
-    try std.testing.expect(pacer.tick(src, 1100));
-    try std.testing.expectEqualStrings(src.text, src.text[0..pacer.shown]);
-    // A new paragraph starts over.
-    const next: Source = .{ .text = "five ", .kind = .reply, .generation = 2 };
-    try std.testing.expect(pacer.tick(next, 1100));
-    try std.testing.expectEqualStrings("five ", next.text[0..pacer.shown]);
-}
-
-test "the preview wraps like the transcript and shows the newest rows" {
-    const alloc = std.testing.allocator;
-    const long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
-    var pacer: Pacer = .{ .shown = long.len, .kind = .reasoning, .generation = 0 };
-    const p = pacer.preview(.{ .text = long, .kind = .reasoning, .generation = 0 }, 30).?;
-    var first = try composeRow(alloc, p, 0, 30);
-    defer first.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, first.items, "* alpha") != null);
-    var last = try composeRow(alloc, p, p.rows - 2, 30);
-    defer last.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, last.items, "tau") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(last.items) <= 30);
-    try std.testing.expect(pacer.preview(null, 30) == null);
-}

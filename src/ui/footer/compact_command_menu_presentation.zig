@@ -6,9 +6,7 @@ const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const render_input = @import("render_input.zig");
 const info_panel_presentation = @import("info_panel_presentation.zig");
-const usage_presentation = @import("usage_presentation.zig");
 
-pub const usageVisibleModelItems = usage_presentation.visibleModelItems;
 const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
 
@@ -31,7 +29,6 @@ pub fn desiredRowCount(projection: CompactCommandMenuProjection, width: u16) u16
     const count: usize = switch (projection) {
         .statusline => settings_row_offset + settings_catalog.statuslineChoiceCount(),
         .info_panel => |panel| info_panel_presentation.desiredRowCount(panel, width),
-        .usage => |usage| usage_presentation.desiredRowCount(usage),
         .workspace => |workspace| workspace_pinned_rows +
             workspace_menu.State.rowCount(workspace.entries),
     };
@@ -58,7 +55,6 @@ pub noinline fn composeCompactCommandMenuRow(
     return switch (projection) {
         .statusline => composeSettingsRow(alloc, projection, row_index, visible_rows, width),
         .info_panel => |panel| info_panel_presentation.composeRow(alloc, panel, row_index, visible_rows, width),
-        .usage => |usage| usage_presentation.composeRow(alloc, usage, row_index, visible_rows, width),
         .workspace => |workspace| composeWorkspaceRow(alloc, workspace, row_index, visible_rows, width),
     };
 }
@@ -73,7 +69,7 @@ fn composeSettingsRow(
     const empty: std.ArrayList(u8) = .empty;
     const statusline = switch (projection) {
         .statusline => |value| value,
-        .info_panel, .usage, .workspace => return empty,
+        .info_panel, .workspace => return empty,
     };
     const choice_count = settings_catalog.statuslineChoiceCount();
     if (choice_count == 0) return empty;
@@ -113,7 +109,7 @@ fn choiceView(projection: CompactCommandMenuProjection, choice_index: usize) ?Ch
                 .selected = choice_index == statusline.selected_index % settings_catalog.statuslineChoiceCount(),
             };
         },
-        .info_panel, .usage, .workspace => null,
+        .info_panel, .workspace => null,
     };
 }
 
@@ -491,151 +487,4 @@ test "compact status line menu renders toggled items without choose copy" {
     defer session.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, session.items, "Session") != null);
     try std.testing.expect(std.mem.find(u8, session.items, "on") != null);
-}
-
-test "compact status line menu anchors options and prioritizes the selected tiny row" {
-    const projection: CompactCommandMenuProjection = .{ .statusline = .{
-        .active = true,
-        .selected_index = 2,
-        .snapshot = .{
-            .statusline_context = false,
-            .statusline_session = true,
-            .statusline_workspace = false,
-        },
-    } };
-
-    var tiny = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 1, 80);
-    defer tiny.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, tiny.items, "Workspace") != null);
-    try std.testing.expect(std.mem.find(u8, tiny.items, "Status line") == null);
-
-    var medium = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 5, 80);
-    defer medium.deinit(std.testing.allocator);
-    var wide = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 5, 180);
-    defer wide.deinit(std.testing.allocator);
-    const medium_option = std.mem.find(u8, medium.items, "off") orelse return error.TestExpectedOption;
-    const wide_option = std.mem.find(u8, wide.items, "off") orelse return error.TestExpectedOption;
-    const expected_column = 2 + display_width.visibleWidth("Workspace") + 4;
-    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(medium.items[0..medium_option]));
-    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(wide.items[0..wide_option]));
-}
-
-test "workspace menu keeps paths and status on the same width-safe row" {
-    var entries = [_]workspace_access.Entry{.{
-        .path = @constCast("/Users/example/Developer/Spark/docs"),
-        .saved = true,
-        .command_line = false,
-        .available = true,
-        .active = true,
-    }};
-    const projection: CompactCommandMenuProjection = .{ .workspace = .{
-        .active = true,
-        .selected_row = 1,
-        .primary_directory = "/Users/example/Developer/Spark",
-        .entries = &entries,
-    } };
-
-    try std.testing.expectEqual(@as(u16, 8), desiredRowCount(projection, 80));
-    var primary = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 8, 120);
-    defer primary.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, primary.items, "Primary") != null);
-    try std.testing.expect(std.mem.find(u8, primary.items, "/Users/example/Developer/Spark") != null);
-
-    var entry = try composeCompactCommandMenuRow(std.testing.allocator, projection, 6, 8, 120);
-    defer entry.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.findScalar(u8, entry.items, '\n') == null);
-    try std.testing.expect(std.mem.find(u8, entry.items, "/Users/example/Developer/Spark/docs") != null);
-    try std.testing.expect(std.mem.find(u8, entry.items, "Active · Saved") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(entry.items) <= 120);
-}
-
-test "workspace menu anchors metadata and prioritizes the selected tiny action" {
-    var entries = [_]workspace_access.Entry{
-        .{
-            .path = @constCast("/short"),
-            .saved = true,
-            .command_line = false,
-            .available = true,
-            .active = true,
-        },
-        .{
-            .path = @constCast("/this/is/a/much-longer-path"),
-            .saved = true,
-            .command_line = false,
-            .available = true,
-            .active = true,
-        },
-    };
-    const projection: CompactCommandMenuProjection = .{ .workspace = .{
-        .active = true,
-        .selected_row = 2,
-        .primary_directory = "/workspace",
-        .entries = &entries,
-    } };
-
-    var header = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 9, 80);
-    defer header.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, header.items, "Workspace") != null);
-    try std.testing.expect(std.mem.find(u8, header.items, "Workspace:") == null);
-
-    var tiny = try composeCompactCommandMenuRow(std.testing.allocator, projection, 0, 1, 100);
-    defer tiny.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, tiny.items, "much-longer-path") != null);
-
-    var medium = try composeCompactCommandMenuRow(std.testing.allocator, projection, 6, 9, 80);
-    defer medium.deinit(std.testing.allocator);
-    var wide = try composeCompactCommandMenuRow(std.testing.allocator, projection, 6, 9, 180);
-    defer wide.deinit(std.testing.allocator);
-    const medium_status = std.mem.find(u8, medium.items, "Active · Saved") orelse return error.TestExpectedStatus;
-    const wide_status = std.mem.find(u8, wide.items, "Active · Saved") orelse return error.TestExpectedStatus;
-    const expected_column = 2 + display_width.visibleWidth("/this/is/a/much-longer-path") + 4;
-    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(medium.items[0..medium_status]));
-    try std.testing.expectEqual(expected_column, display_width.visibleWidthIgnoringAnsi(wide.items[0..wide_status]));
-}
-
-test "workspace menu keeps launch-only roots visible but not selectable" {
-    var entries = [_]workspace_access.Entry{
-        .{
-            .path = @constCast("/tmp/launch-only"),
-            .saved = false,
-            .command_line = true,
-            .available = true,
-            .active = true,
-        },
-        .{
-            .path = @constCast("/tmp/saved"),
-            .saved = true,
-            .command_line = false,
-            .available = true,
-            .active = true,
-        },
-    };
-    const projection: CompactCommandMenuProjection = .{ .workspace = .{
-        .active = true,
-        .selected_row = 2,
-        .primary_directory = "/tmp/workspace",
-        .entries = &entries,
-    } };
-
-    try std.testing.expectEqual(@as(u16, 9), desiredRowCount(projection, 80));
-    var launch_only = try composeCompactCommandMenuRow(std.testing.allocator, projection, 6, 9, 80);
-    defer launch_only.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, launch_only.items, "Launch only") != null);
-    try std.testing.expect(std.mem.find(u8, launch_only.items, "❯") == null);
-
-    var saved = try composeCompactCommandMenuRow(std.testing.allocator, projection, 7, 9, 80);
-    defer saved.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, saved.items, "❯ /tmp/saved") != null);
-}
-
-test "compact command menu rows stay single-line and width safe" {
-    const projection: CompactCommandMenuProjection = .{ .statusline = .{
-        .active = true,
-    } };
-    for ([_]u16{ 1, 4, 18 }) |width| {
-        var row = try composeCompactCommandMenuRow(std.testing.allocator, projection, 2, 4, width);
-        defer row.deinit(std.testing.allocator);
-        try std.testing.expect(std.mem.findScalar(u8, row.items, '\n') == null);
-        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
-    }
 }

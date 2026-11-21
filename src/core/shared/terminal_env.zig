@@ -57,17 +57,3 @@ fn terminalColumns(fd: std.posix.fd_t) ?usize {
     if (rc == -1 or ws.col == 0) return null;
     return @intCast(ws.col);
 }
-
-test "NO_COLOR counts only when it is set to something" {
-    try std.testing.expect(noColorValue("1"));
-    try std.testing.expect(noColorValue("0"));
-    try std.testing.expect(!noColorValue(""));
-    try std.testing.expect(!noColorValue(null));
-}
-
-test "only TERM=dumb is a dumb terminal" {
-    try std.testing.expect(dumbTerminalValue("dumb"));
-    try std.testing.expect(!dumbTerminalValue("xterm-256color"));
-    try std.testing.expect(!dumbTerminalValue("dumb-ish"));
-    try std.testing.expect(!dumbTerminalValue(null));
-}

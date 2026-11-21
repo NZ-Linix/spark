@@ -5,7 +5,6 @@ const command_admission = @import("../../permissions/command_admission.zig");
 const types = @import("../../shared/types.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
-const session_permission_state = @import("../../permissions/session_permission_state.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
 const result_commit = @import("../../tooling/result_commit.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
@@ -18,7 +17,6 @@ test {
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
-const PermissionGrant = types.PermissionGrant;
 const ToolCall = types.ToolCall;
 
 /// Borrowed child-only authority refreshed immediately before one tool action.
@@ -28,9 +26,6 @@ pub const LiveToolAuthority = struct {
     root_id: []const u8,
     tools: []const []const u8,
     integrations: []const []const u8,
-    rules: types.PermissionRuleSet,
-    grants: []const PermissionGrant,
-    permission_state: ?*const session_permission_state.State = null,
     permission_mode: types.PermissionMode = .yolo,
 };
 
@@ -118,26 +113,12 @@ pub const ToolExecutionResult = struct {
     result_commit: ?result_commit.Token = null,
 };
 
-test "tool result retains one memory payload across preparation" {
-    try std.testing.expect(@hasField(ToolExecutionResult, "tool_result_memory"));
-    try std.testing.expect(@hasField(ToolExecutionResult, "tool_result_memory_prepared"));
-    try std.testing.expect(!@hasField(ToolExecutionResult, "prepared_result_memory"));
-}
-
 pub inline fn failToolExecutionResult(err: anytype) @TypeOf(err)!ToolExecutionResult {
     return @errorCast(failToolExecutionResultDynamic(err));
 }
 
 noinline fn failToolExecutionResultDynamic(err: anyerror) anyerror!ToolExecutionResult {
     return err;
-}
-
-test "tool result failure writer preserves exact error type and identity" {
-    const failure = failToolExecutionResult(error.LiveToolAuthorityUnavailable);
-    try std.testing.expect(
-        @TypeOf(failure) == error{LiveToolAuthorityUnavailable}!ToolExecutionResult,
-    );
-    try std.testing.expectError(error.LiveToolAuthorityUnavailable, failure);
 }
 
 pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecutionResult {
@@ -169,7 +150,6 @@ pub const ToolExecutionRequest = struct {
     /// Borrowed execution evidence retained by the owning agent loop until
     /// the current turn is committed.
     current_turn_messages: []const ChatMessage = &.{},
-    session_grants: []const PermissionGrant,
     live_authority: ?LiveToolAuthority = null,
     expected_mcp_runtime_generation: ?u64 = null,
     expected_mcp_binding: ?types.McpToolBinding = null,

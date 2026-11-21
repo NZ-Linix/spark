@@ -1,5 +1,4 @@
 const std = @import("std");
-const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const js_host_config_store = @import("../config/js_host_config_store.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
@@ -33,9 +32,7 @@ pub fn Runtime(comptime App: type) type {
 
             if (try loadValue(app, "mode")) |mode_id| {
                 defer app.alloc.free(mode_id);
-                if (modes.lookup(mode_id)) |mode| {
-                    app_permission_runtime.Runtime(App).setMode(app, agent, mode.permission_mode);
-                } else {
+                if (modes.lookup(mode_id) == null) {
                     debug_trace.logf(
                         "host_config",
                         "restore_ignored id=mode reason=unknown_value",
@@ -88,10 +85,4 @@ fn configIdForPermissionMode(mode: PermissionMode) []const u8 {
         .ask => "ask",
         .yolo => "full-access",
     };
-}
-
-test "host config maps permission modes to restorable product modes" {
-    try std.testing.expectEqualStrings("auto", configIdForPermissionMode(.auto));
-    try std.testing.expectEqualStrings("ask", configIdForPermissionMode(.ask));
-    try std.testing.expectEqualStrings("full-access", configIdForPermissionMode(.yolo));
 }

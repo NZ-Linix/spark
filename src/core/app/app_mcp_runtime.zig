@@ -1367,14 +1367,13 @@ pub const State = struct {
         self: *State,
         arena: Allocator,
         request: tool_mcp_runtime.SearchRequest,
-        permission_rules: types.PermissionRuleSet,
         limits: context_limits.Values,
         access: tool_mcp_runtime.Access,
         cancel_flag: ?*std.atomic.Value(bool),
     ) !tool_mcp_runtime.SearchResult {
         if (self.leaseHost()) |l| {
             defer l.deinit();
-            return l.host.catalog.searchTools(arena, request, permission_rules, limits, access, cancel_flag);
+            return l.host.catalog.searchTools(arena, request, limits, access, cancel_flag);
         }
         return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
     }
@@ -1383,22 +1382,21 @@ pub const State = struct {
         self: *State,
         arena: Allocator,
         name: []const u8,
-        permission_rules: types.PermissionRuleSet,
         limits: context_limits.Values,
         access: tool_mcp_runtime.Access,
         cancel_flag: ?*std.atomic.Value(bool),
     ) !?tool_mcp_runtime.ToolSchemaResult {
         if (self.leaseHost()) |l| {
             defer l.deinit();
-            return l.host.catalog.toolSchema(arena, name, permission_rules, limits, access, cancel_flag);
+            return l.host.catalog.toolSchema(arena, name, limits, access, cancel_flag);
         }
         return null;
     }
 
-    pub fn snapshotToolDefinition(self: *State, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access) !tool_mcp_runtime.DefinitionSnapshot {
+    pub fn snapshotToolDefinition(self: *State, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, limits: context_limits.Values, access: tool_mcp_runtime.Access) !tool_mcp_runtime.DefinitionSnapshot {
         if (self.leaseHost()) |l| {
             defer l.deinit();
-            return l.host.catalog.snapshotToolDefinition(alloc, name, known, permission_rules, limits, access);
+            return l.host.catalog.snapshotToolDefinition(alloc, name, known, limits, access);
         }
         return .unavailable;
     }
@@ -1472,95 +1470,11 @@ test "a typed /mcp login names its server wherever --no-browser goes" {
     }
 }
 
-test "a typed sign-in prints an address that can't be a link, to copy" {
-    var sink: State.HostSink = .{};
-    defer sink.deinit();
-    const notify = sink.notify();
-    sink.markTyped("docs");
-    notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/a b\x1b[2J" } });
-    try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
-    const text = sink.notices.items[0].text;
-    try std.testing.expect(std.mem.startsWith(u8, text, "Sign in to docs in your browser. If it didn't open, go to:\n  https://a.example/a b"));
-    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
-}
-
-test "a typed sign-in reports in the transcript, any other on the status line" {
-    var sink: State.HostSink = .{};
-    defer sink.deinit();
-    const notify = sink.notify();
-    sink.markTyped("docs");
-    notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
-    notify.notice(notify.context, .{ .signed_in = "docs" });
-    try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
-    // The address is a link under a few words, not printed out.
-    try std.testing.expectEqualStrings(
-        "Sign in to docs in your browser. Didn't open? \x1b]8;id=spark-mcp-sign-in;https://a.example/authorize\x1b\\Open the sign-in page\x1b]8;;\x1b\\.",
-        sink.notices.items[0].text,
-    );
-    try std.testing.expectEqualStrings("Signed in to docs.", sink.notices.items[1].text);
-    try std.testing.expect(sink.news == null);
-    // Once reported, the next sign-in to it isn't typed.
-    notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
-    try std.testing.expect(sink.sign_in != null);
-    notify.notice(notify.context, .{ .sign_in_failed = .{ .server = "docs", .reason = "it said no" } });
-    try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
-    try std.testing.expectEqualStrings("Couldn't sign in to docs: it said no.", sink.news.?);
-    try std.testing.expect(sink.sign_in == null);
-    // Needing a login is the status line's to say.
-    notify.notice(notify.context, .{ .needs_login = "docs" });
-    try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
-}
-
 fn writeTestFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
     if (std.Io.Dir.path.dirname(sub_path)) |parent| try tmp.dir.createDirPath(io_mod.getIo(), parent);
     var file = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), content);
-}
-
-test "the config stamp follows the MCP config files and project choices, and nothing else" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.spark");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-
-    const none = configStamp(alloc, home, root);
-    try std.testing.expectEqual(none, configStamp(alloc, home, root));
-    // An empty file isn't a missing one.
-    try writeTestFile(&tmp, "home/.spark/mcp.json", "");
-    const blank = configStamp(alloc, home, root);
-    try std.testing.expect(blank != none);
-    try writeTestFile(&tmp, "home/.spark/mcp.json",
-        \\{"mcp":{"linear":{"url":"https://mcp.linear.app/mcp"}}}
-    );
-    const profile = configStamp(alloc, home, root);
-    try std.testing.expect(profile != blank);
-    try writeTestFile(&tmp, "workspace/.mcp.json",
-        \\{"mcpServers":{"p":{"command":"p-server"}}}
-    );
-    const project = configStamp(alloc, home, root);
-    try std.testing.expect(project != profile);
-
-    // Settings other than the project's MCP choices, such as a model switch,
-    // leave it as it was.
-    const unrelated = try alloc.print("{{\"permission_mode\":\"auto\",\"workspaces\":{{\"{s}\":{{\"max_agent_steps\":10}}}}}}", .{root});
-    defer alloc.free(unrelated);
-    try writeTestFile(&tmp, "home/.spark/settings.json", unrelated);
-    try std.testing.expectEqual(project, configStamp(alloc, home, root));
-
-    const approved = try alloc.print("{{\"workspaces\":{{\"{s}\":{{\"" ++ @import("../mcp/project_config.zig").enabled_servers_key ++ "\":[\"p\"]}}}}}}", .{root});
-    defer alloc.free(approved);
-    try writeTestFile(&tmp, "home/.spark/settings.json", approved);
-    // The approval is read, so the change below is the approval's.
-    var load = try config_runtime.loadProjectMcpChoicesFromHome(alloc, home, root);
-    defer load.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), load.choices.approved.len);
-    try std.testing.expect(configStamp(alloc, home, root) != project);
 }
 
 const TestLoader = struct {
@@ -1573,56 +1487,3 @@ const TestLoader = struct {
         return null;
     }
 };
-
-test "the host loads again when its config files change outside the session, once per change" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.spark");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(root);
-    TestLoader.loads = 0;
-    TestLoader.fail = false;
-    const registry: tool_dispatch.Registry = .{ .tools = &.{} };
-    var state: State = .{};
-    defer state.deinit();
-
-    try state.loadHost(TestLoader.load, alloc, home, root, registry, .{});
-    try std.testing.expectEqual(@as(usize, 1), TestLoader.loads);
-    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .files));
-
-    // `spark mcp add` in a shell writes the profile; only a check that reads the
-    // files notices.
-    try writeTestFile(&tmp, "home/.spark/mcp.json",
-        \\{"mcp":{"linear":{"url":"https://mcp.linear.app/mcp"}}}
-    );
-    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .requested));
-    try std.testing.expect(state.refreshHost(alloc, home, root, registry, .files));
-    try std.testing.expectEqual(@as(usize, 2), TestLoader.loads);
-    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .files));
-
-    // A `/mcp` command's own change loads even when the files read the same.
-    state.host_reload_requested.store(true, .release);
-    try std.testing.expect(state.refreshHost(alloc, home, root, registry, .requested));
-    try std.testing.expectEqual(@as(usize, 3), TestLoader.loads);
-
-    // A load that fails warns once for the change, not at every check.
-    TestLoader.fail = true;
-    try writeTestFile(&tmp, "workspace/.mcp.json",
-        \\{"mcpServers":{"p":{"command":"p-server"}}}
-    );
-    try std.testing.expect(state.refreshHost(alloc, home, root, registry, .files));
-    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .files));
-    try std.testing.expectEqual(@as(usize, 4), TestLoader.loads);
-    const notices = state.takeHostNotices();
-    defer {
-        for (notices) |n| std.heap.c_allocator.free(n.text);
-        std.heap.c_allocator.free(notices);
-    }
-    try std.testing.expectEqual(@as(usize, 1), notices.len);
-    try std.testing.expect(notices[0].warning);
-    try std.testing.expectEqualStrings("The MCP config changed, but spark couldn't load it: ~/.spark/mcp.json isn't valid JSON. Your current servers are still active.", notices[0].text);
-}

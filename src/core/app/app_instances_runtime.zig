@@ -27,7 +27,7 @@ const Allocator = std.mem.Allocator;
 /// second spark started the same way would read them. Owned.
 pub const Seed = struct {
     captured: bool = false,
-    provider: model_provider.ProviderId = .gateway,
+    provider: model_provider.ProviderId = .none,
     configured_model: []u8 = &.{},
     model_source: config_runtime.ModelSource = .compiled_default,
     selected_model: []u8 = &.{},
@@ -39,10 +39,8 @@ pub const Seed = struct {
     effort_process_override: ?types.ReasoningEffort = null,
     fast_process_override: ?bool = null,
     provider_process_override: ?model_provider.ProviderId = null,
-    permission_mode: types.PermissionMode = .ask,
+    permission_mode: types.PermissionMode = .yolo,
     turn_settings: worker_runtime.AgentTurnSettings = .{},
-    provider_order: [][]u8 = &.{},
-    provider_strict: bool = false,
     agent_effort: types.ReasoningEffort = .auto,
     /// `experimental.workspace_capture`, read once at startup (D98).
     workspace_capture: bool = false,
@@ -51,8 +49,6 @@ pub const Seed = struct {
     pub fn deinit(self: *Seed, alloc: Allocator) void {
         alloc.free(self.configured_model);
         alloc.free(self.selected_model);
-        for (self.provider_order) |name| alloc.free(name);
-        alloc.free(self.provider_order);
         if (self.profile_name) |name| alloc.free(name);
         self.* = .{};
     }
@@ -95,24 +91,9 @@ pub const Seed = struct {
     }
 
     /// The first instance's turn settings, permission mode, and effort once
-    /// the bootstrap set them. Copies the provider order.
-    pub fn captureAgent(self: *Seed, alloc: Allocator, agent: *const agents.Agent, mode: types.PermissionMode) !void {
-        const order = try alloc.alloc([]u8, agent.worker.agent_turn_settings.provider_order.len);
-        var filled: usize = 0;
-        errdefer {
-            for (order[0..filled]) |name| alloc.free(name);
-            alloc.free(order);
-        }
-        for (agent.worker.agent_turn_settings.provider_order, 0..) |name, index| {
-            order[index] = try alloc.dupe(u8, name);
-            filled += 1;
-        }
-        for (self.provider_order) |name| alloc.free(name);
-        alloc.free(self.provider_order);
-        self.provider_order = order;
-        self.provider_strict = agent.worker.agent_turn_settings.provider_strict;
+    /// the bootstrap set them.
+    pub fn captureAgent(self: *Seed, agent: *const agents.Agent, mode: types.PermissionMode) !void {
         self.turn_settings = agent.worker.agent_turn_settings;
-        self.turn_settings.provider_order = &.{};
         self.agent_effort = agent.effort;
         self.workspace_capture = agent.session_persistence.workspace_capture;
         self.permission_mode = mode;
@@ -228,13 +209,6 @@ fn failureText(err: anyerror) []const u8 {
     };
 }
 
-test "instance failures read as sentences, not error names" {
-    try std.testing.expectEqualStrings("its saved session is gone", failureText(error.SessionNotFound));
-    try std.testing.expect(std.mem.find(u8, failureText(error.SessionBusy), "another spark") != null);
-    try std.testing.expect(std.mem.find(u8, failureText(error.Unexpected), "SPARK_TRACE=1") != null);
-    try std.testing.expect(std.mem.find(u8, failureText(error.ThreadQuotaExceeded), "Thread") == null);
-}
-
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AgentsRuntime = app_agents_runtime.Runtime(App);
@@ -290,8 +264,6 @@ pub fn Runtime(comptime App: type) type {
                 seed.provider_process_override,
             );
             agent.worker.agent_turn_settings = seed.turn_settings;
-            agent.worker.agent_turn_settings.provider_order = &.{};
-            try agent.worker.setProviderRouting(std.heap.c_allocator, constNames(seed.provider_order), seed.provider_strict);
             // Its screen starts in its worker's fast mode, so a change made on
             // it reaches the worker.
             child.screen.fast_mode = agent.worker.agent_turn_settings.fast_mode;

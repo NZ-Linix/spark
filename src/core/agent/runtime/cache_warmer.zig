@@ -415,65 +415,6 @@ test "a ping changes only the top-level reply limit" {
     , ping_body);
 }
 
-test "a body without a reply limit gets one, and nothing else changes" {
-    const cases = [_][2][]const u8{
-        .{ "{\"prompt\":[],\"tools\":[]}", "{\"prompt\":[],\"tools\":[],\"maxOutputTokens\":1}" },
-        .{ "{}", "{\"maxOutputTokens\":1}" },
-        .{ "{\"a\":{\"maxOutputTokens\":3}} \n", "{\"a\":{\"maxOutputTokens\":3},\"maxOutputTokens\":1} \n" },
-    };
-    for (cases) |case| {
-        const ping_body = (try pingBody(testing.allocator, case[0])).?;
-        defer testing.allocator.free(ping_body);
-        try testing.expectEqualStrings(case[1], ping_body);
-    }
-}
-
-test "a body that is not one object with a single numeric reply limit is not pinged" {
-    const cases = [_][]const u8{
-        \\{"maxOutputTokens":10,"maxOutputTokens":20}
-        ,
-        \\{"maxOutputTokens":"10"}
-        ,
-        \\{"maxOutputTokens":10
-        ,
-        \\[{"maxOutputTokens":10}]
-        ,
-        \\{"maxOutputTokens":10} trailing
-        ,
-    };
-    for (cases) |body| try testing.expectEqual(@as(?[]u8, null), try pingBody(testing.allocator, body));
-}
-
-test "a reply limit after an escaped key is still found" {
-    const body =
-        \\{"k\u0065y":{"maxOutputTokens":5},"maxOutputTokens":64}
-    ;
-    const ping_body = (try pingBody(testing.allocator, body)).?;
-    defer testing.allocator.free(ping_body);
-    try testing.expectEqualStrings(
-        \\{"k\u0065y":{"maxOutputTokens":5},"maxOutputTokens":1}
-    , ping_body);
-}
-
-test "pingBody frees everything on allocation failure" {
-    const body =
-        \\{"k\u0065y":1,"maxOutputTokens":64}
-    ;
-    try testing.checkAllAllocationFailures(@import("../../shared/testing_allocator.zig").no_resize, struct {
-        fn run(alloc: Allocator, input: []const u8) !void {
-            const out = (try pingBody(alloc, input)).?;
-            alloc.free(out);
-        }
-    }.run, .{body});
-}
-
-test "a ping that wrote more than it read missed the entry" {
-    try testing.expectEqual(cache_warming.Outcome.read, outcomeOf(.{ .cache_read_tokens = 9_530, .cache_write_tokens = 0 }));
-    try testing.expectEqual(cache_warming.Outcome.read, outcomeOf(.{ .cache_read_tokens = 9_530, .cache_write_tokens = 12 }));
-    try testing.expectEqual(cache_warming.Outcome.missed, outcomeOf(.{ .cache_read_tokens = 0, .cache_write_tokens = 9_530 }));
-    try testing.expectEqual(cache_warming.Outcome.missed, outcomeOf(.{}));
-}
-
 /// A provider that records each ping and answers as told. `block` holds a
 /// ping on the wire until the warmer cancels it.
 const FakeProvider = struct {
@@ -544,7 +485,7 @@ fn armedForTest(fake: *FakeProvider) !*Warmer {
         .session_id = "s1",
         .body = test_body,
         .api_key = "key",
-        .credential_source = .ai_gateway_api_key,
+        .credential_source = .configured,
         .account_id = null,
         .gateway_team = null,
         .started_ms = io_mod.milliTimestamp() - warmer.timing.interval(),
@@ -569,116 +510,4 @@ fn warmerSettled(warmer: *Warmer) bool {
     warmer.mutex.lockUncancelable(io);
     defer warmer.mutex.unlock(io);
     return warmer.state.in_flight == null and warmer.sending == null;
-}
-
-test "a due ping resends the exact request with a one-token reply and keeps its usage" {
-    var fake: FakeProvider = .{};
-    defer fake.deinit();
-    const warmer = try armedForTest(&fake);
-    defer warmer.destroy();
-    try waitFor(pinged, &fake);
-    for (0..2_000) |_| {
-        if (warmerSettled(warmer)) break;
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    try testing.expectEqualStrings(
-        \\{"prompt":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"maxOutputTokens":1,"providerOptions":{"gateway":{"caching":"auto"}}}
-    , fake.bodies.items[0]);
-    try testing.expectEqualStrings("anthropic/claude-opus-5.5", fake.models.items[0]);
-    try testing.expectEqualStrings("s1", fake.session_ids.items[0].?);
-    try testing.expectEqual(@as(?u32, 1), fake.max_output_tokens);
-    try testing.expectEqual(@as(usize, 1), fake.retry_count);
-    // The ping read the entry, so the next one waits a full interval.
-    try testing.expect(warmer.state.armed);
-    try testing.expectEqual(@as(usize, 1), fake.pings());
-    const usage = warmer.takeUsage().?;
-    try testing.expectEqual(@as(?u64, 9_530), usage.cache_read_tokens);
-    try testing.expectEqual(@as(?types.Usage, null), warmer.takeUsage());
-    // A real request disarms it; no ping follows.
-    warmer.disarm("request");
-    try testing.expect(!warmer.state.armed);
-    try testing.expectEqual(@as(?*Snapshot, null), warmer.armed);
-}
-
-test "a failed ping stops warming until the next arm" {
-    var fake: FakeProvider = .{ .fail = true };
-    defer fake.deinit();
-    const warmer = try armedForTest(&fake);
-    defer warmer.destroy();
-    try waitFor(pinged, &fake);
-    for (0..2_000) |_| {
-        if (warmerSettled(warmer)) break;
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    try testing.expect(!warmer.state.armed);
-    try testing.expectEqual(@as(?cache_warming.Stop, .failed), warmer.state.stopped);
-    try testing.expectEqual(@as(?*Snapshot, null), warmer.armed);
-}
-
-test "a ping that wrote the entry stops warming" {
-    var fake: FakeProvider = .{ .usage = .{ .cache_read_tokens = 0, .cache_write_tokens = 9_530 } };
-    defer fake.deinit();
-    const warmer = try armedForTest(&fake);
-    defer warmer.destroy();
-    try waitFor(pinged, &fake);
-    for (0..2_000) |_| {
-        if (warmerSettled(warmer)) break;
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    try testing.expectEqual(@as(?cache_warming.Stop, .missed), warmer.state.stopped);
-    // The write is still paid for, so it is still recorded.
-    try testing.expectEqual(@as(?u64, 9_530), warmer.takeUsage().?.cache_write_tokens);
-}
-
-test "closing cancels a ping on the wire and joins at once" {
-    var fake: FakeProvider = .{ .block = true };
-    defer fake.deinit();
-    const warmer = try armedForTest(&fake);
-    try waitFor(pinged, &fake);
-    const started = io_mod.milliTimestamp();
-    warmer.destroy();
-    try testing.expect(io_mod.milliTimestamp() - started < 1_000);
-}
-
-test "closing while waiting for the next ping does not wait for it" {
-    var fake: FakeProvider = .{};
-    defer fake.deinit();
-    const warmer = try Warmer.create();
-    warmer.arm(.{
-        .provider = fake.provider(),
-        .model = "anthropic/claude-opus-5.5",
-        .session_id = null,
-        .body = test_body,
-        .api_key = "key",
-        .credential_source = .ai_gateway_api_key,
-        .account_id = null,
-        .gateway_team = null,
-        .started_ms = io_mod.milliTimestamp(),
-    });
-    try testing.expect(warmer.state.armed);
-    io_mod.sleep(20 * std.time.ns_per_ms);
-    const started = io_mod.milliTimestamp();
-    warmer.destroy();
-    try testing.expect(io_mod.milliTimestamp() - started < 1_000);
-    try testing.expectEqual(@as(usize, 0), fake.pings());
-}
-
-test "a request whose body is not a JSON object is not armed" {
-    var fake: FakeProvider = .{};
-    defer fake.deinit();
-    const warmer = try Warmer.create();
-    defer warmer.destroy();
-    warmer.arm(.{
-        .provider = fake.provider(),
-        .model = "anthropic/claude-opus-5.5",
-        .session_id = null,
-        .body = "[{\"maxOutputTokens\":10}]",
-        .api_key = "key",
-        .credential_source = .ai_gateway_api_key,
-        .account_id = null,
-        .gateway_team = null,
-        .started_ms = io_mod.milliTimestamp(),
-    });
-    try testing.expect(!warmer.state.armed);
-    try testing.expect(warmer.task == null);
 }

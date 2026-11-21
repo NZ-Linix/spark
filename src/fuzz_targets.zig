@@ -11,7 +11,6 @@ test {
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/auth/credentials.zig");
     _ = @import("core/auth/pending_revocation.zig");
-    _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/agent/runtime/execution_memory.zig");
     _ = @import("core/agent/runtime/orchestrator.zig");
     _ = @import("core/agent/runtime/parallel_execution.zig");
@@ -26,7 +25,6 @@ test {
     _ = @import("core/compactor/compactor.zig");
     _ = @import("core/app/host_record.zig");
     _ = @import("core/config/tool_placement.zig");
-    _ = @import("core/gateway/token_pass_memory.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_data.zig");
     _ = @import("core/images/image_route.zig");
@@ -69,7 +67,6 @@ test {
     _ = @import("core/workspace/tool_call_metrics.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = @import("gateway/client.zig");
-    _ = @import("gateway/openai_codex.zig");
     _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/sse.zig");
     _ = @import("main.zig");

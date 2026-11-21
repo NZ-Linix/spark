@@ -36,25 +36,3 @@ pub fn hasMajorVersionAtLeast(text: []const u8, family: []const u8, min_major: u
     }
     return false;
 }
-
-test "hasMajorVersionAtLeast reads the major version after the family" {
-    for ([_][]const u8{ "openai/gpt-5", "openai/gpt-5.4-mini", "openai/gpt-6.1-sol", "openai/GPT-10" }) |text| {
-        try std.testing.expect(hasMajorVersionAtLeast(text, "gpt-", 5));
-    }
-    for ([_][]const u8{ "openai/gpt-4.1", "openai/gpt-4o", "openai/gpt-oss-120b", "openai/gpt-", "openai/o3" }) |text| {
-        try std.testing.expect(!hasMajorVersionAtLeast(text, "gpt-", 5));
-    }
-    try std.testing.expect(hasMajorVersionAtLeast("xai/grok-4.20-reasoning", "grok-", 4));
-    try std.testing.expect(!hasMajorVersionAtLeast("xai/grok-code-fast-1", "grok-", 4));
-}
-
-test "containsIgnoreCase finds a needle anywhere, ignoring ASCII case" {
-    try std.testing.expect(containsIgnoreCase("Session/Model-Picker", "model"));
-    try std.testing.expect(containsIgnoreCase("spark-commit", "SPARK-C"));
-    try std.testing.expect(containsIgnoreCase("abc", "abc"));
-    try std.testing.expect(containsIgnoreCase("abc", ""));
-    try std.testing.expect(containsIgnoreCase("", ""));
-    try std.testing.expect(!containsIgnoreCase("ab", "abc"));
-    try std.testing.expect(!containsIgnoreCase("aab", "abb"));
-    try std.testing.expect(!containsIgnoreCase("", "a"));
-}

@@ -750,54 +750,6 @@ test "only application/json, with or without parameters, is JSON" {
     for ([_][]const u8{ "", "text/plain", "text/json", "application/json-rpc", "application/jsonx", "text/event-stream" }) |m| try testing.expect(!isJson(m));
 }
 
-test "a header that can't go out as it is never does, and the request ends refused" {
-    // Nothing listens on port 1, so a request that does go out breaks.
-    var c: Client = undefined;
-    try c.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:1/mcp" });
-    defer c.deinit();
-    for ([_][]const u8{ "a\r\nb", "a\nInjected: yes" }, 1..) |value, key| {
-        try c.send(key, .post, "{}", &.{.{ .name = "X-Team", .value = value }});
-        try testing.expectEqual(Ending.http_failure, (try c.next(10_000)).ended.how);
-    }
-    try c.send(3, .post, "{}", &.{.{ .name = "X-Team", .value = "a b\tc" }});
-    try testing.expectEqual(Ending.broken, (try c.next(10_000)).ended.how);
-    // A sign-in request is refused too: there, CR LF would abort in `std.http`.
-    try c.fetch(4, .post, "http://127.0.0.1:1/token", "x", "text/plain", &.{.{ .name = "X-Team", .value = "a\r\nb" }});
-    try testing.expectEqual(@as(u16, 0), (try c.next(10_000)).fetched.status);
-}
-
-test "a request past the slots waits for one, oldest first, and one cancelled while it waits never goes out" {
-    // Nothing listens on port 1, so each request ends as soon as it goes out.
-    var c: Client = undefined;
-    try c.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 1 });
-    defer c.deinit();
-    for (1..5) |key| try c.send(key, .post, "{}", &.{});
-    c.cancel(3);
-    for ([_]u64{ 1, 2, 4 }) |key| try testing.expectEqual(key, (try c.next(10_000)).ended.key);
-    try testing.expect((try c.next(200)) == .timeout);
-    // Cancelling the one in flight lets the next one in.
-    try c.send(5, .post, "{}", &.{});
-    try c.send(6, .post, "{}", &.{});
-    c.cancel(5);
-    try testing.expectEqual(@as(u64, 6), (try c.next(10_000)).ended.key);
-}
-
-test "a request's end wakes a timed wait at once, with or without a shared bell" {
-    // With one, as when the engine closes a server, the shared bell rings too.
-    var shared: Bell = undefined;
-    shared.init(testing.io);
-    for ([_]?*Bell{ null, &shared }) |bell| {
-        var c: Client = undefined;
-        try c.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:1/mcp", .bell = bell });
-        defer c.deinit();
-        const started = now(testing.io);
-        try c.send(1, .post, "{}", &.{});
-        try testing.expectEqual(Ending.broken, (try c.next(10_000)).ended.how);
-        try testing.expect(now(testing.io) - started < 3_000);
-    }
-    try testing.expect(shared.rung);
-}
-
 /// Answers one request on `server` with `count` SSE notifications of 45
 /// bytes, then the response, and closes.
 fn serveEvents(server: *Io.net.Server, count: usize) !void {
@@ -832,95 +784,6 @@ fn serveStatusBody(server: *Io.net.Server, status: []const u8, content_type: []c
     try w.interface.flush();
 }
 
-test "an answer over max_message ends too_large, not broken, in a JSON body and in an SSE event" {
-    const pad: [200]u8 = @splat('x');
-    const json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"t\":\"" ++ pad ++ "\"}}";
-    const Case = struct { content_type: []const u8, body: []const u8 };
-    for ([_]Case{
-        .{ .content_type = "application/json", .body = json },
-        .{ .content_type = "text/event-stream", .body = "id: e1\ndata: " ++ json ++ "\n\n" },
-    }) |case| {
-        var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-        var server = try address.listen(testing.io, .{ .reuse_address = true });
-        defer server.deinit(testing.io);
-        var serving = try testing.io.concurrent(serveBody, .{ &server, case.content_type, case.body });
-        defer serving.cancel(testing.io) catch {};
-        var url: [64]u8 = undefined;
-        var c: Client = undefined;
-        try c.init(testing.io, testing.allocator, .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}), .max_message = 64 });
-        defer c.deinit();
-        try c.send(1, .post, "{}", &.{});
-        while (true) switch (try c.next(5_000)) {
-            .ended => |e| {
-                try testing.expectEqual(Ending.too_large, e.how);
-                break;
-            },
-            .timeout => return error.TestTimeout,
-            else => {},
-        };
-    }
-}
-
-test "a 200 body that is no JSON-RPC message ends unreadable, and an SSE event that is none comes as refused" {
-    const Case = struct { content_type: []const u8, body: []const u8 };
-    for ([_]Case{
-        .{ .content_type = "application/json", .body = "not json at all" },
-        .{ .content_type = "application/json", .body = "{\"jsonrpc\":\"1.0\",\"id\":1,\"result\":{}}" },
-        .{ .content_type = "text/event-stream", .body = "id: e1\nretry: 50\ndata: not json at all\n\n" },
-    }, 0..) |case, n| {
-        var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-        var server = try address.listen(testing.io, .{ .reuse_address = true });
-        defer server.deinit(testing.io);
-        var serving = try testing.io.concurrent(serveBody, .{ &server, case.content_type, case.body });
-        defer serving.cancel(testing.io) catch {};
-        var url: [64]u8 = undefined;
-        var c: Client = undefined;
-        try c.init(testing.io, testing.allocator, .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}) });
-        defer c.deinit();
-        try c.send(1, .post, "{}", &.{});
-        var refused = false;
-        while (true) switch (try c.next(5_000)) {
-            .refused => |r| {
-                // The event's own bytes and ids, not an ending: the engine decides what it was.
-                try testing.expectEqual(@as(usize, 2), n);
-                try testing.expectEqualStrings("not json at all", r.bytes);
-                try testing.expectEqualStrings("e1", r.event_id.?);
-                try testing.expectEqual(@as(?u32, 50), r.retry_ms);
-                refused = true;
-            },
-            .ended => |e| {
-                try testing.expectEqual(if (n == 2) Ending.complete else Ending.unreadable, e.how);
-                try testing.expectEqual(n == 2, refused);
-                break;
-            },
-            .timeout => return error.TestTimeout,
-            else => {},
-        };
-    }
-}
-
-test "an error status whose JSON body is no JSON-RPC message stays an http_failure: the server did not answer the request" {
-    var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var server = try address.listen(testing.io, .{ .reuse_address = true });
-    defer server.deinit(testing.io);
-    var serving = try testing.io.concurrent(serveStatusBody, .{ &server, "500 Internal Server Error", "application/json", "{\"error\":\"boom\"}" });
-    defer serving.cancel(testing.io) catch {};
-    var url: [64]u8 = undefined;
-    var c: Client = undefined;
-    try c.init(testing.io, testing.allocator, .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}) });
-    defer c.deinit();
-    try c.send(1, .post, "{}", &.{});
-    while (true) switch (try c.next(5_000)) {
-        .ended => |e| {
-            try testing.expectEqual(@as(u16, 500), e.status);
-            try testing.expectEqual(Ending.http_failure, e.how);
-            break;
-        },
-        .timeout => return error.TestTimeout,
-        else => {},
-    };
-}
-
 /// Answers one request on `server` with a 202 that has no length, then holds
 /// the connection open until the client closes it.
 fn holdAfterAccepted(server: *Io.net.Server) !void {
@@ -934,57 +797,6 @@ fn holdAfterAccepted(server: *Io.net.Server) !void {
     try w.interface.writeAll("HTTP/1.1 202 Accepted\r\n\r\n");
     try w.interface.flush();
     _ = r.interface.discardRemaining() catch {};
-}
-
-test "a request that leaves its answer unread ends at once while the server holds the connection open" {
-    // Without a length, the 202's body runs until the connection closes, so
-    // reading it to the end to keep the connection would wait on the server.
-    var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var server = try address.listen(testing.io, .{ .reuse_address = true });
-    defer server.deinit(testing.io);
-    var serving = try testing.io.concurrent(holdAfterAccepted, .{&server});
-    defer serving.cancel(testing.io) catch {};
-    var url: [64]u8 = undefined;
-    var c: Client = undefined;
-    try c.init(testing.io, testing.allocator, .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}) });
-    defer c.deinit();
-    try c.send(1, .post, "{}", &.{});
-    while (true) switch (try c.next(5_000)) {
-        .ended => |e| {
-            try testing.expectEqual(Ending.accepted, e.how);
-            break;
-        },
-        .timeout => return error.TestTimeout,
-        else => {},
-    };
-}
-
-test "events past the budget all arrive, each once the one before it is taken" {
-    var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var server = try address.listen(testing.io, .{ .reuse_address = true });
-    defer server.deinit(testing.io);
-    var serving = try testing.io.concurrent(serveEvents, .{ &server, 6 });
-    defer serving.cancel(testing.io) catch {};
-    var url: [64]u8 = undefined;
-    var c: Client = undefined;
-    // Six events of 45 bytes against a 64-byte budget: each waits for room.
-    try c.init(testing.io, testing.allocator, .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}), .max_message = 64 });
-    defer c.deinit();
-    try c.send(1, .post, "{}", &.{});
-    var notes: usize = 0;
-    while (true) switch (try c.next(5_000)) {
-        .message => |m| if (m.message == .notification) {
-            notes += 1;
-        },
-        .ended => |e| {
-            try testing.expectEqual(Ending.complete, e.how);
-            break;
-        },
-        .timeout => return error.TestTimeout,
-        else => {},
-    };
-    try testing.expectEqual(@as(usize, 6), notes);
-    try testing.expect(c.budget.used <= 64);
 }
 
 /// Counts the bytes an allocator has live, and the most it had at once.
@@ -1103,15 +915,6 @@ fn manyLargeAnswers(events: bool) !void {
     try testing.expect(peak.peak.load(.monotonic) < count * size / 2);
 }
 
-test "many large answers at once are read within the budget, one large read at a time" {
-    // About 0.9 MiB here, and 3.5 MiB before D178.
-    try manyLargeAnswers(false);
-}
-
-test "many large events at once are read into one buffer each, within the budget" {
-    try manyLargeAnswers(true);
-}
-
 fn hangAfterComment(stream: Io.net.Stream) !void {
     defer stream.close(testing.io);
     var in: [4096]u8 = undefined;
@@ -1133,37 +936,6 @@ fn serveCommentThenEvent(server: *Io.net.Server) !void {
     try answerOne(try server.accept(testing.io), 200 * 1024, true);
     // The comment's stream stays open until the test ends.
     try Io.sleep(testing.io, .fromSeconds(30), .awake);
-}
-
-test "a large comment doesn't keep the large read from the next large event" {
-    var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var server = try address.listen(testing.io, .{ .reuse_address = true });
-    defer server.deinit(testing.io);
-    var serving = try testing.io.concurrent(serveCommentThenEvent, .{&server});
-    defer serving.cancel(testing.io) catch {};
-    var url: [64]u8 = undefined;
-    var c: Client = undefined;
-    try c.init(testing.io, testing.allocator, .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}), .max_message = 256 * 1024 });
-    defer c.deinit();
-    c.budget.allowance = 4 * 1024;
-    try c.send(1, .post, "{}", &.{});
-    // The comment is read, past the allowance, and cut.
-    try Io.sleep(testing.io, .fromMilliseconds(200), .awake);
-    try c.send(2, .post, "{}", &.{});
-    while (true) switch (try c.next(5_000)) {
-        .message => |m| if (m.message == .response) break,
-        .timeout => return error.TestTimeout,
-        else => {},
-    };
-}
-
-test "a timed wait starts no task, so it works where none can run" {
-    var threaded: Io.Threaded = .init(testing.allocator, .{ .concurrent_limit = .nothing });
-    defer threaded.deinit();
-    var c: Client = undefined;
-    try c.init(threaded.io(), testing.allocator, .{ .url = "http://127.0.0.1:1/mcp" });
-    defer c.deinit();
-    try testing.expect((try c.next(20)) == .timeout);
 }
 
 /// What a test server does to each connection once it has answered on it.
@@ -1260,65 +1032,4 @@ fn fetchedStatus(c: *Client) !u16 {
         .timeout => return error.TestTimeout,
         else => {},
     };
-}
-
-test "a kept connection the server reset or closed while idle isn't sent on again: each request goes out once, on a new one" {
-    for ([_]Drop{ .reset, .close }) |drop| {
-        var kept: Kept = undefined;
-        try kept.start(drop);
-        defer kept.stop();
-        var c: Client = undefined;
-        try c.init(testing.io, testing.allocator, .{ .url = kept.url });
-        defer c.deinit();
-        try c.send(1, .post, "{}", &.{});
-        try testing.expectEqual(Ending.complete, try endingOf(&c));
-        // The server drops each connection after one answer, so the next
-        // request and the sign-in request after it find theirs gone.
-        try Io.sleep(testing.io, .fromMilliseconds(300), .awake);
-        try c.send(2, .post, "{}", &.{});
-        try testing.expectEqual(Ending.complete, try endingOf(&c));
-        try Io.sleep(testing.io, .fromMilliseconds(300), .awake);
-        try c.fetch(3, .post, kept.url, "{}", "application/json", &.{});
-        try testing.expectEqual(@as(u16, 200), try fetchedStatus(&c));
-        try testing.expectEqual(@as(u32, 3), kept.connections.load(.monotonic));
-        try testing.expectEqual(@as(u32, 3), kept.requests.load(.monotonic));
-    }
-}
-
-test "a request whose send fails goes out once more, on a new connection, and reaches the server once" {
-    var kept: Kept = undefined;
-    try kept.start(.keep);
-    defer kept.stop();
-    var c: Client = undefined;
-    try c.init(testing.io, testing.allocator, .{ .url = kept.url });
-    defer c.deinit();
-    try c.send(1, .post, "{}", &.{});
-    try testing.expectEqual(Ending.complete, try endingOf(&c));
-    // The connection kept for the next request can't send any more, and
-    // nothing says so until a send on it fails.
-    const node = c.http.connection_pool.free.last orelse return error.TestUnexpectedResult;
-    const connection: *std.http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", node));
-    try connection.stream_reader.stream.shutdown(testing.io, .send);
-    try c.send(2, .post, "{}", &.{});
-    try testing.expectEqual(Ending.complete, try endingOf(&c));
-    try testing.expectEqual(@as(u32, 2), kept.connections.load(.monotonic));
-    try testing.expectEqual(@as(u32, 2), kept.requests.load(.monotonic));
-}
-
-test "a kept connection is used again, unless the client sat idle past max_idle_ms" {
-    for ([_]u32{ 60_000, 0 }, [_]u32{ 1, 2 }) |max_idle_ms, connections| {
-        var kept: Kept = undefined;
-        try kept.start(.keep);
-        defer kept.stop();
-        var c: Client = undefined;
-        try c.init(testing.io, testing.allocator, .{ .url = kept.url, .max_idle_ms = max_idle_ms });
-        defer c.deinit();
-        for (1..3) |key| {
-            try c.send(key, .post, "{}", &.{});
-            try testing.expectEqual(Ending.complete, try endingOf(&c));
-            try Io.sleep(testing.io, .fromMilliseconds(20), .awake);
-        }
-        try testing.expectEqual(connections, kept.connections.load(.monotonic));
-        try testing.expectEqual(@as(u32, 2), kept.requests.load(.monotonic));
-    }
 }

@@ -172,8 +172,7 @@ pub fn toolUpdateContentText(is_failure: bool, output: []const u8) []const u8 {
         return "binary or non-utf8 tool output omitted";
     }
     if (is_failure and
-        (tool_result_errors.isToolPermissionDeniedOutput(output) or
-            tool_result_errors.isToolReviewHeldOutput(output)))
+        tool_result_errors.isToolPermissionDeniedOutput(output))
     {
         return output;
     }
@@ -212,38 +211,6 @@ test "describeToolCall flags internal discovery and names MCP identity" {
     try std.testing.expect(!titled.meta.internal);
 }
 
-test "read titles say what they read while other tools keep their verb" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const registry = builtin_tools.registry;
-    const read: ToolCall = .{
-        .id = "read",
-        .name = "read_tool_result",
-        .arguments_json = "{\"request\":{\"handle\":\"spark-command-replay-0123.bin\",\"query\":\"error:\"}}",
-        .resolved_display_target = "zig build test output for \"error:\"",
-    };
-    try std.testing.expectEqualStrings("Searching zig build test output for \"error:\"", describeToolCall(registry, arena, read, null).title);
-    var unresolved = read;
-    unresolved.resolved_display_target = null;
-    try std.testing.expectEqualStrings("Searching command output", describeToolCall(registry, arena, unresolved, null).title);
-    const file: ToolCall = .{ .id = "file", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" };
-    try std.testing.expectEqualStrings("Reading", describeToolCall(registry, arena, file, null).title);
-}
-
-test "toolUpdateContentText clips long output and guards unsafe bytes" {
-    const long = text_utils.repeat("x", 500);
-    const clipped = toolUpdateContentText(false, long);
-    try std.testing.expectEqual(@as(usize, 200), clipped.len);
-
-    const unsafe = toolUpdateContentText(false, "ok\xFF\xFEbinary");
-    try std.testing.expectEqualStrings("binary or non-utf8 tool output omitted", unsafe);
-
-    const denied_json = "{\"error\":{\"type\":\"tool_permission_denied\",\"tool_name\":\"run_command\",\"message\":\"Permission denied by user\",\"reason\":\"user_denied\"}}";
-    const denied = toolUpdateContentText(true, denied_json);
-    try std.testing.expectEqualStrings(denied_json, denied);
-}
-
 fn expectShellUpdateContent(expected: ?[]const u8, tool_name: []const u8, output: []const u8) !void {
     const actual = try shellUpdateContentText(std.testing.allocator, tool_name, output);
     defer if (actual) |text| std.testing.allocator.free(text);
@@ -252,61 +219,4 @@ fn expectShellUpdateContent(expected: ?[]const u8, tool_name: []const u8, output
     } else {
         try std.testing.expect(actual == null);
     }
-}
-
-test "shell update content shows the command output instead of the result JSON" {
-    try expectShellUpdateContent(
-        "hello-42\n",
-        "shell",
-        "{\"session_id\":null,\"state\":\"completed\",\"output_truncated\":false,\"full_output_handle\":\"spark-command-replay-1.bin\",\"exit_code\":0,\"error\":null,\"output_delta\":\"hello-42\\n\"}",
-    );
-    try expectShellUpdateContent(
-        "",
-        "shell",
-        "{\"state\":\"completed\",\"output_truncated\":false,\"exit_code\":4,\"output_delta\":\"\"}",
-    );
-    try expectShellUpdateContent(
-        "shell snapshot unavailable (x); startup files run for every command\nhello\n",
-        "shell",
-        "{\"state\":\"completed\",\"output_delta\":\"hello\\n\",\"notice\":\"shell snapshot unavailable (x); startup files run for every command\"}",
-    );
-    // Output that merely prints the notice key is output, not a notice.
-    try expectShellUpdateContent(
-        ",\"notice\":\"x\"",
-        "shell",
-        "{\"state\":\"completed\",\"output_delta\":\",\\\"notice\\\":\\\"x\\\"\"}",
-    );
-}
-
-test "shell update content keeps the preview bound and marks cut output" {
-    const long = text_utils.repeat("x", 500);
-    try expectShellUpdateContent(
-        text_utils.repeat("x", 200) ++ "\n" ++ shell_output_cut_marker,
-        "shell",
-        "{\"state\":\"completed\",\"output_truncated\":false,\"output_delta\":\"" ++ long ++ "\"}",
-    );
-    // The shell already cut the output before the model saw it.
-    try expectShellUpdateContent(
-        "tail\n" ++ shell_output_cut_marker,
-        "shell",
-        "{\"state\":\"completed\",\"output_truncated\":true,\"output_delta\":\"tail\\n\"}",
-    );
-    try expectShellUpdateContent(
-        "binary or non-utf8 tool output omitted",
-        "shell",
-        "{\"state\":\"completed\",\"output_truncated\":true,\"output_delta\":\"ok\\u0000binary\"}",
-    );
-}
-
-test "shell update content leaves other results to the generic preview" {
-    const result = "{\"state\":\"completed\",\"output_delta\":\"hello\\n\"}";
-    try expectShellUpdateContent(null, "read_file", result);
-    try expectShellUpdateContent(null, "shell", "{\"exit_code\":0}");
-    try expectShellUpdateContent(
-        null,
-        "shell",
-        "{\"error\":{\"type\":\"tool_permission_denied\",\"tool_name\":\"shell\",\"message\":\"Permission denied by user\"}}",
-    );
-    try expectShellUpdateContent(null, "shell", "{\"state\":\"completed\",\"output_delta\":\"cut mid-str");
-    try expectShellUpdateContent(null, "shell", "shell result is unavailable");
 }

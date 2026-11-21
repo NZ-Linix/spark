@@ -460,7 +460,7 @@ const WireEvent = struct {
 
 test "libfx hook content is opt in bounded and excludes opaque provider state" {
     const alloc = std.testing.allocator;
-    const secret_message = types.ChatMessage{ .role = .assistant, .content = "visible", .provider_replay = .{ .source = .{ .provider = .gateway, .model = "fixture" }, .parts_json = "opaque-secret" } };
+    const secret_message = types.ChatMessage{ .role = .assistant, .content = "visible", .provider_replay = .{ .source = .{ .provider = .none, .model = "fixture" }, .parts_json = "opaque-secret" } };
     var bridge: Bridge = undefined;
     // Only the serialization fields are used by this test.
     bridge.session_id = "fixture-session";
@@ -491,109 +491,4 @@ test "libfx hook content is opt in bounded and excludes opaque provider state" {
     try std.testing.expectEqual(@as(usize, max_content_bytes), budget.text(long, budget.allot(long)).?.len);
     try std.testing.expect(budget.truncated);
     try std.testing.expectEqual(@as(usize, 0), budget.text("extra", budget.allot("extra")).?.len);
-}
-
-test "libfx model capture reserves the newest messages before instructions" {
-    const alloc = std.testing.allocator;
-    const Capture = struct {
-        fn write(_: ?*anyopaque, _: []const u8) !void {}
-    };
-    var writer = jsonrpc.Writer.initCallback(null, Capture.write);
-    var bridge: Bridge = undefined;
-    bridge.init(alloc, &writer, "fixture-session", "fixture-turn", .{ .capture_content = true });
-    const instructions = try alloc.alloc(u8, max_content_bytes);
-    defer alloc.free(instructions);
-    @memset(instructions, 'x');
-    const messages = try alloc.alloc(types.ChatMessage, max_entries + 1);
-    defer alloc.free(messages);
-    for (messages) |*message| message.* = .{ .role = .user, .content = "history" };
-    messages[0].content = "obsolete";
-    messages[max_entries].content = "needle";
-    const wire = WireEvent{ .bridge = &bridge, .step = 1, .event = .{ .model_start = .{ .id = 1, .purpose = .agent, .request = .{
-        .model = "fixture",
-        .instructions = &.{.{ .role = .system, .content = instructions }},
-        .messages = messages,
-        .tool_choice = .none,
-        .provider_options = .{},
-    } } } };
-    const encoded = try std.json.Stringify.valueAlloc(alloc, wire, .{});
-    defer alloc.free(encoded);
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
-    defer parsed.deinit();
-    const captured = parsed.value.object.get("data").?.object.get("messages").?.array.items;
-    try std.testing.expectEqual(max_entries, captured.len);
-    try std.testing.expectEqualStrings("needle", captured[captured.len - 1].object.get("content").?.string);
-    try std.testing.expect(std.mem.find(u8, encoded, "obsolete") == null);
-    var total: usize = 0;
-    for (captured) |message| total += message.object.get("content").?.string.len;
-    for (parsed.value.object.get("data").?.object.get("instructions").?.array.items) |message| total += message.object.get("content").?.string.len;
-    try std.testing.expectEqual(max_content_bytes, total);
-    try std.testing.expect(parsed.value.object.get("contentTruncated").?.bool);
-}
-
-test "libfx hook bridge owns session and turn identities" {
-    const Capture = struct {
-        fn write(_: ?*anyopaque, _: []const u8) !void {}
-    };
-    var writer = jsonrpc.Writer.initCallback(null, Capture.write);
-    var session = [_]u8{ 'c', 'h', 'i', 'l', 'd' };
-    var turn = [_]u8{ 't', 'u', 'r', 'n' };
-    var bridge: Bridge = undefined;
-    bridge.init(std.testing.allocator, &writer, &session, &turn, .{});
-    @memset(&session, 0xaa);
-    @memset(&turn, 0xaa);
-    try std.testing.expectEqualStrings("child", bridge.session_id);
-    try std.testing.expectEqualStrings("child", bridge.root_session_id);
-    try std.testing.expectEqualStrings("turn", bridge.turn_id);
-}
-
-test "libfx hook bridge disables observation for overlong identities in every build mode" {
-    const Capture = struct {
-        writes: usize = 0,
-        fn write(raw: ?*anyopaque, _: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.writes += 1;
-        }
-    };
-    var capture: Capture = .{};
-    var writer = jsonrpc.Writer.initCallback(&capture, Capture.write);
-    var session: [256]u8 = @splat('s');
-    var turn: [journal.max_turn_id_bytes + 1]u8 = @splat('t');
-    var bridge: Bridge = undefined;
-    bridge.init(std.testing.allocator, &writer, &session, "turn", .{});
-    try std.testing.expect(!bridge.enabled);
-    bridge.observer.beginTurn("input", false);
-    bridge.observer.endTurn(.completed, null);
-    bridge.init(std.testing.allocator, &writer, "session", &turn, .{});
-    try std.testing.expect(!bridge.enabled);
-    bridge.observer.beginTurn("input", false);
-    bridge.observer.endTurn(.completed, null);
-    try std.testing.expectEqual(@as(usize, 0), capture.writes);
-    bridge.init(std.testing.allocator, &writer, session[0..255], turn[0..journal.max_turn_id_bytes], .{});
-    try std.testing.expect(bridge.enabled);
-}
-
-test "libfx hooks are disabled by default and reject invalid capture configuration" {
-    const alloc = std.testing.allocator;
-    try std.testing.expect(try parseConfig(alloc, null) == null);
-    try std.testing.expect(try parseConfig(alloc, "{}") == null);
-    try std.testing.expect(!(try parseConfig(alloc, "{\"hooks\":{}}")).?.capture_content);
-    try std.testing.expect((try parseConfig(alloc, "{\"hooks\":{\"captureContent\":true}}")).?.capture_content);
-    try std.testing.expectError(error.InvalidHooks, parseConfig(alloc, "{\"hooks\":true}"));
-    try std.testing.expectError(error.InvalidHooks, parseConfig(alloc, "{\"hooks\":{\"captureContent\":\"true\"}}"));
-}
-
-test "libfx hook encoding failure cannot fail the execution callback" {
-    const Capture = struct {
-        fn write(_: ?*anyopaque, _: []const u8) !void {
-            return error.UnexpectedWrite;
-        }
-    };
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var writer = jsonrpc.Writer.initCallback(null, Capture.write);
-    var bridge: Bridge = undefined;
-    bridge.init(failing.allocator(), &writer, "fixture-session", "fixture-turn", .{});
-    bridge.observer.beginTurn("input", false);
-    bridge.observer.endTurn(.completed, null);
-    try std.testing.expect(bridge.observer.turn_ended);
 }

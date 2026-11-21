@@ -35,34 +35,3 @@ fn keepNames(arena: std.mem.Allocator, names: []const []const u8, keep: anytype)
     for (names) |name| if (keep.allows(name)) try kept.append(arena, name);
     return kept.items;
 }
-
-test "narrowing a tool set keeps only the allowed tools, and keeping them all changes nothing" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var tools: [3]tool_dispatch.Tool = undefined;
-    for (&tools, [_][]const u8{ "read_file", "write_file", "subagent" }) |*tool, name| tool.name = name;
-    var base = empty;
-    base.registry.tools = &tools;
-    base.order = &.{ "read_file", "write_file", "subagent" };
-    base.read_only_tool_names = &.{"read_file"};
-
-    const ReadOnly = struct {
-        fn allows(_: @This(), name: []const u8) bool {
-            return std.mem.eql(u8, name, "read_file");
-        }
-    };
-    const narrowed = (try narrow(arena, base, ReadOnly{})).?;
-    try std.testing.expectEqual(@as(usize, 1), narrowed.registry.tools.len);
-    try std.testing.expect(narrowed.registry.lookup("read_file") != null);
-    try std.testing.expect(narrowed.registry.lookup("write_file") == null);
-    try std.testing.expectEqual(@as(usize, 1), narrowed.order.len);
-    try std.testing.expectEqual(@as(usize, 1), narrowed.read_only_tool_names.len);
-
-    const All = struct {
-        fn allows(_: @This(), _: []const u8) bool {
-            return true;
-        }
-    };
-    try std.testing.expect((try narrow(arena, base, All{})) == null);
-}

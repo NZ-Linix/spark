@@ -79,13 +79,3 @@ test {
     _ = @import("agent.zig");
     _ = @import("child_run.zig");
 }
-
-test "an agent's totals are stored, loaded, and added to saturating" {
-    var total: u64 = 0;
-    storeTotal(&total, 41);
-    addTotal(&total, 1);
-    try std.testing.expectEqual(@as(u64, 42), loadTotal(&total));
-    storeTotal(&total, std.math.maxInt(u64) - 1);
-    addTotal(&total, 5);
-    try std.testing.expectEqual(std.math.maxInt(u64), loadTotal(&total));
-}

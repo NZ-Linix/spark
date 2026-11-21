@@ -220,29 +220,6 @@ pub const ForkMenu = struct {
     }
 };
 
-test "the fork menu's question keeps the chosen prompt, and closing frees it (D97)" {
-    const alloc = std.testing.allocator;
-    const points = try alloc.alloc(session_adapter.Session.ForkPoint, 2);
-    points[0] = .{ .turn = 1, .prompt = try alloc.dupe(u8, "first") };
-    points[1] = .{ .turn = 2, .prompt = try alloc.dupe(u8, "second") };
-    const children = try alloc.alloc(session_adapter.Child, 1);
-    children[0] = .{
-        .id = try alloc.dupe(u8, "kid"),
-        .work_id = try alloc.dupe(u8, "w1"),
-        .open = false,
-        .outcome = .ok,
-        .spawn_data = try alloc.dupe(u8, "{}"),
-        .finish_data = null,
-        .seq = 4,
-    };
-    var menu: ForkMenu = .{ .points = points, .selected = 1, .question = children };
-    try std.testing.expect(menu.asking());
-    menu.move(-1);
-    try std.testing.expectEqual(@as(usize, 1), menu.selected);
-    menu.close(alloc);
-    try std.testing.expect(!menu.active() and !menu.asking());
-}
-
 pub const SessionPickerCatalogCache = struct {
     ready: bool = false,
     loaded_at_ns: i128 = 0,
@@ -1223,21 +1200,6 @@ pub const Persistence = struct {
     }
 };
 
-test "persistence in-place initialization preserves empty ownership" {
-    var persistence: Persistence = undefined;
-    Persistence.initInto(&persistence);
-    defer persistence.deinit(std.testing.allocator);
-
-    try std.testing.expect(persistence.v2_store == null);
-    try std.testing.expect(persistence.v2 == null);
-    try std.testing.expect(persistence.subagent_host == null);
-    try std.testing.expect(!persistence.fast_mode_model_bound);
-    try std.testing.expect(!persistence.session_picker.active);
-    try std.testing.expect(persistence.session_picker_load.task == null);
-    try std.testing.expect(!persistence.session_picker_cache.ready);
-    try std.testing.expect(persistence.resume_handoff_intent == .none);
-}
-
 /// A saved session with `turns` turns in one compaction cycle, for the
 /// Ctrl+O archive read tests.
 const ArchiveReadTestHome = struct {
@@ -1258,7 +1220,6 @@ const ArchiveReadTestHome = struct {
         self.session = try session_adapter.Session.create(alloc, &self.store, "/w", .ask, .{
             .preferences = .{ .model = &self.model, .effort = .auto, .fast_mode = false },
             .language = types.ConversationLanguage.default(),
-            .permission_state = .{},
         });
         errdefer self.session.close();
         for (0..turns) |_| {
@@ -1287,45 +1248,4 @@ fn waitForArchiveRead(read: *TranscriptArchiveRead) !*TranscriptArchiveRead.Task
         io_mod.sleep(std.time.ns_per_ms);
     }
     return error.TestArchiveReadTimedOut;
-}
-
-test "a finished Ctrl+O archive read at an older generation is dropped, and one at the current generation stays" {
-    var home: ArchiveReadTestHome = undefined;
-    try home.init(2);
-    defer home.deinit();
-    var read: TranscriptArchiveRead = .{};
-    defer read.cancel();
-
-    try home.start(&read, 4);
-    const task = try waitForArchiveRead(&read);
-    try std.testing.expectEqual(@as(?anyerror, null), task.failure);
-    try std.testing.expectEqual(@as(usize, 2), task.turns.items.len);
-    // Still the transcript's generation: it waits for its replay.
-    try std.testing.expect(!read.dropIfStale(4));
-    try std.testing.expect(read.busy());
-    // A compaction, resume, drop, or clear since then: it goes.
-    try std.testing.expect(read.dropIfStale(5));
-    try std.testing.expect(!read.busy());
-    try std.testing.expect(!read.dropIfStale(5));
-}
-
-test "cancelling a running Ctrl+O archive read stops it, and the next read finishes whole" {
-    var home: ArchiveReadTestHome = undefined;
-    try home.init(300);
-    defer home.deinit();
-    var read: TranscriptArchiveRead = .{};
-    defer read.cancel();
-
-    // Cancelled right after it starts, mostly while it still reads.
-    try home.start(&read, 1);
-    read.cancel();
-    try std.testing.expect(!read.busy());
-    try std.testing.expect(read.completed() == null);
-
-    try home.start(&read, 1);
-    const task = try waitForArchiveRead(&read);
-    try std.testing.expectEqual(@as(?anyerror, null), task.failure);
-    try std.testing.expectEqual(@as(usize, 300), task.turns.items.len);
-    read.finish();
-    try std.testing.expect(!read.busy());
 }

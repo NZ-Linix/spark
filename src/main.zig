@@ -12,19 +12,14 @@ pub const version = "26.11.19";
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
-const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
-const js_host_auth = @import("core/auth/js_host_auth.zig");
+const builtin_oauth_http = @import("builtins/oauth_http.zig");
 const js_host_clipboard = @import("core/hosts/js_host_clipboard.zig");
 const credentials = @import("core/auth/credentials.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
-const usage = @import("usage/usage.zig");
-const usage_host = @import("core/app/usage_host.zig");
-const credits_lookup = @import("core/app/credits_lookup.zig");
-const token_pass_check = @import("core/app/token_pass_check.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
-const app_connect_runtime = @import("core/app/app_connect_runtime.zig");
+const app_provider_menu_runtime = @import("core/app/app_provider_menu_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
@@ -35,7 +30,6 @@ const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
-const app_permission_runtime = @import("core/app/app_permission_runtime.zig");
 const app_process_runtime = @import("core/app/app_process_runtime.zig");
 const managed_execution = @import("core/execution/managed_execution.zig");
 const prompt_history_runtime = @import("core/app/prompt_history_runtime.zig");
@@ -70,12 +64,9 @@ const prompts = @import("core/prompts/prompts.zig");
 const builtin_commands = @import("builtins/commands.zig");
 const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
-const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_providers = @import("builtins/providers.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
-const provider_catalog = @import("core/auth/provider_catalog.zig");
-const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
@@ -109,8 +100,6 @@ const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
 const command_admission = @import("core/permissions/command_admission.zig");
-const permission_auto_classifier = @import("core/permissions/auto_classifier.zig");
-const auto_classifier_context = @import("core/permissions/auto_classifier_context.zig");
 const agent_runtime = @import("core/agent/agent_runtime.zig");
 const assistant_presentation = @import("core/agent/assistant_presentation.zig");
 const auto_upgrade = @import("core/upgrade/auto_upgrade.zig");
@@ -141,8 +130,6 @@ const web_search_runtime = @import("core/tooling/web_search_runtime.zig");
 const worker_runtime = @import("core/agent/worker_runtime.zig");
 const question_prompt = @import("core/agent/question_prompt.zig");
 const gateway_client = @import("gateway/client.zig");
-const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
-const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
 const url_opener = @import("core/hosts/url_opener.zig");
 const event_loop = @import("ui/event_loop.zig");
 const footer_runtime = @import("ui/footer/runtime.zig");
@@ -159,8 +146,6 @@ const ui_program_status = @import("ui/terminal/program_status.zig");
 const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
-const approval_prompt = @import("core/permissions/approval_prompt.zig");
-const permission_request = @import("core/permissions/permission_request.zig");
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -171,16 +156,12 @@ const ChatMessage = types.ChatMessage;
 const PermissionMode = types.PermissionMode;
 const ReasoningEffort = types.ReasoningEffort;
 const ToolPermissionDecision = types.ToolPermissionDecision;
-const PermissionGrant = types.PermissionGrant;
-const PermissionEngine = permissions.PermissionEngine;
 const QueuedPrompt = worker_runtime.QueuedPrompt;
 const WorkItem = worker_runtime.WorkItem;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 const SessionRuntime = session_runtime.SessionRuntime;
 const PromptHistoryRuntime = prompt_history_runtime.PromptHistoryRuntime;
 const ToolExecutionResult = agent_runtime.ToolExecutionResult;
-const ApprovalPrompt = approval_prompt.ApprovalPrompt;
-const ApprovalScreenState = footer_runtime.ApprovalScreenState;
 const QuestionPrompt = question_prompt.QuestionPrompt;
 const InputRuntime = core_input_runtime.Runtime;
 const TerminalInputRuntime = ui_input.Runtime;
@@ -196,7 +177,8 @@ const idle_wasm_poll_timeout_ms: i32 = 16;
 const resize_debounce_ms: i64 = 100;
 const max_transcript_bytes: usize = 256 * 1024;
 const default_max_agent_steps: usize = agent_steps.default_max_agent_steps;
-const native_gateway_provider = builtin_gateway.provider;
+/// How many times a model request is retried after a transient failure.
+const model_retry_count: usize = 3;
 const max_history_turns = agents.max_history_turns;
 const max_list_entries: usize = 100;
 const max_read_file_bytes: usize = 50 * 1024;
@@ -210,7 +192,6 @@ const input_escape_timeout_ms: i64 = 30;
 fn nativeLoopPollTimeoutMs(
     default_timeout_ms: i32,
     first_frame_pending: bool,
-    auth_refresh_active: bool,
     skills_refresh_active: bool,
     transcript_page_work_active: bool,
     file_listing_hold_pending: bool,
@@ -220,7 +201,6 @@ fn nativeLoopPollTimeoutMs(
 ) i32 {
     if (next_iteration_due) return 0;
     return if (first_frame_pending or
-        auth_refresh_active or
         skills_refresh_active or
         transcript_page_work_active or
         file_listing_hold_pending)
@@ -389,16 +369,6 @@ var resize_interlock = shell_runtime.ResizeApprovalInterlock{};
 const default_context_registry = context_contract.Registry{ .default_provider = builtin_context.provider };
 const WorkspaceHostRuntime = if (host_target.is_wasm) js_host_workspace.Runtime else struct {};
 const selected_host_profile = if (host_target.is_wasm) host_runtime_profile.wasm else host_runtime_profile.native;
-const app_api_key_validator = if (host_target.is_wasm)
-    api_key_validator.unavailable_provider
-else
-    builtin_gateway.api_key_validator;
-const app_oauth_transport = if (selected_host_profile.js_host_auth)
-    js_host_auth.oauth_provider
-else if (selected_host_profile.native_auth)
-    builtin_gateway.oauth_transport_provider
-else
-    oauth_transport.unavailable_provider;
 const app_secret_store = if (host_target.is_wasm)
     host.unavailable_secret_store
 else
@@ -423,7 +393,6 @@ const App = struct {
     const Self = @This();
     const AgentAppRuntime = app_agent_runtime.Runtime(Self);
     const AuthAppRuntime = app_auth_runtime.Runtime(Self);
-    const TokenPassCheckRuntime = token_pass_check.Runtime(Self);
     const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const ProfileAppRuntime = app_profile_runtime.Runtime(Self);
@@ -535,7 +504,7 @@ const App = struct {
     }
 
     pub fn secretStore(self: *const Self) host.SecretStore {
-        return self.auth.secret_store;
+        return self.auth.secretStore();
     }
 
     pub fn clipboard(_: *const Self) host.Clipboard {
@@ -558,31 +527,17 @@ const App = struct {
     alloc: Allocator,
     terminal: TerminalState = .{},
 
-    auth: auth_runtime.Runtime = auth_runtime.Runtime.init(
-        app_api_key_validator,
-        app_oauth_transport,
-        app_secret_store,
-    ),
+    auth: auth_runtime.Runtime = .{},
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
-    model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
-    /// Replaced in `init` with the real home directory.
-    usage_dashboard: usage.Dashboard = usage.Dashboard.init(std.heap.c_allocator, usage_host.unset),
-    /// The `/credits` lookup in flight, if any.
-    credits_lookup: credits_lookup.Lookup = .{},
-    /// Whether the credential's team has Token Pass: the check that asks.
-    token_pass_check: token_pass_check.State = .{},
+    model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator),
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
     workspace: app_workspace_runtime.State = .{},
-    permission_engine: PermissionEngine = .{},
-    permission_state: app_permission_runtime.State = .{},
+    authority_mutex: std.Io.Mutex = .init,
     agent_step_limit: usize = default_max_agent_steps,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
-    web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
-        .provider = if (host_profile.web_search) builtin_providers.native.gateway.spark_search else null,
-    }),
-    web_search_models_path: []const u8 = builtin_gateway.models_path,
+    web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
@@ -591,7 +546,6 @@ const App = struct {
 
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
-    approval_screen: ApprovalScreenState = .{},
 
     should_exit: bool = false,
     input_runtime: InputRuntime = .{},
@@ -621,7 +575,6 @@ const App = struct {
     question_lender: ?*app_agents_runtime.ChildAgent = null,
     /// The subagent whose approval main's prompt holds, while main is on
     /// screen. Owned by `app_agents_runtime.zig`.
-    approval_lender: ?*app_agents_runtime.ChildAgent = null,
     /// How many subagent prompts have been asked, which orders them for the
     /// instance's screen. Owned by `app_agents_runtime.zig`.
     prompt_order: u64 = 0,
@@ -658,10 +611,6 @@ const App = struct {
     /// `/update` is waiting for its check: it reports the result, or
     /// restarts into the update once it is installed.
     manual_update: app_upgrade_runtime.ManualUpdate = .{},
-    /// Resolved review-model override for automatic permission review
-    /// (`review_model` setting or SPARK_REVIEW_MODEL). Owned; empty keeps the
-    /// reviewer's compiled default.
-    review_model: []u8 = &.{},
 
     statusline_context: bool = false,
     statusline_session: bool = false,
@@ -685,8 +634,11 @@ const App = struct {
     ) !Self {
         var app = Self{
             .alloc = alloc,
-            .auth = undefined,
-            .usage_dashboard = undefined,
+            .auth = .{
+                .mode = auth_mode,
+                .oauth = if (comptime host_target.is_wasm) oauth_transport.unavailable_provider else builtin_oauth_http.provider,
+                .secrets = app_secret_store,
+            },
             .input_runtime = undefined,
             .shell = TranscriptRuntime.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
@@ -697,17 +649,6 @@ const App = struct {
 
             .main_agent = .{ .session_persistence = undefined, .session = undefined },
         };
-        auth_runtime.Runtime.initIntoWithMode(
-            &app.auth,
-            app_api_key_validator,
-            app_oauth_transport,
-            app_secret_store,
-            auth_mode,
-        );
-        app.usage_dashboard = usage.Dashboard.init(
-            std.heap.c_allocator,
-            usage_host.host(io_mod.homeDir() orelse ""),
-        );
         app_session_runtime.Persistence.initInto(&app.main_agent.session_persistence);
         InputRuntime.initInto(&app.input_runtime);
         SessionRuntime.initInto(&app.main_agent.session, max_history_turns);
@@ -755,7 +696,7 @@ const App = struct {
             &app,
             &app.main_agent,
             footer_rows,
-            builtin_gateway.default_model,
+            "",
             default_max_agent_steps,
             handle_sigwinch,
             .{
@@ -771,8 +712,6 @@ const App = struct {
                 .effort_from_profile = launch.modifiers.effort_override == null and launch_profile.effort != null,
                 .fast = launch.modifiers.fast_override,
                 .ultrafast = launch.modifiers.ultrafast_override,
-                .provider_order = launch.modifiers.provider_order_override,
-                .provider_strict = launch.modifiers.provider_strict_override,
                 .permission_mode = launch.modifiers.permission_override,
                 .upgrade_relaunch = launch.upgrade_relaunch != null,
             },
@@ -791,11 +730,6 @@ const App = struct {
         );
         if (comptime !host_target.is_wasm) {
             app.provider_selection.ensureGatewayHttpPool();
-            if (app.provider_selection.selection().provider == .gateway) {
-                if (app.provider_selection.gateway_http_pool) |pool| {
-                    pool.warmAsync(gateway_client.resolveChatUrlForWarmup(builtin_gateway.agentChatUrl()));
-                }
-            }
         }
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
         app.toolbox_behind = config_runtime.tool_placement.behindToolbox(app.tool_placement, launch.modifiers.tool_placement_overrides);
@@ -864,11 +798,6 @@ const App = struct {
 
     pub fn rebindAfterInit(self: *App, agent: *agents.Agent) void {
         SessionAppRuntime.rebindAfterMove(self, agent);
-        // The WebAssembly terminal runs `/usage` fetches in its event loop,
-        // which they pulse through the app while they wait.
-        if (comptime host_target.is_wasm) {
-            self.usage_dashboard.host = usage_host.cooperativeHost(App, self, self.usage_dashboard.host.home);
-        }
     }
 
     pub fn setNotificationPreferences(
@@ -1005,11 +934,6 @@ const App = struct {
         self.releaseTerminal();
         shutdown_trace.mark("terminal_released");
 
-        // Exit never waits, not even for a sign-in refresh, which is never cut
-        // off: a preparation or prompt refresh still running ends with the
-        // process.
-        self.auth.leaveProviderPreparationForExit();
-        self.auth.leavePromptRefreshesForExit();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream(main_agent);
@@ -1034,12 +958,6 @@ const App = struct {
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self, main_agent) catch |err| {
             SessionAppRuntime.recordShutdownFailure(main_agent, err);
         };
-        // Cancel a /usage or /credits fetch in flight before shutdown continues.
-        self.usage_dashboard.deinit();
-        self.credits_lookup.leaveForExit();
-        // The Token Pass check never renews a sign-in, so stopping it
-        // returns at once.
-        self.token_pass_check.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, main_agent, "shutdown");
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         // Quitting from a subagent's screen resumes its instance.
@@ -1089,7 +1007,6 @@ const App = struct {
         // startups (no TTY, too small) reach deinit through errdefer and must
         // not write to the profile directory.
         const was_interactive = self.terminal.raw_enabled or self.terminal.signal_handler_installed;
-        self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         self.stopStream(main_agent);
@@ -1119,9 +1036,6 @@ const App = struct {
         self.terminal_client.deinit();
         main_agent.managed_executions.deinit();
         self.model_cache.deinit();
-        self.usage_dashboard.deinit();
-        self.credits_lookup.deinit();
-        self.token_pass_check.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, main_agent, "shutdown");
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         // Children close first: they borrow main's session store.
@@ -1148,9 +1062,6 @@ const App = struct {
             self.requested_resume = null;
         }
         main_agent.session.deinit(self.alloc);
-        self.permission_engine.deinit(self.alloc);
-        app_permission_runtime.Runtime(App).deinitSessionGrants(self, main_agent);
-        main_agent.approval_prompt.deinit(self.alloc);
         main_agent.question_prompt.deinit(self.alloc);
 
         main_agent.change_tracker.deinit(std.heap.c_allocator);
@@ -1170,7 +1081,6 @@ const App = struct {
         WorkspaceAppRuntime.deinit(self);
         self.workspace_identity.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
-        if (self.review_model.len > 0) self.alloc.free(self.review_model);
         shutdown_trace.mark("complete");
         if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
     }
@@ -1213,18 +1123,8 @@ const App = struct {
         return AuthAppRuntime.admitQueuedPromptCredential(self, agent);
     }
 
-    pub fn adoptRenewedCredential(self: *App, renewed: *const credentials.Credential) !void {
-        try AuthAppRuntime.adoptRenewedCredential(self, renewed);
-    }
-
     pub fn restoreSessionCredential(self: *App, previous_provider: model_provider.ProviderId) !void {
         try AuthAppRuntime.restoreSessionCredential(self, previous_provider);
-    }
-
-    pub fn startPromptCredentialPrewarm(self: *App) void {
-        if (comptime !host_target.is_wasm) {
-            AuthAppRuntime.startPromptCredentialPrewarm(self);
-        }
     }
 
     pub fn collectPendingPromptCredential(
@@ -1241,10 +1141,6 @@ const App = struct {
         return AuthAppRuntime.retryPendingPromptCredential(self, agent);
     }
 
-    pub fn runProviderCommand(self: *App, agent: *agents.Agent) !void {
-        try AuthAppRuntime.runProviderCommand(self, agent);
-    }
-
     pub fn requestPromptRetryAfterAuth(_: *App, agent: *agents.Agent) void {
         InputSubmitRuntime.requestPromptRetryAfterAuth(agent);
     }
@@ -1257,24 +1153,8 @@ const App = struct {
         try InputSubmitRuntime.resumePromptAfterAuth(self, agent, max_prompt_history);
     }
 
-    pub fn beginRecoverySignIn(self: *App, agent: *agents.Agent) !void {
-        try AuthAppRuntime.beginRecoverySignIn(self, agent);
-    }
-
-    pub fn closeRecoverySignInForStoredLogin(self: *App, source: credentials.Source) !void {
-        try AuthAppRuntime.closeRecoverySignInForStoredLogin(self, source);
-    }
-
     pub fn saveConnection(self: *App, agent: *agents.Agent) !void {
-        try app_connect_runtime.Runtime(App).saveConnection(self, agent);
-    }
-
-    pub fn applyAuthPickerChoice(self: *App, agent: *agents.Agent, choice: auth_runtime.Choice) !void {
-        try AuthAppRuntime.applyPickerChoice(self, agent, choice);
-    }
-
-    pub fn selectCredentialSource(self: *App, source: credentials.Source) !bool {
-        return AuthAppRuntime.selectCredentialSource(self, source);
+        try app_provider_menu_runtime.Runtime(App).saveConnection(self, agent);
     }
 
     pub fn run(self: *App) !void {
@@ -1299,10 +1179,9 @@ const App = struct {
             return nativeLoopPollTimeoutMs(
                 default_timeout_ms,
                 self.shell.render_requests.hasReason(.first_frame),
-                self.auth.sourceInventoryRefreshActive(),
                 self.skills.refreshActive(),
                 self.fullTranscriptFocusedWorkActive(),
-                InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
+                InputAppRuntime.fileListingHoldPending(self, io_mod.awakeMilliTimestamp()),
                 self.takeDrainContinuationDue(),
             );
         }
@@ -1736,40 +1615,15 @@ const App = struct {
             provider_runtime.modelOf(self, agent));
         errdefer std.heap.c_allocator.free(model_copy);
 
-        const gateway_credential: auth_runtime.GatewayCredential = if (child_run) |active_run| routed: {
-            const credential = active_run.credential orelse break :routed self.auth.queuedPromptCredential() orelse return error.MissingApiKey;
-            break :routed .{
-                .api_key = credential.token,
-                .gateway_team = credential.gatewayTeam(),
-                .source = credential.source,
-                .team_slug = credential.team_slug,
-            };
-        } else self.auth.queuedPromptCredential() orelse return error.MissingApiKey;
-        const api_key_copy = if (gateway_credential.api_key) |api_key|
+        const prompt_credential: auth_runtime.PromptCredential = if (child_run) |active_run| routed: {
+            const credential = active_run.credential orelse break :routed self.auth.promptCredential() orelse return error.MissingApiKey;
+            break :routed .{ .api_key = credential.token, .source = credential.source };
+        } else self.auth.promptCredential() orelse return error.MissingApiKey;
+        const api_key_copy = if (prompt_credential.api_key) |api_key|
             try std.heap.c_allocator.dupe(u8, api_key)
         else
             @constCast(&[_]u8{});
         errdefer secret.zeroAndFree(std.heap.c_allocator, api_key_copy);
-
-        const gateway_team_copy = if (gateway_credential.gateway_team) |team|
-            try std.heap.c_allocator.dupe(u8, team)
-        else
-            null;
-        errdefer if (gateway_team_copy) |team| std.heap.c_allocator.free(team);
-        const gateway_team_label_copy = if (gateway_credential.team_slug) |slug|
-            try std.heap.c_allocator.dupe(u8, slug)
-        else
-            null;
-        errdefer if (gateway_team_label_copy) |label| std.heap.c_allocator.free(label);
-        const account_id_value = if (child_run) |active_run|
-            if (active_run.credential) |credential| credential.accountId() else self.auth.accountId()
-        else
-            self.auth.accountId();
-        const account_id_copy = if (account_id_value) |account_id|
-            try std.heap.c_allocator.dupe(u8, account_id)
-        else
-            null;
-        errdefer if (account_id_copy) |account_id| std.heap.c_allocator.free(account_id);
 
         const authorized_image_catalog = if (recovery_checkpoint) |checkpoint| blk: {
             const history_catalog = try agent.session.snapshotImageCatalog(std.heap.c_allocator, &.{});
@@ -1787,11 +1641,7 @@ const App = struct {
         const root_user_intent_context = if (child_run) |active_run|
             try std.heap.c_allocator.dupe(u8, active_run.root_user_intent_context)
         else
-            try auto_classifier_context.buildCanonicalRootUserContext(
-                std.heap.c_allocator,
-                prompt_copy,
-                agent.session.agent.history.items,
-            );
+            try std.heap.c_allocator.dupe(u8, "");
         errdefer std.heap.c_allocator.free(root_user_intent_context);
 
         const images_copy = try types.dupeImageAttachmentSlice(
@@ -1806,12 +1656,6 @@ const App = struct {
             null;
         errdefer if (recovery_checkpoint_copy) |*checkpoint|
             checkpoint.deinit(std.heap.c_allocator);
-
-        const grants_copy = if (child_run) |active_run|
-            try types.dupePermissionGrantSlice(std.heap.c_allocator, active_run.admission.grants)
-        else
-            try app_permission_runtime.Runtime(App).copyGrants(self, agent, std.heap.c_allocator);
-        errdefer types.freePermissionGrantSlice(std.heap.c_allocator, grants_copy);
 
         var context_snapshot_copy = if (self.context_enabled)
             try agent.context_snapshot.dupe(std.heap.c_allocator)
@@ -1837,15 +1681,11 @@ const App = struct {
             .model = model_copy,
             .provider = if (child_run) |active_run| active_run.admission.provider else provider_runtime.providerOf(self, agent),
             .api_key = api_key_copy,
-            .gateway_team = gateway_team_copy,
-            .gateway_team_label = gateway_team_label_copy,
-            .credential_source = gateway_credential.source,
-            .account_id = account_id_copy,
-            .permission_mode = if (child_run) |active_run| active_run.admission.permission_mode else app_permission_runtime.Runtime(App).viewOf(self, agent).mode,
+            .credential_source = prompt_credential.source,
+            .permission_mode = if (child_run) |active_run| active_run.admission.permission_mode else .yolo,
             .history = history_copy,
             .unversioned_history_count = agent.session.unversionedHistoryEnd(),
             .root_user_intent_context = root_user_intent_context,
-            .grants = grants_copy,
             .skill_bindings = skill_bindings,
             .skill_display_spans = skill_display_spans,
             .context_snapshot = context_snapshot_copy,
@@ -1864,22 +1704,12 @@ const App = struct {
         if (agent.worker.isProcessing() or agent.worker.queuedPromptCount() > 0) return false;
         const model = try std.heap.c_allocator.dupe(u8, provider_runtime.modelOf(self, agent));
         errdefer std.heap.c_allocator.free(model);
-        const credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        const credential = self.auth.promptCredential() orelse return error.MissingApiKey;
         const api_key = if (credential.api_key) |value|
             try std.heap.c_allocator.dupe(u8, value)
         else
             @constCast(&[_]u8{});
         errdefer secret.zeroAndFree(std.heap.c_allocator, api_key);
-        const gateway_team = if (credential.gateway_team) |team|
-            try std.heap.c_allocator.dupe(u8, team)
-        else
-            null;
-        errdefer if (gateway_team) |team| std.heap.c_allocator.free(team);
-        const account_id = if (self.auth.accountId()) |id|
-            try std.heap.c_allocator.dupe(u8, id)
-        else
-            null;
-        errdefer if (account_id) |id| std.heap.c_allocator.free(id);
         const history = try agent.session.snapshotHistory(std.heap.c_allocator);
         errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history);
 
@@ -1888,9 +1718,7 @@ const App = struct {
             .model = model,
             .provider = provider_runtime.providerOf(self, agent),
             .api_key = api_key,
-            .gateway_team = gateway_team,
             .credential_source = credential.source,
-            .account_id = account_id,
             .history = history,
             .unversioned_history_count = agent.session.unversionedHistoryEnd(),
         });
@@ -2031,21 +1859,20 @@ const App = struct {
         return self.mcp.callTool(arena, name, arguments_json, max_tool_result_bytes, options);
     }
 
-    pub fn searchMcpTools(self: *App, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !tool_mcp_runtime.SearchResult {
-        return self.mcp.searchTools(arena, request, permission_rules, self.context_limits, access, cancel_flag);
+    pub fn searchMcpTools(self: *App, arena: Allocator, request: tool_mcp_runtime.SearchRequest, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !tool_mcp_runtime.SearchResult {
+        return self.mcp.searchTools(arena, request, self.context_limits, access, cancel_flag);
     }
 
-    pub fn mcpToolSchemaJson(self: *App, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !?tool_mcp_runtime.ToolSchemaResult {
-        return self.mcp.toolSchema(arena, name, permission_rules, self.context_limits, access, cancel_flag);
+    pub fn mcpToolSchemaJson(self: *App, arena: Allocator, name: []const u8, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !?tool_mcp_runtime.ToolSchemaResult {
+        return self.mcp.toolSchema(arena, name, self.context_limits, access, cancel_flag);
     }
 
     pub fn addMcpSlack(self: *App) !void {
         return app_commands.Handlers(App).addSlack(self);
     }
 
-    /// `mode` is the mode of the agent that refreshes the tool: its rules are none in full access.
-    pub fn snapshotMcpDefinition(self: *App, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, mode: types.PermissionMode) !tool_mcp_runtime.DefinitionSnapshot {
-        return self.mcp.snapshotToolDefinition(alloc, name, known, permissions.mcpRules(mode, self.permission_engine.rules), self.context_limits, .unrestricted);
+    pub fn snapshotMcpDefinition(self: *App, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, _: types.PermissionMode) !tool_mcp_runtime.DefinitionSnapshot {
+        return self.mcp.snapshotToolDefinition(alloc, name, known, self.context_limits, .unrestricted);
     }
 
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
@@ -2067,13 +1894,12 @@ const App = struct {
         alloc: Allocator,
         permission_mode: types.PermissionMode,
     ) !tool_projection.EffectiveToolProjection {
-        self.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
-        defer self.permission_state.authority_mutex.unlock(io_mod.getIo());
+        self.authority_mutex.lockUncancelable(io_mod.getIo());
+        defer self.authority_mutex.unlock(io_mod.getIo());
         return self.snapshotModelToolProjectionForRules(
             agent,
             alloc,
             permission_mode,
-            self.permission_engine.rules,
         );
     }
 
@@ -2082,13 +1908,11 @@ const App = struct {
         agent: *agents.Agent,
         alloc: Allocator,
         permission_mode: types.PermissionMode,
-        permission_rules: types.PermissionRuleSet,
     ) !tool_projection.EffectiveToolProjection {
         return self.snapshotModelToolProjectionForRules(
             agent,
             alloc,
             permission_mode,
-            permission_rules,
         );
     }
 
@@ -2097,7 +1921,6 @@ const App = struct {
         agent: *agents.Agent,
         alloc: Allocator,
         permission_mode: types.PermissionMode,
-        permission_rules: types.PermissionRuleSet,
     ) !tool_projection.EffectiveToolProjection {
         const subagent_available = agent.session_persistence.subagent_host != null;
         // Listed fresh for each turn, so a profile saved during the session shows.
@@ -2110,7 +1933,6 @@ const App = struct {
         } else &.{};
         return tool_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(agent), .{
             .permission_mode = permission_mode,
-            .permission_rules = permission_rules,
             .subagent_available = subagent_available,
             .subagent_profiles = subagent_profiles,
             .behind_toolbox = self.toolbox_behind.slice(),
@@ -2122,7 +1944,7 @@ const App = struct {
         agent: *agents.Agent,
         admission: subagent_domain.AdmissionSnapshot,
     ) tool_runtime.Context {
-        return AgentAppRuntime.toolContextForSubagent(self, agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl(), admission);
+        return AgentAppRuntime.toolContextForSubagent(self, agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "", admission);
     }
 
     pub fn bindSubagentWorker(
@@ -2188,12 +2010,6 @@ const App = struct {
         defer if (owned) worker_runtime.freeQueuedPrompt(std.heap.c_allocator, prompt);
         prompt.author = author;
         prompt.mail = mail;
-        // A subagent's turn runs under its run's root context, main's.
-        if (agent.child_run == null) {
-            const context = try auto_classifier_context.buildAgentTurnRootUserContext(std.heap.c_allocator, agent.session.agent.history.items);
-            if (prompt.root_user_intent_context.len > 0) std.heap.c_allocator.free(prompt.root_user_intent_context);
-            prompt.root_user_intent_context = context;
-        }
         if (mail == .message) {
             place_held = false;
             try agent.worker.postReservedMail(std.heap.c_allocator, prompt);
@@ -2213,13 +2029,6 @@ const App = struct {
             home,
             builtin_skills.root_policy,
         );
-    }
-
-    /// Holds the first prompt of a session while the Token Pass check that
-    /// decides its model runs.
-    pub fn collectPendingTokenPass(self: *App, agent: *agents.Agent) token_pass_check.Readiness {
-        if (comptime host_target.is_wasm) return .current;
-        return TokenPassCheckRuntime.collectPendingPrompt(self, agent);
     }
 
     pub fn collectPendingSkillRefresh(
@@ -2254,61 +2063,19 @@ const App = struct {
         return completion;
     }
 
-    /// Records an "always" approval from `agent`'s turn on its instance.
-    pub fn allowToolForSession(self: *App, agent: *agents.Agent, tool_name: []const u8, target_path: []const u8) !void {
-        try app_permission_runtime.Runtime(App).allowForSession(self, agent, tool_name, target_path);
-    }
-
-    pub fn permissionReviewerProvider(self: *const App) ?permission_auto_classifier.Provider {
-        return self.providerSet()
-            .select(self.provider_selection.selection().provider)
-            .permission_reviewer;
-    }
-
     pub fn providerSet(self: *const App) provider_set.Set {
-        if (self.provider_selection.model_requests_blocked) return .{ .gateway = .{}, .codex = .{}, .grok = .{} };
-        if (comptime host_target.is_wasm) {
-            return provider_set.gateway_only(.{
-                .capabilities = .{
-                    .gateway_prompt_caching = true,
-                    .vision_fallback = host_profile.tools,
-                },
-                .presentation = provider_catalog.find(.gateway),
-                .auth_strategy = .vercel,
-                .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
-                .agent_stream = js_host_stream_provider.provider(),
-                .model_catalog = js_host_model_catalog.provider,
-                .permission_reviewer = if (comptime host_profile.tools)
-                    builtin_gateway.permission_reviewer.provider
-                else
-                    null,
-            });
-        }
+        if (self.provider_selection.model_requests_blocked) return .{};
         var providers = builtin_providers.native;
         providers.definitions = self.provider_selection.definitions.definitions;
-        if (self.provider_selection.gateway_http_pool) |pool| {
-            // Rebind the gateway stream provider to the process-long pooled
-            // client so chat requests reuse warm keep-alive connections.
-            if (providers.gateway.agent_stream) |stream| {
-                var stamped = stream;
-                stamped.context = pool;
-                providers.gateway.agent_stream = stamped;
-            }
-        }
-        if (comptime !host_profile.tools) {
-            providers.gateway.permission_reviewer = null;
-            providers.codex.permission_reviewer = null;
-            providers.grok.permission_reviewer = null;
-        }
         return providers;
     }
 
     pub fn describeToolAction(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return AgentAppRuntime.describeToolAction(self, agent, arena, call, display_target, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        return AgentAppRuntime.describeToolAction(self, agent, arena, call, display_target, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
     pub fn resolveToolActionDisplayTarget(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall) !?[]const u8 {
-        return AgentAppRuntime.resolveToolActionDisplayTarget(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        return AgentAppRuntime.resolveToolActionDisplayTarget(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
     pub fn describeToolActionWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -2316,7 +2083,7 @@ const App = struct {
     }
 
     pub fn describeToolActionCompleted(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return AgentAppRuntime.describeToolActionCompleted(self, agent, arena, call, display_target, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        return AgentAppRuntime.describeToolActionCompleted(self, agent, arena, call, display_target, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
     pub fn describeToolActionCompletedWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -2324,87 +2091,51 @@ const App = struct {
     }
 
     pub fn describeToolActionDenied(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return AgentAppRuntime.describeToolActionDenied(self, agent, arena, call, display_target, label, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        return AgentAppRuntime.describeToolActionDenied(self, agent, arena, call, display_target, label, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
     pub fn describeToolActionDeniedWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
         return self.describeToolActionDenied(agent, arena, call, display_target, label, advertised_dynamic_tool_names);
     }
 
-    pub fn requestToolPermissionSync(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
-        return AgentAppRuntime.requestToolPermissionSync(self, agent, arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, mcp_review_schema_json, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    pub fn requestToolPermissionSyncWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?command_admission.ToolExecutionAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
+        return AgentAppRuntime.requestToolPermissionSync(self, agent, arena, call, live_authority, revalidation, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
-    pub fn requestToolPermissionSyncWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
-        return self.requestToolPermissionSync(agent, arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, mcp_review_schema_json);
-    }
-
-    pub fn requestPreparedFileMutationPermissionSyncWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
-        return AgentAppRuntime.requestPreparedFileMutationPermissionSync(self, agent, arena, call, prepared, review_turn, permission_mode, local_grants, live_authority, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    pub fn requestPreparedFileMutationPermissionSyncWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
+        return AgentAppRuntime.requestPreparedFileMutationPermissionSync(self, agent, arena, call, prepared, live_authority, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
     pub fn validateToolCall(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
-        return AgentAppRuntime.validateToolCall(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        return AgentAppRuntime.validateToolCall(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
     pub fn resolveUnselectedMcpTool(self: *App, agent: *agents.Agent, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
-        return AgentAppRuntime.resolveUnselectedMcpTool(self, agent, arena, name, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        return AgentAppRuntime.resolveUnselectedMcpTool(self, agent, arena, name, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
     pub fn checkToolAvailability(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall) !?[]const u8 {
-        return AgentAppRuntime.checkToolAvailability(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        return AgentAppRuntime.checkToolAvailability(self, agent, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
     pub fn permissionTargetForCall(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
-        return AgentAppRuntime.permissionTargetForCall(self, agent, arena, call, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        return AgentAppRuntime.permissionTargetForCall(self, agent, arena, call, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
     pub fn permissionTargetForCallWithAdvertised(self: *App, agent: *agents.Agent, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
         return self.permissionTargetForCall(agent, arena, call, advertised_dynamic_tool_names);
     }
 
-    pub fn preparePermissionStateAction(
-        self: *App,
-        agent: *agents.Agent,
-        arena: Allocator,
-        call: ToolCall,
-    ) !tool_admission.PreparedPermissionStateAction {
-        const ctx = AgentAppRuntime.toolContext(
-            self,
-            agent,
-            &ignored_list_entries,
-            max_list_entries,
-            max_read_file_bytes,
-            max_read_file_lines,
-            max_read_file_line_len,
-            max_command_output_bytes,
-            builtin_gateway.retry_count,
-            builtin_gateway.defaultChatUrl(),
-        );
-        return tool_admission.preparePermissionStateAction(
-            ctx.admissionInput(),
-            arena,
-            call,
-        );
-    }
-
     pub fn fetchModelIds(self: *App) !std.ArrayList([]u8) {
         return AgentAppRuntime.fetchModelIds(
             self,
-            if (comptime host_target.is_wasm)
-                js_host_model_catalog.provider
-            else
-                self.providerSet().select(provider_runtime.provider(self)).model_catalog orelse return error.ModelCatalogUnavailable,
-            builtin_gateway.models_path,
+            self.providerSet().select(provider_runtime.provider(self)).model_catalog orelse return error.ModelCatalogUnavailable,
+            self.model_cache.models_path,
         );
     }
 
     pub fn startModelCacheWarmup(self: *App) void {
         self.loadModelCatalog(.activity);
-        // The same credential's team may have Token Pass; ask once per team.
-        if (comptime !host_profile.cooperative_agent) {
-            if (!AuthAppRuntime.startupCredentialPending(self)) TokenPassCheckRuntime.start(self);
-        }
     }
 
     /// Opening the model picker revalidates the catalog in the background;
@@ -2414,29 +2145,12 @@ const App = struct {
     }
 
     fn loadModelCatalog(self: *App, trigger: model_cache_runtime.LoadTrigger) void {
+        const provider = self.providerSet().select(provider_runtime.provider(self)).model_catalog orelse return;
         if (comptime host_profile.cooperative_agent) {
-            // Cooperative hosts fetch inline, so only stale catalogs reload there.
-            if (self.auth.credentialNeedsRefresh()) {
-                debug_trace.logf("auth", "model_cache_warmup_deferred reason=credential_refresh_required", .{});
-                return;
-            }
-            self.model_cache.loadCooperative(
-                js_host_model_catalog.provider,
-                self.auth.modelCatalogAccess(),
-            );
+            // Cooperative hosts fetch inline.
+            self.model_cache.loadCooperative(provider, self.auth.modelCatalogAccess());
         } else {
-            // Warming without the launch credential would fetch the catalog
-            // twice; the credential's arrival starts the warmup instead.
-            if (AuthAppRuntime.startupCredentialPending(self)) {
-                debug_trace.logf("auth", "model_cache_warmup_deferred reason=startup_credential_pending", .{});
-                return;
-            }
-            self.model_cache.startWarmupWithSharedSignIn(
-                self.providerSet().select(provider_runtime.provider(self)).model_catalog orelse return,
-                self.auth.modelCatalogAccess(),
-                trigger,
-                self.auth.backgroundSignIn(),
-            );
+            self.model_cache.startWarmup(provider, self.auth.modelCatalogAccess(), trigger);
         }
     }
 
@@ -2445,8 +2159,7 @@ const App = struct {
     }
 
     pub fn isModelCacheLoading(self: *App) bool {
-        // The catalog load waits for a deferred launch credential.
-        return self.model_cache.isLoading() or AuthAppRuntime.startupCredentialPending(self);
+        return self.model_cache.isLoading();
     }
 
     pub fn isModelCacheFailed(self: *App) bool {
@@ -2475,7 +2188,7 @@ const App = struct {
             bundle.fallbackModelCapabilities(model),
             self.model_cache.metadataForModel(model),
         );
-        // A connection's settings change at runtime through /connect, so its
+        // A connection's settings change at runtime through /provider, so its
         // declared levels and window come from the current definitions, not
         // the catalog fetched at startup.
         if (provider == .configured) if (self.provider_selection.definitions.get(provider.label())) |definition| {
@@ -2619,15 +2332,15 @@ const App = struct {
                 self,
                 agent,
                 job,
-                builtin_gateway.retry_count,
-                builtin_gateway.defaultChatUrl(),
+                model_retry_count,
+                "",
                 failure_provenance,
             ),
             .compact_context => |task| AgentAppRuntime.processContextCompaction(
                 self,
                 agent,
                 task,
-                builtin_gateway.retry_count,
+                model_retry_count,
                 failure_provenance,
             ),
         };
@@ -2646,7 +2359,7 @@ const App = struct {
                 return agent_runtime.unavailableHostToolResult(request.result_allocator);
             }
         }
-        return AgentAppRuntime.executeToolCall(self, agent, request, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        return AgentAppRuntime.executeToolCall(self, agent, request, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
     pub fn executeToolCallWithAdvertised(self: *App, agent: *agents.Agent, request: agent_runtime.ToolExecutionRequest) !ToolExecutionResult {
@@ -2664,8 +2377,8 @@ const App = struct {
             max_read_file_lines,
             max_read_file_line_len,
             max_command_output_bytes,
-            builtin_gateway.retry_count,
-            builtin_gateway.defaultChatUrl(),
+            model_retry_count,
+            "",
         );
     }
 
@@ -2680,8 +2393,8 @@ const App = struct {
             max_read_file_lines,
             max_read_file_line_len,
             max_command_output_bytes,
-            builtin_gateway.retry_count,
-            builtin_gateway.defaultChatUrl(),
+            model_retry_count,
+            "",
         );
     }
 
@@ -2691,11 +2404,11 @@ const App = struct {
     }
 
     pub fn appendRuntimeContextMessage(self: *App, agent: *agents.Agent, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
-        try AgentAppRuntime.appendTransientRuntimeContextMessage(self, agent, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        try AgentAppRuntime.appendTransientRuntimeContextMessage(self, agent, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
     }
 
     pub fn appendStaticContextMessage(self: *App, agent: *agents.Agent, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
-        try AgentAppRuntime.appendStaticContextMessage(self, agent, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        try AgentAppRuntime.appendStaticContextMessage(self, agent, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, model_retry_count, "");
         if (comptime host_target.is_wasm) {
             try messages.append(arena, .{
                 .role = .system,
@@ -3117,8 +2830,7 @@ const App = struct {
             self.input_runtime.paste.active() or
             self.terminal_input_runtime.hasPendingTerminalAction() or
             agent.question_prompt.isActive() or
-            agent.approval_prompt.isActive() or
-            self.auth.apiKeyEntryActive() or
+            false or
             !self.shell.has_committed_frame or
             !self.shell.footer_viewport.has_frame or
             self.shell.footer_viewport.cursor.row == 0 or
@@ -3376,11 +3088,6 @@ const App = struct {
             }
             try app_commands.Handlers(App).collectSkillsRefreshFacts(self, self.screenAgent());
         }
-        if (comptime host_profile.native_auth) {
-            // Settle a deferred launch credential before admitting prompts.
-            try AuthAppRuntime.collectStartupCredentialFacts(self);
-            AuthAppRuntime.collectDeferredStartupInventory(self);
-        }
         if (comptime host_profile.durable_sessions) SessionAppRuntime.collectInterruptedTurnHint(self);
         InputSubmitRuntime.collectPendingSubmissionFacts(self, self.screenAgent());
         try InputSubmitRuntime.collectLaunchPromptFacts(self, max_prompt_history);
@@ -3392,17 +3099,9 @@ const App = struct {
         if (comptime !host_target.is_wasm) {
             UpgradeAppRuntime.collectUpgradeFacts(self);
         }
-        app_permission_runtime.Runtime(App).tick(
-            self,
-            app_permission_runtime.monotonicMillis(),
-        );
         InstancesAppRuntime.syncRecord(self);
 
         if (try self.model_cache.pollLoadTransition()) {
-            TokenPassCheckRuntime.observeCatalog(self);
-            RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
-        }
-        if (try app_commands.Handlers(App).collectUsageDashboardFacts(self)) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         if (try app_commands.Handlers(App).collectInfoPanelFacts(self)) {
@@ -3427,20 +3126,6 @@ const App = struct {
             }
         }
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);
-        try app_commands.Handlers(App).collectCreditsFacts(self);
-        if (try TokenPassCheckRuntime.collect(self)) {
-            RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
-        }
-        if (comptime host_profile.native_auth or host_profile.js_host_auth) {
-            try AuthAppRuntime.collectProviderPreparationFacts(self, self.screenAgent());
-            try AuthAppRuntime.collectSourceInventoryFacts(self, self.screenAgent());
-            try AuthAppRuntime.collectSignInFacts(self, self.screenAgent());
-        }
-        if (comptime host_profile.native_auth) {
-            try AuthAppRuntime.collectApiKeySaveFacts(self, self.screenAgent());
-            try AuthAppRuntime.collectRemoteRevocationFacts(self);
-            try AuthAppRuntime.collectTeamListFacts(self);
-        }
         try self.processNextCooperativePrompt(self.screenAgent());
 
         const cols_before_resize = self.shell.layout.cols;
@@ -3457,7 +3142,7 @@ const App = struct {
                 &resize_interlock,
                 footer_rows,
                 resize_debounce_ms,
-                !InputAppRuntime.terminalPasteActive(self) and !self.auth.apiKeyEntryActive(),
+                !InputAppRuntime.terminalPasteActive(self),
             ) catch |err| {
                 if (err != error.TerminalTooSmall and err != error.UnableToReadTerminalSize) {
                     return err;
@@ -3512,7 +3197,7 @@ const App = struct {
         if (!self.shell.fullTranscriptActive() and
             self.shell.takeReadyFullTranscriptOpen() and
             self.terminal.alternate_screen_owner == .none and
-            !self.screenAgent().approval_prompt.isActive())
+            !false)
         {
             try app_lifecycle.openFullTranscript(
                 self.alloc,
@@ -3680,25 +3365,6 @@ const App = struct {
         AgentsAppRuntime.notePromptAsked(self, agent, kind);
     }
 
-    /// Whether `agent` keeps its approval prompt this pass,
-    /// because an approval is lent between main and a subagent.
-    pub fn keepLentApproval(self: *App, agent: *agents.Agent, pending: ?permission_request.PermissionRequest) bool {
-        return AgentsAppRuntime.keepLentApproval(self, agent, pending);
-    }
-
-    /// The worker and id of the subagent whose approval main's prompt
-    /// shows, while main is on screen, or null for main's own.
-    pub fn lentApproval(self: *App) ?struct { worker: *WorkerRuntime, id: []const u8 } {
-        const child = AgentsAppRuntime.lentApproval(self, self.screenAgent()) orelse return null;
-        return .{ .worker = &child.agent.worker, .id = child.id };
-    }
-
-    /// Runs a cancel of the approval on main's screen in the context of the
-    /// subagent it came from. False for main's own approval.
-    pub fn answerLentApproval(self: *App, agent: *agents.Agent, comptime body: fn (*App, *agents.Agent) anyerror!void) !bool {
-        return AgentsAppRuntime.answerLentApproval(self, agent, body);
-    }
-
     pub fn subagentDisplayName(self: *App, id: []const u8) []const u8 {
         const child = AgentsAppRuntime.findChild(self, id) orelse return id;
         return child.displayName();
@@ -3739,7 +3405,7 @@ const App = struct {
             try WorkerAppRuntime.tickWithinBudget(self, agent, handlers, app_worker_runtime.interactive_drain_budget_ns);
         }
         const now_ns = io_mod.nanoTimestamp();
-        if (!agent.approval_prompt.isActive() and !agent.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
+        if (!false and !agent.question_prompt.isActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
         } else {
             self.pacer.pause(now_ns);
@@ -3762,7 +3428,7 @@ const App = struct {
         }
         _ = try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history);
         if (self.should_exit) return;
-        if (!InputAppRuntime.holdFrameForFileListing(self, self.screenAgent(), app_permission_runtime.monotonicMillis())) try self.flushRequestedFrame();
+        if (!InputAppRuntime.holdFrameForFileListing(self, self.screenAgent(), io_mod.awakeMilliTimestamp())) try self.flushRequestedFrame();
         if (comptime !host_target.is_wasm) {
             try SessionAppRuntime.settlePendingLiveSessionTransition(self, self.screenAgent());
             if (try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history)) try self.flushRequestedFrame();
@@ -4061,29 +3727,6 @@ fn namesNonFolderRaw(path: []const u8) bool {
     buffer[trimmed.len + 1] = 0;
     const rc = std.c.access(@ptrCast(&buffer), std.c.F_OK);
     return rc != 0 and std.posix.errno(rc) == .NOTDIR;
-}
-
-test "SPARK_HOME is refused only when it is a file or a path through one" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "file", .data = "" });
-    try tmp.dir.createDirPath(io_mod.getIo(), "folder");
-    const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
-    defer std.testing.allocator.free(root);
-
-    const cases = [_]struct { sub: []const u8, refused: bool }{
-        .{ .sub = "file", .refused = true },
-        .{ .sub = "file/", .refused = true },
-        .{ .sub = "file/spark", .refused = true },
-        .{ .sub = "folder", .refused = false },
-        .{ .sub = "folder/spark", .refused = false },
-        .{ .sub = "missing", .refused = false },
-    };
-    for (cases) |case| {
-        const path = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, case.sub });
-        defer std.testing.allocator.free(path);
-        try std.testing.expectEqual(case.refused, namesNonFolderRaw(path));
-    }
 }
 
 /// Creates `path` and every folder above it that is missing. This runs before
@@ -4423,271 +4066,6 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "usage");
 }
 
-test "auth and upgrade commands use early threaded io without full entry config" {
-    const args = &.{@as([:0]const u8, "upgrade")};
-    try std.testing.expect(!needsFullEntryConfig(args));
-    try std.testing.expect(needsEarlyThreadedIo(args));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "update")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "slack")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "login")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "logout")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "teams")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "provider")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "usage")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "setup")}));
-}
-
-test "every alias of an early threaded io command uses early threaded io" {
-    const alloc = std.testing.allocator;
-    for (builtin_commands.top_level_specs) |spec| {
-        const token = try alloc.dupeSentinel(u8, spec.token, 0);
-        defer alloc.free(token);
-        if (!needsEarlyThreadedIo(&.{token})) continue;
-        for (spec.aliases) |alias| {
-            const alias_arg = try alloc.dupeSentinel(u8, alias, 0);
-            defer alloc.free(alias_arg);
-            try std.testing.expect(needsEarlyThreadedIo(&.{alias_arg}));
-        }
-    }
-}
-
-test "credential-reading commands use early threaded io without full entry config" {
-    for ([_][:0]const u8{ "status", "doctor", "models", "credits" }) |command| {
-        const args = &.{command};
-        try std.testing.expect(!needsFullEntryConfig(args));
-        try std.testing.expect(needsEarlyThreadedIo(args));
-    }
-}
-
-test "MCP credential commands use early threaded io" {
-    try std.testing.expect(needsEarlyThreadedIo(&.{ "mcp", "add", "slack" }));
-    try std.testing.expect(needsEarlyThreadedIo(&.{ "mcp", "add", "web", "https://w.example/mcp" }));
-    try std.testing.expect(needsEarlyThreadedIo(&.{ "mcp", "add", "--no-login", "web", "https://w.example/mcp" }));
-    for ([_][:0]const u8{ "auth", "list", "logout", "show", "login", "remove", "approve", "reject" }) |operation| {
-        try std.testing.expect(needsEarlyThreadedIo(&.{
-            @as([:0]const u8, "mcp"),
-            operation,
-            @as([:0]const u8, "fixture"),
-        }));
-    }
-    for ([_][:0]const u8{ "add", "path" }) |operation| {
-        try std.testing.expect(!needsEarlyThreadedIo(&.{
-            @as([:0]const u8, "mcp"),
-            operation,
-        }));
-    }
-}
-
-test "early threaded io is resolved after global launch args" {
-    try std.testing.expect(needsEarlyThreadedIo(&.{
-        @as([:0]const u8, "--add-dir"),
-        @as([:0]const u8, "/tmp/shared"),
-        @as([:0]const u8, "status"),
-    }));
-    try std.testing.expect(needsEarlyThreadedIo(&.{
-        @as([:0]const u8, "--no-additional-dirs"),
-        @as([:0]const u8, "login"),
-    }));
-    try std.testing.expect(needsEarlyThreadedIo(&.{
-        @as([:0]const u8, "--model"),
-        @as([:0]const u8, "provider/model"),
-        @as([:0]const u8, "--fast"),
-        @as([:0]const u8, "status"),
-    }));
-    try std.testing.expect(needsEarlyThreadedIo(&.{
-        @as([:0]const u8, "--provider"),
-        @as([:0]const u8, "grok"),
-        @as([:0]const u8, "login"),
-    }));
-    try std.testing.expect(needsFullEntryConfig(&.{
-        @as([:0]const u8, "--provider=grok"),
-        @as([:0]const u8, "ask"),
-    }));
-    try std.testing.expect(needsFullEntryConfig(&.{
-        @as([:0]const u8, "--effort=high"),
-        @as([:0]const u8, "--no-fast"),
-        @as([:0]const u8, "ask"),
-    }));
-}
-
-test "full entry config commands also use early threaded io" {
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "ask")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "acp")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "pr")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "issue")}));
-    try std.testing.expect(needsEarlyThreadedIo(&.{
-        @as([:0]const u8, "--add-dir"),
-        @as([:0]const u8, "/tmp/shared"),
-        @as([:0]const u8, "ask"),
-    }));
-    try std.testing.expect(needsEarlyThreadedIo(&.{
-        @as([:0]const u8, "--context-limit=project_bytes=2048"),
-        @as([:0]const u8, "--no-additional-dirs"),
-        @as([:0]const u8, "acp"),
-    }));
-}
-
-test "lightweight local commands do not request early threaded io" {
-    try std.testing.expect(!needsEarlyThreadedIo(&.{}));
-    for ([_][:0]const u8{ "help", "sessions", "tasks", "permissions" }) |command| {
-        try std.testing.expect(!needsEarlyThreadedIo(&.{command}));
-    }
-}
-
-test "process io connects through a reachable address while spark tasks hold every async slot" {
-    // This test builds the process Io from processIoOptions instead of using
-    // std.testing.io, because those options are what it checks. Only name
-    // lookup and the unreachable address are faked. std's HostName.connect,
-    // Io.Threaded, and the loopback socket are real.
-    const Fake = struct {
-        var base: std.Io.VTable = undefined;
-        var vtable: std.Io.VTable = undefined;
-        var port: u16 = 0;
-
-        // A connect to this address never completes, like a black-holed IPv6
-        // route, until std cancels the losing attempt.
-        fn blackHoleAt(port_number: u16) std.Io.net.IpAddress {
-            return .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = port_number } };
-        }
-
-        fn lookup(
-            userdata: ?*anyopaque,
-            _: std.Io.net.HostName,
-            resolved: *std.Io.Queue(std.Io.net.HostName.LookupResult),
-            options: std.Io.net.HostName.LookupOptions,
-        ) std.Io.net.HostName.LookupError!void {
-            const io: std.Io = .{ .userdata = userdata, .vtable = &vtable };
-            defer resolved.close(io);
-            resolved.putAll(io, &.{
-                .{ .address = blackHoleAt(options.port) },
-                .{ .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = options.port } } },
-            }) catch return error.UnknownHostName;
-        }
-
-        fn connect(
-            userdata: ?*anyopaque,
-            address: *const std.Io.net.IpAddress,
-            options: std.Io.net.IpAddress.ConnectOptions,
-        ) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
-            if (address.eql(&blackHoleAt(address.getPort()))) {
-                const io: std.Io = .{ .userdata = userdata, .vtable = &vtable };
-                var never: std.Io.Event = .unset;
-                try never.wait(io);
-                unreachable;
-            }
-            return base.netConnectIp(userdata, address, options);
-        }
-
-        fn hold(gate: *std.Io.Event, io: std.Io) void {
-            gate.wait(io) catch {};
-        }
-
-        fn dial(io: std.Io) !std.Io.net.Stream {
-            const name = try std.Io.net.HostName.init("gateway.test");
-            return name.connect(io, port, .{ .mode = .stream });
-        }
-
-        fn expire(io: std.Io) std.Io.Cancelable!void {
-            try io.sleep(.fromMilliseconds(5000), .awake);
-        }
-    };
-
-    const argv = [_][*:0]const u8{"spark"};
-    const environ = [_:null]?[*:0]const u8{};
-    var threaded = std.Io.Threaded.init(std.testing.allocator, processIoOptions(.{ .vector = &argv }, .{ .slice = &environ }));
-    defer threaded.deinit();
-    const real = threaded.io();
-    Fake.base = real.vtable.*;
-    Fake.vtable = Fake.base;
-    Fake.vtable.netLookup = Fake.lookup;
-    Fake.vtable.netConnectIp = Fake.connect;
-    const io: std.Io = .{ .userdata = real.userdata, .vtable = &Fake.vtable };
-
-    var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
-    defer server.deinit(io);
-    Fake.port = server.socket.address.getPort();
-
-    // Hold more tasks than there are CPUs, as running MCP servers, request
-    // watches, and requests do.
-    var gate: std.Io.Event = .unset;
-    var holders: std.Io.Group = .init;
-    defer {
-        gate.set(io);
-        holders.await(io) catch {};
-    }
-    const cpu_count = std.Thread.getCpuCount() catch 1;
-    for (0..cpu_count + 1) |_| try holders.concurrent(io, Fake.hold, .{ &gate, io });
-
-    const Event = union(enum) {
-        dial: anyerror!std.Io.net.Stream,
-        expire: std.Io.Cancelable!void,
-    };
-    var buffer: [2]Event = undefined;
-    var select: std.Io.Select(Event) = .init(io, &buffer);
-    defer while (select.cancel()) |event| switch (event) {
-        .dial => |result| if (result) |stream| stream.close(io) else |_| {},
-        .expire => {},
-    };
-    try select.concurrent(.dial, Fake.dial, .{io});
-    try select.concurrent(.expire, Fake.expire, .{io});
-    switch (try select.await()) {
-        .dial => |result| {
-            const stream = try result;
-            defer stream.close(io);
-            const accepted = try server.accept(io);
-            accepted.close(io);
-        },
-        .expire => return error.ConnectWaitedOnUnreachableAddress,
-    }
-}
-
-test "focused UI workers retain a bounded native poll timeout" {
-    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true, false));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, false, false, false, false, false, true));
-    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true));
-}
-
-test "footer runtime compatibility facade exports composeFooterFrame" {
-    _ = footer_runtime.composeFooterFrame;
-}
-
-test "interactive app keeps notification handlers registered for live preference changes" {
-    var app = App{ .alloc = std.testing.allocator };
-    defer app.lifecycle_runtime.deinit();
-
-    try app.configureNotifications(app.screenAgent());
-
-    try std.testing.expect(app.lifecycle_view.hasPostTurnEnd());
-    try std.testing.expect(app.lifecycle_view.hasAttentionRequired());
-
-    app.setNotificationPreferences(true, true, true);
-    const preferences = app.notificationPreferences();
-    try std.testing.expect(preferences.turn_end);
-    try std.testing.expect(preferences.attention_required);
-    try std.testing.expect(preferences.max);
-    try std.testing.expect(app.soundMaxEnabled());
-    try std.testing.expect(!@hasField(App, "notification_player"));
-}
-
-test "native app preserves the built-in tool set without workspace metadata" {
-    var app = App{ .alloc = std.testing.allocator };
-    try std.testing.expect(app.workspaceHostInfo() == null);
-
-    const registry = app.toolRegistry(app.screenAgent());
-    try std.testing.expect(registry.tools.ptr == builtin_tools.registry.tools.ptr);
-    try std.testing.expectEqual(builtin_tools.registry.tools.len, registry.tools.len);
-
-    const advertised = app.toolAdvertisementSet(app.screenAgent());
-    try std.testing.expect(advertised.order.ptr == builtin_tools.advertisement_set.order.ptr);
-    try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
-}
-
 fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
@@ -4695,13 +4073,13 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
-        .default_model = builtin_gateway.default_model,
+        .default_model = "",
         .default_agent_step_limit = default_max_agent_steps,
-        .models_path = builtin_gateway.models_path,
-        .gateway_retry_count = builtin_gateway.retry_count,
-        .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = native_gateway_provider,
+        .models_path = "/models",
+        .gateway_retry_count = model_retry_count,
+        .gateway_chat_url = "",
         .provider_set = builtin_providers.native,
+        .oauth_transport = builtin_oauth_http.provider,
         .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -4732,13 +4110,13 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
-        .default_model = builtin_gateway.default_model,
+        .default_model = "",
         .default_agent_step_limit = default_max_agent_steps,
-        .models_path = builtin_gateway.models_path,
-        .gateway_retry_count = builtin_gateway.retry_count,
-        .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = native_gateway_provider,
+        .models_path = "/models",
+        .gateway_retry_count = model_retry_count,
+        .gateway_chat_url = "",
         .provider_set = builtin_providers.native,
+        .oauth_transport = builtin_oauth_http.provider,
         .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -4774,8 +4152,8 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .models_path = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
-        .gateway_provider = native_gateway_provider,
         .provider_set = builtin_providers.native,
+        .oauth_transport = builtin_oauth_http.provider,
         .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -4816,737 +4194,6 @@ const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
 else
     handleSigWinchNative;
 
-test "interactive startup does not begin with synthetic resize pending" {
-    try std.testing.expect(!resize_interlock.resizePending());
-}
-
-test "session reset traces and clears active paste state" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "session-reset-paste.log" });
-    defer alloc.free(trace_path);
-
-    debug_trace.resetForTest();
-    defer debug_trace.resetForTest();
-    try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
-
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    var app = App{
-        .alloc = alloc,
-        .shell = .{
-            .stdout_file = sink,
-            .layout = .{
-                .rows = 24,
-                .cols = 80,
-                .content_bottom = 21,
-                .divider_top_row = 22,
-                .input_row = 23,
-                .divider_bottom_row = 24,
-                .hint_row = 22,
-            },
-        },
-    };
-    defer app.deinit();
-    try app.shell.enableShadowVt(alloc);
-    app.input_runtime.paste.owner = .decision_prompt;
-    app.input_runtime.paste.decision_bytes = 4;
-    try app.input_runtime.edit_state.input.appendSlice(alloc, "normal input");
-
-    try app.clearSession(app.screenAgent());
-
-    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.paste.decision_bytes);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-    debug_trace.shutdown();
-
-    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
-    defer trace_file.close(io_mod.getIo());
-    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 8192);
-    defer alloc.free(trace);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "decision prompt paste dropped bytes=4 reason=session_reset"));
-}
-
-test "fresh session resize preflight keeps a pending draft until geometry settles" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    try app.shell.enableShadowVt(alloc);
-    app.shell.has_committed_frame = true;
-    resize_interlock.noteResizeSignal();
-    defer _ = resize_interlock.takeResizePending();
-    app.input_runtime.paste.owner = .decision_prompt;
-    app.input_runtime.paste.decision_bytes = 4;
-
-    try app.newSession(app.screenAgent());
-
-    try std.testing.expect(!resize_interlock.resizePending());
-    try std.testing.expect(app.shell.render_requests.resizeLifecyclePending());
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy != null);
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy.? == .carry_forward);
-    try std.testing.expectEqual(paste_framing.Owner.decision_prompt, app.input_runtime.paste.owner);
-    try std.testing.expectEqual(@as(usize, 4), app.input_runtime.paste.decision_bytes);
-}
-
-test "partial session handoff resize cancels the pending transition without exiting" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    try app.shell.initBacking(alloc);
-    try app.shell.enableShadowVt(alloc);
-    try app.shell.writeTranscript(alloc, &app.metrics, "old session retained\n", true);
-    app.shell.has_committed_frame = true;
-    app.main_agent.session_persistence.pending_live_session_policy = .carry_forward;
-    app.shell.pending_session_scrollback_handoff = .{
-        .remaining_rows = 1,
-        .total_rows = 2,
-        .terminal_cols = 80,
-        .terminal_rows = 24,
-    };
-    app.shell.layout.cols = 78;
-    app.shell.render_requests.observeResizeSignal(100, 100);
-    const worker_alloc = std.heap.c_allocator;
-    try app.screenAgent().worker.enqueueContextCompaction(.{
-        .model = try worker_alloc.dupe(u8, "test/model"),
-        .api_key = try worker_alloc.dupe(u8, "test-key"),
-        .history = &.{},
-    });
-    app.screenAgent().worker.holdSessionTransition();
-    try std.testing.expect((try app.screenAgent().worker.tryTakeNextWork(worker_alloc)) == null);
-
-    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
-
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy == null);
-    try std.testing.expect(!app.screenAgent().worker.session_transition_held);
-    try std.testing.expect(app.screenAgent().worker.queued_context_compaction != null);
-    try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
-    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "old session retained") != null);
-    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "Session change cancelled") != null);
-    try std.testing.expect(app.shell.render_requests.hasPending());
-}
-
-test "deferred session transition replays later input only after the fresh session installs" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    app.main_agent.session_persistence.pending_live_session_policy = .carry_forward;
-    app.screenAgent().worker.holdSessionTransition();
-
-    for ("hello") |byte| try app.handleTerminalInputByte(byte);
-    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(@as(usize, 5), app.terminal_input_runtime.deferred_session_input.items.len);
-    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
-
-    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy == null);
-    try std.testing.expect(app.screenAgent().worker.session_transition_held);
-    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
-    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app, (&app).screenAgent());
-    try std.testing.expect(!app.screenAgent().worker.session_transition_held);
-    try std.testing.expectEqualStrings("hello", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
-}
-
-test "deferred session input stops replay after quit" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    app.main_agent.session_persistence.pending_live_session_policy = .carry_forward;
-    app.screenAgent().worker.holdSessionTransition();
-    for ("/quit\r/status\r") |byte| {
-        try std.testing.expect(try app.terminal_input_runtime.deferSessionInputByte(alloc, byte, App.input_limits.composer_bytes));
-    }
-    try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
-    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-
-    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
-    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
-    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app, (&app).screenAgent());
-    try std.testing.expect(!app.screenAgent().worker.session_transition_held);
-    try std.testing.expect(app.should_exit);
-    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
-    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "* status:") == null);
-}
-
-test "active native turn cancels before resize-deferred session handoff" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    try app.shell.enableShadowVt(alloc);
-    app.shell.has_committed_frame = true;
-    app.shell.render_requests.observeResizeSignal(100, 100);
-    app.screenAgent().worker.worker_processing = true;
-    try app.newSession(app.screenAgent());
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy != null);
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_wait.? == .worker);
-    try std.testing.expect(app.screenAgent().worker.isCancelRequested());
-    try std.testing.expect(app.screenAgent().worker.session_transition_held);
-
-    app.screenAgent().worker.worker_processing = false;
-    app.shell.has_committed_frame = false;
-    app.main_agent.session_persistence.pending_live_session_wait = .{ .worker = 1 };
-    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy == null);
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_wait == null);
-    try std.testing.expect(!app.screenAgent().worker.session_transition_held);
-}
-
-test "deferred paste settles before input from the next delivery epoch" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    app.main_agent.session_persistence.pending_live_session_policy = .carry_forward;
-    app.screenAgent().worker.holdSessionTransition();
-    for ("\x1b[200~hello\x1b[201~") |byte| try app.handleTerminalInputByte(byte);
-    try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
-    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-
-    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
-    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
-    try std.testing.expect(!app.input_runtime.paste.active());
-    const pasted_input_len = app.input_runtime.edit_state.input.items.len;
-    try std.testing.expect(pasted_input_len > 0);
-    try app.handleTerminalInputByte('x');
-    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app, (&app).screenAgent());
-    try std.testing.expect(!app.input_runtime.paste.active());
-    try std.testing.expect(app.input_runtime.edit_state.input.items.len > pasted_input_len);
-}
-
-test "stalled fresh-session handoff replays Ctrl+C after timeout" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    try app.shell.initBacking(alloc);
-    try app.shell.enableShadowVt(alloc);
-    try app.shell.writeTranscript(alloc, &app.metrics, "old session retained\n", true);
-    app.shell.has_committed_frame = true;
-    app.shell.render_requests.observeResizeSignal(100, 100);
-    try app.newSession(app.screenAgent());
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy != null);
-    try std.testing.expect(app.screenAgent().worker.session_transition_held);
-
-    const worker_alloc = std.heap.c_allocator;
-    try app.screenAgent().worker.enqueueContextCompaction(.{
-        .model = try worker_alloc.dupe(u8, "test/model"),
-        .api_key = try worker_alloc.dupe(u8, "test-key"),
-        .history = &.{},
-    });
-    for ("draft") |byte| try app.handleTerminalInputByte(byte);
-    for ("\x1b[99;5u") |byte| try app.handleTerminalInputByte(byte);
-    try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
-    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(app.screenAgent().worker.queued_context_compaction != null);
-    app.main_agent.session_persistence.pending_live_session_wait = .{ .geometry = 1 };
-    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy == null);
-    try std.testing.expect(app.screenAgent().worker.session_transition_held);
-    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
-    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app, (&app).screenAgent());
-
-    try std.testing.expect(!app.screenAgent().worker.session_transition_held);
-    try std.testing.expect(app.screenAgent().worker.queued_context_compaction == null);
-    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "old session retained") != null);
-    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
-    try std.testing.expect(!app.should_exit);
-}
-
-test "replayed new command retains the worker hold through a second deferred transition" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    try app.shell.enableShadowVt(alloc);
-    app.shell.has_committed_frame = true;
-    app.shell.render_requests.observeResizeSignal(100, 100);
-    try app.newSession(app.screenAgent());
-
-    const worker_alloc = std.heap.c_allocator;
-    try app.screenAgent().worker.enqueueContextCompaction(.{
-        .model = try worker_alloc.dupe(u8, "test/model"),
-        .api_key = try worker_alloc.dupe(u8, "test-key"),
-        .history = &.{},
-    });
-    for ("/new\r") |byte| try app.handleTerminalInputByte(byte);
-    try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
-    app.main_agent.session_persistence.pending_live_session_wait = .{ .geometry = 1 };
-    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
-    try std.testing.expect(app.screenAgent().worker.session_transition_held);
-    try std.testing.expect((try app.screenAgent().worker.tryTakeNextWork(worker_alloc)) == null);
-
-    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
-    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app, (&app).screenAgent());
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy != null);
-    try std.testing.expect(app.screenAgent().worker.session_transition_held);
-    try std.testing.expect(app.screenAgent().worker.queued_context_compaction != null);
-    try std.testing.expect((try app.screenAgent().worker.tryTakeNextWork(worker_alloc)) == null);
-}
-
-test "quit exits after a timed-out handoff without a completed input epoch" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    try app.shell.enableShadowVt(alloc);
-    app.shell.has_committed_frame = true;
-    app.shell.render_requests.observeResizeSignal(100, 100);
-    try app.newSession(app.screenAgent());
-    for ("/quit\r") |byte| try app.handleTerminalInputByte(byte);
-    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy != null);
-    app.main_agent.session_persistence.pending_live_session_wait = .{ .geometry = 1 };
-    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
-    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
-    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app, (&app).screenAgent());
-
-    try std.testing.expect(app.should_exit);
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy == null);
-    try std.testing.expect(!app.screenAgent().worker.session_transition_held);
-    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
-}
-
-test "raw benchmark preflight matches no-arg SPARK_BENCH presence" {
-    const no_args = [_][*:0]const u8{"spark"};
-    const help_args = [_][*:0]const u8{ "spark", "help" };
-    const bench_env = [_:null]?[*:0]const u8{"SPARK_BENCH=1"};
-    const empty_env = [_:null]?[*:0]const u8{};
-
-    try std.testing.expect(shouldRunBenchmarkNoArgRaw(no_args[0..], @ptrCast(&bench_env)));
-    try std.testing.expect(!shouldRunBenchmarkNoArgRaw(help_args[0..], @ptrCast(&bench_env)));
-    try std.testing.expect(!shouldRunBenchmarkNoArgRaw(no_args[0..], @ptrCast(&empty_env)));
-}
-
-test "terminal help styling respects terminal capability and color opt-outs" {
-    try std.testing.expectEqual(command_specs.HelpStyle.ansi, topLevelHelpStyleForValues(true, false, false));
-    try std.testing.expectEqual(command_specs.HelpStyle.plain, topLevelHelpStyleForValues(false, false, false));
-    try std.testing.expectEqual(command_specs.HelpStyle.plain, topLevelHelpStyleForValues(true, true, false));
-    try std.testing.expectEqual(command_specs.HelpStyle.plain, topLevelHelpStyleForValues(true, false, true));
-}
-
-test "follow up prompt card top margin is renderer-owned" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    var app = App{
-        .alloc = std.testing.allocator,
-        .shell = .{
-            .stdout_file = sink,
-            .layout = .{
-                .rows = 24,
-                .cols = 80,
-                .content_bottom = 21,
-                .divider_top_row = 22,
-                .input_row = 23,
-                .divider_bottom_row = 24,
-                .hint_row = 22,
-            },
-        },
-    };
-    defer {
-        app.shell.deinit(std.testing.allocator);
-        app.screenAgent().session.deinit(std.testing.allocator);
-    }
-
-    try app.screenAgent().session.appendAssistantHistoryTurn(std.testing.allocator, "hi", "hello");
-    try app.writeTranscript("hello\n", true);
-    try app.writeUserPromptCard(app.screenAgent(), .{ .text = @constCast("follow up") });
-
-    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "hello\n\n") == null);
-
-    const rendered = try transcript_runtime.renderEntriesToBytes(std.testing.allocator, app.shell.notebook.entries.items, app.shell.layout.cols, .{});
-    defer std.testing.allocator.free(rendered);
-
-    try std.testing.expect(std.mem.find(u8, rendered, "hello\n\n") != null);
-}
-
-test "follow up prompt card does not over-pad when assistant ends with blank row" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    var app = App{
-        .alloc = std.testing.allocator,
-        .shell = .{
-            .stdout_file = sink,
-            .layout = .{
-                .rows = 24,
-                .cols = 80,
-                .content_bottom = 21,
-                .divider_top_row = 22,
-                .input_row = 23,
-                .divider_bottom_row = 24,
-                .hint_row = 22,
-            },
-        },
-    };
-    defer {
-        app.shell.deinit(std.testing.allocator);
-        app.screenAgent().session.deinit(std.testing.allocator);
-    }
-
-    try app.screenAgent().session.appendAssistantHistoryTurn(std.testing.allocator, "hi", "hello");
-    try app.writeTranscript("hello\n\n", true);
-    try app.writeUserPromptCard(app.screenAgent(), .{ .text = @constCast("follow up") });
-
-    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "hello\n\n\n") == null);
-    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "hello\n\n") != null);
-}
-
-test "diff block writes are classified" {
-    const alloc = std.testing.allocator;
-    const c_alloc = std.heap.c_allocator;
-    const diff_mod = @import("core/output/diff.zig");
-
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    var app = App{
-        .alloc = alloc,
-        .shell = .{
-            .stdout_file = sink,
-            .layout = .{
-                .rows = 24,
-                .cols = 80,
-                .content_bottom = 21,
-                .divider_top_row = 22,
-                .input_row = 23,
-                .divider_bottom_row = 24,
-                .hint_row = 22,
-            },
-        },
-    };
-    defer {
-        for (app.screenAgent().diff_entries.items) |*entry| entry.deinit(c_alloc);
-        app.screenAgent().diff_entries.deinit(c_alloc);
-        app.shell.deinit(alloc);
-        app.screenAgent().session.deinit(alloc);
-    }
-
-    const payload = agent_runtime.DiffEntryPayload{
-        .preview = try c_alloc.dupe(u8, "diff preview"),
-    };
-    errdefer diff_mod.freeDiffEntryPayload(c_alloc, payload);
-
-    try app.registerAndEmitDiffBlock(app.screenAgent(), payload);
-
-    try std.testing.expect(app.shell.notebook.entries.items.len > 0);
-    try std.testing.expectEqual(
-        transcript_runtime.RawEntryClass.diff_block,
-        app.shell.notebook.entries.items[app.shell.notebook.entries.items.len - 1].raw_bytes.class,
-    );
-}
-
-test "deferred resumed diff builds once and degrades to its preview" {
-    const alloc = std.testing.allocator;
-    const c_alloc = std.heap.c_allocator;
-    const diff_mod = @import("core/output/diff.zig");
-
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    var app = App{
-        .alloc = alloc,
-        .shell = .{
-            .stdout_file = sink,
-            .layout = .{
-                .rows = 24,
-                .cols = 80,
-                .content_bottom = 21,
-                .divider_top_row = 22,
-                .input_row = 23,
-                .divider_bottom_row = 24,
-                .hint_row = 22,
-            },
-        },
-    };
-    defer {
-        for (app.screenAgent().diff_entries.items) |*entry| entry.deinit(c_alloc);
-        app.screenAgent().diff_entries.deinit(c_alloc);
-        app.shell.deinit(alloc);
-        app.screenAgent().session.deinit(alloc);
-    }
-
-    const lifecycle: types.ToolLifecycleId = .{ .turn_id = 3, .call_id = "call_deferred" };
-    var payload = agent_runtime.DiffEntryPayload{
-        .preview = try c_alloc.dupe(u8, "diff preview"),
-    };
-    payload.deferred = diff_mod.DeferredFullDiff.clone(
-        c_alloc,
-        "call_deferred",
-        "diff-0000000000000000-0000000000000000.json",
-        lifecycle,
-    ) catch |err| {
-        diff_mod.freeDiffEntryPayload(c_alloc, payload);
-        return err;
-    };
-    try app.registerAndEmitDiffBlock(app.screenAgent(), payload);
-    const id = app.screenAgent().diff_entries.items[0].id;
-    // Registering and drawing a resumed edit builds nothing; the full diff
-    // waits for the full transcript to ask for it.
-    try std.testing.expect(app.screenAgent().diff_entries.items[0].deferred != null);
-    try std.testing.expect(app.screenAgent().diff_entries.items[0].full == null);
-
-    // No saved session owns the snapshots: the entry falls back to its
-    // preview, and the failed build is not retried on every lookup.
-    try std.testing.expect(!App.hasFullDiffForLifecycle(&app, lifecycle));
-    try std.testing.expect(app.screenAgent().diff_entries.items[0].deferred == null);
-    try std.testing.expect(App.fullDiffForMarker(&app, id) == null);
-    try std.testing.expect(app.screenAgent().diff_entries.items[0].full == null);
-}
-
-test "prompt card wraps image badges in OSC 8 hyperlinks" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    var app = App{
-        .alloc = std.testing.allocator,
-        .shell = .{
-            .stdout_file = sink,
-            .layout = .{
-                .rows = 24,
-                .cols = 80,
-                .content_bottom = 21,
-                .divider_top_row = 22,
-                .input_row = 23,
-                .divider_bottom_row = 24,
-                .hint_row = 22,
-            },
-        },
-    };
-    defer {
-        app.shell.deinit(std.testing.allocator);
-        app.screenAgent().session.deinit(std.testing.allocator);
-    }
-
-    var images = [_]types.ImageAttachment{
-        .{ .id = 1, .path = @constCast("/tmp/a.png"), .media_type = @constCast("image/png") },
-    };
-    try app.writeUserPromptCard(app.screenAgent(), .{ .text = @constCast("[Image #1]"), .images = &images });
-
-    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "\x1b]8;;file:///tmp/a.png\x1b\\[Image 1]\x1b]8;;\x1b\\") != null);
-    const reconstructed = try transcript_runtime.renderEntriesToBytes(std.testing.allocator, app.shell.notebook.entries.items, app.shell.layout.cols, .{});
-    defer std.testing.allocator.free(reconstructed);
-    try std.testing.expect(std.mem.find(u8, reconstructed, "\x1b]8;;file:///tmp/a.png\x1b\\[Image 1]\x1b]8;;\x1b\\") != null);
-}
-
-test "/version command writes version to transcript" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-
-    var app = App{
-        .alloc = std.testing.allocator,
-        .shell = .{
-            .stdout_file = sink,
-            .layout = .{
-                .rows = 24,
-                .cols = 80,
-                .content_bottom = 21,
-                .divider_top_row = 22,
-                .input_row = 23,
-                .divider_bottom_row = 24,
-                .hint_row = 22,
-            },
-        },
-    };
-    defer app.shell.deinit(std.testing.allocator);
-
-    try app.handleCommand("/version");
-
-    try std.testing.expectEqual(@as(usize, 1), app.shell.notebook.entries.items.len);
-    try std.testing.expect(app.shell.notebook.entries.items[0] == .semantic_notice);
-    const notice = app.shell.notebook.entries.items[0].semantic_notice;
-    try std.testing.expectEqualStrings("version", notice.topic);
-    try std.testing.expectEqual(types.NoticeTone.neutral, notice.tone);
-    try std.testing.expect(std.mem.find(u8, notice.body, version) != null);
-}
-
-test "normalize assistant text removes markdown emphasis and leading blank lines" {
-    const normalized = try agent_runtime.normalizeAssistantTextForDisplay(std.testing.allocator, "\n\n**Hola** `mundo`");
-    defer std.testing.allocator.free(normalized);
-
-    try std.testing.expectEqualStrings("Hola mundo", normalized);
-}
-
-test "semantic code block preserves indentation on wrapped continuation rows" {
-    const alloc = std.testing.allocator;
-    var entries: std.ArrayList(transcript_runtime.TranscriptEntry) = .empty;
-    defer {
-        for (entries.items) |*entry| entry.deinit(alloc);
-        entries.deinit(alloc);
-    }
-
-    const block = assistant_presentation.CodeBlockPayload{
-        .language = try alloc.dupe(u8, "text"),
-        .code = try alloc.dupe(u8, "  abcdefghijkl\n"),
-    };
-    try entries.append(alloc, .{ .assistant_code_block = .{ .id = 1, .block = block } });
-
-    const wide = try transcript_runtime.renderEntriesToBytes(alloc, entries.items, 80, .{});
-    defer alloc.free(wide);
-    try std.testing.expect(std.mem.find(u8, wide, "text") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "─") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "│") == null);
-    try std.testing.expect(std.mem.find(u8, wide, "  abcdefghijkl") != null);
-
-    const narrow = try transcript_runtime.renderEntriesToBytes(alloc, entries.items, 12, .{});
-    defer alloc.free(narrow);
-    try std.testing.expect(std.mem.find(u8, narrow, "\n    ijkl\n") != null);
-    var lines = std.mem.splitScalar(u8, narrow, '\n');
-    while (lines.next()) |line| {
-        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 12);
-    }
-
-    const tiny = try transcript_runtime.renderEntriesToBytes(alloc, entries.items, 1, .{});
-    defer alloc.free(tiny);
-    try std.testing.expect(std.mem.find(u8, tiny, "┌") == null);
-    lines = std.mem.splitScalar(u8, tiny, '\n');
-    while (lines.next()) |line| {
-        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 1);
-    }
-
-    var wide_rune_entries: std.ArrayList(transcript_runtime.TranscriptEntry) = .empty;
-    defer {
-        for (wide_rune_entries.items) |*entry| entry.deinit(alloc);
-        wide_rune_entries.deinit(alloc);
-    }
-    const wide_rune_block = assistant_presentation.CodeBlockPayload{
-        .language = try alloc.dupe(u8, "text"),
-        .code = try alloc.dupe(u8, " a\xf0\x9f\x98\x80\n"),
-    };
-    try wide_rune_entries.append(alloc, .{ .assistant_code_block = .{ .id = 2, .block = wide_rune_block } });
-
-    const boxed_wide_rune = try transcript_runtime.renderEntriesToBytes(alloc, wide_rune_entries.items, 6, .{});
-    defer alloc.free(boxed_wide_rune);
-    lines = std.mem.splitScalar(u8, boxed_wide_rune, '\n');
-    while (lines.next()) |line| {
-        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 6);
-    }
-
-    const unboxed_wide_rune = try transcript_runtime.renderEntriesToBytes(alloc, wide_rune_entries.items, 2, .{});
-    defer alloc.free(unboxed_wide_rune);
-    lines = std.mem.splitScalar(u8, unboxed_wide_rune, '\n');
-    while (lines.next()) |line| {
-        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 2);
-    }
-}
-
 test {
     _ = @import("core/agent/runtime/journal.zig");
     _ = @import("acp/libfx_journal.zig");
@@ -5585,7 +4232,6 @@ test {
     _ = @import("core/app/app_auth_runtime.zig");
     _ = auth_runtime;
     _ = @import("core/auth/auth_transition.zig");
-    _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/subagent_turn_metrics.zig");
     _ = @import("core/workspace/workspace_access.zig");
@@ -5596,8 +4242,6 @@ test {
     _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
-    _ = @import("core/app/usage_host.zig");
-    _ = credits_lookup;
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = input_submit_runtime;
@@ -5645,8 +4289,6 @@ test {
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
     _ = @import("ui/footer/settings_menu_presentation.zig");
     _ = @import("builtins/context.zig");
-    _ = @import("builtins/gateway.zig");
-    _ = @import("builtins/gateway/typesafe_permission_reviewer.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/output/full_transcript_metadata.zig");
@@ -5656,22 +4298,9 @@ test {
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/cli/doctor_probes.zig");
     _ = @import("core/cli/doctor_child_status.zig");
-    _ = @import("core/auth/login_flow.zig");
-    _ = @import("core/auth/chatgpt_oauth.zig");
-    _ = @import("core/auth/provider_catalog.zig");
-    _ = @import("gateway/openai_codex_models.zig");
-    _ = @import("gateway/openai_codex.zig");
     _ = @import("gateway/responses_protocol.zig");
-    _ = @import("gateway/openai_codex_permission_reviewer.zig");
-    _ = @import("core/auth/grok_session.zig");
-    _ = @import("core/auth/grok_oauth.zig");
-    _ = @import("gateway/xai_grok_models.zig");
-    _ = @import("gateway/provider_versions.zig");
-    _ = @import("gateway/xai_grok.zig");
-    _ = @import("gateway/xai_grok_permission_reviewer.zig");
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
-    _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/auth/pending_revocation.zig");
     _ = @import("core/mcp_host/kept_sign_outs.zig");
     _ = @import("core/workspace/file_index.zig");
@@ -5716,7 +4345,6 @@ test {
     _ = @import("core/execution/router.zig");
     _ = @import("core/execution/command_runner.zig");
     _ = @import("core/permissions/direct_command.zig");
-    _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/permissions/command_admission.zig");
     _ = @import("core/mcp/tool_result.zig");
     _ = @import("core/mcp/tool_search.zig");
@@ -5757,7 +4385,6 @@ test {
     _ = @import("core/subagent/agent_adapter.zig");
     _ = @import("core/subagent/tool_host.zig");
     _ = @import("core/subagent/authority.zig");
-    _ = @import("core/subagent/approval_registry.zig");
     _ = @import("core/subagent/reports.zig");
     _ = @import("core/shared/agent_frame.zig");
     _ = @import("core/terminal/contracts.zig");
@@ -5771,7 +4398,6 @@ test {
     _ = @import("core/terminal/managed_observer.zig");
     _ = @import("tools/shell/shell.zig");
     _ = @import("tools/shell/process_provider.zig");
-    _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/shared/text_utils.zig");
     _ = @import("core/shared/testing_listener.zig");
@@ -5822,9 +4448,7 @@ test {
     _ = @import("ui/input/terminal_action_decoder.zig");
     _ = @import("ui/input/visual_layout.zig");
     _ = @import("ui/input/runtime.zig");
-    _ = @import("ui/approval_screen.zig");
     _ = @import("ui/ask_presentation.zig");
-    _ = @import("ui/footer/approval_ui.zig");
     _ = @import("ui/footer/surface_invalidation.zig");
     _ = @import("ui/full_transcript_screen.zig");
     _ = @import("ui/render_engine/frame_fixed_point.zig");
@@ -5836,102 +4460,7 @@ test {
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");
     _ = @import("gateway/open_job.zig");
-    _ = @import("gateway/vercel_failure_diagnostics.zig");
-    _ = @import("gateway/host_model_catalog.zig");
-    _ = @import("gateway/host_openai_codex.zig");
-    _ = @import("gateway/host_xai_grok.zig");
     _ = @import("gateway/host_chat_completions.zig");
-}
-
-test "the busiest agent wins herdr's state: an approval over work, work over idle, and a closed first instance not at all" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer app.instances.agents_menu.deinit(alloc);
-    const runtime = App.AgentsAppRuntime;
-    const Busiest = app_agents_runtime.Busiest;
-    const asking = try addTestChildAgent(&app, "asking");
-    const working = try addTestChildAgent(&app, "working");
-    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
-
-    working.agent.worker.worker_processing = true;
-    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
-    try std.testing.expect(try asking.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
-    try std.testing.expectEqual(Busiest.needs_approval, runtime.busiest(&app));
-    asking.agent.approval_prompt.clear(alloc);
-    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
-
-    // A turn that ended unseen leaves its agent idle for herdr.
-    working.agent.worker.worker_processing = false;
-    working.agent.finished_unseen = true;
-    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
-
-    // Once the first instance is closed, main's agent no longer counts.
-    app.main_agent.worker.worker_processing = true;
-    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
-    app.instances.first_open = false;
-    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
-    app.main_agent.worker.worker_processing = false;
-}
-
-test "an upgrade sees the agents its restart would stop, but not the one on screen" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer app.instances.agents_menu.deinit(alloc);
-    const runtime = App.AgentsAppRuntime;
-    const Busiest = app_agents_runtime.Busiest;
-    var buf: [32]u8 = undefined;
-    const reviewer = try addTestChildAgent(&app, "reviewer");
-    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
-
-    // Main is on screen, so the upgrade's own checks cover its turn.
-    app.main_agent.worker.worker_processing = true;
-    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
-    app.main_agent.worker.worker_processing = false;
-
-    reviewer.agent.worker.worker_processing = true;
-    const working = runtime.busyAgentElsewhere(&app, &buf).?;
-    try std.testing.expectEqualStrings("reviewer", working.name);
-    try std.testing.expectEqual(Busiest.working, working.doing);
-    reviewer.agent.worker.worker_processing = false;
-
-    try std.testing.expect(try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
-    try std.testing.expectEqual(Busiest.needs_approval, runtime.busyAgentElsewhere(&app, &buf).?.doing);
-    reviewer.agent.approval_prompt.clear(alloc);
-
-    // On the reviewer's screen, main's turn counts and the reviewer's own
-    // does not.
-    app.agent_on_screen = reviewer;
-    defer app.agent_on_screen = null;
-    reviewer.agent.worker.worker_processing = true;
-    try std.testing.expect(runtime.busyAgentElsewhere(&app, &buf) == null);
-    app.main_agent.worker.worker_processing = true;
-    try std.testing.expectEqualStrings("main", runtime.busyAgentElsewhere(&app, &buf).?.name);
-    app.main_agent.worker.worker_processing = false;
-    reviewer.agent.worker.worker_processing = false;
-}
-
-/// How many session approvals `agent` has, read as a thread other than the
-/// resolver reads them: a copy taken under the authority lock.
-fn grantCount(app: *App, agent: *agents.Agent) usize {
-    const copy = app_permission_runtime.Runtime(App).copyGrants(app, agent, std.testing.allocator) catch return 0;
-    defer types.freePermissionGrantSlice(std.testing.allocator, copy);
-    return copy.len;
-}
-
-/// Whether a session approval of `agent` allows `tool_name` on `target_path`,
-/// read from a copy.
-fn grantAllowed(app: *App, agent: *agents.Agent, tool_name: []const u8, target_path: []const u8) bool {
-    const copy = app_permission_runtime.Runtime(App).copyGrants(app, agent, std.testing.allocator) catch return false;
-    defer types.freePermissionGrantSlice(std.testing.allocator, copy);
-    return permissions.sessionGrantAllowed(copy, tool_name, target_path);
 }
 
 fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent {
@@ -5941,316 +4470,6 @@ fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent 
     errdefer app.alloc.free(child.id);
     try app.child_agents.append(app.alloc, child);
     return child;
-}
-
-// The per-step refresh of a selected MCP tool reads the host's rules through the agent's own deps, in
-// the mode of the agent that runs it: none in full access, so a tool a deny rule names stays, and the
-// host's rules in ask (tests/tla/mcp_host/McpRules.tla `FullAccessIgnoresRules`, `DenyHoldsOutside`).
-test "the per-step refresh of an MCP tool takes the rules of the mode of the agent that runs it" {
-    const alloc = std.testing.allocator;
-    const Permission = app_permission_runtime.Runtime(App);
-    const Fixture = @import("core/mcp_host/fake_server.zig").Fixture;
-    const mcp_contract = @import("core/mcp/mcp_contract.zig");
-    const lexical_relevance = @import("core/shared/lexical_relevance.zig");
-
-    var f: Fixture = undefined;
-    try f.init();
-    defer f.deinit();
-    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
-    const mcp = try mcp_host.Host.create(alloc, std.testing.io, &configs, &f.inherited, f.options(), .{});
-    defer mcp.destroy();
-
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer Permission.deinitSessionGrants(&app, &app.main_agent);
-    const full_access = try addTestChildAgent(&app, "instance-2");
-    full_access.agent.role = .instance;
-    Permission.initMode(&app, &app.main_agent, .ask);
-    Permission.initMode(&app, &full_access.agent, .ask);
-    Permission.setMode(&app, &full_access.agent, .yolo);
-
-    var rules_buf = [_]types.PermissionRule{
-        .{ .permission = @constCast("mcp_fake_echo"), .pattern = @constCast("*"), .action = .deny },
-    };
-    app.permission_engine.rules = .{ .rules = rules_buf[0..] };
-    app.mcp.host = mcp;
-    defer app.mcp.host = null;
-
-    // The tool, found with no rules, and its binding as a selected tool carries it.
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const query = try lexical_relevance.prepare("echo");
-    const found = try mcp.catalog.searchTools(arena, .{ .query = &query, .kind = .mcp }, .{}, .{}, .unrestricted, null);
-    try std.testing.expectEqual(@as(usize, 1), found.selected_tools.len);
-    const binding = found.selected_tools[0].mcp_binding.?;
-
-    const Bindings = app_callbacks.Bindings(App);
-    const yolo_deps = Bindings.agentRuntimeDeps(&app, &full_access.agent);
-    const ask_deps = Bindings.agentRuntimeDeps(&app, &app.main_agent);
-    const yolo_refresh = try yolo_deps.snapshot_mcp_definition.?(yolo_deps.ctx, arena, "mcp_fake_echo", binding);
-    const ask_refresh = try ask_deps.snapshot_mcp_definition.?(ask_deps.ctx, arena, "mcp_fake_echo", binding);
-    // Full access keeps the tool the rule names; ask drops it.
-    try std.testing.expect(yolo_refresh == .current);
-    try std.testing.expect(ask_refresh == .unavailable);
-}
-
-test "visiting a child agent puts its context, transcript, and pacer on the screen until it returns" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-
-    try app.shell.notebook.transcript.appendSlice(alloc, "main text\n");
-    try app.pacer.enqueue(alloc, "main paced");
-
-    const Body = struct {
-        fn run(expected: *agents.Agent, a: *App, agent: *agents.Agent) anyerror!void {
-            try std.testing.expect(agent == expected);
-            try std.testing.expectEqualStrings("", a.shell.notebook.transcript.items);
-            try std.testing.expect(!a.pacer.hasPending());
-            try a.shell.notebook.transcript.appendSlice(a.alloc, "child text\n");
-            try a.pacer.enqueue(a.alloc, "child paced");
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, &child.agent, Body.run);
-
-    try std.testing.expect(app.screenAgent() == &app.main_agent);
-    try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
-    try std.testing.expectEqualStrings("child text\n", child.screen.transcript.notebook.transcript.items);
-    try std.testing.expect(app.pacer.hasPending());
-    try std.testing.expect(child.screen.pacer.hasPending());
-}
-
-test "a transcript keeps its resume handoff through a visit and drops it when another agent's takes the screen" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-    // Main's resume handed its flow to the commit anchor, and the next frame
-    // has not repainted it yet.
-    app.shell.resume_handoff_repaint_pending = true;
-
-    // A hidden agent's work swaps main's transcript out only until it
-    // returns, so main's rows are still on screen.
-    const Body = struct {
-        fn run(_: void, a: *App, _: *agents.Agent) anyerror!void {
-            try std.testing.expect(!a.shell.resume_handoff_repaint_pending);
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, {}, Body.run);
-    try std.testing.expect(app.shell.resume_handoff_repaint_pending);
-
-    // Showing the subagent takes main's rows off the screen. Main comes back
-    // before the checks, so a failed check never leaves the subagent on
-    // screen for the cleanup.
-    try App.AgentsAppRuntime.show(&app, child);
-    const shown = app.agent_on_screen;
-    const held_off_screen = app.main_screen.transcript.resume_handoff_repaint_pending;
-    try App.AgentsAppRuntime.show(&app, null);
-    try std.testing.expect(shown == child);
-    try std.testing.expect(!held_off_screen);
-    try std.testing.expect(!app.shell.resume_handoff_repaint_pending);
-}
-
-test "the tick visits only the child agents with work waiting" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const idle = try addTestChildAgent(&app, "idle");
-    const busy = try addTestChildAgent(&app, "busy");
-    try busy.agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
-
-    const Visits = struct {
-        seen: std.ArrayList(*agents.Agent) = .empty,
-        fn record(self: *@This(), a: *App, agent: *agents.Agent) anyerror!void {
-            try self.seen.append(a.alloc, agent);
-            var events = agent.worker.takeEvents();
-            defer {
-                for (events.items) |event| worker_runtime.freeWorkerEvent(a.alloc, event);
-                events.deinit(a.alloc);
-            }
-        }
-    };
-    var visits: Visits = .{};
-    defer visits.seen.deinit(alloc);
-    try App.AgentsAppRuntime.tickChildren(&app, &visits, Visits.record);
-
-    try std.testing.expectEqual(@as(usize, 1), visits.seen.items.len);
-    try std.testing.expect(visits.seen.items[0] == &busy.agent);
-    try std.testing.expect(!idle.agent.worker.hasPendingEvents());
-    try std.testing.expect(!busy.agent.worker.hasPendingEvents());
-    try std.testing.expect(app.screenAgent() == &app.main_agent);
-}
-
-test "the tick leaves hidden agents' work for a later pass while a scrollback handoff is pending" {
-    const alloc = std.testing.allocator;
-    // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const on_screen = try addTestChildAgent(&app, "on-screen");
-    const hidden = try addTestChildAgent(&app, "hidden");
-    try App.AgentsAppRuntime.show(&app, on_screen);
-    for ([_]*agents.Agent{ &app.main_agent, &hidden.agent }) |agent| {
-        try agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
-    }
-
-    const Visits = struct {
-        seen: std.ArrayList(*agents.Agent) = .empty,
-        fn record(self: *@This(), a: *App, agent: *agents.Agent) anyerror!void {
-            try self.seen.append(a.alloc, agent);
-            var events = agent.worker.takeEvents();
-            defer {
-                for (events.items) |event| worker_runtime.freeWorkerEvent(a.alloc, event);
-                events.deinit(a.alloc);
-            }
-        }
-    };
-    var visits: Visits = .{};
-    defer visits.seen.deinit(alloc);
-
-    // Swapping a hidden transcript in now would trip swapSlot's handoff
-    // assertion.
-    app.shell.pending_session_scrollback_handoff = .{ .remaining_rows = 1, .total_rows = 2, .terminal_cols = 80, .terminal_rows = 24 };
-    try App.AgentsAppRuntime.tickChildren(&app, &visits, Visits.record);
-    try std.testing.expectEqual(@as(usize, 0), visits.seen.items.len);
-    try std.testing.expect(app.main_agent.worker.hasPendingEvents());
-    try std.testing.expect(hidden.agent.worker.hasPendingEvents());
-    try std.testing.expect(app.screenAgent() == &on_screen.agent);
-
-    // Once the handoff's rows are written, the next pass handles the work.
-    app.shell.pending_session_scrollback_handoff = null;
-    try App.AgentsAppRuntime.tickChildren(&app, &visits, Visits.record);
-    try std.testing.expectEqual(@as(usize, 2), visits.seen.items.len);
-    try std.testing.expect(visits.seen.items[0] == &app.main_agent);
-    try std.testing.expect(visits.seen.items[1] == &hidden.agent);
-    try std.testing.expect(!app.main_agent.worker.hasPendingEvents());
-    try std.testing.expect(!hidden.agent.worker.hasPendingEvents());
-    try std.testing.expect(app.screenAgent() == &on_screen.agent);
-}
-
-test "a hidden agent's pacer is flushed for held mail once a scrollback handoff ends, and not while it is pending, under the sign-in key entry" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const on_screen = try addTestChildAgent(&app, "on-screen");
-    const hidden = try addTestChildAgent(&app, "hidden");
-    try App.AgentsAppRuntime.show(&app, on_screen);
-
-    // The hidden agent finished a turn that a report missed. The sign-in key
-    // entry is open, so no pacer is ticked and the hidden agent's keeps the
-    // finished turn, and its worker holds the report for the commit. (A
-    // subagent's approval would not do: a visit clears an approval its worker
-    // does not wait on.)
-    const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
-    const worker = &hidden.agent.worker;
-    // `deinitChildren` leaves a worker to its owner. Its queue is allocated
-    // with `c_allocator`, as `postAgentMessage` allocates it, and the turn the
-    // flush commits lands in the agent's session and names its title.
-    const gpa = std.heap.c_allocator;
-    defer worker.deinit(gpa);
-    defer hidden.agent.session_persistence.deinit(alloc);
-    defer hidden.agent.session.deinit(alloc);
-    defer hidden.agent.session_title.deinit(alloc);
-    worker.enableCommitGate();
-    worker.worker_processing = true;
-    worker.active_turn_id = 9;
-    worker.direct_steering_closed = true;
-    try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = turn } });
-    try worker.postMail(gpa, .{
-        .prompt = try gpa.dupe(u8, "a report"),
-        .images = &.{},
-        .model = try gpa.dupe(u8, "test-model"),
-        .api_key = try gpa.dupe(u8, "test-key"),
-        .permission_mode = .auto,
-        .history = try gpa.alloc(types.HistoryTurn, 0),
-        .grants = try gpa.alloc(types.PermissionGrant, 0),
-    });
-    worker.finishProcessing();
-    var taken = worker.takeEvents();
-    for (taken.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
-    taken.deinit(gpa);
-    try hidden.screen.pacer.enqueue(alloc, "still showing");
-    try std.testing.expect(try hidden.screen.pacer.deferFinish(alloc, .{ .turn = turn }));
-    app.auth.picker_active = true;
-    app.auth.picker_stage = .api_key;
-    defer app.auth.picker_active = false;
-    try std.testing.expect(app.auth.apiKeyEntryActive());
-    try std.testing.expect(worker.commitGateWaitsForCommit());
-
-    // While the handoff is pending the tick skips the hidden agent: nothing is
-    // flushed, so no hidden transcript is swapped onto the screen.
-    app.shell.pending_session_scrollback_handoff = .{ .remaining_rows = 1, .total_rows = 2, .terminal_cols = 80, .terminal_rows = 24 };
-    for (0..3) |_| try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
-    try std.testing.expect(hidden.screen.pacer.deferred_turn != null);
-    try std.testing.expectEqual(@as(u32, 1), worker.unacknowledged_finishes);
-    try std.testing.expect(worker.commitGateWaitsForCommit());
-    try std.testing.expect(app.screenAgent() == &on_screen.agent);
-
-    // Once the handoff ends, the agent's own tick flushes its pacer and the
-    // commit releases the held report.
-    app.shell.pending_session_scrollback_handoff = null;
-    try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
-    try std.testing.expect(hidden.screen.pacer.deferred_turn == null);
-    try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
-    try std.testing.expect(!worker.commitGateWaitsForCommit());
-    try std.testing.expect(app.screenAgent() == &on_screen.agent);
-    const work = (try worker.tryTakeNextWork(gpa)) orelse return error.TestExpectedReportToStart;
-    defer worker_runtime.freeWorkItem(gpa, work);
-    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
-}
-
-test "a run handed to a hidden agent waits while a scrollback handoff is pending" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    // The hand-off list uses the C allocator, as the slot threads do.
-    defer app.child_handoffs.posts.clearAndFree(std.heap.c_allocator);
-    const child = try addTestChildAgent(&app, "child-1");
-
-    // Taking the run reads only the turn's child id and name.
-    var turn: subagent_execution.TurnContext = undefined;
-    turn.child_id = child.id;
-    turn.child_name = null;
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-    var post: app_agents_runtime.Post = .{ .turn = &turn, .run = try testChildRun(alloc, &resolver, false, null) };
-    // A held run stays the post's own.
-    defer if (post.run) |*run| run.deinit(alloc);
-    try app.child_handoffs.posts.append(std.heap.c_allocator, &post);
-
-    app.shell.pending_session_scrollback_handoff = .{ .remaining_rows = 1, .total_rows = 2, .terminal_cols = 80, .terminal_rows = 24 };
-    defer app.shell.pending_session_scrollback_handoff = null;
-    App.AgentsAppRuntime.takePosts(&app);
-
-    try std.testing.expectEqual(app_agents_runtime.Post.State.posted, post.state.load(.acquire));
-    try std.testing.expect(post.held);
-    try std.testing.expectEqual(@as(usize, 1), app.child_handoffs.posts.items.len);
-    try std.testing.expect(app.child_handoffs.posts.items[0] == &post);
-    try std.testing.expect(child.agent.child_run == null);
-    try std.testing.expect(app.screenAgent() == &app.main_agent);
 }
 
 /// A scrollback handoff that still has rows to write, for tests.
@@ -6298,625 +4517,6 @@ fn pushTestText(agent: *agents.Agent, comptime fmt: []const u8, args: anytype) !
     try agent.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{ .text = text } });
 }
 
-test "hidden work held over a thousand passes is all handled once the handoff ends, in order" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "hidden-tick.log" });
-    defer alloc.free(trace_path);
-    debug_trace.resetForTest();
-    defer debug_trace.resetForTest();
-    try debug_trace.configureForTestWithScopes(alloc, trace_path, "host");
-
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const hidden = try addTestChildAgent(&app, "hidden");
-    var visits: HiddenWorkVisits = .{};
-    defer visits.deinit(alloc);
-
-    const passes = 1000;
-    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
-    defer app.shell.pending_session_scrollback_handoff = null;
-    for (0..passes) |pass| {
-        try pushTestText(&hidden.agent, "event-{d}", .{pass});
-        try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
-    }
-    try std.testing.expectEqual(@as(usize, 0), visits.seen.items.len);
-    try std.testing.expect(hidden.agent.worker.hasPendingEvents());
-
-    app.shell.pending_session_scrollback_handoff = null;
-    try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
-    try std.testing.expectEqual(@as(usize, 1), visits.seen.items.len);
-    try std.testing.expect(visits.seen.items[0] == &hidden.agent);
-    try std.testing.expectEqual(@as(usize, passes), visits.texts.items.len);
-    var want: [64]u8 = undefined;
-    for (visits.texts.items, 0..) |text, index| {
-        try std.testing.expectEqualStrings(try std.mem.print(&want, "event-{d}", .{index}), text);
-    }
-    try std.testing.expect(!hidden.agent.worker.hasPendingEvents());
-
-    // One line for each pass that held work, and none once it ran.
-    debug_trace.shutdown();
-    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
-    defer trace_file.close(io_mod.getIo());
-    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 1024 * 1024);
-    defer alloc.free(trace);
-    try std.testing.expectEqual(@as(usize, passes), std.mem.count(u8, trace, "event=hidden_tick_deferred"));
-    try std.testing.expectEqual(@as(usize, passes), std.mem.count(u8, trace, "reason=scrollback_handoff_pending agents=1"));
-}
-
-test "main and every hidden subagent wait during a pending handoff and are each handled once after it" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-
-    const count = 64;
-    var hidden: [count]*app_agents_runtime.ChildAgent = undefined;
-    var name: [32]u8 = undefined;
-    for (&hidden, 0..) |*slot, index| slot.* = try addTestChildAgent(&app, try std.mem.print(&name, "hidden-{d}", .{index}));
-    const on_screen = try addTestChildAgent(&app, "on-screen");
-    try App.AgentsAppRuntime.show(&app, on_screen);
-    try pushTestText(&app.main_agent, "main", .{});
-    for (hidden, 0..) |child, index| {
-        for (0..3) |part| try pushTestText(&child.agent, "hidden-{d}-{d}", .{ index, part });
-    }
-
-    var visits: HiddenWorkVisits = .{};
-    defer visits.deinit(alloc);
-    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
-    defer app.shell.pending_session_scrollback_handoff = null;
-    for (0..10) |_| try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
-    try std.testing.expectEqual(@as(usize, 0), visits.seen.items.len);
-    try std.testing.expect(app.screenAgent() == &on_screen.agent);
-
-    app.shell.pending_session_scrollback_handoff = null;
-    try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
-    try std.testing.expectEqual(@as(usize, count + 1), visits.seen.items.len);
-    try std.testing.expect(visits.seen.items[0] == &app.main_agent);
-    for (hidden, 1..) |child, index| try std.testing.expect(visits.seen.items[index] == &child.agent);
-    try std.testing.expectEqual(@as(usize, 1 + count * 3), visits.texts.items.len);
-    try std.testing.expectEqualStrings("main", visits.texts.items[0]);
-    try std.testing.expectEqualStrings("hidden-0-0", visits.texts.items[1]);
-    try std.testing.expectEqualStrings("hidden-63-2", visits.texts.items[count * 3]);
-    try std.testing.expect(!app.main_agent.worker.hasPendingEvents());
-    for (hidden) |child| try std.testing.expect(!child.agent.worker.hasPendingEvents());
-    try std.testing.expect(app.screenAgent() == &on_screen.agent);
-}
-
-test "hidden work held by a handoff runs once a resize cancels the handoff" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    try app.shell.initBacking(alloc);
-    try app.shell.enableShadowVt(alloc);
-    try app.shell.writeTranscript(alloc, &app.metrics, "old session retained\n", true);
-    app.shell.has_committed_frame = true;
-    const hidden = try addTestChildAgent(&app, "hidden");
-    try pushTestText(&hidden.agent, "held", .{});
-
-    app.main_agent.session_persistence.pending_live_session_policy = .carry_forward;
-    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
-    var visits: HiddenWorkVisits = .{};
-    defer visits.deinit(alloc);
-    try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
-    try std.testing.expectEqual(@as(usize, 0), visits.seen.items.len);
-
-    app.shell.layout.cols = 78;
-    app.shell.render_requests.observeResizeSignal(100, 100);
-    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
-    try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy == null);
-
-    try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
-    try std.testing.expectEqual(@as(usize, 1), visits.seen.items.len);
-    try std.testing.expectEqual(@as(usize, 1), visits.texts.items.len);
-    try std.testing.expectEqualStrings("held", visits.texts.items[0]);
-}
-
-test "a thousand handoffs that come and go lose no hidden work and run none of it early" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const hidden = try addTestChildAgent(&app, "hidden");
-    var visits: HiddenWorkVisits = .{};
-    defer visits.deinit(alloc);
-    defer app.shell.pending_session_scrollback_handoff = null;
-
-    const cycles = 1000;
-    for (0..cycles) |cycle| {
-        try pushTestText(&hidden.agent, "cycle-{d}", .{cycle});
-        app.shell.pending_session_scrollback_handoff = test_pending_handoff;
-        try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
-        try std.testing.expectEqual(cycle, visits.seen.items.len);
-        app.shell.pending_session_scrollback_handoff = null;
-        try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
-        try std.testing.expectEqual(cycle + 1, visits.seen.items.len);
-    }
-    try std.testing.expectEqual(@as(usize, cycles), visits.texts.items.len);
-    var want: [64]u8 = undefined;
-    for (visits.texts.items, 0..) |text, index| {
-        try std.testing.expectEqualStrings(try std.mem.print(&want, "cycle-{d}", .{index}), text);
-    }
-}
-
-test "runs handed to hidden agents during a pending handoff stay held in their order" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer app.child_handoffs.posts.clearAndFree(std.heap.c_allocator);
-    const first = try addTestChildAgent(&app, "first");
-    const second = try addTestChildAgent(&app, "second");
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-
-    var turns: [2]subagent_execution.TurnContext = undefined;
-    turns[0].child_id = first.id;
-    turns[1].child_id = second.id;
-    for (&turns) |*turn| turn.child_name = null;
-    var posts: [2]app_agents_runtime.Post = undefined;
-    var made: usize = 0;
-    defer for (posts[0..made]) |*post| if (post.run) |*run| run.deinit(alloc);
-    for (&posts, &turns) |*post, *turn| {
-        post.* = .{ .turn = turn, .run = try testChildRun(alloc, &resolver, false, null) };
-        made += 1;
-        try app.child_handoffs.posts.append(std.heap.c_allocator, post);
-    }
-
-    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
-    defer app.shell.pending_session_scrollback_handoff = null;
-    for (0..100) |_| App.AgentsAppRuntime.takePosts(&app);
-
-    try std.testing.expectEqual(@as(usize, 2), app.child_handoffs.posts.items.len);
-    try std.testing.expect(app.child_handoffs.posts.items[0] == &posts[0]);
-    try std.testing.expect(app.child_handoffs.posts.items[1] == &posts[1]);
-    for (&posts) |*post| {
-        try std.testing.expect(post.held);
-        try std.testing.expectEqual(app_agents_runtime.Post.State.posted, post.state.load(.acquire));
-    }
-    try std.testing.expect(first.agent.child_run == null);
-    try std.testing.expect(second.agent.child_run == null);
-}
-
-test "slot threads that cancel runs held by a pending handoff get them back" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer app.child_handoffs.posts.clearAndFree(std.heap.c_allocator);
-    const count = 8;
-    var children: [count]*app_agents_runtime.ChildAgent = undefined;
-    var name: [32]u8 = undefined;
-    for (&children, 0..) |*slot, index| slot.* = try addTestChildAgent(&app, try std.mem.print(&name, "child-{d}", .{index}));
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
-    defer app.shell.pending_session_scrollback_handoff = null;
-
-    const Poster = struct {
-        fn run(handoffs: *app_agents_runtime.Handoffs, post: *app_agents_runtime.Post, cancel: *std.atomic.Value(bool), result: *?anyerror) void {
-            app_agents_runtime.postAndWait(handoffs, post, cancel) catch |err| {
-                result.* = err;
-                return;
-            };
-            result.* = null;
-        }
-    };
-
-    for (0..100) |_| {
-        var turns: [count]subagent_execution.TurnContext = undefined;
-        var posts: [count]app_agents_runtime.Post = undefined;
-        var cancels: [count]std.atomic.Value(bool) = undefined;
-        var results: [count]?anyerror = undefined;
-        var threads: [count]std.Thread = undefined;
-        var made: usize = 0;
-        defer for (posts[0..made]) |*post| if (post.run) |*run| run.deinit(alloc);
-        for (0..count) |index| {
-            turns[index].child_id = children[index].id;
-            turns[index].child_name = null;
-            posts[index] = .{ .turn = &turns[index], .run = try testChildRun(alloc, &resolver, false, null) };
-            made += 1;
-            cancels[index] = .init(false);
-            results[index] = error.TestNotFinished;
-        }
-        var started: usize = 0;
-        defer for (threads[0..started]) |thread| thread.join();
-        for (0..count) |index| {
-            threads[index] = try std.Thread.spawn(.{}, Poster.run, .{ &app.child_handoffs, &posts[index], &cancels[index], &results[index] });
-            started += 1;
-        }
-        // The loop holds the runs while the threads post them.
-        for (0..20) |_| {
-            App.AgentsAppRuntime.takePosts(&app);
-            io_mod.sleep(std.time.ns_per_ms);
-        }
-        for (&cancels) |*cancel| cancel.store(true, .seq_cst);
-        // The loop keeps holding runs while each thread withdraws its own.
-        const deadline = io_mod.milliTimestamp() + 10_000;
-        while (true) {
-            App.AgentsAppRuntime.takePosts(&app);
-            var done = true;
-            for (&posts) |*post| {
-                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
-                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
-                for (app.child_handoffs.posts.items) |queued| if (queued == post) {
-                    done = false;
-                };
-            }
-            if (done) break;
-            try std.testing.expect(io_mod.milliTimestamp() < deadline);
-            io_mod.sleep(std.time.ns_per_ms);
-        }
-        for (threads[0..started]) |thread| thread.join();
-        started = 0;
-        for (results) |result| try std.testing.expectEqual(@as(?anyerror, error.Cancelled), result);
-        for (children) |child| try std.testing.expect(child.agent.child_run == null);
-        try std.testing.expectEqual(@as(usize, 0), app.child_handoffs.posts.items.len);
-    }
-}
-
-test "a handoff that gives way before it pushed any row only redraws" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    try app.shell.initBacking(alloc);
-    try app.shell.enableShadowVt(alloc);
-    try app.shell.writeTranscript(alloc, &app.metrics, "old session retained\n", true);
-    app.shell.has_committed_frame = true;
-
-    app.main_agent.session_persistence.pending_live_session_policy = .carry_forward;
-    defer app.main_agent.session_persistence.pending_live_session_policy = null;
-    defer app.main_agent.session_persistence.pending_live_session_wait = null;
-    app.shell.pending_session_scrollback_handoff = .{ .remaining_rows = 2, .total_rows = 2, .terminal_cols = 80, .terminal_rows = 24 };
-    defer app.shell.pending_session_scrollback_handoff = null;
-    app.screenAgent().worker.worker_processing = true;
-    defer app.screenAgent().worker.worker_processing = false;
-
-    try std.testing.expect(!app.shell.terminal_reset_pending);
-    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
-    try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
-    try std.testing.expect(!app.shell.terminal_reset_pending);
-}
-
-test "a subagent its parent closes during a pending handoff is dropped once the handoff ends" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const closed = try addTestChildAgent(&app, "closed");
-    try App.AgentsAppRuntime.show(&app, closed);
-
-    // The hidden parent's `close` runs on its own worker thread and leaves
-    // the id with its host. Only the fields that path reads are set.
-    var parent_host: subagent_tool_host.Runtime = undefined;
-    parent_host.alloc = alloc;
-    parent_host.admission_mutex = .init;
-    parent_host.closed_unseen = .empty;
-    parent_host.closed_waiting = .init(false);
-    defer {
-        for (parent_host.closed_unseen.items) |id| alloc.free(id);
-        parent_host.closed_unseen.deinit(alloc);
-    }
-    try parent_host.closed_unseen.append(alloc, try alloc.dupe(u8, closed.id));
-    parent_host.closed_waiting.store(true, .release);
-    app.main_agent.session_persistence.subagent_host = &parent_host;
-    defer app.main_agent.session_persistence.subagent_host = null;
-
-    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
-    defer app.shell.pending_session_scrollback_handoff = null;
-    for (0..10) |_| try std.testing.expect(!try App.AgentsAppRuntime.dropClosedSubagents(&app));
-    try std.testing.expect(parent_host.hasClosed());
-    try std.testing.expectEqual(@as(usize, 1), app.child_agents.items.len);
-    try std.testing.expect(app.screenAgent() == &closed.agent);
-
-    app.shell.pending_session_scrollback_handoff = null;
-    try std.testing.expect(try App.AgentsAppRuntime.dropClosedSubagents(&app));
-    try std.testing.expect(!parent_host.hasClosed());
-    try std.testing.expectEqual(@as(usize, 0), app.child_agents.items.len);
-    try std.testing.expect(app.screenAgent() == &app.main_agent);
-}
-
-test "quitting while a scrollback handoff is pending closes every agent" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const on_screen = try addTestChildAgent(&app, "on-screen");
-    const hidden = try addTestChildAgent(&app, "hidden");
-    try App.AgentsAppRuntime.show(&app, on_screen);
-    try pushTestText(&hidden.agent, "unhandled", .{});
-
-    // A closed terminal fails the handoff's write and then ends the loop.
-    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
-    defer app.shell.pending_session_scrollback_handoff = null;
-    App.AgentsAppRuntime.stopChildren(&app, .cooperative);
-    App.AgentsAppRuntime.shutdownChildren(&app);
-
-    try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
-    try std.testing.expect(app.screenAgent() == &app.main_agent);
-}
-
-test "a turn that starts on screen during a pending handoff lets the hidden agents run" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{
-        .alloc = alloc,
-        .shell = .{ .stdout_file = sink, .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 21,
-            .divider_top_row = 22,
-            .input_row = 23,
-            .divider_bottom_row = 24,
-            .hint_row = 22,
-        } },
-    };
-    defer app.deinit();
-    try app.shell.initBacking(alloc);
-    try app.shell.enableShadowVt(alloc);
-    try app.shell.writeTranscript(alloc, &app.metrics, "old session retained\n", true);
-    app.shell.has_committed_frame = true;
-    const hidden = try addTestChildAgent(&app, "hidden");
-    try pushTestText(&hidden.agent, "waited on", .{});
-
-    // A subagent's report starts a turn on the idle agent on screen while
-    // its session change still has rows to hand off.
-    app.main_agent.session_persistence.pending_live_session_policy = .carry_forward;
-    defer app.main_agent.session_persistence.pending_live_session_policy = null;
-    app.main_agent.session_persistence.pending_live_session_wait = .{ .geometry = @import("core/mcp/operation_control.zig").monotonicMillis(io_mod.getIo()) };
-    defer app.main_agent.session_persistence.pending_live_session_wait = null;
-    app.shell.pending_session_scrollback_handoff = test_pending_handoff;
-    defer app.shell.pending_session_scrollback_handoff = null;
-    app.screenAgent().worker.worker_processing = true;
-    defer app.screenAgent().worker.worker_processing = false;
-
-    try std.testing.expect(!app.shell.terminal_reset_pending);
-    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app, (&app).screenAgent());
-    // The session change still waits for the turn.
-    try std.testing.expect(app.main_agent.session_persistence.pending_live_session_policy != null);
-    try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
-    // Its frame had pushed a row into scrollback, so the terminal is cleared
-    // and printed again, and the next handoff does not push that row twice.
-    try std.testing.expect(app.shell.terminal_reset_pending);
-
-    var visits: HiddenWorkVisits = .{};
-    defer visits.deinit(alloc);
-    try App.AgentsAppRuntime.tickChildren(&app, &visits, HiddenWorkVisits.record);
-    try std.testing.expectEqual(@as(usize, 1), visits.seen.items.len);
-    try std.testing.expectEqualStrings("waited on", visits.texts.items[0]);
-}
-
-test "the agent list previews each agent by switching, keeps every draft where it was typed, Up on the first row closes it, and Esc goes back" {
-    const alloc = std.testing.allocator;
-    // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer app.instances.agents_menu.deinit(alloc);
-    const runtime = App.AgentsAppRuntime;
-    const menu = &app.instances.agents_menu;
-    const first = try addTestChildAgent(&app, "first");
-    const second = try addTestChildAgent(&app, "second");
-    first.name = try alloc.dupe(u8, "reviewer");
-    try app.shell.notebook.transcript.appendSlice(alloc, "main text\n");
-    try first.screen.transcript.notebook.transcript.appendSlice(alloc, "first text\n");
-    try app.input_runtime.edit_state.setText(alloc, "main draft");
-
-    // The list opens on main; ↓ previews the first subagent on its own
-    // screen, and main's draft waits with main. The composer stays the
-    // list's search box, with the subagent's own empty draft set aside.
-    try runtime.openMenu(&app);
-    try std.testing.expect(runtime.menuActive(&app));
-    try std.testing.expectEqual(@as(usize, 0), menu.selected);
-    try std.testing.expect(try runtime.moveMenu(&app, 1, 10));
-    try std.testing.expectEqual(@as(usize, 1), menu.selected);
-    try std.testing.expect(app.agent_on_screen == first);
-    try std.testing.expect(app.screenAgent() == &first.agent);
-    try std.testing.expectEqualStrings("first text\n", app.shell.notebook.transcript.items);
-    try std.testing.expectEqualStrings("main text\n", app.main_screen.transcript.notebook.transcript.items);
-    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqualStrings("", menu.draft.?.edit.input.items);
-    try std.testing.expectEqualStrings("main draft", app.main_screen.draft.edit.input.items);
-
-    // On to the last row, which stays put past the end.
-    _ = try runtime.moveMenu(&app, 1, 10);
-    try std.testing.expect(app.agent_on_screen == second);
-    _ = try runtime.moveMenu(&app, 1, 10);
-    try std.testing.expectEqual(@as(usize, 2), menu.selected);
-    try std.testing.expect(app.agent_on_screen == second);
-
-    // Esc goes back to main, with its draft.
-    try std.testing.expect(try runtime.backMenu(&app));
-    try std.testing.expect(!runtime.menuActive(&app));
-    try std.testing.expect(app.agent_on_screen == null);
-    try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
-    try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
-
-    // Up on main's row, the first, has nothing above it: the list closes,
-    // and main stays.
-    try runtime.openMenu(&app);
-    try std.testing.expect(try runtime.moveMenu(&app, -1, 10));
-    try std.testing.expect(!runtime.menuActive(&app));
-    try std.testing.expect(app.agent_on_screen == null);
-
-    // Enter keeps the agent shown; main's draft stays with main.
-    try runtime.openMenu(&app);
-    _ = try runtime.moveMenu(&app, 1, 10);
-    try std.testing.expect(try runtime.submitMenu(&app));
-    try std.testing.expect(!runtime.menuActive(&app));
-    try std.testing.expect(app.agent_on_screen == first);
-    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqualStrings("main draft", app.main_screen.draft.edit.input.items);
-
-    // The list opens on the subagent on screen. A draft typed on it stays
-    // with it while ↑ previews main, which sets main's draft aside, and
-    // when Enter keeps main, which gives main its draft back.
-    try app.input_runtime.edit_state.setText(alloc, "first draft");
-    try runtime.openMenu(&app);
-    try std.testing.expectEqual(@as(usize, 1), menu.selected);
-    _ = try runtime.moveMenu(&app, -1, 10);
-    try std.testing.expect(app.agent_on_screen == null);
-    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqualStrings("main draft", menu.draft.?.edit.input.items);
-    try std.testing.expectEqualStrings("first draft", first.screen.draft.edit.input.items);
-    _ = try runtime.submitMenu(&app);
-    try std.testing.expect(app.agent_on_screen == null);
-    try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqualStrings("reviewer", first.displayName());
-    try std.testing.expectEqualStrings("second", second.displayName());
-}
-
-test "a search edit that makes the agent list show another agent keeps the cursor and selection where they were in the search" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer app.instances.agents_menu.deinit(alloc);
-    const runtime = App.AgentsAppRuntime;
-    const edit = &app.input_runtime.edit_state;
-    const first = try addTestChildAgent(&app, "first");
-    const second = try addTestChildAgent(&app, "second");
-    first.name = try alloc.dupe(u8, "reviewer");
-
-    // The list opens on main. The user typed "rview", moved the cursor back
-    // after the r, and typed e there: "review" matches only reviewer, which
-    // the list shows at once, and the cursor stays after the e.
-    try runtime.openMenu(&app);
-    try edit.setText(alloc, "review");
-    edit.cursor = 2;
-    runtime.searchChanged(&app);
-    try std.testing.expect(app.agent_on_screen == first);
-    try std.testing.expectEqualStrings("review", edit.input.items);
-    try std.testing.expectEqual(@as(usize, 2), edit.cursor);
-    try std.testing.expectEqual(@as(?usize, null), edit.selection_anchor);
-
-    // A selection in the search comes along too.
-    try edit.setText(alloc, "second");
-    edit.cursor = 3;
-    edit.selection_anchor = 1;
-    runtime.searchChanged(&app);
-    try std.testing.expect(app.agent_on_screen == second);
-    try std.testing.expectEqualStrings("second", edit.input.items);
-    try std.testing.expectEqual(@as(usize, 3), edit.cursor);
-    try std.testing.expectEqual(@as(?usize, 1), edit.selection_anchor);
-}
-
-test "the agent list holds a subagent among the working ones until its finished turn is applied" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer app.instances.agents_menu.deinit(alloc);
-    const runtime = App.AgentsAppRuntime;
-    const reviewer = try addTestChildAgent(&app, "reviewer");
-    const tester = try addTestChildAgent(&app, "tester");
-    defer reviewer.agent.session.agent.history.deinit(alloc);
-    defer tester.agent.session.agent.history.deinit(alloc);
-    defer {
-        var left = tester.agent.worker.takeEvents();
-        for (left.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
-        left.deinit(alloc);
-    }
-    const user: types.UserTurn = .{ .text = @constCast("task") };
-    // The reviewer replied earlier, and its reply is in its history.
-    try reviewer.agent.session.agent.history.append(alloc, .{ .assistant = .{
-        .user = user,
-        .assistant = @constCast("reviewed"),
-        .execution = .{ .turn_summary = .{ .completed_at_ms = 100 } },
-    } });
-    // The tester's worker has finished its turn, but the loop has not applied
-    // the finish yet, so its history holds no reply.
-    try tester.agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
-    try std.testing.expect(!tester.agent.worker.isProcessing());
-
-    var order: std.ArrayList(?*app_agents_runtime.ChildAgent) = .empty;
-    defer order.deinit(alloc);
-    try runtime.switchList(&app, &order);
-    try std.testing.expectEqual(@as(usize, 3), order.items.len);
-    // It stays above the reviewer, as it will once its reply is in the
-    // history, instead of dropping below it for the frames in between.
-    try std.testing.expectEqualStrings("tester", order.items[1].?.id);
-    try std.testing.expectEqualStrings("reviewer", order.items[2].?.id);
-    try runtime.openMenu(&app);
-    const pending = runtime.menuProjection(&app);
-    try std.testing.expectEqualStrings("working", pending.rows[1].state);
-
-    // The loop applies the finish: its reply is in the history, and the list
-    // keeps the same order.
-    var events = tester.agent.worker.takeEvents();
-    for (events.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
-    events.deinit(alloc);
-    try tester.agent.session.agent.history.append(alloc, .{ .assistant = .{
-        .user = user,
-        .assistant = @constCast("tested"),
-        .execution = .{ .turn_summary = .{ .completed_at_ms = 200 } },
-    } });
-    order.clearRetainingCapacity();
-    try runtime.switchList(&app, &order);
-    try std.testing.expectEqualStrings("tester", order.items[1].?.id);
-    try std.testing.expectEqualStrings("reviewer", order.items[2].?.id);
-    const applied = runtime.menuProjection(&app);
-    try std.testing.expectEqualStrings("idle", applied.rows[1].state);
-}
-
 /// What main's "waiting on N subagents" row counts, with `children` owned by
 /// main. The host is only compared, never read, so it is set for this call
 /// alone: the list reads a host it is given.
@@ -6936,55 +4536,6 @@ fn waitCountOwnedByMain(app: *App, children: []const *app_agents_runtime.ChildAg
 fn menuRowState(projection: anytype, name: []const u8) ![]const u8 {
     for (projection.rows) |row| if (std.mem.eql(u8, row.name, name)) return row.state;
     return error.RowNotListed;
-}
-
-test "an idle agent's waiting row counts a subagent until its finished turn is applied" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer app.instances.agents_menu.deinit(alloc);
-    const runtime = App.AgentsAppRuntime;
-    const finishing = try addTestChildAgent(&app, "finishing");
-    const asking = try addTestChildAgent(&app, "asking");
-    const children = [_]*app_agents_runtime.ChildAgent{ finishing, asking };
-    defer finishing.agent.session.agent.history.deinit(alloc);
-    defer asking.agent.session.agent.history.deinit(alloc);
-    defer {
-        var left = finishing.agent.worker.takeEvents();
-        for (left.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
-        left.deinit(alloc);
-    }
-    try std.testing.expectEqual(@as(usize, 0), waitCountOwnedByMain(&app, &children));
-
-    // The finishing subagent's worker has ended its turn, but the loop has not
-    // applied the finish yet. The list shows it working, so main's row counts
-    // it too.
-    try finishing.agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
-    try std.testing.expect(!finishing.agent.worker.isProcessing());
-    try runtime.openMenu(&app);
-    try std.testing.expectEqualStrings("working", try menuRowState(runtime.menuProjection(&app), "finishing"));
-    try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
-
-    // Once the loop has applied the finish, nothing is left to wait for.
-    var events = finishing.agent.worker.takeEvents();
-    for (events.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
-    events.deinit(alloc);
-    try std.testing.expectEqualStrings("idle", try menuRowState(runtime.menuProjection(&app), "finishing"));
-    try std.testing.expectEqual(@as(usize, 0), waitCountOwnedByMain(&app, &children));
-
-    // A subagent that waits for the user's approval is still one main waits on,
-    // though the list shows it as needing approval.
-    asking.agent.worker.worker_processing = true;
-    defer asking.agent.worker.worker_processing = false;
-    app.approval_lender = asking;
-    defer app.approval_lender = null;
-    try std.testing.expectEqualStrings("needs approval", try menuRowState(runtime.menuProjection(&app), "asking"));
-    try std.testing.expectEqual(@as(usize, 1), waitCountOwnedByMain(&app, &children));
 }
 
 /// Sends `bytes` to `app` one at a time, as the terminal does, so each goes
@@ -7016,251 +4567,6 @@ fn expectArmedFor(app: *App, expected: ?*app_agents_runtime.ChildAgent, step: []
     defer alloc.free(got);
     try std.testing.expectEqualStrings(want, got);
     return error.TestUnexpectedResult;
-}
-
-test "a run of Backspace presses that edited the agent list's search never arms a close, held or not, in any encoding, and another key ends the run" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(std.testing.io);
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer app.instances.agents_menu.deinit(alloc);
-    const runtime = App.AgentsAppRuntime;
-    const menu = &app.instances.agents_menu;
-    const edit = &app.input_runtime.edit_state;
-    const first = try addTestChildAgent(&app, "first");
-    const second = try addTestChildAgent(&app, "second");
-    first.name = try alloc.dupe(u8, "reviewer");
-    const backspace = "\x7f";
-    const down = "\x1b[B";
-
-    // The list opens on main; ↓ shows the reviewer, which Backspace can close.
-    try runtime.openMenu(&app);
-    _ = try runtime.moveMenu(&app, 1, 10);
-    try std.testing.expect(menu.highlight.agent == first);
-
-    // With nothing searched, the first Backspace arms the close and the second
-    // goes on to close it. This test app has no subagent host, so the close
-    // finds nothing to close and only disarms; what shows is the arming.
-    try sendTerminalKey(&app, backspace, 1);
-    try expectArmedFor(&app, first, "Backspace on a list nothing was searched in");
-    try sendTerminalKey(&app, backspace, 1);
-    try expectArmedFor(&app, null, "the second Backspace, which closes");
-
-    // Backspace as a key held past the search: "rev" takes three presses to
-    // empty, and none of the presses after arms anything.
-    try sendTerminalBytes(&app, "rev");
-    try std.testing.expectEqualStrings("rev", edit.input.items);
-    try std.testing.expect(menu.highlight.agent == first);
-    try sendTerminalKey(&app, backspace, 3);
-    try std.testing.expectEqualStrings("", edit.input.items);
-    try expectArmedFor(&app, null, "three Backspaces that emptied the search");
-    for (1..5) |extra| {
-        try sendTerminalKey(&app, backspace, 1);
-        var step: [48]u8 = undefined;
-        try expectArmedFor(&app, null, try std.mem.print(&step, "Backspace {d} past the emptied search", .{extra}));
-    }
-    try std.testing.expectEqualStrings("", edit.input.items);
-
-    // A sequence spark ignores is no key: the run goes on.
-    _ = try App.InputAppRuntime.handleTerminalInputIngressWithLimits(&app, .{ .event = .{ .action = .{ .action = .ignore } } }, App.input_limits, max_prompt_history);
-    try sendTerminalKey(&app, backspace, 1);
-    try expectArmedFor(&app, null, "Backspace after an ignored sequence");
-
-    // Another key, here ↓ to the next row, ends the run: two Backspaces arm
-    // and close that row, as on any list.
-    try sendTerminalKey(&app, down, 1);
-    try std.testing.expect(menu.highlight.agent == second);
-    try sendTerminalKey(&app, backspace, 1);
-    try expectArmedFor(&app, second, "Backspace after the run ended with a key");
-    try sendTerminalKey(&app, backspace, 1);
-    try expectArmedFor(&app, null, "the second Backspace, which closes");
-
-    // Typing ends a run too, and the next run is as good as the first: "rev"
-    // goes by Backspace, which then does nothing again.
-    try sendTerminalBytes(&app, "rev");
-    try sendTerminalKey(&app, backspace, 3 + 2);
-    try std.testing.expectEqualStrings("", edit.input.items);
-    try expectArmedFor(&app, null, "a second run of Backspaces");
-
-    // The same keys as Kitty sends them, which go through the router once as
-    // the key they stand for and again as the byte they are replayed as, and
-    // as a repeat of a held key: still one Backspace each.
-    try sendTerminalBytes(&app, "rev");
-    try sendTerminalKey(&app, "\x1b[127u", 1);
-    try sendTerminalKey(&app, "\x1b[127;1u", 1);
-    try sendTerminalKey(&app, "\x1b[127;1:2u", 1);
-    try std.testing.expectEqualStrings("", edit.input.items);
-    try expectArmedFor(&app, null, "three Kitty Backspaces that emptied the search");
-    for ([_][]const u8{ "\x1b[127u", "\x1b[127;1:2u", "\x08", "\x7f" }) |key| {
-        try sendTerminalKey(&app, key, 1);
-        try expectArmedFor(&app, null, key);
-    }
-
-    // The byte 8 is Backspace too, and arms once the run is over.
-    try sendTerminalKey(&app, down, 1);
-    try sendTerminalKey(&app, "\x08", 1);
-    try expectArmedFor(&app, second, "the byte 8 after the run ended with a key");
-}
-
-test "a run of forward Delete presses that edited the agent list's search never arms a close either, and Delete after a Backspace run arms as on any list" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(std.testing.io);
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer app.instances.agents_menu.deinit(alloc);
-    const runtime = App.AgentsAppRuntime;
-    const menu = &app.instances.agents_menu;
-    const edit = &app.input_runtime.edit_state;
-    const first = try addTestChildAgent(&app, "first");
-    const second = try addTestChildAgent(&app, "second");
-    first.name = try alloc.dupe(u8, "reviewer");
-    const backspace = "\x7f";
-    const delete = "\x1b[3~";
-    const left = "\x1b[D";
-    const down = "\x1b[B";
-
-    try runtime.openMenu(&app);
-    _ = try runtime.moveMenu(&app, 1, 10);
-    try std.testing.expect(menu.highlight.agent == first);
-
-    // Delete takes text away when the cursor is not at the end of the search,
-    // so it can empty the search as Backspace does.
-    try sendTerminalBytes(&app, "rev");
-    try sendTerminalKey(&app, left, 3);
-    try sendTerminalKey(&app, delete, 1);
-    try std.testing.expectEqualStrings("ev", edit.input.items);
-    try sendTerminalKey(&app, delete, 2);
-    try std.testing.expectEqualStrings("", edit.input.items);
-    try expectArmedFor(&app, null, "three Deletes that emptied the search");
-    for (1..5) |extra| {
-        try sendTerminalKey(&app, delete, 1);
-        var step: [48]u8 = undefined;
-        try expectArmedFor(&app, null, try std.mem.print(&step, "Delete {d} past the emptied search", .{extra}));
-    }
-
-    // A key other than Delete ends its run: Backspace is one, and arms.
-    try sendTerminalKey(&app, backspace, 1);
-    try expectArmedFor(&app, first, "Backspace after a Delete run");
-    try sendTerminalKey(&app, backspace, 1);
-    try expectArmedFor(&app, null, "the second Backspace, which closes");
-
-    // Delete after a Backspace run is another key: it arms, and the next
-    // Delete goes on to close, as on any list.
-    try sendTerminalBytes(&app, "rev");
-    try sendTerminalKey(&app, backspace, 3 + 2);
-    try std.testing.expectEqualStrings("", edit.input.items);
-    try expectArmedFor(&app, null, "a Backspace run");
-    try sendTerminalKey(&app, delete, 1);
-    try expectArmedFor(&app, first, "Delete after a Backspace run");
-    try sendTerminalKey(&app, delete, 1);
-    try expectArmedFor(&app, null, "the second Delete, which closes");
-
-    // And Backspace after a Delete run arms, since it is another key too.
-    try sendTerminalBytes(&app, "rev");
-    try sendTerminalKey(&app, left, 3);
-    try sendTerminalKey(&app, delete, 3);
-    try std.testing.expectEqualStrings("", edit.input.items);
-    try sendTerminalKey(&app, backspace, 1);
-    try expectArmedFor(&app, first, "Backspace after a Delete run");
-
-    // Any other key disarms.
-    try sendTerminalKey(&app, down, 1);
-    try expectArmedFor(&app, null, "a key that disarms");
-    try std.testing.expect(menu.highlight.agent == second);
-
-    // The list closing ends a run too, with no key to do it: a paste or
-    // another surface closes the list in the middle of one, and the list
-    // opened again arms on its first press.
-    try sendTerminalBytes(&app, "rev");
-    try sendTerminalKey(&app, backspace, 3);
-    try std.testing.expectEqualStrings("", edit.input.items);
-    try std.testing.expect(try runtime.backMenu(&app));
-    try std.testing.expect(!runtime.menuActive(&app));
-    try runtime.openMenu(&app);
-    _ = try runtime.moveMenu(&app, 1, 10);
-    try std.testing.expect(menu.highlight.agent == first);
-    try sendTerminalKey(&app, backspace, 1);
-    try expectArmedFor(&app, first, "Backspace on the list opened again");
-}
-
-test "the agent list's highlight stays on its agent as rows change, and moves to the agent on screen when its agent is dropped" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer app.instances.agents_menu.deinit(alloc);
-    const runtime = App.AgentsAppRuntime;
-    const menu = &app.instances.agents_menu;
-    _ = try addTestChildAgent(&app, "first");
-    const second = try addTestChildAgent(&app, "second");
-    const third = try addTestChildAgent(&app, "third");
-
-    try runtime.openMenu(&app);
-    _ = try runtime.moveMenu(&app, 1, 10);
-    _ = try runtime.moveMenu(&app, 1, 10);
-    try std.testing.expectEqual(@as(usize, 2), menu.selected);
-    try std.testing.expect(menu.highlight == .agent and menu.highlight.agent == second);
-    try std.testing.expect(app.agent_on_screen == second);
-
-    // A row ahead of it goes: the highlight stays on its agent, a row up.
-    const first = app.child_agents.orderedRemove(0);
-    defer {
-        first.screen.deinit(alloc);
-        alloc.free(first.id);
-        alloc.destroy(first);
-    }
-    _ = runtime.menuProjection(&app);
-    try std.testing.expectEqual(@as(usize, 1), menu.selected);
-    try std.testing.expect(menu.highlight.agent == second);
-
-    // Its own agent goes: a close shows another agent first, and dropHosted
-    // puts the highlight back on the agent on screen before it frees the
-    // agent, so no later agent at that address inherits it.
-    try runtime.show(&app, null);
-    runtime.dropHosted(&app, second);
-    try std.testing.expect(menu.highlight == .on_screen);
-    _ = runtime.menuProjection(&app);
-    try std.testing.expectEqual(@as(usize, 0), menu.selected);
-    try std.testing.expect(try runtime.submitMenu(&app));
-    try std.testing.expect(app.agent_on_screen == null);
-    try std.testing.expectEqual(@as(usize, 1), app.child_agents.items.len);
-    try std.testing.expect(app.child_agents.items[0] == third);
-}
-
-test "the agent list's highlight and the agent on screen hold for fuzzed steps" {
-    try std.testing.fuzz({}, fuzzAgentsMenu, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            // Open, down twice, Enter.
-            "\x00\x01\x01\x03",
-            // Two subagents, open, down twice, drop the highlighted one, up.
-            "\x05\x05\x00\x01\x01\x06\x02\x02",
-            // Three subagents, open, down, reorder, drop the one on screen,
-            // a new one at a freed address, Enter.
-            "\x05\x05\x05\x00\x01\x07\x00\x02\x06\x00\x05\x03",
-            // Switch with the list closed, open, down, Esc, open, Enter.
-            "\x05\x05\x88\x01\x00\x01\x04\x00\x03",
-            // One subagent, open on main, Up on the first row.
-            "\x05\x00\x02",
-            // Two subagents, open on the first, down, drop the first, which
-            // the list opened on, a new one at its address, Esc.
-            "\x05\x05\x80\x00\x01\x06\x00\x05\x04",
-            // Two subagents, open, down twice, drop the one shown, Esc.
-            "\x05\x05\x00\x01\x01\x06\x01\x04",
-        }) ++ @import("fuzz_corpus").agents_menu_selection.*),
-    });
 }
 
 /// One fuzzed run of the agent list over the real runtime, as
@@ -7393,28 +4699,6 @@ fn indexOfAgent(order: []const ?*app_agents_runtime.ChildAgent, agent: ?*app_age
     return null;
 }
 
-test "the footer indicator names the agent on screen and the key that opens the list" {
-    const alloc = std.testing.allocator;
-    // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    // One agent: nothing to switch to, so no indicator.
-    try std.testing.expectEqualStrings("", app.footerAgentLabel());
-    const writer = try addTestChildAgent(&app, "writer-id");
-    writer.name = try alloc.dupe(u8, "writer");
-    // ↓ opens the list from an idle composer; with a draft, Ctrl+X does.
-    try std.testing.expectEqualStrings("main ↓", app.footerAgentLabel());
-    try app.input_runtime.edit_state.setText(alloc, "half typed");
-    try std.testing.expectEqualStrings("main · ctrl+x", app.footerAgentLabel());
-    try App.AgentsAppRuntime.show(&app, writer);
-    try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
-}
-
 /// What the tests of a subagent's end build: an app that writes its tab title
 /// to /dev/null, and the cleanup its parts need, in the order they need it.
 /// Its children point at its `app`, so it stays where `init` built it.
@@ -7439,582 +4723,6 @@ const EndsFixture = struct {
     }
 };
 
-test "a subagent's footer says how its last turn ended until its next turn starts" {
-    const alloc = std.testing.allocator;
-    var fixture: EndsFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-    const app = &fixture.app;
-    const runtime = App.AgentsAppRuntime;
-    const writer = try addTestChildAgent(app, "writer-id");
-    writer.name = try alloc.dupe(u8, "writer");
-    try runtime.show(app, writer);
-    try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
-
-    // A turn that fails, and one that is stopped, each say so.
-    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 1, .outcome = .failed });
-    try std.testing.expectEqualStrings("writer · failed ↓", app.footerAgentLabel());
-    // The next turn starts over: the name stands alone while it goes.
-    writer.agent.worker.worker_processing = true;
-    try std.testing.expectEqualStrings("writer ↓", app.footerAgentLabel());
-    writer.agent.worker.worker_processing = false;
-    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 2, .outcome = .interrupted });
-    try std.testing.expectEqualStrings("writer · stopped ↓", app.footerAgentLabel());
-    // A turn that waits for the user was cancelled for its parent too.
-    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 3, .outcome = .paused });
-    try std.testing.expectEqualStrings("writer · stopped ↓", app.footerAgentLabel());
-
-    // A later turn that completes clears it.
-    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 4, .outcome = .completed });
-    try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
-
-    // A turn that handed off to the user's image or `$skill` is not a stop.
-    writer.agent.worker.handed_off_turn_id = 5;
-    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 5, .outcome = .interrupted });
-    try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
-    runtime.noteChildTurnFinished(app, &writer.agent, .{ .turn_id = 6, .outcome = .interrupted });
-    try std.testing.expectEqualStrings("writer · stopped ↓", app.footerAgentLabel());
-}
-
-test "the agent list says failed or stopped on a subagent row whose last turn ended so, and the row sorts as an idle one does" {
-    const alloc = std.testing.allocator;
-    var fixture: EndsFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-    const app = &fixture.app;
-    const runtime = App.AgentsAppRuntime;
-    const failing = try addTestChildAgent(app, "failing");
-    const stopping = try addTestChildAgent(app, "stopping");
-    const fine = try addTestChildAgent(app, "fine");
-    defer failing.agent.session.agent.history.deinit(alloc);
-    defer {
-        var left = failing.agent.worker.takeEvents();
-        for (left.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
-        left.deinit(alloc);
-    }
-    var before: std.ArrayList(?*app_agents_runtime.ChildAgent) = .empty;
-    defer before.deinit(alloc);
-    try runtime.switchList(app, &before);
-
-    runtime.noteChildTurnFinished(app, &failing.agent, .{ .turn_id = 1, .outcome = .failed });
-    runtime.noteChildTurnFinished(app, &stopping.agent, .{ .turn_id = 1, .outcome = .interrupted });
-    runtime.noteChildTurnFinished(app, &fine.agent, .{ .turn_id = 1, .outcome = .completed });
-    try runtime.openMenu(app);
-    const ended = runtime.menuProjection(app);
-    try std.testing.expectEqualStrings("failed", try menuRowState(ended, "failing"));
-    try std.testing.expectEqualStrings("stopped", try menuRowState(ended, "stopping"));
-    try std.testing.expectEqualStrings("idle", try menuRowState(ended, "fine"));
-    try std.testing.expectEqualStrings("idle", try menuRowState(ended, "main"));
-
-    // They sort where the same rows sorted while they showed idle.
-    var after: std.ArrayList(?*app_agents_runtime.ChildAgent) = .empty;
-    defer after.deinit(alloc);
-    try runtime.switchList(app, &after);
-    try std.testing.expectEqualSlices(?*app_agents_runtime.ChildAgent, before.items, after.items);
-
-    // A turn that starts says working, and the next one that completes clears
-    // the failure.
-    failing.agent.worker.worker_processing = true;
-    try std.testing.expectEqualStrings("working", try menuRowState(runtime.menuProjection(app), "failing"));
-    failing.agent.worker.worker_processing = false;
-    try std.testing.expectEqualStrings("failed", try menuRowState(runtime.menuProjection(app), "failing"));
-    runtime.noteChildTurnFinished(app, &failing.agent, .{ .turn_id = 2, .outcome = .completed });
-    try std.testing.expectEqualStrings("idle", try menuRowState(runtime.menuProjection(app), "failing"));
-
-    // A turn that ended but is not applied yet is still working: the row
-    // says what its newest reply decides, as the sort does.
-    runtime.noteChildTurnFinished(app, &failing.agent, .{ .turn_id = 3, .outcome = .failed });
-    try failing.agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
-    try std.testing.expectEqualStrings("working", try menuRowState(runtime.menuProjection(app), "failing"));
-    var events = failing.agent.worker.takeEvents();
-    for (events.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
-    events.deinit(alloc);
-    try std.testing.expectEqualStrings("failed", try menuRowState(runtime.menuProjection(app), "failing"));
-}
-
-test "a subagent's record in /trace says failed or stopped as its row does" {
-    const alloc = std.testing.allocator;
-    var fixture: EndsFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-    const app = &fixture.app;
-    const runtime = App.AgentsAppRuntime;
-    const failing = try addTestChildAgent(app, "failing");
-    const stopping = try addTestChildAgent(app, "stopping");
-    const fine = try addTestChildAgent(app, "fine");
-    runtime.noteChildTurnFinished(app, &failing.agent, .{ .turn_id = 1, .outcome = .failed });
-    runtime.noteChildTurnFinished(app, &stopping.agent, .{ .turn_id = 1, .outcome = .interrupted });
-    runtime.noteChildTurnFinished(app, &fine.agent, .{ .turn_id = 1, .outcome = .completed });
-    try runtime.openMenu(app);
-    const list = runtime.menuProjection(app);
-
-    var rows: std.ArrayList(app_agents_runtime.TraceRow) = .empty;
-    defer rows.deinit(alloc);
-    try runtime.traceRows(app, alloc, &rows);
-    defer for (rows.items) |row| if (row.status.len > 0) alloc.free(row.status);
-    try std.testing.expectEqual(@as(usize, 3), rows.items.len);
-    // The record and the list say the same of each subagent.
-    for (rows.items) |row| try std.testing.expectEqualStrings(try menuRowState(list, row.id), row.state);
-    try std.testing.expectEqualStrings("failed", rows.items[0].state);
-    try std.testing.expectEqualStrings("stopped", rows.items[1].state);
-    try std.testing.expectEqualStrings("idle", rows.items[2].state);
-}
-
-test "an instance's row keeps its states whatever its turns did" {
-    var fixture: EndsFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-    const app = &fixture.app;
-    const runtime = App.AgentsAppRuntime;
-    const second = try addTestChildAgent(app, "instance-2");
-    second.agent.role = .instance;
-    const LastEnd = @TypeOf(second.last_end);
-    // Its turns end as a subagent's do, but nothing is kept for an instance.
-    runtime.noteChildTurnFinished(app, &second.agent, .{ .turn_id = 1, .outcome = .failed });
-    runtime.noteChildTurnFinished(app, &app.main_agent, .{ .turn_id = 1, .outcome = .interrupted });
-    try std.testing.expectEqual(LastEnd.done, second.last_end);
-    // And what is kept for it is not read: an instance's row is its own.
-    second.last_end = .failed;
-    try runtime.openMenu(app);
-    const rows = runtime.menuProjection(app).rows;
-    try std.testing.expect(rows.len >= 2);
-    for (rows) |row| try std.testing.expectEqualStrings("idle", row.state);
-}
-
-test "while a subagent is on screen, the tick visits main and the other hidden agents" {
-    const alloc = std.testing.allocator;
-    // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const on_screen = try addTestChildAgent(&app, "on-screen");
-    const hidden = try addTestChildAgent(&app, "hidden");
-    try App.AgentsAppRuntime.show(&app, on_screen);
-    for ([_]*agents.Agent{ &app.main_agent, &on_screen.agent, &hidden.agent }) |agent| {
-        try agent.worker.pushEvent(alloc, .{ .assistant_presentation = .{ .text = @constCast("queued") } });
-    }
-
-    const Visits = struct {
-        seen: std.ArrayList(*agents.Agent) = .empty,
-        fn record(self: *@This(), a: *App, agent: *agents.Agent) anyerror!void {
-            try self.seen.append(a.alloc, agent);
-            var events = agent.worker.takeEvents();
-            defer {
-                for (events.items) |event| worker_runtime.freeWorkerEvent(a.alloc, event);
-                events.deinit(a.alloc);
-            }
-        }
-    };
-    var visits: Visits = .{};
-    defer visits.seen.deinit(alloc);
-    try App.AgentsAppRuntime.tickChildren(&app, &visits, Visits.record);
-
-    try std.testing.expectEqual(@as(usize, 2), visits.seen.items.len);
-    try std.testing.expect(visits.seen.items[0] == &app.main_agent);
-    try std.testing.expect(visits.seen.items[1] == &hidden.agent);
-    // The agent on screen is the loop's own context, so the tick leaves it be.
-    try std.testing.expect(app.screenAgent() == &on_screen.agent);
-    try std.testing.expect(on_screen.agent.worker.hasPendingEvents());
-    try visits.record(&app, app.screenAgent());
-}
-
-test "the footer notes a hidden agent waiting on an approval, never the one on screen" {
-    const alloc = std.testing.allocator;
-    // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const writer = try addTestChildAgent(&app, "writer-id");
-    writer.name = try alloc.dupe(u8, "writer");
-    const reviewer = try addTestChildAgent(&app, "reviewer-id");
-    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent }) |agent| {
-        _ = agent.approval_prompt.syncRequest(alloc, null) catch {};
-    };
-    var buf: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("", app.hiddenAgentWaitingNote(&buf));
-
-    _ = try writer.agent.approval_prompt.syncRequest(alloc, .{ .label = "write" });
-    try std.testing.expectEqualStrings("writer needs approval", app.hiddenAgentWaitingNote(&buf));
-    // A subagent's request that main shows too is not main waiting.
-    _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{ .label = "write", .origin = .{ .subagent = "writer" } });
-    try std.testing.expectEqualStrings("writer needs approval", app.hiddenAgentWaitingNote(&buf));
-
-    // On its own screen the prompt shows instead of a note.
-    try App.AgentsAppRuntime.show(&app, writer);
-    try std.testing.expectEqualStrings("", app.hiddenAgentWaitingNote(&buf));
-
-    // From another subagent's screen, main's own request comes first.
-    try App.AgentsAppRuntime.show(&app, reviewer);
-    _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{ .label = "shell" });
-    try std.testing.expectEqualStrings("2 agents require attention", app.hiddenAgentWaitingNote(&buf));
-}
-
-test "the footer notes a hidden agent whose request waits for the user" {
-    const alloc = std.testing.allocator;
-    // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const writer = try addTestChildAgent(&app, "writer-id");
-    writer.name = try alloc.dupe(u8, "writer");
-    const reviewer = try addTestChildAgent(&app, "reviewer-id");
-    reviewer.name = try alloc.dupe(u8, "reviewer");
-    defer _ = reviewer.agent.approval_prompt.syncRequest(alloc, null) catch {};
-    var buf: [128]u8 = undefined;
-
-    // A hidden subagent out of credits waits on its own screen, where
-    // the status row says why; the screen the user is on says who.
-    writer.screen.transcript.notebook.worker_status.set_route_recovery(.{ .kind = .need_user, .need = .quota });
-    try std.testing.expectEqualStrings("writer needs you", app.hiddenAgentWaitingNote(&buf));
-
-    // On its own screen the status row shows instead of a note.
-    try App.AgentsAppRuntime.show(&app, writer);
-    try std.testing.expectEqualStrings("", app.hiddenAgentWaitingNote(&buf));
-
-    // It counts with the agents waiting on an answer.
-    try App.AgentsAppRuntime.show(&app, null);
-    _ = try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "write" });
-    try std.testing.expectEqualStrings("2 agents require attention", app.hiddenAgentWaitingNote(&buf));
-}
-
-test "a hidden subagent's approval is lent to main's screen, answered on its worker, and goes back" {
-    const alloc = std.testing.allocator;
-    // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const writer = try addTestChildAgent(&app, "writer-id");
-    writer.name = try alloc.dupe(u8, "writer");
-    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent }) |agent| {
-        agent.approval_prompt.deinit(alloc);
-        agent.question_prompt.deinit(alloc);
-    };
-    const request: permission_request.PermissionRequest = .{ .id = 7, .label = "shell ls", .origin = .{ .subagent = "writer" } };
-    _ = try writer.agent.approval_prompt.syncRequest(alloc, request);
-
-    // Main is on screen with nothing of its own: it shows the subagent's
-    // approval, and an answer there goes to the subagent's worker.
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.approval_lender == writer);
-    try std.testing.expect(app.main_agent.approval_prompt.isActive());
-    try std.testing.expect(!writer.agent.approval_prompt.isActive());
-    try std.testing.expect(app.lentApproval().?.worker == &writer.agent.worker);
-    // Main keeps it while its own worker asks nothing, and no question is
-    // lent over it.
-    try std.testing.expect(app.keepLentApproval(app.screenAgent(), null));
-    const options = [_]types.QuestionOption{.{ .label = "Alpha", .description = null }};
-    const entries = [_]types.QuestionBatchEntry{.{ .question = "Pick one?", .options = &options }};
-    try writer.agent.question_prompt.syncFrom(alloc, &entries);
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.question_lender == null);
-    writer.agent.question_prompt.discard(alloc, "test");
-
-    // Switching to the subagent gives it back to its own screen, and nothing
-    // is lent while a subagent is on screen.
-    try App.AgentsAppRuntime.show(&app, writer);
-    try std.testing.expect(app.approval_lender == null);
-    try std.testing.expect(writer.agent.approval_prompt.isActive());
-    try std.testing.expect(!app.main_agent.approval_prompt.isActive());
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.approval_lender == null);
-
-    // Back on main it is lent again. In the subagent's own context the same
-    // request keeps it there; another one brings it back to be synced.
-    try App.AgentsAppRuntime.show(&app, null);
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.approval_lender == writer);
-    const InWriter = struct {
-        fn run(_: void, a: *App, agent: *agents.Agent) anyerror!void {
-            try std.testing.expect(a.keepLentApproval(agent, .{ .id = 7, .label = "shell ls" }));
-            try std.testing.expect(a.approval_lender != null);
-            try std.testing.expect(!a.keepLentApproval(agent, .{ .id = 8, .label = "shell pwd" }));
-            try std.testing.expect(a.approval_lender == null);
-            try std.testing.expect(agent.approval_prompt.isActive());
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, writer, {}, InWriter.run);
-    try std.testing.expect(!app.main_agent.approval_prompt.isActive());
-    try std.testing.expect(app.lentApproval() == null);
-}
-
-test "an approval answered on main's screen goes back, so the next one of the tree is lent" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const writer = try addTestChildAgent(&app, "writer-id");
-    writer.name = try alloc.dupe(u8, "writer");
-    const reader = try addTestChildAgent(&app, "reader-id");
-    reader.name = try alloc.dupe(u8, "reader");
-    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent, &reader.agent }) |agent| {
-        agent.approval_prompt.deinit(alloc);
-        agent.question_prompt.deinit(alloc);
-    };
-    _ = try writer.agent.approval_prompt.syncRequest(alloc, .{ .id = 7, .label = "shell ls", .origin = .{ .subagent = "writer" } });
-    _ = try reader.agent.approval_prompt.syncRequest(alloc, .{ .id = 9, .label = "shell pwd", .origin = .{ .subagent = "reader" } });
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.approval_lender == writer);
-
-    // The user answers it on main's screen: the prompt there clears and the
-    // writer's worker stops asking. Synced in the writer's context, the
-    // answered approval goes back instead of staying lent.
-    app.main_agent.approval_prompt.clearAfterAcceptedSubmission(alloc);
-    const InWriter = struct {
-        fn run(_: void, a: *App, agent: *agents.Agent) anyerror!void {
-            try std.testing.expect(!a.keepLentApproval(agent, null));
-            try std.testing.expect(a.approval_lender == null);
-            try std.testing.expect(!agent.approval_prompt.isActive());
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, writer, {}, InWriter.run);
-
-    // The reader's approval, still waiting, shows on main's screen next.
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.approval_lender == reader);
-    try std.testing.expectEqual(@as(u64, 9), app.main_agent.approval_prompt.request.?.id);
-}
-
-test "main's screen shows its tree's oldest prompt first, approval or question" {
-    const alloc = std.testing.allocator;
-    // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const writer = try addTestChildAgent(&app, "writer-id");
-    writer.name = try alloc.dupe(u8, "writer");
-    const asker = try addTestChildAgent(&app, "asker-id");
-    asker.name = try alloc.dupe(u8, "asker");
-    const reader = try addTestChildAgent(&app, "reader-id");
-    reader.name = try alloc.dupe(u8, "reader");
-    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent, &asker.agent, &reader.agent }) |agent| {
-        agent.approval_prompt.deinit(alloc);
-        agent.question_prompt.deinit(alloc);
-    };
-    // The asker's question comes first, then the reader's approval, then the
-    // writer's, though the writer started first.
-    const options = [_]types.QuestionOption{.{ .label = "Alpha", .description = null }};
-    const entries = [_]types.QuestionBatchEntry{.{ .question = "Pick one?", .options = &options }};
-    try asker.agent.question_prompt.syncFrom(alloc, &entries);
-    app.notePromptAsked(&asker.agent, .question);
-    _ = try reader.agent.approval_prompt.syncRequest(alloc, .{ .id = 9, .label = "shell pwd", .origin = .{ .subagent = "reader" } });
-    app.notePromptAsked(&reader.agent, .approval);
-    _ = try writer.agent.approval_prompt.syncRequest(alloc, .{ .id = 7, .label = "shell ls", .origin = .{ .subagent = "writer" } });
-    app.notePromptAsked(&writer.agent, .approval);
-
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.question_lender == asker);
-    try std.testing.expect(app.approval_lender == null);
-
-    // Once the question is answered, the reader's approval, asked next, shows.
-    _ = App.AgentsAppRuntime.returnQuestion(&app);
-    asker.agent.question_prompt.discard(alloc, "test");
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.approval_lender == reader);
-    try std.testing.expectEqual(@as(u64, 9), app.main_agent.approval_prompt.request.?.id);
-
-    // Shown on its own screen and back, it is still the oldest.
-    try App.AgentsAppRuntime.show(&app, reader);
-    try App.AgentsAppRuntime.show(&app, null);
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.approval_lender == reader);
-}
-
-test "a hidden subagent's question is lent to main's screen and goes back on a switch" {
-    const alloc = std.testing.allocator;
-    // A switch writes the tab title, so keep it off the test runner's stdout.
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const asker = try addTestChildAgent(&app, "asker-id");
-    asker.name = try alloc.dupe(u8, "asker");
-    defer for ([_]*agents.Agent{ &app.main_agent, &asker.agent }) |agent| agent.question_prompt.deinit(alloc);
-    const options = [_]types.QuestionOption{
-        .{ .label = "Alpha", .description = null },
-        .{ .label = "Beta", .description = null },
-    };
-    const entries = [_]types.QuestionBatchEntry{.{ .question = "Pick one?", .options = &options }};
-    try asker.agent.question_prompt.syncFrom(alloc, &entries);
-
-    // Main is on screen with no question of its own: it shows the subagent's,
-    // named for it, and the subagent no longer holds it.
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.question_lender == asker);
-    try std.testing.expect(app.main_agent.question_prompt.isActive());
-    try std.testing.expect(!asker.agent.question_prompt.isActive());
-    try std.testing.expectEqualStrings("asker", app.main_agent.question_prompt.projection().?.asker);
-
-    // Switching to the subagent gives the question back to its own screen,
-    // and nothing is lent while a subagent is on screen.
-    try App.AgentsAppRuntime.show(&app, asker);
-    try std.testing.expect(app.question_lender == null);
-    try std.testing.expect(asker.agent.question_prompt.isActive());
-    try std.testing.expect(!app.main_agent.question_prompt.isActive());
-    try std.testing.expectEqualStrings("", asker.agent.question_prompt.projection().?.asker);
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.question_lender == null);
-
-    // Back on main it is lent again; once the subagent's worker no longer
-    // waits on it, it is gone from both screens.
-    try App.AgentsAppRuntime.show(&app, null);
-    App.AgentsAppRuntime.lendPrompt(&app);
-    try std.testing.expect(app.question_lender == asker);
-    App.AgentsAppRuntime.settleLentQuestion(&app);
-    try std.testing.expect(app.question_lender == null);
-    try std.testing.expect(!app.main_agent.question_prompt.isActive());
-    try std.testing.expect(!asker.agent.question_prompt.isActive());
-}
-
-test "attaching a subagent's session restores only that agent's conversation" {
-    const alloc = std.testing.allocator;
-    const child_state = @import("core/subagent/child_state.zig");
-    const session_adapter = @import("core/session/session_adapter.zig");
-    var parent: child_state.TestParent = undefined;
-    try parent.init(alloc);
-    defer parent.deinit();
-    var history = [_]types.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("child task"), .work_id = @constCast("child-work") },
-        .assistant = @constCast("CHILD_ANSWER"),
-    } }};
-    const opened = try parent.openChild("child-1", &history);
-
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = addTestChildAgent(&app, "child-1") catch |err| {
-        opened.close();
-        return err;
-    };
-    // Closes the child's session and frees its state, after any failure too.
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-
-    const Attach = struct {
-        fn run(source: *session_adapter.Session, a: *App, agent: *agents.Agent) anyerror!void {
-            try App.SessionAppRuntime.attachChildV2Session(a, agent, source);
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, opened, Attach.run);
-
-    try std.testing.expect(child.agent.session_persistence.v2 != null);
-    try std.testing.expect(app.main_agent.session_persistence.v2 == null);
-    try std.testing.expectEqual(@as(usize, 1), child.agent.session.agent.history.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.main_agent.session.agent.history.items.len);
-    try std.testing.expectEqualStrings("test-model", child.agent.session_persistence.session_preferences.?.model);
-    try std.testing.expect(app.main_agent.session_persistence.session_preferences == null);
-}
-
-test "closing a subagent whose slot thread does not let go closes its session but keeps its agent whole" {
-    const alloc = std.testing.allocator;
-    const child_state = @import("core/subagent/child_state.zig");
-    const session_adapter = @import("core/session/session_adapter.zig");
-    var parent: child_state.TestParent = undefined;
-    try parent.init(alloc);
-    defer parent.deinit();
-    var history = [_]types.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("child task"), .work_id = @constCast("child-work") },
-        .assistant = @constCast("CHILD_ANSWER"),
-    } }};
-    const opened = try parent.openChild("child-1", &history);
-
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = addTestChildAgent(&app, "child-1") catch |err| {
-        opened.close();
-        return err;
-    };
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-    const Attach = struct {
-        fn run(source: *session_adapter.Session, a: *App, agent: *agents.Agent) anyerror!void {
-            try App.SessionAppRuntime.attachChildV2Session(a, agent, source);
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, opened, Attach.run);
-    try std.testing.expect(child.agent.session_persistence.v2 != null);
-
-    // The run's slot thread holds the subagent's worker and never lets go.
-    child.bound.hold();
-    app_agents_runtime.test_release_timeout_ms = 20;
-    defer app_agents_runtime.test_release_timeout_ms = null;
-    App.AgentsAppRuntime.dropHosted(&app, child);
-
-    // It left the list and its session is closed, but its agent is not freed,
-    // since the slot thread may still read its worker.
-    try std.testing.expectEqual(@as(usize, 0), app.child_agents.items.len);
-    try std.testing.expect(child.agent.session_persistence.v2 == null);
-    try std.testing.expect(child.agent.role == .subagent);
-
-    // Once the slot lets go, the shutdown frees what the close kept.
-    child.bound.release();
-    try app.child_agents.append(alloc, child);
-}
-
-test "quitting waits for a subagent's slot thread to let go before it frees the subagent" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-
-    // Stands in for the run's slot thread: it still reads the subagent's
-    // worker as it detaches, and only then lets go.
-    const Slot = struct {
-        fn run(held: *app_agents_runtime.ChildAgent, whole: *bool) void {
-            io_mod.sleep(100 * std.time.ns_per_ms);
-            whole.* = held.agent.role == .subagent;
-            held.bound.release();
-        }
-    };
-    child.bound.hold();
-    var whole = false;
-    const thread = try std.Thread.spawn(.{}, Slot.run, .{ child, &whole });
-    App.AgentsAppRuntime.shutdownChildren(&app);
-    thread.join();
-    try std.testing.expect(whole);
-}
-
-test "a child agent's worker thread starts for that agent and stops at shutdown" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-
-    try app_process_runtime.Runtime(App).startAgentWorkerThread(&app, &child.agent);
-    try std.testing.expect(child.agent.worker_thread != null);
-    try std.testing.expect(app.main_agent.worker_thread == null);
-}
-
 fn testChildRun(
     alloc: Allocator,
     resolver: *@import("core/subagent/authority.zig").Resolver,
@@ -8029,10 +4737,8 @@ fn testChildRun(
             .model = try alloc.dupe(u8, "child/model"),
             .effort = types.ReasoningEffort.literal("high"),
             .ultrafast_mode = ultrafast_mode,
-            .permission_mode = .ask,
+            .permission_mode = .yolo,
             .tool_names = try alloc.alloc([]u8, 0),
-            .rules = .{},
-            .grants = try alloc.alloc(types.PermissionGrant, 0),
             .integration_names = try alloc.alloc([]u8, 0),
         },
         .authority_resolver = resolver,
@@ -8040,219 +4746,6 @@ fn testChildRun(
         .root_user_intent_context = try alloc.dupe(u8, "ROOT_REQUEST"),
         .credential = credential,
     };
-}
-
-test "a subagent's run ends only once the turn carrying its work id is saved" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-    var completion: agents.ChildRunCompletion = .{};
-    var child_run = try testChildRun(alloc, &resolver, false, null);
-    child_run.work_id = try alloc.dupe(u8, "work-1");
-    child_run.completion = &completion;
-    App.AgentsAppRuntime.installChildRun(&app, child, child_run);
-
-    const Check = struct {
-        fn saved(work_id: ?[]const u8) types.FinishedPrompt {
-            return .{ .turn = .{ .assistant = .{
-                .user = .{ .text = @constCast("task"), .work_id = if (work_id) |id| @constCast(id) else null },
-                .assistant = @constCast("answer"),
-            } } };
-        }
-        fn run(done: *agents.ChildRunCompletion, a: *App, agent: *agents.Agent) anyerror!void {
-            // A turn the user typed carries no work id, and another run's
-            // carries its own; neither ends this run.
-            App.AgentsAppRuntime.commitChildTurn(a, agent, saved(null));
-            App.AgentsAppRuntime.commitChildTurn(a, agent, saved("work-0"));
-            try std.testing.expect(done.outcome == null);
-            try std.testing.expect(agent.child_run.?.inFlight());
-            App.AgentsAppRuntime.commitChildTurn(a, agent, saved("work-1"));
-            try std.testing.expectEqual(agents.ChildRunCompletion.Outcome.completed, done.outcome.?);
-            try std.testing.expect(!agent.child_run.?.inFlight());
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, &completion, Check.run);
-}
-
-test "a turn's end gives a subagent's row and its parent's work one outcome, for every end and hand-off" {
-    const alloc = std.testing.allocator;
-    var fixture: EndsFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-    const app = &fixture.app;
-    const child = try addTestChildAgent(app, "child-1");
-    defer App.AgentsAppRuntime.shutdownChildren(app);
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-
-    const Work = agents.ChildRunCompletion.Outcome;
-    const LastEnd = @TypeOf(child.last_end);
-    const Case = struct { ended: types.TurnPresentationOutcome, handed_off: bool, work: Work, mark: LastEnd };
-    // A hand-off turns only an interrupted turn into a finished one.
-    const cases = [_]Case{
-        .{ .ended = .completed, .handed_off = false, .work = .completed, .mark = .done },
-        .{ .ended = .completed, .handed_off = true, .work = .completed, .mark = .done },
-        .{ .ended = .failed, .handed_off = false, .work = .failed, .mark = .failed },
-        .{ .ended = .failed, .handed_off = true, .work = .failed, .mark = .failed },
-        .{ .ended = .interrupted, .handed_off = false, .work = .cancelled, .mark = .stopped },
-        .{ .ended = .interrupted, .handed_off = true, .work = .completed, .mark = .done },
-        .{ .ended = .paused, .handed_off = false, .work = .cancelled, .mark = .stopped },
-        .{ .ended = .paused, .handed_off = true, .work = .cancelled, .mark = .stopped },
-    };
-    const Ctx = struct { done: *agents.ChildRunCompletion, case: Case, turn_id: u64 };
-    const Check = struct {
-        fn run(ctx: Ctx, a: *App, agent: *agents.Agent) anyerror!void {
-            App.AgentsAppRuntime.noteChildTurnFinished(a, agent, .{ .turn_id = ctx.turn_id, .outcome = ctx.case.ended });
-            // The run's own flag is set whatever the end was, as a hand-off
-            // that the end did not use would leave it.
-            agent.child_run.?.handed_off = ctx.case.handed_off;
-            App.AgentsAppRuntime.commitChildTurn(a, agent, .{
-                .turn = .{ .assistant = .{
-                    .user = .{ .text = @constCast("task"), .work_id = @constCast("work-1") },
-                    .assistant = @constCast("answer"),
-                } },
-                .terminal_outcome = ctx.case.ended,
-            });
-            try std.testing.expect(!agent.child_run.?.inFlight());
-            try std.testing.expectEqual(ctx.case.work, ctx.done.outcome.?);
-        }
-    };
-    for (cases, 0..) |case, index| {
-        var completion: agents.ChildRunCompletion = .{};
-        var child_run = try testChildRun(alloc, &resolver, false, null);
-        child_run.work_id = try alloc.dupe(u8, "work-1");
-        child_run.completion = &completion;
-        App.AgentsAppRuntime.installChildRun(app, child, child_run);
-        child.last_end = .done;
-        const turn_id: u64 = 10 + index;
-        child.agent.worker.handed_off_turn_id = if (case.handed_off) turn_id else 0;
-        try App.AgentsAppRuntime.visit(app, child, Ctx{ .done = &completion, .case = case, .turn_id = turn_id }, Check.run);
-        // The row says what the work's outcome says.
-        try std.testing.expectEqual(case.mark, child.last_end);
-    }
-}
-
-test "each agent keeps its own fast mode across switches, and a run leaves the subagent's alone" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-    app.fast_mode = true;
-
-    const Check = struct {
-        fn fresh(_: void, a: *App, agent: *agents.Agent) anyerror!void {
-            // The subagent's own, not main's.
-            try std.testing.expect(!a.fast_mode);
-            a.fast_mode = true;
-            agent.worker.agent_turn_settings.fast_mode = true;
-        }
-        fn kept(_: void, a: *App, _: *agents.Agent) anyerror!void {
-            try std.testing.expect(a.fast_mode);
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, {}, Check.fresh);
-    try std.testing.expect(app.fast_mode);
-    app.fast_mode = false;
-    try App.AgentsAppRuntime.visit(&app, child, {}, Check.kept);
-    try std.testing.expect(!app.fast_mode);
-
-    // A run main sends keeps the subagent's fast mode.
-    app.main_agent.worker.agent_turn_settings.fast_mode = false;
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-    App.AgentsAppRuntime.installChildRun(&app, child, try testChildRun(alloc, &resolver, false, null));
-    try std.testing.expect(child.agent.worker.agent_turn_settings.fast_mode);
-}
-
-test "a subagent's tools work under its admission, with no subagent host" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-    var child_run = try testChildRun(alloc, &resolver, false, null);
-    child_run.subagent_id = 7;
-    App.AgentsAppRuntime.installChildRun(&app, child, child_run);
-    app.main_agent.permission_mode = .yolo;
-
-    const Check = struct {
-        fn run(admission: *subagent_domain.AdmissionSnapshot, a: *App, agent: *agents.Agent) anyerror!void {
-            const ctx = App.AgentAppRuntime.toolContext(a, agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
-            try std.testing.expect(ctx.subagent_host == null);
-            try std.testing.expect(ctx.subagent_caller_id == null);
-            try std.testing.expectEqual(types.PermissionMode.ask, ctx.permission_mode);
-            try std.testing.expect(ctx.permission_grants.ptr == admission.grants.ptr);
-            try std.testing.expectEqualStrings("child/model", ctx.model);
-            try std.testing.expect(ctx.worker == &agent.worker);
-            try std.testing.expect(ctx.session_grants.ptr == admission.grants.ptr);
-            try std.testing.expect(ctx.permission_state_override == &admission.permission_state);
-            try std.testing.expect(ctx.advertised_dynamic_tool_names.ptr == admission.integration_names.ptr);
-            try std.testing.expect(ctx.mcp_access == .disabled);
-            try std.testing.expect(ctx.lifecycle_scope.kind == .subagent);
-            try std.testing.expectEqualStrings("child-1", ctx.lifecycle_scope.session_id.?);
-            try std.testing.expectEqual(@as(?u64, 7), ctx.lifecycle_scope.subagent_id);
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, &child.agent.child_run.?.admission, Check.run);
-
-    // The first instance's own tool context follows its own mode.
-    const main_ctx = App.AgentAppRuntime.toolContext(&app, (&app).screenAgent(), &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
-    try std.testing.expectEqual(types.PermissionMode.yolo, main_ctx.permission_mode);
-    try std.testing.expect(main_ctx.worker == &app.main_agent.worker);
-    try std.testing.expect(main_ctx.lifecycle_scope.kind == .interactive);
-}
-
-test "each instance keeps its own permission mode and session approvals" {
-    const alloc = std.testing.allocator;
-    const Permission = app_permission_runtime.Runtime(App);
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    defer Permission.deinitSessionGrants(&app, &app.main_agent);
-    const second = try addTestChildAgent(&app, "instance-2");
-    second.agent.role = .instance;
-    const child = try addTestChildAgent(&app, "child-1");
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-
-    // Each instance has its own mode.
-    Permission.initMode(&app, &app.main_agent, .ask);
-    Permission.initMode(&app, &second.agent, .ask);
-    Permission.setMode(&app, &second.agent, .yolo);
-    try std.testing.expectEqual(types.PermissionMode.ask, Permission.modeOf(&app, &app.main_agent));
-    try std.testing.expectEqual(types.PermissionMode.yolo, Permission.modeOf(&app, &second.agent));
-    try std.testing.expectEqual(types.PermissionMode.yolo, Permission.livePermissionSnapshot(&app, &second.agent).mode);
-
-    // An approval belongs to the instance whose turn asked for it.
-    try Permission.allowForSession(&app, &second.agent, "run_command", "/tmp/workspace::zig build");
-    const second_count = grantCount(&app, &second.agent);
-    try std.testing.expect(second_count > 0);
-    try std.testing.expectEqual(@as(usize, 0), grantCount(&app, &app.main_agent));
-
-    // A subagent's still go to the first instance, as before instances.
-    try Permission.allowForSession(&app, &child.agent, "run_command", "/tmp/workspace::zig fmt");
-    try std.testing.expect(grantCount(&app, &app.main_agent) > 0);
-    try std.testing.expect(Permission.grantsLocked(&app, &child.agent).ptr == Permission.grantsLocked(&app, &app.main_agent).ptr);
-    try std.testing.expectEqual(second_count, grantCount(&app, &second.agent));
-
-    // A session ending clears only that instance's approvals.
-    Permission.clearSessionGrants(&app, &app.main_agent);
-    try std.testing.expectEqual(@as(usize, 0), grantCount(&app, &app.main_agent));
-    try std.testing.expectEqual(second_count, grantCount(&app, &second.agent));
-
-    // What the second instance's screen reports is its own.
-    const view = Permission.viewOf(&app, &second.agent);
-    try std.testing.expectEqual(types.PermissionMode.yolo, view.mode);
-    try std.testing.expectEqual(second_count, grantCount(&app, &second.agent));
 }
 
 /// An `App` for a test of session approvals. `deinit` stops the subagents the
@@ -8263,274 +4756,11 @@ const ApprovalsFixture = struct {
 
     fn deinit(self: *ApprovalsFixture) void {
         App.AgentsAppRuntime.shutdownChildren(&self.app);
-        app_permission_runtime.Runtime(App).deinitSessionGrants(&self.app, &self.app.main_agent);
         App.AgentsAppRuntime.deinitChildren(&self.app);
         self.app.pacer.deinit(self.app.alloc);
         self.app.shell.deinit(self.app.alloc);
     }
 };
-
-test "a subagent's always approval reaches its instance's list at once, for main and its siblings only" {
-    const alloc = std.testing.allocator;
-    const Permission = app_permission_runtime.Runtime(App);
-    const Worker = app_worker_runtime.Runtime(App);
-    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
-    defer fixture.deinit();
-    const app = &fixture.app;
-    const second = try addTestChildAgent(app, "instance-2");
-    second.agent.role = .instance;
-    const child = try addTestChildAgent(app, "child-1");
-    const sibling = try addTestChildAgent(app, "child-2");
-    const other = try addTestChildAgent(app, "child-of-instance-2");
-    other.agent.root_instance = &second.agent;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // The grants a file change's approval offers: the workspace tree.
-    const file_grants = try permissions.suggestedSessionGrants(arena, "/tmp/workspace", "write_file", "/tmp/workspace/app/page.tsx", .path_create_parent);
-    try std.testing.expect(file_grants.len > 0);
-
-    // They are in the list when the call returns, before the event that
-    // carries them reaches the main loop.
-    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
-    for ([_]*agents.Agent{ &app.main_agent, &child.agent, &sibling.agent }) |agent| {
-        try std.testing.expect(grantAllowed(app, agent, "write_file", "/tmp/workspace/other/file.txt"));
-    }
-    try std.testing.expect(Permission.grantsLocked(app, &child.agent).ptr == Permission.grantsLocked(app, &app.main_agent).ptr);
-    const stored = grantCount(app, &app.main_agent);
-
-    // The same approval again leaves the list as it was.
-    for (file_grants) |grant| try Worker.propagateGrant(app, &child.agent, grant.tool_name, grant.target_path);
-    try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
-
-    // A second instance is another session: it keeps its own list, and its
-    // subagent's approval stays there.
-    try std.testing.expectEqual(@as(usize, 0), grantCount(app, &second.agent));
-    try std.testing.expect(!grantAllowed(app, &other.agent, "write_file", "/tmp/workspace/other/file.txt"));
-    try Worker.propagateGrant(app, &other.agent, "skill", "demo");
-    try std.testing.expect(grantAllowed(app, &second.agent, "skill", "demo"));
-    try std.testing.expect(!grantAllowed(app, &app.main_agent, "skill", "demo"));
-    try std.testing.expectEqual(stored, grantCount(app, &app.main_agent));
-
-    // Main's own answer is written at once too, so a subagent that is running
-    // reads it at its next call. The main loop's event for the same answer
-    // then adds no second row.
-    try Worker.propagateGrant(app, &app.main_agent, "skill", "main-only");
-    try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
-    try std.testing.expect(grantAllowed(app, &child.agent, "skill", "main-only"));
-    try Permission.allowForSession(app, &app.main_agent, "skill", "main-only");
-    try std.testing.expectEqual(stored + 1, grantCount(app, &app.main_agent));
-}
-
-test "main's check reads the approvals its instance holds when it checks, and no other instance's" {
-    const alloc = std.testing.allocator;
-    const Worker = app_worker_runtime.Runtime(App);
-    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
-    defer fixture.deinit();
-    const app = &fixture.app;
-    const second = try addTestChildAgent(app, "instance-2");
-    second.agent.role = .instance;
-    const child = try addTestChildAgent(app, "child-1");
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const Merge = App.AgentAppRuntime;
-
-    // The turn began, or the prompt was queued, before the approval, so its own
-    // list has none of it.
-    const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("own") }};
-    try std.testing.expect(!permissions.sessionGrantAllowed(Merge.mergeLiveGrants(app, &app.main_agent, arena, &own), "skill", "granted"));
-    try Worker.propagateGrant(app, &child.agent, "skill", "granted");
-
-    // Main's check now reads it, and still reads the turn's own approval.
-    const main_grants = Merge.mergeLiveGrants(app, &app.main_agent, arena, &own);
-    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "skill", "granted"));
-    try std.testing.expect(permissions.sessionGrantAllowed(main_grants, "skill", "own"));
-    // The approval covers what it names, and nothing else.
-    try std.testing.expect(!permissions.sessionGrantAllowed(main_grants, "skill", "other"));
-
-    // Another instance is another session, whether its turn is running or its
-    // prompt is queued: its check does not read this instance's list.
-    const second_grants = Merge.mergeLiveGrants(app, &second.agent, arena, &own);
-    try std.testing.expectEqual(own.len, second_grants.len);
-    try std.testing.expect(!permissions.sessionGrantAllowed(second_grants, "skill", "granted"));
-}
-
-test "subagents' workers and main's worker add approvals while main's worker and main's thread read them" {
-    const alloc = std.testing.allocator;
-    const Permission = app_permission_runtime.Runtime(App);
-    const Worker = app_worker_runtime.Runtime(App);
-    // The process Io installs its wrapped vtable on first use, before threads
-    // start; touch it here so the threads below meet it ready.
-    _ = io_mod.getIo();
-    var fixture = ApprovalsFixture{ .app = .{ .alloc = alloc } };
-    defer fixture.deinit();
-    const app = &fixture.app;
-    const first = try addTestChildAgent(app, "child-1");
-    const second = try addTestChildAgent(app, "child-2");
-
-    const Race = struct {
-        app: *App,
-        writers_left: std.atomic.Value(u32) = .init(3),
-        torn: std.atomic.Value(u32) = .init(0),
-        const approvals = 200;
-
-        fn writing(self: *@This()) bool {
-            return self.writers_left.load(.acquire) > 0;
-        }
-
-        /// An agent's worker, a subagent's or main's: one approval after
-        /// another, each a new target, so the list grows and moves.
-        fn write(self: *@This(), child: *agents.Agent, prefix: []const u8) void {
-            defer _ = self.writers_left.fetchSub(1, .release);
-            for (0..approvals) |i| {
-                var buf: [24]u8 = undefined;
-                const target = std.mem.print(&buf, "{s}-{d}", .{ prefix, i }) catch {
-                    _ = self.torn.fetchAdd(1, .monotonic);
-                    return;
-                };
-                Worker.propagateGrant(self.app, child, "skill", target) catch {
-                    _ = self.torn.fetchAdd(1, .monotonic);
-                    return;
-                };
-            }
-        }
-
-        /// Every approval read has a whole name and target.
-        fn check(self: *@This(), grants: []const types.PermissionGrant) void {
-            for (grants) |grant| {
-                const whole = std.mem.eql(u8, grant.tool_name, "skill") and
-                    (std.mem.startsWith(u8, grant.target_path, "a-") or
-                        std.mem.startsWith(u8, grant.target_path, "b-") or
-                        std.mem.startsWith(u8, grant.target_path, "m-"));
-                if (!whole) _ = self.torn.fetchAdd(1, .monotonic);
-            }
-        }
-
-        /// Main's worker: a tool context at every call, and the approvals a
-        /// check or an execution reads, the turn's own and a copy of the
-        /// instance's, in an arena that ends with the call.
-        fn readAsWorker(self: *@This()) void {
-            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-            defer arena.deinit();
-            while (self.writing()) {
-                _ = arena.reset(.retain_capacity);
-                const ctx = App.AgentAppRuntime.toolContext(self.app, &self.app.main_agent, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
-                _ = ctx;
-                const own = [_]types.PermissionGrant{.{ .tool_name = @constCast("skill"), .target_path = @constCast("m-own") }};
-                self.check(App.AgentAppRuntime.mergeLiveGrants(self.app, &self.app.main_agent, arena.allocator(), &own));
-            }
-        }
-
-        /// Main's thread: the copy a turn takes as it starts.
-        fn readAsMainThread(self: *@This()) void {
-            while (self.writing()) {
-                const copy = Permission.copyGrants(self.app, &self.app.main_agent, std.heap.c_allocator) catch continue;
-                defer types.freePermissionGrantSlice(std.heap.c_allocator, copy);
-                self.check(copy);
-            }
-        }
-
-        /// What the status line and `/permissions` count and list.
-        fn readForDisplay(self: *@This()) void {
-            while (self.writing()) {
-                _ = Permission.liveGrantCount(self.app, &self.app.main_agent);
-                const shown = Permission.liveGrants(self.app, &self.app.main_agent, std.heap.c_allocator) catch continue;
-                defer types.freePermissionGrantSlice(std.heap.c_allocator, shown);
-                self.check(shown);
-            }
-        }
-    };
-    var race = Race{ .app = app };
-    const first_writer = try std.Thread.spawn(.{}, Race.write, .{ &race, &first.agent, "a" });
-    const second_writer = try std.Thread.spawn(.{}, Race.write, .{ &race, &second.agent, "b" });
-    // Main's worker writes its own answers, each at once. Main's thread writes
-    // the same answers below, as it does when it handles the events that carry
-    // them.
-    const main_writer = try std.Thread.spawn(.{}, Race.write, .{ &race, &app.main_agent, "m" });
-    const worker_reader = try std.Thread.spawn(.{}, Race.readAsWorker, .{&race});
-    const main_reader = try std.Thread.spawn(.{}, Race.readAsMainThread, .{&race});
-    const display_reader = try std.Thread.spawn(.{}, Race.readForDisplay, .{&race});
-    // Main's thread handles the events for main's own answers meanwhile: the
-    // same approvals its worker has written, which add no second row.
-    for (0..Race.approvals) |i| {
-        var buf: [16]u8 = undefined;
-        const target = try std.mem.print(&buf, "m-{d}", .{i});
-        try Permission.allowForSession(app, &app.main_agent, "skill", target);
-    }
-    first_writer.join();
-    second_writer.join();
-    main_writer.join();
-    worker_reader.join();
-    main_reader.join();
-    display_reader.join();
-
-    try std.testing.expectEqual(@as(u32, 0), race.torn.load(.monotonic));
-    try std.testing.expectEqual(@as(usize, 3 * Race.approvals), grantCount(app, &app.main_agent));
-}
-
-test "a subagent's turn is stamped with its run's model, permissions, credential, and root request" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-    const credential = credentials.Credential{
-        .token = try alloc.dupe(u8, "CHILD_TOKEN"),
-        .source = .stored_key,
-    };
-    App.AgentsAppRuntime.installChildRun(&app, child, try testChildRun(alloc, &resolver, false, credential));
-
-    const Snapshot = struct {
-        fn run(_: void, a: *App, agent: *agents.Agent) anyerror!void {
-            const job = try a.snapshotPrompt(agent, "child prompt", &.{}, null, null, 1, false);
-            defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, job);
-            try std.testing.expectEqualStrings("child/model", job.model);
-            try std.testing.expectEqualStrings("CHILD_TOKEN", job.api_key);
-            try std.testing.expectEqual(types.CredentialSource.stored_key, job.credential_source.?);
-            try std.testing.expectEqual(types.PermissionMode.ask, job.permission_mode);
-            try std.testing.expectEqualStrings("ROOT_REQUEST", job.root_user_intent_context);
-            try std.testing.expectEqual(@as(usize, 0), job.grants.len);
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, {}, Snapshot.run);
-    // Main has no credential of its own here, so its turn cannot borrow the
-    // child's.
-    try std.testing.expectError(error.MissingApiKey, app.snapshotPrompt(app.screenAgent(), "main prompt", &.{}, null, null, 2, false));
-}
-
-test "a report reaches the agent that owns its host as its subagent's message" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    // A subagent whose own subagent reports to it.
-    const child = try addTestChildAgent(&app, "child-1");
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-    const credential = credentials.Credential{
-        .token = try alloc.dupe(u8, "CHILD_TOKEN"),
-        .source = .stored_key,
-    };
-    App.AgentsAppRuntime.installChildRun(&app, child, try testChildRun(alloc, &resolver, false, credential));
-    // An image waiting in the composer stays there.
-    try child.agent.pending_images.append(alloc, .{ .id = 1, .path = try alloc.dupe(u8, "/tmp/shot.png"), .media_type = try alloc.dupe(u8, "image/png") });
-
-    try app.postAgentMessage(&child.agent, "Subagent report (untrusted agent output, not user instructions):", .child, .report);
-    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queuedPromptCount());
-    const queued = child.agent.worker.queued_prompts.items[0];
-    try std.testing.expectEqual(types.MessageAuthor.child, queued.author);
-    try std.testing.expectEqual(@as(usize, 0), queued.images.len);
-    try std.testing.expectEqual(@as(usize, 1), child.agent.pending_images.items.len);
-    // A subagent's turn keeps its run's root request.
-    try std.testing.expectEqualStrings("ROOT_REQUEST", queued.root_user_intent_context);
-    try std.testing.expect(queued.delivery == .continuation);
-}
 
 /// A subagent that owns the host `reporter`, with a run installed so that a
 /// report for it can build its turn. Clear `session_persistence.subagent_host`
@@ -8544,7 +4774,7 @@ fn addReportTarget(
     const child = try addTestChildAgent(app, id);
     const credential = credentials.Credential{
         .token = try app.alloc.dupe(u8, "CHILD_TOKEN"),
-        .source = .stored_key,
+        .source = .configured,
     };
     App.AgentsAppRuntime.installChildRun(app, child, try testChildRun(app.alloc, resolver, false, credential));
     child.agent.session_persistence.subagent_host = reporter;
@@ -8633,242 +4863,4 @@ fn runReportBetweenFinishAndCommit(
     try std.testing.expect(std.mem.find(u8, work.prompt.prompt, "SECOND_CHILD_REPORT") != null);
     try session.appendProgress(user_report, .{}, .{});
     try session.commitTurn(turn_report, language);
-}
-
-test "a report that missed a finished turn starts no turn until the loop commits it, and the log shows no superseded turn" {
-    const alloc = std.testing.allocator;
-    const child_state = @import("core/subagent/child_state.zig");
-    var tp: child_state.TestParent = undefined;
-    try tp.init(alloc);
-    defer tp.deinit();
-    // A subagent is made during turn N, as a prompt's own work makes one.
-    try runReportBetweenFinishAndCommit(alloc, &tp, true, true);
-    try std.testing.expectEqual(@as(usize, 0), try countLogLines(alloc, &tp, "\"superseded\""));
-    try std.testing.expectEqual(@as(usize, 0), try countLogLines(alloc, &tp, "turn_interrupted"));
-    // The setup's turn, turn N, and the report's turn, each committed once.
-    try std.testing.expectEqual(@as(usize, 3), try countLogLines(alloc, &tp, "turn_committed"));
-
-    // A fork before turn N's prompt offers none of the subagents that turn made.
-    // A superseded turn N is written again after them, so a fork before the
-    // rewritten prompt offers them as if they came first.
-    const session_adapter = @import("core/session/session_adapter.zig");
-    const points = try tp.parent.forkPoints(alloc);
-    defer session_adapter.Session.freeForkPoints(alloc, points);
-    var turn_n: ?u64 = null;
-    for (points) |point| if (std.mem.eql(u8, point.prompt, "turn N")) {
-        turn_n = point.turn;
-    };
-    const offered = try tp.parent.forkChildren(alloc, turn_n.?);
-    defer session_adapter.freeChildren(alloc, offered);
-    try std.testing.expectEqual(@as(usize, 0), offered.len);
-}
-
-test "the same turns written without the gate supersede each other, which the log shows" {
-    const alloc = std.testing.allocator;
-    const child_state = @import("core/subagent/child_state.zig");
-    var tp: child_state.TestParent = undefined;
-    try tp.init(alloc);
-    defer tp.deinit();
-    try runReportBetweenFinishAndCommit(alloc, &tp, false, false);
-    try std.testing.expect(try countLogLines(alloc, &tp, "\"superseded\"") > 0);
-    try std.testing.expect(try countLogLines(alloc, &tp, "turn_interrupted") > 0);
-}
-
-test "installing a subagent's run sets its effort, keeps ultrafast only when main has it, and frees the last run" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-    defer App.AgentsAppRuntime.shutdownChildren(&app);
-    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
-    app.main_agent.worker.agent_turn_settings.effort = types.ReasoningEffort.literal("low");
-    app.main_agent.worker.agent_turn_settings.ultrafast_mode = false;
-    app.main_agent.worker.agent_turn_settings.max_tool_result_bytes = 4321;
-
-    App.AgentsAppRuntime.installChildRun(&app, child, try testChildRun(alloc, &resolver, true, null));
-    const settings = child.agent.worker.agent_turn_settings;
-    try std.testing.expect(settings.effort.eql(types.ReasoningEffort.literal("high")));
-    try std.testing.expect(!settings.ultrafast_mode);
-    try std.testing.expectEqual(@as(usize, 4321), settings.max_tool_result_bytes);
-
-    app.main_agent.worker.agent_turn_settings.ultrafast_mode = true;
-    App.AgentsAppRuntime.installChildRun(&app, child, try testChildRun(alloc, &resolver, true, null));
-    try std.testing.expect(child.agent.worker.agent_turn_settings.ultrafast_mode);
-    try std.testing.expect(app.main_agent.child_run == null);
-}
-
-test "a subagent's view is rebuilt from its saved conversation without touching the screen" {
-    const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const child = try addTestChildAgent(&app, "child-1");
-
-    try app.shell.notebook.transcript.appendSlice(alloc, "main text\n");
-    app.shell.command_output_render.styles.dim_style = "SCREEN_DIM";
-
-    const history = [_]types.HistoryTurn{.{ .interrupted = .{
-        .user = .{ .text = @constCast("EARLIER_TASK") },
-        .assistant = @constCast("EARLIER_ANSWER"),
-    } }};
-    const Body = struct {
-        fn run(turns: []const types.HistoryTurn, a: *App, agent: *agents.Agent) anyerror!void {
-            try App.SessionAppRuntime.rebuildChildView(a, agent, turns);
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, @as([]const types.HistoryTurn, &history), Body.run);
-
-    // The view holds the saved turn, to be published when it is painted.
-    const view = &child.screen.transcript.notebook;
-    var saw_task = false;
-    var saw_answer = false;
-    for (view.entries.items) |entry| switch (entry) {
-        .user_turn => |user| saw_task = saw_task or std.mem.eql(u8, user.turn.text, "EARLIER_TASK"),
-        .assistant_turn => saw_answer = true,
-        else => {},
-    };
-    try std.testing.expect(saw_task);
-    try std.testing.expect(saw_answer);
-    try std.testing.expect(view.pending_resume_source != null);
-    try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
-    try std.testing.expectEqualStrings("SCREEN_DIM", app.shell.command_output_render.styles.dim_style);
-}
-
-test "a theme change rewrites hidden agents' transcripts and paced text" {
-    const alloc = std.testing.allocator;
-    const shared_theme = @import("core/shared/theme.zig");
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    app.shell.layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 };
-    const child = try addTestChildAgent(&app, "child-1");
-
-    var dark = shared_theme.spark_dark;
-    dark.name = "probe-dark";
-    dark.inline_code_open = "\x1b[38;2;136;192;208m";
-    var light = shared_theme.spark_light;
-    light.name = "probe-light";
-    light.inline_code_open = "\x1b[38;2;23;108;116m";
-
-    const Fill = struct {
-        fn run(_: void, a: *App, _: *agents.Agent) anyerror!void {
-            _ = try a.shell.appendRawTranscriptEntryClassified(a.alloc, "\x1b[38;2;136;192;208mshown\x1b[39m\n", .tool_status);
-            try a.pacer.enqueue(a.alloc, "\x1b[38;2;136;192;208mpaced\x1b[39m");
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, {}, Fill.run);
-    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "\x1b[38;2;136;192;208mmain\x1b[39m\n", .tool_status);
-
-    App.AgentsAppRuntime.retintHiddenScreens(&app, dark, light);
-
-    try std.testing.expect(std.mem.find(u8, child.screen.transcript.notebook.transcript.items, "\x1b[38;2;23;108;116mshown") != null);
-    try std.testing.expect(std.mem.find(u8, child.screen.pacer.pending.items, "\x1b[38;2;23;108;116mpaced") != null);
-    // The agent on screen is the theme change's own work, not this one's.
-    try std.testing.expect(std.mem.find(u8, app.shell.notebook.transcript.items, "\x1b[38;2;136;192;208mmain") != null);
-}
-
-test "a hidden agent's turn that its own tick commits reaches the report queued behind it" {
-    const alloc = std.testing.allocator;
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
-    defer sink.close(io_mod.getIo());
-    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer app.input_runtime.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    const on_screen = try addTestChildAgent(&app, "on-screen");
-    const hidden = try addTestChildAgent(&app, "hidden");
-    try App.AgentsAppRuntime.show(&app, on_screen);
-
-    // The hidden agent finished a turn, and its pacer still shows the text. A
-    // report was posted meanwhile, with the history its loop had: one turn.
-    const turn: types.HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = @constCast("the finished prompt") },
-        .assistant = @constCast("the finished answer"),
-    } };
-    const worker = &hidden.agent.worker;
-    // `deinitChildren` leaves a worker to its owner. Its queue is allocated
-    // with `c_allocator`, as `postAgentMessage` allocates it, and the turn the
-    // tick commits lands in the agent's session and names its title.
-    const gpa = std.heap.c_allocator;
-    defer worker.deinit(gpa);
-    defer hidden.agent.session_persistence.deinit(alloc);
-    defer hidden.agent.session.deinit(alloc);
-    defer hidden.agent.session_title.deinit(alloc);
-    hidden.agent.session.max_history_turns = 8;
-    worker.enableCommitGate();
-    worker.worker_processing = true;
-    worker.active_turn_id = 9;
-    worker.direct_steering_closed = true;
-    try worker.pushEvent(gpa, .{ .finish_prompt = .{ .turn = turn } });
-    const earlier = try gpa.alloc(types.HistoryTurn, 1);
-    earlier[0] = .{ .assistant = .{
-        .user = .{ .text = try gpa.dupe(u8, "earlier prompt") },
-        .assistant = try gpa.dupe(u8, "earlier answer"),
-    } };
-    try worker.postMail(gpa, .{
-        .prompt = try gpa.dupe(u8, "a report"),
-        .images = &.{},
-        .model = try gpa.dupe(u8, "test-model"),
-        .api_key = try gpa.dupe(u8, "test-key"),
-        .permission_mode = .auto,
-        .history = earlier,
-        .grants = try gpa.alloc(types.PermissionGrant, 0),
-    });
-    worker.finishProcessing();
-    var taken = worker.takeEvents();
-    for (taken.items) |event| worker_runtime.freeWorkerEvent(gpa, event);
-    taken.deinit(gpa);
-    try hidden.screen.pacer.enqueue(alloc, "still showing");
-    try std.testing.expect(try hidden.screen.pacer.deferFinish(alloc, .{ .turn = turn }));
-    try std.testing.expectEqual(@as(u32, 1), worker.queued_history_owed);
-
-    // The agent's own tick shows the text and commits the turn.
-    try App.AgentsAppRuntime.tickChildren(&app, {}, App.tickAgentInContext);
-    try std.testing.expect(hidden.screen.pacer.deferred_turn == null);
-    try std.testing.expectEqual(@as(usize, 1), hidden.agent.session.historyLen());
-    try std.testing.expectEqual(@as(u32, 0), worker.unacknowledged_finishes);
-
-    // The report starts with the turn the tick committed, after the earlier one.
-    const work = (try worker.tryTakeNextWork(gpa)) orelse return error.TestExpectedReportToStart;
-    defer worker_runtime.freeWorkItem(gpa, work);
-    try std.testing.expectEqual(@as(usize, 2), work.prompt.history.len);
-    try std.testing.expectEqualStrings("earlier answer", work.prompt.history[0].assistant.assistant);
-    try std.testing.expectEqualStrings("the finished answer", work.prompt.history[1].assistant.assistant);
-}
-
-test "a theme change leaves hidden agents alone while a scrollback handoff is pending" {
-    const alloc = std.testing.allocator;
-    const shared_theme = @import("core/shared/theme.zig");
-    var app = App{ .alloc = alloc };
-    defer app.shell.deinit(alloc);
-    defer app.pacer.deinit(alloc);
-    defer App.AgentsAppRuntime.deinitChildren(&app);
-    app.shell.layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 };
-    const child = try addTestChildAgent(&app, "child-1");
-
-    var dark = shared_theme.spark_dark;
-    dark.name = "probe-dark";
-    dark.inline_code_open = "\x1b[38;2;136;192;208m";
-    var light = shared_theme.spark_light;
-    light.name = "probe-light";
-    light.inline_code_open = "\x1b[38;2;23;108;116m";
-
-    const Fill = struct {
-        fn run(_: void, a: *App, _: *agents.Agent) anyerror!void {
-            _ = try a.shell.appendRawTranscriptEntryClassified(a.alloc, "\x1b[38;2;136;192;208mshown\x1b[39m\n", .tool_status);
-        }
-    };
-    try App.AgentsAppRuntime.visit(&app, child, {}, Fill.run);
-
-    // Swapping a transcript in now would trip swapSlot's handoff assertion.
-    app.shell.pending_session_scrollback_handoff = .{ .remaining_rows = 1, .total_rows = 2, .terminal_cols = 80, .terminal_rows = 24 };
-    defer app.shell.pending_session_scrollback_handoff = null;
-    App.AgentsAppRuntime.retintHiddenScreens(&app, dark, light);
-
-    try std.testing.expect(std.mem.find(u8, child.screen.transcript.notebook.transcript.items, "\x1b[38;2;136;192;208mshown") != null);
 }

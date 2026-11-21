@@ -59,13 +59,13 @@ zig build
 
 ## Quick start
 
-Start spark in a project and add a model connection:
+Start spark in a project and add a model provider:
 
 ```text
-/connect
+/provider
 ```
 
-The form asks for a name, a base URL such as `https://openrouter.ai/api/v1`, an API key (leave it empty for a local server), and one or more models with their context window. spark saves the connection in `~/.spark/settings.json` and switches to it.
+The form asks for a name, a base URL such as `https://openrouter.ai/api/v1`, an API key (leave it empty for a local server), and one or more models with their context window. spark saves the provider in `~/.spark/settings.json` and switches to it.
 
 Then just type what you want done.
 
@@ -80,10 +80,9 @@ spark ask --json "summarize the failing tests" | jq -r .final_output
 
 | Command    | What it does                                                         |
 | ---------- | -------------------------------------------------------------------- |
-| `/connect` | Add, edit, rename, or delete model connections                       |
+| `/provider` | Add, edit, rename, or delete model providers                        |
 | `/model`   | Switch models                                                        |
 | `/prompt`  | Pick a custom system prompt from your prompt folders; Tab stars one  |
-| `/search`  | Choose the web search provider: Vercel, Firecrawl, or auto           |
 | `/mcp`     | Manage MCP servers                                                   |
 | `/help`    | List every command                                                   |
 

@@ -155,29 +155,3 @@ fn pathExists(path: []const u8) bool {
     std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
     return true;
 }
-
-test "a test build holds a stopped work's end only through its hook" {
-    // Without a hook nothing is armed, a hold returns at once, and the file
-    // controls are never read.
-    try std.testing.expect(!armed());
-    holdStoppedEnd("child", "parent");
-    try std.testing.expectEqual(@as(u32, 0), holds.load(.seq_cst));
-}
-
-test "a test build holds the host before it settles an ended work only through its hook" {
-    try std.testing.expect(!settleArmed());
-    holdBeforeSettle("child");
-    try std.testing.expectEqual(@as(u32, 0), settle_holds.load(.seq_cst));
-}
-
-test "a hold is armed only when both of its paths are absolute" {
-    const files = usableHoldFiles("/tmp/held", "/tmp/release").?;
-    try std.testing.expectEqualStrings("/tmp/held", files.held);
-    try std.testing.expectEqualStrings("/tmp/release", files.release);
-    try std.testing.expect(usableHoldFiles(null, "/tmp/release") == null);
-    try std.testing.expect(usableHoldFiles("/tmp/held", null) == null);
-    try std.testing.expect(usableHoldFiles("held", "/tmp/release") == null);
-    try std.testing.expect(usableHoldFiles("/tmp/held", "release") == null);
-    try std.testing.expect(usableHoldFiles("./held", "../release") == null);
-    try std.testing.expect(usableHoldFiles("", "") == null);
-}

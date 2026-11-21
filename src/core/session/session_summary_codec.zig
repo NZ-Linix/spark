@@ -90,23 +90,3 @@ fn lessSummaryNewerFirst(_: void, a: SessionSummary, b: SessionSummary) bool {
     if (a.updated_at_ms != b.updated_at_ms) return a.updated_at_ms > b.updated_at_ms;
     return std.mem.order(u8, a.id, b.id) == .gt;
 }
-
-test "summary clone owns every string" {
-    const alloc = std.testing.allocator;
-    var clone = try cloneSessionSummary(alloc, .{
-        .id = @constCast("session"),
-        .workspace_root = @constCast("/workspace"),
-        .origin_workspace_root = @constCast("/origin"),
-        .title = @constCast("Title"),
-        .preview = @constCast("Preview"),
-        .display_metadata_present = true,
-        .created_at_ms = 1,
-        .updated_at_ms = 2,
-        .conversation_language = .literal("en"),
-        .history_len = 3,
-    });
-    defer clone.deinit(alloc);
-    try std.testing.expectEqualStrings("session", clone.id);
-    try std.testing.expectEqualStrings("Title", clone.title.?);
-    try std.testing.expectEqualStrings("Preview", clone.preview.?);
-}

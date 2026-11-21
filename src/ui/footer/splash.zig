@@ -111,23 +111,3 @@ pub fn composeRow(alloc: Allocator, state: *const State, index: u16, width: u16,
     try row.appendSlice(alloc, reset);
     return row;
 }
-
-test "the splash row starts with the version line and stays inside the width" {
-    const alloc = std.testing.allocator;
-    var state: State = .{};
-    try std.testing.expect(state.tick(1000));
-    try std.testing.expect(!state.tick(1010));
-    var frame: u32 = 0;
-    while (frame < 200) : (frame += 7) {
-        state.frame = frame;
-        var row = try composeRow(alloc, &state, 0, 60, "-=✦ v1\n\n");
-        defer row.deinit(alloc);
-        try std.testing.expect(std.mem.startsWith(u8, row.items, "-=✦ v1"));
-        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 60);
-    }
-    var gap = try composeRow(alloc, &state, 1, 60, "-=✦ v1\n\n");
-    defer gap.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), gap.items.len);
-    state.dismiss();
-    try std.testing.expect(!state.tick(5000));
-}

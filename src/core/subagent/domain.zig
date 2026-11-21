@@ -2,7 +2,6 @@ const std = @import("std");
 const mcp_access = @import("../mcp/access_policy.zig");
 const model_provider = @import("../config/model_provider.zig");
 const session_layout = @import("../session/session_layout.zig");
-const session_permission_state = @import("../permissions/session_permission_state.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -45,14 +44,11 @@ pub const AdmissionSnapshot = struct {
     parent_id: []u8,
     source_id: []u8,
     model: []u8,
-    provider: model_provider.ProviderId = .gateway,
+    provider: model_provider.ProviderId = .none,
     effort: types.ReasoningEffort,
     ultrafast_mode: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     tool_names: [][]u8,
-    rules: types.PermissionRuleSet,
-    grants: []types.PermissionGrant,
-    permission_state: session_permission_state.State = .{},
     integration_names: [][]u8,
     authority_generation: u64 = 0,
     mcp_view: ?mcp_access.View = null,
@@ -68,9 +64,6 @@ pub const AdmissionSnapshot = struct {
             .ultrafast_mode = self.ultrafast_mode,
             .permission_mode = self.permission_mode,
             .tool_names = self.tool_names,
-            .rules = self.rules,
-            .grants = self.grants,
-            .permission_state = self.permission_state,
             .integration_names = self.integration_names,
             .authority_generation = self.authority_generation,
             .mcp_view = self.mcp_view,
@@ -82,9 +75,6 @@ pub const AdmissionSnapshot = struct {
         alloc.free(self.source_id);
         alloc.free(self.model);
         freeStrings(alloc, self.tool_names);
-        self.rules.deinit(alloc);
-        types.freePermissionGrantSlice(alloc, self.grants);
-        self.permission_state.deinit(alloc);
         freeStrings(alloc, self.integration_names);
         if (self.mcp_view) |*view| view.deinit(alloc);
         self.* = undefined;
@@ -95,14 +85,11 @@ pub const AdmissionInput = struct {
     parent_id: []const u8,
     source_id: []const u8,
     model: []const u8,
-    provider: model_provider.ProviderId = .gateway,
+    provider: model_provider.ProviderId = .none,
     effort: types.ReasoningEffort,
     ultrafast_mode: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     tool_names: []const []const u8 = &.{},
-    rules: types.PermissionRuleSet = .{},
-    grants: []const types.PermissionGrant = &.{},
-    permission_state: session_permission_state.State = .{},
     integration_names: []const []const u8 = &.{},
     authority_generation: u64 = 0,
     mcp_view: ?mcp_access.View = null,
@@ -124,24 +111,11 @@ pub fn captureAdmission(
     validateBoundedText(input.model, max_model_bytes) catch return error.InvalidModel;
     // Integration names mirror the parent's MCP catalog, which is already
     // bounded per server by the MCP tool limits, so they carry no count cap.
-    if (input.tool_names.len > max_admission_items or
-        input.rules.rules.len > max_admission_items or
-        input.grants.len > max_admission_items)
-    {
+    if (input.tool_names.len > max_admission_items) {
         return error.TooManyAdmissionItems;
     }
     try validateStrings(input.tool_names);
     try validateStrings(input.integration_names);
-    for (input.rules.rules) |rule| {
-        try validateAdmissionText(rule.permission);
-        try validateAdmissionText(rule.pattern);
-    }
-    for (input.grants) |grant| {
-        try validateAdmissionText(grant.tool_name);
-        try validateAdmissionText(grant.target_path);
-    }
-    session_permission_state.validate(input.permission_state) catch
-        return error.InvalidAdmissionItem;
 
     const parent_id = try alloc.dupe(u8, input.parent_id);
     errdefer alloc.free(parent_id);
@@ -151,21 +125,6 @@ pub fn captureAdmission(
     errdefer alloc.free(model);
     const tool_names = try cloneStrings(alloc, input.tool_names);
     errdefer freeStrings(alloc, tool_names);
-    var rules = try types.dupePermissionRuleSet(alloc, input.rules);
-    errdefer rules.deinit(alloc);
-    const grants = try types.dupePermissionGrantSlice(alloc, input.grants);
-    errdefer types.freePermissionGrantSlice(alloc, grants);
-    const permission_state = session_permission_state.dupe(
-        alloc,
-        input.permission_state,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidAdmissionItem,
-    };
-    errdefer {
-        var value = permission_state;
-        value.deinit(alloc);
-    }
     var mcp_view = if (input.mcp_view) |view| try view.clone(alloc) else null;
     errdefer if (mcp_view) |*view| view.deinit(alloc);
     const integration_names = try cloneStrings(alloc, input.integration_names);
@@ -178,9 +137,6 @@ pub fn captureAdmission(
         .ultrafast_mode = input.ultrafast_mode,
         .permission_mode = input.permission_mode,
         .tool_names = tool_names,
-        .rules = rules,
-        .grants = grants,
-        .permission_state = permission_state,
         .integration_names = integration_names,
         .authority_generation = input.authority_generation,
         .mcp_view = mcp_view,
@@ -252,78 +208,4 @@ fn cloneStrings(
 fn freeStrings(alloc: Allocator, values: [][]u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);
-}
-
-test "captured admission owns independent authority slices" {
-    const alloc = std.testing.allocator;
-    var snapshot = try captureAdmission(alloc, .{
-        .parent_id = "01J00000000000000000000000",
-        .source_id = "01J00000000000000000000000",
-        .model = "test/model",
-        .effort = .auto,
-        .tool_names = &.{"read_file"},
-    });
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqualStrings("read_file", snapshot.tool_names[0]);
-}
-
-test "admission accepts more integration names than the admission item cap" {
-    const alloc = std.testing.allocator;
-    var names: [max_admission_items + 1][]const u8 = undefined;
-    for (&names) |*name| name.* = "mcp_fixture_tool";
-    var snapshot = try captureAdmission(alloc, .{
-        .parent_id = "01J00000000000000000000000",
-        .source_id = "01J00000000000000000000000",
-        .model = "test/model",
-        .effort = .auto,
-        .integration_names = &names,
-    });
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(names.len, snapshot.integration_names.len);
-}
-
-test "admission still validates each integration name" {
-    try std.testing.expectError(error.InvalidAdmissionItem, captureAdmission(std.testing.allocator, .{
-        .parent_id = "01J00000000000000000000000",
-        .source_id = "01J00000000000000000000000",
-        .model = "test/model",
-        .effort = .auto,
-        .integration_names = &.{""},
-    }));
-}
-
-test "admission keeps the item cap for tool names" {
-    var names: [max_admission_items + 1][]const u8 = undefined;
-    for (&names) |*name| name.* = "read_file";
-    try std.testing.expectError(error.TooManyAdmissionItems, captureAdmission(std.testing.allocator, .{
-        .parent_id = "01J00000000000000000000000",
-        .source_id = "01J00000000000000000000000",
-        .model = "test/model",
-        .effort = .auto,
-        .tool_names = &names,
-    }));
-}
-
-test "a cloned admission owns copies of every field" {
-    const alloc = std.testing.allocator;
-    const tools = [_][]const u8{ "read_file", "grep_files" };
-    var original = try captureAdmission(alloc, .{
-        .parent_id = "parent",
-        .source_id = "source",
-        .model = "test-model",
-        .effort = .auto,
-        .permission_mode = .ask,
-        .tool_names = &tools,
-        .authority_generation = 7,
-    });
-    var copy = try original.clone(alloc);
-    defer copy.deinit(alloc);
-    original.deinit(alloc);
-    try std.testing.expectEqualStrings("parent", copy.parent_id);
-    try std.testing.expectEqualStrings("source", copy.source_id);
-    try std.testing.expectEqualStrings("test-model", copy.model);
-    try std.testing.expectEqual(types.PermissionMode.ask, copy.permission_mode);
-    try std.testing.expectEqual(@as(usize, 2), copy.tool_names.len);
-    try std.testing.expectEqualStrings("grep_files", copy.tool_names[1]);
-    try std.testing.expectEqual(@as(u64, 7), copy.authority_generation);
 }

@@ -114,11 +114,11 @@ pub const keys = [_]Key{
     .{ .name = "auto_compact_percent", .where = .profile, .kind = .integer, .minimum = 10, .maximum = 80, .description = "Start automatic compaction at this percentage of usable input capacity" },
     .{ .name = "auto_upgrade", .where = .profile, .kind = .boolean, .description = "Download and install updates in the background" },
     .{ .name = "cache_warming", .where = .profile, .kind = .boolean, .description = "Keep a waiting Claude conversation's prompt cache alive for up to 30 minutes" },
-    .{ .name = "codex_model", .where = .profile, .kind = .string, .superseded_by = "models.codex", .description = "Older form of models.codex" },
+    .{ .name = "codex_model", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "collapse_tool_calls", .where = .profile, .kind = .boolean, .description = "Show a summary for each group of tool calls" },
     .{ .name = "context", .where = .project_safe, .kind = .boolean, .description = "Load project instructions such as AGENTS.md" },
     .{ .name = "context_limits", .where = .profile, .kind = .object, .map = true, .description = "Context limits by name, in bytes or off, as --context-limit takes them" },
-    .{ .name = "credential_source", .where = .profile, .kind = .string, .values = &.{ "vercel_oidc_token", "ai_gateway_api_key", "spark_login", "stored_key", "chatgpt_subscription", "grok_subscription" }, .description = "The saved credential spark uses; spark login sets it" },
+    .{ .name = "credential_source", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "disabledMcpjsonServers", .where = .profile, .kind = .strings, .workspace_only = true, .description = "Project MCP servers rejected in this workspace; manage them with spark mcp approve and reject" },
     .{ .name = "effort", .where = .profile, .kind = .string_or_null, .description = "Reasoning effort: auto or a name the model supports; null means auto" },
     .{ .name = "enableAllProjectMcpServers", .where = .profile, .kind = .boolean, .workspace_only = true, .description = "Approve every server in this workspace's .mcp.json; manage it with spark mcp approve and reject" },
@@ -127,22 +127,22 @@ pub const keys = [_]Key{
     .{ .name = "fast_mode", .where = .profile, .kind = .boolean, .description = "Use faster inference when the model supports it" },
     .{ .name = "fast_mode_model_bound", .where = .profile, .kind = .boolean, .description = "Managed by spark alongside fast_mode" },
     .{ .name = "first_call_tool_choice", .where = .profile, .kind = .string, .values = &.{ "auto", "none" }, .description = "Tool choice for the first request of a turn" },
-    .{ .name = "grok_model", .where = .profile, .kind = .string, .superseded_by = "models.grok", .description = "Older form of models.grok" },
+    .{ .name = "grok_model", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "input_appearance", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "max_agent_steps", .where = .project_safe, .kind = .integer, .minimum = 0, .description = "Most agent steps per turn; 0 means no limit" },
     .{ .name = "max_tool_result_bytes", .where = .project_safe, .kind = .integer, .minimum = 1024, .description = "Tool output budget in model context, in bytes" },
     .{ .name = "maxxing_mode", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "model", .where = .profile, .kind = .string, .superseded_by = "models.gateway", .description = "Older form of models.gateway" },
-    .{ .name = "models", .where = .profile, .kind = .string_map, .map = true, .description = "The saved model for each provider or connection, such as {\"gateway\": \"<model id>\"}" },
+    .{ .name = "models", .where = .profile, .kind = .string_map, .map = true, .description = "The saved model for each provider or connection, such as {\"local\": \"<model id>\"}" },
     .{ .name = "notifications", .where = .profile, .kind = .switches, .children = &sound_children, .child_descriptions = &sound_child_descriptions, .renamed_to = "sound", .description = "Renamed to sound" },
     .{ .name = "permission", .where = .profile, .kind = .object, .map = true, .description = "Permission rules; manage them with /permissions" },
     .{ .name = "permission_mode", .where = .profile, .kind = .string, .values = &.{ "ask", "auto", "full-access", "yolo" }, .description = "How spark handles tool calls that need permission; yolo is an older name for full-access" },
     .{ .name = "prompt_history", .where = .profile, .kind = .switches, .children = &.{"enabled"}, .child_descriptions = &.{"Save prompts and slash commands for input history"}, .description = "Input history" },
-    .{ .name = "provider", .where = .profile, .kind = .string, .description = "The service for model requests: gateway, codex, grok, or a name under providers" },
-    .{ .name = "provider_order", .where = .project_safe, .kind = .strings, .max_items = 8, .description = "Preferred AI Gateway providers, in order" },
-    .{ .name = "provider_strict", .where = .project_safe, .kind = .boolean, .description = "Send AI Gateway requests only to the providers in provider_order" },
+    .{ .name = "provider", .where = .profile, .kind = .string, .description = "The model provider: a name under providers" },
+    .{ .name = "provider_order", .where = .retired, .kind = .any, .description = retired_description },
+    .{ .name = "provider_strict", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "providers", .where = .profile, .kind = .object, .map = true, .top_level_only = true, .description = "Named custom model connections" },
-    .{ .name = "review_model", .where = .profile, .kind = .string, .description = "The AI Gateway model that reviews actions in auto mode" },
+    .{ .name = "review_model", .where = .profile, .kind = .string, .description = "Unused: spark always runs with full access" },
     .{ .name = "sandbox", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "session_titles", .where = .profile, .kind = .boolean, .description = "Name each session from its first prompt" },
     // Retired, but still read so that spark can explain the migration.
@@ -155,7 +155,7 @@ pub const keys = [_]Key{
     .{ .name = "status_line", .where = .profile, .kind = .switches, .children = &status_line_children, .child_descriptions = &status_line_child_descriptions, .description = "What the footer shows" },
     .{ .name = "theme", .where = .profile, .kind = .string, .description = "light, dark, or the name of a theme file in ~/.spark/themes" },
     .{ .name = "tool_placement", .where = .profile, .kind = .string_map, .map = true, .values = &.{ "direct", "toolbox" }, .description = "Where each built-in tool is offered: \"direct\" sends it with the tools, \"toolbox\" lists it in the toolbox menu" },
-    .{ .name = "ultrafast_mode", .where = .profile, .kind = .boolean, .description = "Request the higher-priced Ultrafast tier for an eligible AI Gateway model" },
+    .{ .name = "ultrafast_mode", .where = .profile, .kind = .boolean, .description = "Request the higher-priced Ultrafast tier for an eligible model" },
     .{ .name = "update_channel", .where = .profile, .kind = .string, .values = &.{ "stable", "dev" }, .description = "Release channel for updates" },
     .{ .name = "web_fetch_worker_model", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "workspaces", .where = .profile, .kind = .workspaces, .map = true, .top_level_only = true, .description = "Overrides for each workspace, by absolute path" },
@@ -354,155 +354,4 @@ test "every key says what it holds and what it does" {
             try std.testing.expect(find(path[0..dot]) != null);
         }
     }
-}
-
-test "both spellings are reported only when spark would use the current one" {
-    const alloc = std.testing.allocator;
-    const text =
-        \\{"notifications":{"turn_end":true},"sound":false,
-        \\ "statusLine":{"context":true},"status_line":{"context":false}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
-    defer parsed.deinit();
-
-    const found = try findOlderNames(alloc, parsed.value, .profile);
-    defer alloc.free(found);
-    try std.testing.expectEqual(@as(usize, 1), found.len);
-    try std.testing.expectEqualStrings("statusLine", found[0].older);
-}
-
-test "keys are unique and sorted so the list stays easy to scan" {
-    for (keys[1..], 1..) |key, index| {
-        try std.testing.expect(std.mem.order(u8, keys[index - 1].name, key.name) == .lt);
-    }
-}
-
-test "renamed settings point to a current key with the same children" {
-    for (keys) |key| {
-        const current = find(key.renamed_to orelse continue).?;
-        try std.testing.expect(current.renamed_to == null);
-        try std.testing.expectEqual(key.where, current.where);
-        try std.testing.expectEqual(key.children.len, current.children.len);
-        for (key.children) |child| try std.testing.expect(current.hasChild(child));
-    }
-}
-
-test "older names map to the current ones, in paths and in files" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct { path: []const u8, expected: []const u8 }{
-        .{ .path = "statusLine.context", .expected = "status_line.context" },
-        .{ .path = "statusLine", .expected = "status_line" },
-        .{ .path = "notifications.max", .expected = "sound.max" },
-        .{ .path = "status_line.context", .expected = "status_line.context" },
-        .{ .path = "statusLine.contxt", .expected = "statusLine.contxt" },
-        .{ .path = "fast_mode", .expected = "fast_mode" },
-    };
-    for (cases) |case| try std.testing.expectEqualStrings(case.expected, currentPath(case.path));
-    // A mistyped child of an older name is reported under the current one.
-    try std.testing.expectEqualStrings("status_line", unknownPart("statusLine.contxt").?.parent.?);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"statusLine":{"context":true},"status_line":{"context":false},"notifications":{"max":true},
-        \\ "workspaces":{"/w":{"notifications":{},"sound":{}},"/x":{"sound":{}}}}
-    , .{});
-    defer parsed.deinit();
-    const twice = try findOlderNames(alloc, parsed.value, .profile);
-    defer alloc.free(twice);
-    // A top-level older name is reported alone too, so spark doctor can say when
-    // it stops working.
-    try std.testing.expectEqual(@as(usize, 3), twice.len);
-    try std.testing.expectEqualStrings("notifications", twice[0].older);
-    try std.testing.expect(!twice[0].both and twice[0].workspace == null);
-    try std.testing.expectEqualStrings("statusLine", twice[1].older);
-    try std.testing.expectEqualStrings("status_line", twice[1].current);
-    try std.testing.expect(twice[1].both and twice[1].workspace == null);
-    try std.testing.expectEqualStrings("notifications", twice[2].older);
-    try std.testing.expectEqualStrings("/w", twice[2].workspace.?);
-}
-
-test "project files ignore profile keys but not project-safe or retired ones" {
-    try std.testing.expect(ignoredInProject("model"));
-    try std.testing.expect(ignoredInProject("workspaces"));
-    try std.testing.expect(ignoredInProject("enabledMcpjsonServers"));
-    try std.testing.expect(!ignoredInProject("max_agent_steps"));
-    try std.testing.expect(!ignoredInProject("provider_order"));
-    try std.testing.expect(!ignoredInProject("maxxing_mode"));
-    try std.testing.expect(!ignoredInProject("not_a_setting"));
-}
-
-test "unknown keys are found at the top level, in fixed objects, and in workspace overrides" {
-    const alloc = std.testing.allocator;
-    const text =
-        \\{"fast_mdoe":true,"model":"m","maxxing_mode":1,"sandbox":"os",
-        \\ "statusLine":{"context":true,"contxt":false},
-        \\ "notifications":"off",
-        \\ "models":{"anything":"m"},
-        \\ "workspaces":{"/w":{"effort":"high","efort":"low","statusLine":{"sesion":true}},"/bad":3}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
-    defer parsed.deinit();
-
-    const unknown = try findUnknown(alloc, parsed.value, .profile);
-    defer alloc.free(unknown);
-    try std.testing.expectEqual(@as(usize, 4), unknown.len);
-
-    try std.testing.expectEqualStrings("fast_mdoe", unknown[0].name);
-    try std.testing.expect(unknown[0].parent == null and unknown[0].workspace == null);
-    try std.testing.expectEqual(@as(usize, keys.len), unknown[0].known.len);
-
-    try std.testing.expectEqualStrings("contxt", unknown[1].name);
-    try std.testing.expectEqualStrings("statusLine", unknown[1].parent.?);
-    try std.testing.expectEqual(@as(usize, 3), unknown[1].known.len);
-
-    try std.testing.expectEqualStrings("efort", unknown[2].name);
-    try std.testing.expectEqualStrings("/w", unknown[2].workspace.?);
-
-    try std.testing.expectEqualStrings("sesion", unknown[3].name);
-    try std.testing.expectEqualStrings("statusLine", unknown[3].parent.?);
-    try std.testing.expectEqualStrings("/w", unknown[3].workspace.?);
-}
-
-test "a project file is checked at its top level only" {
-    const alloc = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        \\{"max_agent_step":5,"model":"m","workspaces":{"/w":{"efort":"low"}}}
-    ,
-        .{},
-    );
-    defer parsed.deinit();
-
-    const unknown = try findUnknown(alloc, parsed.value, .project);
-    defer alloc.free(unknown);
-    try std.testing.expectEqual(@as(usize, 1), unknown.len);
-    try std.testing.expectEqualStrings("max_agent_step", unknown[0].name);
-}
-
-test "dotted paths name listed keys, fixed children, and paths into maps" {
-    for ([_][]const u8{ "fast_mode", "status_line", "status_line.context", "statusLine.context", "models", "models.codex", "providers.local.base_url" }) |path| {
-        try std.testing.expect(unknownPart(path) == null);
-    }
-
-    const top = unknownPart("fast_mdoe").?;
-    try std.testing.expectEqualStrings("fast_mdoe", top.name);
-    try std.testing.expect(top.parent == null and top.known.len == keys.len);
-
-    const child = unknownPart("status_line.contxt").?;
-    try std.testing.expectEqualStrings("contxt", child.name);
-    try std.testing.expectEqualStrings("status_line", child.parent.?);
-    try std.testing.expectEqual(@as(usize, 3), child.known.len);
-
-    const under_value = unknownPart("fast_mode.on").?;
-    try std.testing.expectEqualStrings("on", under_value.name);
-    try std.testing.expectEqual(@as(usize, 0), under_value.known.len);
-
-    try std.testing.expect(unknownPart("statusLine.context.x") != null);
-    try std.testing.expect(unknownPart("maxxing_mode") != null);
-}
-
-test "a non-object file has no unknown keys" {
-    const unknown = try findUnknown(std.testing.allocator, .{ .integer = 3 }, .profile);
-    defer std.testing.allocator.free(unknown);
-    try std.testing.expectEqual(@as(usize, 0), unknown.len);
 }

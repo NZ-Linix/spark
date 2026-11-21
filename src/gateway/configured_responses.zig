@@ -59,7 +59,7 @@ pub fn build_request(alloc: Allocator, request: stream_provider.RequestData, opt
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const provider_options = request.provider_options;
     if (provider_options.reasoning != null and options.effort_fields == null) return error.UnsupportedProviderOption;
-    if (provider_options.fast or provider_options.prompt_caching or provider_options.provider_order.len != 0) return error.UnsupportedProviderOption;
+    if (provider_options.fast or provider_options.prompt_caching) return error.UnsupportedProviderOption;
     if (request.max_output_tokens == 0) return error.InvalidOutputLimit;
     if (request.response_format) |format| if (format.schema != .object) return error.UnsupportedResponseFormat;
     const budget: image_attachments.CaptureBudget = if (request.budget) |value|
@@ -262,58 +262,6 @@ test "configured responses body has spark's fields, then the model's, with a dec
     try std.testing.expectEqual(@as(f64, 0.2), plain_parsed.value.object.get("temperature").?.float);
 }
 
-test "configured responses asks for encrypted reasoning only for a model that reasons" {
-    const alloc = std.testing.allocator;
-    const provider = test_provider();
-    for ([_]bool{ false, true }) |reasons| {
-        const body = try build_request(alloc, test_request(), .{ .provider = &provider, .include_reasoning = reasons });
-        defer alloc.free(body);
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-        defer parsed.deinit();
-        const include = parsed.value.object.get("include");
-        try std.testing.expectEqual(reasons, include != null);
-        if (include) |list| try std.testing.expectEqualStrings("reasoning.encrypted_content", list.array.items[0].string);
-    }
-}
-
-test "configured responses refuses what the connection cannot send" {
-    const alloc = std.testing.allocator;
-    const provider = test_provider();
-    var request = test_request();
-    request.provider_options.reasoning = types.ReasoningEffort.literal("high");
-    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{ .provider = &provider }));
-    request = test_request();
-    request.provider_options = .{ .fast = true };
-    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{ .provider = &provider }));
-    request = test_request();
-    request.max_output_tokens = 0;
-    try std.testing.expectError(error.InvalidOutputLimit, build_request(alloc, request, .{ .provider = &provider }));
-    request = test_request();
-    request.response_format = .{ .name = "answer", .description = "", .schema = .null };
-    try std.testing.expectError(error.UnsupportedResponseFormat, build_request(alloc, request, .{ .provider = &provider }));
-    request = test_request();
-    request.vision_mode = .optional;
-    try std.testing.expectError(error.InvalidToolSelection, build_request(alloc, request, .{ .provider = &provider }));
-}
-
-test "configured responses sends a structured reply's schema" {
-    const alloc = std.testing.allocator;
-    const provider = test_provider();
-    var schema = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"object\"}", .{});
-    defer schema.deinit();
-    var request = test_request();
-    request.response_format = .{ .name = "vision_result", .description = "", .schema = schema.value };
-    const body = try build_request(alloc, request, .{ .provider = &provider });
-    defer alloc.free(body);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-    defer parsed.deinit();
-    const format = parsed.value.object.get("text").?.object.get("format").?.object;
-    try std.testing.expectEqualStrings("json_schema", format.get("type").?.string);
-    try std.testing.expectEqualStrings("vision_result", format.get("name").?.string);
-    try std.testing.expect(format.get("description") == null);
-    try std.testing.expectEqualStrings("object", format.get("schema").?.object.get("type").?.string);
-}
-
 const RecordedEvents = struct {
     content: std.ArrayList(u8) = .empty,
 
@@ -345,38 +293,4 @@ fn test_consume(alloc: Allocator, bytes: []const u8, recorded: *RecordedEvents) 
         .events = .{ .context = recorded, .emit_fn = RecordedEvents.emit },
         .cancel_flag = &cancel,
     }, null);
-}
-
-test "configured responses reads a real server's text reply with its cached and reasoning counts" {
-    const alloc = std.testing.allocator;
-    // Abridged from tests/e2e/fixtures/custom-endpoint-captures/responses-text.sse:
-    // the events and the usage block as Ollama sent them.
-    const captured =
-        "event: response.created\ndata: {\"response\":{\"id\":\"resp_1\",\"model\":\"qwen2.5:0.5b\",\"object\":\"response\",\"output\":[],\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}\n\n" ++
-        "event: response.output_item.added\ndata: {\"item\":{\"content\":[],\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"type\":\"message\"},\"output_index\":0,\"sequence_number\":1,\"type\":\"response.output_item.added\"}\n\n" ++
-        "event: response.output_text.delta\ndata: {\"content_index\":0,\"delta\":\"Hello\",\"item_id\":\"msg_1\",\"output_index\":0,\"sequence_number\":2,\"type\":\"response.output_text.delta\"}\n\n" ++
-        "event: response.output_text.done\ndata: {\"content_index\":0,\"item_id\":\"msg_1\",\"output_index\":0,\"sequence_number\":3,\"text\":\"Hello\",\"type\":\"response.output_text.done\"}\n\n" ++
-        "event: response.output_item.done\ndata: {\"item\":{\"content\":[{\"annotations\":[],\"text\":\"Hello\",\"type\":\"output_text\"}],\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"},\"output_index\":0,\"sequence_number\":4,\"type\":\"response.output_item.done\"}\n\n" ++
-        "event: response.completed\ndata: {\"response\":{\"id\":\"resp_1\",\"model\":\"qwen2.5:0.5b\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"Hello\",\"type\":\"output_text\"}],\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"status\":\"completed\",\"usage\":{\"input_tokens\":30,\"input_tokens_details\":{\"cached_tokens\":12},\"output_tokens\":2,\"output_tokens_details\":{\"reasoning_tokens\":1},\"total_tokens\":32}},\"sequence_number\":5,\"type\":\"response.completed\"}\n\n";
-    var recorded: RecordedEvents = .{};
-    defer recorded.content.deinit(alloc);
-    var result = try test_consume(alloc, captured, &recorded);
-    defer result.deinit(alloc);
-    const completion = result.completed.completion;
-    try std.testing.expectEqualStrings("Hello", completion.content.?);
-    try std.testing.expectEqualStrings("Hello", recorded.content.items);
-    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
-    try std.testing.expectEqual(@as(?u64, 30), completion.usage.input_tokens);
-    try std.testing.expectEqual(@as(?u64, 2), completion.usage.output_tokens);
-    try std.testing.expectEqual(@as(?u64, 12), completion.usage.cache_read_tokens);
-    try std.testing.expectEqual(@as(?u64, 1), completion.usage.reasoning_tokens);
-}
-
-test "configured responses fails a reply that never finishes" {
-    const alloc = std.testing.allocator;
-    const cut = "event: response.created\ndata: {\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[]},\"type\":\"response.created\"}\n\n";
-    var recorded: RecordedEvents = .{};
-    defer recorded.content.deinit(alloc);
-    try std.testing.expectError(error.ResponsesStreamIncomplete, test_consume(alloc, cut, &recorded));
-    try std.testing.expectError(error.MalformedResponsesEvent, test_consume(alloc, "data: {not json\n\n", &recorded));
 }

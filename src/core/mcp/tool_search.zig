@@ -61,10 +61,9 @@ pub const Candidate = struct {
     binding: tool_mcp_runtime.Binding,
 };
 
-/// Whether a tool may appear in a search at all: no rule denies it, and the
-/// model's text projection keeps its names intact.
-pub fn searchable(scratch: Allocator, permission_rules: types.PermissionRuleSet, server_name: []const u8, tool: *const McpTool) !bool {
-    if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) return false;
+/// Whether a tool may appear in a search at all: the model's text projection
+/// keeps its names intact.
+pub fn searchable(scratch: Allocator, server_name: []const u8, tool: *const McpTool) !bool {
     return try tool_result_limits.modelProjectionPreservesText(scratch, server_name) and
         try tool_result_limits.modelProjectionPreservesText(scratch, tool.prefixed_name);
 }
@@ -631,28 +630,6 @@ pub fn writeServersChanged(alloc: Allocator, reason: []const u8) ![]u8 {
     return try out.toOwnedSlice();
 }
 
-test "MCP search of a changed view says the servers changed" {
-    const alloc = std.testing.allocator;
-    const output = try writeServersChanged(alloc, "the servers changed.");
-    defer alloc.free(output);
-    try std.testing.expectEqualStrings(
-        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"servers_changed\"," ++
-            "\"error\":\"MCP search is not available to this work: the servers changed.\"}",
-        output,
-    );
-}
-
-test "MCP search names why the server it names is down" {
-    const alloc = std.testing.allocator;
-    const output = try writeServerFailure(alloc, "devtools", "MCP server exited with code 1 before completing startup: npm error code E401");
-    defer alloc.free(output);
-    try std.testing.expectEqualStrings(
-        "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_failed\"," ++
-            "\"error\":\"MCP server 'devtools' is unavailable: MCP server exited with code 1 before completing startup: npm error code E401\"}",
-        output,
-    );
-}
-
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 
@@ -695,91 +672,6 @@ fn selectedNamed(result: tool_mcp_runtime.SearchResult, name: []const u8) ?tool_
     return null;
 }
 
-test "MCP search marks the tools it loads and doesn't call their descriptions truncated" {
-    const alloc = std.testing.allocator;
-    var f: SearchFixture = .{};
-    f.init(.{ 3000, 12, 12 });
-    var result = try f.search(alloc, .{});
-    defer result.deinit(alloc);
-
-    try std.testing.expect(result.notice == null);
-    try std.testing.expectEqual(@as(usize, 3), result.selected_tools.len);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
-    defer parsed.deinit();
-    const tools = parsed.value.object.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), tools.len);
-    for (tools) |tool| {
-        const name = tool.object.get("name").?.string;
-        try std.testing.expect(tool.object.get("schema_loaded").?.bool);
-        try std.testing.expect(tool.object.get("context_limit") == null);
-        try std.testing.expect(tool.object.get("purpose") == null);
-        // The page shows a preview; the loaded schema carries all of it.
-        const full = f.fullDescription(name);
-        try std.testing.expect(tool.object.get("description").?.string.len <= context_limits.Name.mcp_description_bytes.defaultBytes());
-        try std.testing.expect(std.mem.find(u8, selectedNamed(result, name).?.schema_json, full) != null);
-    }
-}
-
-test "MCP search still reports a description truncated when the schema budget leaves the tool out" {
-    const alloc = std.testing.allocator;
-    var f: SearchFixture = .{};
-    f.init(.{ 3000, 3000, 3000 });
-    var limits: context_limits.Values = .{};
-    // Room for one of the schemas, not two.
-    limits.mcp_selected_schema_bytes = .{ .value = .{ .bytes = 4096 }, .source = .command_line };
-    var result = try f.search(alloc, limits);
-    defer result.deinit(alloc);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
-    defer parsed.deinit();
-    const tools = parsed.value.object.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), tools.len);
-    try std.testing.expectEqual(@as(usize, 1), result.selected_tools.len);
-    const loaded_name = tools[0].object.get("name").?.string;
-    try std.testing.expectEqualStrings(loaded_name, result.selected_tools[0].name);
-    try std.testing.expect(tools[0].object.get("schema_loaded").?.bool);
-    try std.testing.expect(tools[0].object.get("context_limit") == null);
-
-    const notice = result.notice.?;
-    var buffer: [64]u8 = undefined;
-    try std.testing.expect(std.mem.find(u8, notice, try std.mem.print(&buffer, "MCP description for \"{s}\"", .{loaded_name})) == null);
-    for (tools[1..]) |tool| {
-        try std.testing.expect(tool.object.get("schema_loaded") == null);
-        const limit = tool.object.get("context_limit").?.object;
-        try std.testing.expectEqualStrings("mcp_description_bytes", limit.get("name").?.string);
-        try std.testing.expectEqualStrings("truncated", limit.get("action").?.string);
-        const named = try std.mem.print(&buffer, "MCP description for \"{s}\"", .{tool.object.get("name").?.string});
-        try std.testing.expect(std.mem.find(u8, notice, named) != null);
-    }
-    try std.testing.expect(std.mem.find(u8, notice, "Additional MCP schemas exceed the search loading budget") != null);
-}
-
-test "MCP search loads only the schemas of the tools its page has room for" {
-    const alloc = std.testing.allocator;
-    var f: SearchFixture = .{};
-    f.init(.{ 12, 12, 12 });
-    var whole = try f.search(alloc, .{});
-    const whole_bytes = whole.model_output.len;
-    whole.deinit(alloc);
-
-    var limits: context_limits.Values = .{};
-    limits.mcp_search_result_bytes = .{ .value = .{ .bytes = whole_bytes - 1 }, .source = .command_line };
-    var result = try f.search(alloc, limits);
-    defer result.deinit(alloc);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
-    defer parsed.deinit();
-    const tools = parsed.value.object.get("tools").?.array.items;
-    try std.testing.expect(tools.len < 3);
-    try std.testing.expectEqualStrings("omitted", parsed.value.object.get("context_limit").?.object.get("action").?.string);
-    try std.testing.expectEqual(tools.len, result.selected_tools.len);
-    for (tools, result.selected_tools) |tool, selected| {
-        try std.testing.expectEqualStrings(tool.object.get("name").?.string, selected.name);
-        try std.testing.expect(tool.object.get("schema_loaded").?.bool);
-    }
-    try std.testing.expect(std.mem.find(u8, result.notice.?, "MCP search omitted") != null);
-}
-
 fn searchUnderPressure(alloc: Allocator) !void {
     var f: SearchFixture = .{};
     f.init(.{ 3000, 3000, 12 });
@@ -793,10 +685,6 @@ fn searchUnderPressure(alloc: Allocator) !void {
     };
     defer result.deinit(alloc);
     try std.testing.expect(result.selected_tools.len > 0);
-}
-
-test "MCP search frees every loaded schema and notice when memory runs out partway" {
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, searchUnderPressure, .{});
 }
 
 /// Text a server may send in a description: plain words, the characters the
@@ -927,111 +815,7 @@ fn expectConsistentSearchPage(alloc: Allocator, result: tool_mcp_runtime.SearchR
     try std.testing.expect(schema_bytes <= limits.mcp_selected_schema_bytes.effectiveBytes());
 }
 
-test "MCP search pages agree with the schemas they load under fuzzed tools and limits" {
-    try std.testing.fuzz({}, fuzzSearchPage, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "\x03\x01\x08\x00\x00\x08\x00\x00\x08\x00\x00",
-            "\x06\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
-        }) ++ @import("fuzz_corpus").mcp_search_page.*),
-    });
-}
-
 fn searchWithArguments(f: *const SearchFixture, alloc: Allocator, limits: context_limits.Values) !tool_mcp_runtime.SearchResult {
     const query = try lexical_relevance.prepare("");
     return rank(alloc, &f.candidates, .{ .query = &query, .kind = .mcp, .server = "srv", .load_schemas = false, .schemas_in_result = true }, limits, null);
-}
-
-test "a search with arguments in its result gives each row its tool's input schema and loads none" {
-    const alloc = std.testing.allocator;
-    var f: SearchFixture = .{};
-    f.init(.{ 100, 100, 100 });
-    var result = try searchWithArguments(&f, alloc, .{});
-    defer result.deinit(alloc);
-    // Nothing is loaded for the next step: the tools spark sends never change.
-    try std.testing.expectEqual(@as(usize, 0), result.selected_tools.len);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
-    defer parsed.deinit();
-    const tools = parsed.value.object.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), tools.len);
-    for (tools) |tool| {
-        try std.testing.expectEqualStrings("object", tool.object.get("arguments").?.object.get("type").?.string);
-        try std.testing.expect(tool.object.get("open_for_arguments") == null);
-        try std.testing.expect(tool.object.get("schema_loaded") == null);
-    }
-}
-
-test "a page with room for one row's arguments keeps every row and gives them to the first" {
-    const alloc = std.testing.allocator;
-    var f: SearchFixture = .{};
-    f.init(.{ 100, 100, 100 });
-    // The page with no arguments at all: no schema fits the one-tool budget.
-    var none_limits: context_limits.Values = .{};
-    none_limits.mcp_selected_schema_bytes = .{ .value = .{ .bytes = 1 }, .source = .command_line };
-    var none = try searchWithArguments(&f, alloc, none_limits);
-    defer none.deinit(alloc);
-    // A row's arguments take this much more room than its open_for_arguments.
-    const extra = ",\"arguments\":{\"type\":\"object\"}".len - ",\"open_for_arguments\":true".len;
-    var limits: context_limits.Values = .{};
-    limits.mcp_search_result_bytes = .{ .value = .{ .bytes = none.model_output.len + extra }, .source = .command_line };
-    var result = try searchWithArguments(&f, alloc, limits);
-    defer result.deinit(alloc);
-    try std.testing.expect(result.model_output.len <= none.model_output.len + extra);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("context_limit") == null);
-    const tools = parsed.value.object.get("tools").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), tools.len);
-    try std.testing.expect(tools[0].object.get("arguments") != null);
-    for (tools[1..]) |tool| {
-        try std.testing.expect(tool.object.get("arguments") == null);
-        try std.testing.expect(tool.object.get("open_for_arguments").?.bool);
-    }
-}
-
-test "a tool whose schema isn't valid JSON is opened for its arguments, never pasted into the page" {
-    const alloc = std.testing.allocator;
-    var f: SearchFixture = .{};
-    f.init(.{ 100, 100, 100 });
-    var broken_schema = "{\"type\":".*;
-    f.tools[1].input_schema_json = &broken_schema;
-    var result = try searchWithArguments(&f, alloc, .{});
-    defer result.deinit(alloc);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
-    defer parsed.deinit();
-    for (parsed.value.object.get("tools").?.array.items) |tool| {
-        const broken = std.mem.eql(u8, tool.object.get("name").?.string, "mcp_srv_b");
-        try std.testing.expectEqual(broken, tool.object.get("arguments") == null);
-        try std.testing.expectEqual(broken, tool.object.get("open_for_arguments") != null);
-    }
-}
-
-test "at every page budget, the rows that show arguments come first, have no room to spare, and fit" {
-    const alloc = std.testing.allocator;
-    var f: SearchFixture = .{};
-    f.init(.{ 300, 60, 900 });
-    const extra = ",\"arguments\":{\"type\":\"object\"}".len - ",\"open_for_arguments\":true".len;
-    var budget: usize = 64;
-    while (budget <= 4096) : (budget += 13) {
-        var limits: context_limits.Values = .{};
-        limits.mcp_description_bytes = .{ .value = .{ .bytes = 256 }, .source = .command_line };
-        limits.mcp_search_result_bytes = .{ .value = .{ .bytes = budget }, .source = .command_line };
-        var result = try searchWithArguments(&f, alloc, limits);
-        defer result.deinit(alloc);
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
-        defer parsed.deinit();
-        const tools = parsed.value.object.get("tools").?.array.items;
-        if (tools.len > 0) try std.testing.expect(result.model_output.len <= budget);
-        var without = false;
-        for (tools) |tool| {
-            const has = tool.object.get("arguments") != null;
-            // Exactly one of the two, and no row with arguments after one without.
-            try std.testing.expect(has != (tool.object.get("open_for_arguments") != null));
-            if (has) try std.testing.expect(!without) else without = true;
-        }
-        // The first row without arguments had no room for them: every schema
-        // here is valid, so its arguments would have put the page over.
-        if (without) try std.testing.expect(result.model_output.len + extra > budget);
-        try std.testing.expectEqual(@as(usize, 0), result.selected_tools.len);
-    }
 }

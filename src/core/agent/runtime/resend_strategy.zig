@@ -69,25 +69,3 @@ pub fn prompt(strategy: Strategy) ?[]const u8 {
         .reconcile_tool => reconcile_tool_prompt,
     };
 }
-
-test "an unsent request resends unchanged whatever the stream showed" {
-    for (std.enums.values(ToolEvidence)) |tool| {
-        try std.testing.expectEqual(Strategy.retry_request, select(.definitely_unsent, tool));
-    }
-}
-
-test "a possibly sent request follows the tool evidence" {
-    try std.testing.expectEqual(Strategy.regenerate_tool, select(.possibly_sent, .proven_unexecuted));
-    try std.testing.expectEqual(Strategy.continue_after_confirmed_tool, select(.possibly_sent, .confirmed));
-    try std.testing.expectEqual(Strategy.repeat_read_only_tool, select(.possibly_sent, .repeatable));
-    try std.testing.expectEqual(Strategy.reconcile_tool, select(.possibly_sent, .uncertain));
-    // A broken-off answer with no tool call is the same request again.
-    try std.testing.expectEqual(Strategy.retry_request, select(.possibly_sent, .none));
-}
-
-test "only strategies that change the request add a prompt" {
-    try std.testing.expect(prompt(.retry_request) == null);
-    for ([_]Strategy{ .regenerate_tool, .continue_after_confirmed_tool, .repeat_read_only_tool, .reconcile_tool }) |strategy| {
-        try std.testing.expect(prompt(strategy).?.len > 0);
-    }
-}

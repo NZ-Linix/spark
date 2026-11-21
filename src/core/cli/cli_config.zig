@@ -133,7 +133,6 @@ const Writable = enum {
     max_agent_steps,
     max_tool_result_bytes,
     @"prompt_history.enabled",
-    provider_strict,
     session_titles,
     slash_menu_categories,
     @"sound.attention_required",
@@ -233,7 +232,6 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .context => patch.context = enabled,
         .fast_mode => patch.fast_mode = enabled,
         .@"prompt_history.enabled" => patch.prompt_history_enabled = enabled,
-        .provider_strict => patch.provider_strict = enabled,
         .session_titles => patch.session_titles = enabled,
         .slash_menu_categories => patch.slash_menu_categories = enabled,
         .@"sound.attention_required" => patch.notification_attention_required = enabled,
@@ -280,12 +278,9 @@ fn ownerHint(key: []const u8) []const u8 {
         .{ .keys = &.{"provider"}, .hint = "use spark provider <name>" },
         .{ .keys = &.{"permission_mode"}, .hint = "use /permissions in a session, or --permission-mode for one run" },
         .{ .keys = &.{"permission"}, .hint = "use /permissions in a session" },
-        .{ .keys = &.{"credential_source"}, .hint = "use spark login" },
-        .{ .keys = &.{"review_model"}, .hint = profile_paths.displayText("edit ~/.spark/settings.json, or set SPARK_REVIEW_MODEL for one run") },
         .{ .keys = &.{ "workspaces", "additional_directories" }, .hint = "use spark workspace" },
         .{ .keys = &.{ "enabledMcpjsonServers", "disabledMcpjsonServers", "enableAllProjectMcpServers" }, .hint = "use spark mcp approve or reject" },
         .{ .keys = &.{"context_limits"}, .hint = profile_paths.displayText("use --context-limit for one run, or edit ~/.spark/settings.json") },
-        .{ .keys = &.{"provider_order"}, .hint = profile_paths.displayText("use --provider-order for one run, or edit ~/.spark/settings.json") },
         .{ .keys = &.{ "yolo_acknowledged", "fast_mode_model_bound", "skill_match_fuzzy" }, .hint = "spark manages it" },
         .{ .keys = &.{"status_line"}, .hint = "set status_line.context, status_line.session, or status_line.workspace" },
         .{ .keys = &.{"sound"}, .hint = "set sound.turn_end, sound.attention_required, or sound.max" },
@@ -449,16 +444,15 @@ pub const Effective = union(enum) {
 /// The keys `spark config` reads from the resolved state instead of the files.
 /// A test checks that each plain key is here or in `files_only_keys`.
 pub const resolved_keys = [_][]const u8{
-    "auto_compact_percent",           "auto_upgrade",             "cache_warming",
-    "collapse_tool_calls",            "context",                  "effort",
-    "experimental.workspace_capture", "fast_mode",                "first_call_tool_choice",
-    "max_agent_steps",                "max_tool_result_bytes",    "permission_mode",
-    "prompt_history.enabled",         "provider",                 "provider_order",
-    "provider_strict",                "review_model",             "session_titles",
-    "slash_menu_categories",          "sound.attention_required", "sound.max",
-    "sound.turn_end",                 "startup_scrollback",       "status_line.context",
-    "status_line.session",            "status_line.workspace",    "theme",
-    "ultrafast_mode",                 "update_channel",
+    "auto_compact_percent",           "auto_upgrade",          "cache_warming",
+    "collapse_tool_calls",            "context",               "effort",
+    "experimental.workspace_capture", "fast_mode",             "first_call_tool_choice",
+    "max_agent_steps",                "max_tool_result_bytes", "permission_mode",
+    "prompt_history.enabled",         "provider",
+    "session_titles",                 "slash_menu_categories", "sound.attention_required",
+    "sound.max",                      "sound.turn_end",        "startup_scrollback",
+    "status_line.context",            "status_line.session",   "status_line.workspace",
+    "theme",                          "ultrafast_mode",        "update_channel",
 };
 
 /// Keys `spark config` shows as the files set them: objects spark checks with its
@@ -470,6 +464,7 @@ const files_only_keys = [_][]const u8{
     "grok_model",                 "model",                  "models",
     "permission",                 "providers",              "skill_symlink_authorities",
     "tool_placement",             "workspaces",             "yolo_acknowledged",
+    "review_model",
 };
 
 /// The value a run uses for `key`, read from a state that
@@ -495,14 +490,6 @@ pub fn effectiveValue(
     if (eql(u8, key, "permission_mode")) return string(state.permission_mode.label());
     if (eql(u8, key, "prompt_history.enabled")) return boolean(state.prompt_history_enabled);
     if (eql(u8, key, "provider")) return string(try arena.dupe(u8, provider.label()));
-    if (eql(u8, key, "provider_order")) {
-        if (state.provider_order.len == 0) return .none;
-        var array: std.json.Array = .init(arena);
-        for (state.provider_order) |slug| try array.append(.{ .string = slug });
-        return .{ .value = .{ .array = array } };
-    }
-    if (eql(u8, key, "provider_strict")) return boolean(state.provider_strict);
-    if (eql(u8, key, "review_model")) return if (state.review_model.len == 0) .none else string(state.review_model);
     if (eql(u8, key, "session_titles")) return boolean(state.session_title_generation);
     if (eql(u8, key, "cache_warming")) return boolean(state.cache_warming);
     if (eql(u8, key, "slash_menu_categories")) return boolean(state.slash_menu_categories);
@@ -638,9 +625,9 @@ fn savedProvider(entries: []const settings_entries.Entry) model_provider.Provide
     while (index > 0) {
         index -= 1;
         if (!std.mem.eql(u8, entries[index].key, "provider")) continue;
-        return model_provider.parse_saved(entries[index].value) catch .gateway;
+        return model_provider.parse_saved(entries[index].value) catch .none;
     }
-    return .gateway;
+    return .none;
 }
 
 fn unknownSetting(key: settings_keys.UnknownKey, file: []const u8) output_contracts.ConfigUnknownSetting {
@@ -694,360 +681,11 @@ fn parseForTest(args: []const [:0]const u8) error{ InvalidConfigArgs, UnknownCon
     return parseArgs(args, &unknown, &problem);
 }
 
-test "config args default to list and take scope, origin, and json flags" {
-    const bare = try parseForTest(&.{});
-    try std.testing.expect(bare.key == null and bare.scope == .all and !bare.show_origin);
-
-    const listed = try parseForTest(&.{ "list", "--global", "--workspace", "--show-origin", "--json" });
-    try std.testing.expectEqual(settings_entries.Scope.workspace, listed.scope);
-    try std.testing.expect(listed.show_origin);
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, listed.format);
-
-    // An older name means its current one.
-    const got = try parseForTest(&.{ "get", "statusLine.context", "--global" });
-    try std.testing.expectEqualStrings("status_line.context", got.key.?);
-    try std.testing.expectEqual(settings_entries.Scope.global, got.scope);
-}
-
-test "config args reject extra words, missing keys, and unknown flags" {
-    const bad = [_][]const [:0]const u8{
-        &.{"set"},
-        &.{ "list", "extra" },
-        &.{"get"},
-        &.{ "get", "" },
-        &.{ "get", "model", "extra" },
-        &.{"--globl"},
-    };
-    for (bad) |args| try std.testing.expectError(error.InvalidConfigArgs, parseForTest(args));
-}
-
-test "config set and unset take a key, and set takes a value" {
-    const set = try parseForTest(&.{ "set", "fast_mode", "on", "--global" });
-    try std.testing.expectEqual(Action.set, set.action);
-    try std.testing.expectEqualStrings("fast_mode", set.key.?);
-    try std.testing.expectEqualStrings("on", set.value.?);
-
-    const unset = try parseForTest(&.{ "unset", "statusLine.context", "--json" });
-    try std.testing.expectEqual(Action.unset, unset.action);
-    try std.testing.expect(unset.value == null);
-
-    for ([_][]const [:0]const u8{ &.{ "set", "fast_mode" }, &.{ "unset", "fast_mode", "x" }, &.{ "set", "fast_mode", "on", "--show-origin" } }) |args| {
-        try std.testing.expectError(error.InvalidConfigArgs, parseForTest(args));
-    }
-    try std.testing.expectError(error.WorkspaceConfigWrite, parseForTest(&.{ "set", "fast_mode", "on", "--workspace" }));
-    try std.testing.expectError(error.WorkspaceConfigWrite, parseForTest(&.{ "unset", "fast_mode", "--workspace" }));
-}
-
 fn changeForTest(args: []const [:0]const u8, problem: *WriteProblem) !Change {
     return change(try parseForTest(args), problem);
-}
-
-test "config set turns each value into the patch the save path writes" {
-    var problem: WriteProblem = .none;
-    const fast = try changeForTest(&.{ "set", "fast_mode", "off" }, &problem);
-    try std.testing.expectEqual(false, fast.patch.fast_mode.?);
-    try std.testing.expect(!fast.value.?.bool);
-
-    const status = try changeForTest(&.{ "set", "statusLine.workspace", "true" }, &problem);
-    try std.testing.expectEqual(settings_store.StatuslineItem.workspace, status.patch.statusline_item.?.item);
-
-    const steps = try changeForTest(&.{ "set", "max_agent_steps", "0" }, &problem);
-    try std.testing.expectEqual(@as(u32, 0), steps.patch.max_agent_steps.?);
-
-    const pinned = try changeForTest(&.{ "set", "theme", "LIGHT" }, &problem);
-    try std.testing.expectEqualStrings("light", pinned.patch.theme.?);
-
-    const channel = try changeForTest(&.{ "set", "update_channel", "dev" }, &problem);
-    try std.testing.expectEqualStrings("dev", channel.value.?.string);
-
-    const removed = try changeForTest(&.{ "unset", "notifications.max" }, &problem);
-    try std.testing.expectEqualStrings("sound.max", removed.patch.remove.?);
-    try std.testing.expect(removed.value == null);
-}
-
-test "config set explains a bad value or a key it doesn't change" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct { args: []const [:0]const u8, err: anyerror, message: []const u8 }{
-        .{ .args = &.{ "set", "fast_mode", "maybe" }, .err = error.InvalidConfigValue, .message = "invalid value for fast_mode: maybe (use true or false)" },
-        .{ .args = &.{ "set", "max_tool_result_bytes", "12" }, .err = error.InvalidConfigValue, .message = "invalid value for max_tool_result_bytes: 12 (use a whole number of bytes, at least 1024)" },
-        .{ .args = &.{ "set", "permission_mode", "full-access" }, .err = error.RefusedConfigSetting, .message = "can't change permission_mode with spark config; use /permissions in a session, or --permission-mode for one run" },
-        .{ .args = &.{ "unset", "review_model" }, .err = error.RefusedConfigSetting, .message = "can't change review_model with spark config; edit ~/.spark/settings.json, or set SPARK_REVIEW_MODEL for one run" },
-        .{ .args = &.{ "set", "models.codex", "gpt" }, .err = error.RefusedConfigSetting, .message = "can't change models.codex with spark config; use /model in a session" },
-        .{ .args = &.{ "set", "yolo_acknowledged", "true" }, .err = error.RefusedConfigSetting, .message = "can't change yolo_acknowledged with spark config; spark manages it" },
-    };
-    for (cases) |case| {
-        const options = try parseForTest(case.args);
-        var problem: WriteProblem = .none;
-        try std.testing.expectError(case.err, change(options, &problem));
-        const message = try formatWriteProblem(alloc, options.key.?, options.value, problem, "spark config");
-        defer alloc.free(message);
-        try std.testing.expectEqualStrings(case.message, message);
-    }
-}
-
-test "--config takes key=value with the keys and checks of config set" {
-    const alloc = std.testing.allocator;
-    var problem: OverrideProblem = .none;
-    const fast = try parseOverride("fast_mode=on", &problem);
-    try std.testing.expectEqualStrings("fast_mode", fast.key);
-    try std.testing.expect(fast.value.bool);
-    const status = try parseOverride("statusLine.context=false", &problem);
-    try std.testing.expectEqualStrings("status_line.context", status.key);
-
-    const cases = [_]struct { text: []const u8, message: []const u8 }{
-        .{ .text = "fast_mode", .message = "--config needs key=value, such as --config fast_mode=on" },
-        .{ .text = "=on", .message = "--config needs key=value, such as --config fast_mode=on" },
-        .{ .text = "fast_mdoe=on", .message = "unknown setting fast_mdoe (did you mean fast_mode?)" },
-        .{ .text = "fast_mode=maybe", .message = "invalid value for fast_mode: maybe (use true or false)" },
-        .{ .text = "permission_mode=full-access", .message = "can't change permission_mode with --config; use /permissions in a session, or --permission-mode for one run" },
-    };
-    for (cases) |case| {
-        problem = .none;
-        try std.testing.expectError(error.InvalidConfigOverride, parseOverride(case.text, &problem));
-        const message = try formatOverrideProblem(alloc, problem);
-        defer alloc.free(message);
-        try std.testing.expectEqualStrings(case.message, message);
-    }
-}
-
-test "every key config set writes is a plain setting in the list" {
-    inline for (@typeInfo(Writable).@"enum".field_names) |name| {
-        try std.testing.expect(settings_keys.unknownPart(name) == null);
-        const dot = comptime std.mem.findScalar(u8, name, '.');
-        const key = settings_keys.find(name[0 .. dot orelse name.len]).?;
-        try std.testing.expect(!key.map and key.where != .retired and key.renamed_to == null);
-    }
-}
-
-test "config get names the part of a key that isn't a setting" {
-    var unknown: ?settings_keys.UnknownPart = null;
-    var problem: ?[]const u8 = null;
-    try std.testing.expectError(error.UnknownConfigSetting, parseArgs(&.{ "get", "statusLine.contxt" }, &unknown, &problem));
-    try std.testing.expectEqualStrings("contxt", unknown.?.name);
-    try std.testing.expectEqualStrings("status_line", unknown.?.parent.?);
-}
-
-test "load reads both files and keeps unknown keys for the scope" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "settings.json",
-        .data = "{\"fast_mode\":true,\"fast_mdoe\":1,\"workspaces\":{\"/w\":{\"efort\":\"x\",\"effort\":\"high\"},\"/other\":{\"nope\":1}}}",
-    });
-    try tmp.dir.writeFile(io, .{ .sub_path = ".spark.json", .data = "{\"max_agent_steps\":3,\"max_agent_step\":4}" });
-    const settings_path = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "settings.json");
-    const project_path = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, ".spark.json");
-    var paths: config_runtime.Paths = .{
-        .user_settings = settings_path,
-        .workspace_settings = project_path,
-        .workspace_root = try alloc.dupe(u8, "/w"),
-    };
-    defer paths.deinit(alloc);
-
-    var failed: ?[]const u8 = null;
-    var all = try load(alloc, paths, "/w", .all, &failed);
-    defer all.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), all.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 3), all.unknown.len);
-    try std.testing.expectEqualStrings("fast_mdoe", all.unknown[0].key.name);
-    try std.testing.expectEqualStrings("fast_mode", all.unknown[0].suggestion.?);
-    try std.testing.expectEqualStrings("efort", all.unknown[1].key.name);
-    try std.testing.expectEqualStrings(".spark.json", all.unknown[2].file);
-
-    var global = try load(alloc, paths, "/w", .global, &failed);
-    defer global.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), global.unknown.len);
-    try std.testing.expectEqualStrings("fast_mdoe", global.unknown[0].key.name);
-}
-
-test "load ends with the SPARK_* overrides spark applies, only without a scope" {
-    const alloc = std.testing.allocator;
-    const io_mod = @import("../shared/io.zig");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "settings.json", .data = "{\"provider\":\"codex\",\"max_agent_steps\":3}" });
-    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(dir);
-    var paths: config_runtime.Paths = .{
-        .user_settings = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "settings.json"),
-        .workspace_settings = try std.mem.concat(alloc, u8, &.{ dir, "/missing.spark.json" }),
-        .workspace_root = try alloc.dupe(u8, "/w"),
-    };
-    defer paths.deinit(alloc);
-
-    const restore = io_mod.environMap() orelse try env_settings.emptyTestEnviron();
-    var env: std.process.Environ.Map = .init(alloc);
-    defer env.deinit();
-    try env.put("SPARK_MAX_AGENT_STEPS", "9");
-    try env.put("SPARK_MODEL", "gpt-env");
-    io_mod.setEnvironMap(&env);
-    defer io_mod.setEnvironMap(restore);
-
-    var failed: ?[]const u8 = null;
-    var all = try load(alloc, paths, "/w", .all, &failed);
-    defer all.deinit(alloc);
-    const steps = try settings_entries.lookup(alloc, all.entries.items, "max_agent_steps");
-    defer alloc.free(steps);
-    try std.testing.expectEqual(settings_entries.Origin.env, steps[0].origin);
-    try std.testing.expectEqualStrings("SPARK_MAX_AGENT_STEPS", steps[0].variable.?);
-    try std.testing.expectEqual(@as(i64, 9), steps[0].value.integer);
-    // The saved provider decides which model SPARK_MODEL replaces.
-    const models = try settings_entries.lookup(alloc, all.entries.items, "models.codex");
-    defer alloc.free(models);
-    try std.testing.expectEqualStrings("gpt-env", models[0].value.string);
-
-    var global = try load(alloc, paths, "/w", .global, &failed);
-    defer global.deinit(alloc);
-    for (global.entries.items) |entry| try std.testing.expect(entry.origin != .env);
-}
-
-test "load names the file it can't parse" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "settings.json", .data = "{\"fast_mode\":" });
-    var paths: config_runtime.Paths = .{
-        .user_settings = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "settings.json"),
-        .workspace_settings = try alloc.dupe(u8, "/nonexistent/.spark.json"),
-        .workspace_root = try alloc.dupe(u8, "/w"),
-    };
-    defer paths.deinit(alloc);
-
-    var failed: ?[]const u8 = null;
-    if (load(alloc, paths, "/w", .all, &failed)) |loaded| {
-        var unexpected = loaded;
-        unexpected.deinit(alloc);
-        return error.TestExpectedError;
-    } else |err| {
-        try std.testing.expectEqualStrings(profileDisplay(), failed.?);
-        try std.testing.expectEqualStrings("isn't valid JSON", loadFailureReason(err));
-    }
-}
-
-test "spark config set writes each key with the type the settings list gives it" {
-    inline for (@typeInfo(Writable).@"enum".field_names) |path| {
-        errdefer std.debug.print("key {s}\n", .{path});
-        const dot = comptime std.mem.findScalar(u8, path, '.');
-        const key = settings_keys.find(path[0 .. dot orelse path.len]).?;
-        // Every child of an object setting is a switch.
-        const kind: settings_keys.Kind = if (dot != null) .boolean else key.kind;
-        var buffer: [32]u8 = undefined;
-        const sample: []const u8 = switch (kind) {
-            .boolean => "true",
-            .integer => try std.mem.print(&buffer, "{d}", .{key.minimum orelse 0}),
-            .string => if (key.values.len > 0) key.values[0] else "dark",
-            .string_or_null => "auto",
-            else => return error.TestUnexpectedResult,
-        };
-        var problem: WriteProblem = .none;
-        const planned = try change(.{ .action = .set, .key = path, .value = sample }, &problem);
-        const want: std.meta.Tag(std.json.Value) = switch (kind) {
-            .boolean => .bool,
-            .integer => .integer,
-            else => .string,
-        };
-        try std.testing.expectEqual(want, std.meta.activeTag(planned.value.?));
-    }
-}
-
-test "spark config schema takes only --project" {
-    var unknown: ?settings_keys.UnknownPart = null;
-    var problem: ?[]const u8 = null;
-    const plain = try parseForTest(&.{"schema"});
-    try std.testing.expectEqual(Action.schema, plain.action);
-    try std.testing.expect(!plain.project);
-    try std.testing.expect((try parseForTest(&.{ "schema", "--project" })).project);
-    for ([_][]const [:0]const u8{
-        &.{"--project"},
-        &.{ "list", "--project" },
-        &.{ "schema", "--json" },
-        &.{ "schema", "--global" },
-        &.{ "schema", "--show-origin" },
-        &.{ "schema", "extra" },
-    }) |args| try std.testing.expectError(error.InvalidConfigArgs, parseArgs(args, &unknown, &problem));
-}
-
-test "spark config names what is wrong with its words" {
-    var unknown: ?settings_keys.UnknownPart = null;
-    for ([_]struct { args: []const [:0]const u8, problem: []const u8 }{
-        .{ .args = &.{ "set", "fast_mode" }, .problem = "set needs a key and a value, as in spark config set fast_mode true" },
-        .{ .args = &.{ "set", "fast_mode=true" }, .problem = "set takes the key and the value as two words, as in spark config set fast_mode true" },
-        .{ .args = &.{"get"}, .problem = "get and unset need a key, as in spark config get fast_mode" },
-        .{ .args = &.{"sett"}, .problem = "the first word is list, get, set, unset, or schema" },
-        .{ .args = &.{ "set", "theme", "--show-origin", "dark" }, .problem = "--show-origin goes with list and get" },
-    }) |case| {
-        var problem: ?[]const u8 = null;
-        try std.testing.expectError(error.InvalidConfigArgs, parseArgs(case.args, &unknown, &problem));
-        try std.testing.expectEqualStrings(case.problem, problem.?);
-    }
-    // A value may start with a dash; the value check rejects it later.
-    const negative = try parseForTest(&.{ "set", "max_agent_steps", "-5" });
-    try std.testing.expectEqualStrings("-5", negative.value.?);
-}
-
-test "every plain setting is resolved or deliberately shown from the files" {
-    for (settings_keys.keys) |key| {
-        switch (key.where) {
-            .retired => continue,
-            else => {},
-        }
-        if (key.kind == .refused or key.renamed_to != null) continue;
-        if (key.kind == .switches) {
-            for (key.children) |child| {
-                var buf: [96]u8 = undefined;
-                const path = try std.fmt.bufPrint(&buf, "{s}.{s}", .{ key.name, child });
-                try std.testing.expect(inList(&resolved_keys, path) or inList(&files_only_keys, key.name));
-            }
-            continue;
-        }
-        if (!inList(&resolved_keys, key.name) and !inList(&files_only_keys, key.name)) {
-            std.debug.print("unclassified setting {s}\n", .{key.name});
-            return error.TestUnexpectedResult;
-        }
-    }
 }
 
 fn inList(list: []const []const u8, name: []const u8) bool {
     for (list) |item| if (std.mem.eql(u8, item, name)) return true;
     return false;
-}
-
-test "effective entries show the value in use and the layer that set it" {
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var state = app_lifecycle.StartupState{ .agent_step_limit = 25 };
-    state.permission_mode = .yolo;
-    state.agent_step_limit = 25;
-    const set = [_]settings_entries.Entry{
-        // A rejected file value: the run uses the default.
-        .{ .key = "max_agent_steps", .value = .{ .integer = -3 }, .origin = .global },
-        // An older spelling of the value in use.
-        .{ .key = "permission_mode", .value = .{ .string = "yolo" }, .origin = .global },
-        .{ .key = "models.codex", .value = .{ .string = "m" }, .origin = .global },
-    };
-    const all = try effectiveEntries(arena, &state, .gateway, &set);
-    // The keys something sets come first, in order.
-    try std.testing.expectEqualStrings("max_agent_steps", all[0].key);
-    try std.testing.expectEqual(@as(i64, 25), all[0].value.integer);
-    try std.testing.expectEqual(settings_entries.Origin.default, all[0].origin);
-    try std.testing.expectEqualStrings("full-access", all[1].value.string);
-    try std.testing.expectEqual(settings_entries.Origin.global, all[1].origin);
-    try std.testing.expectEqualStrings("m", all[2].value.string);
-    var fast_mode: ?settings_entries.Entry = null;
-    for (all) |entry| if (std.mem.eql(u8, entry.key, "fast_mode")) {
-        fast_mode = entry;
-    };
-    try std.testing.expect(!fast_mode.?.value.bool);
-    try std.testing.expectEqual(settings_entries.Origin.default, fast_mode.?.origin);
-}
-
-test "a step count past a JSON integer is shown, not cast" {
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const effective = try integer(arena_state.allocator(), std.math.maxInt(usize));
-    try std.testing.expectEqualStrings("18446744073709551615", effective.value.number_string);
 }

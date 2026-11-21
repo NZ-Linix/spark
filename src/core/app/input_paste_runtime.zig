@@ -1,7 +1,6 @@
 const std = @import("std");
 const agents = @import("../agents/agents.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
-const login_flow = @import("../auth/login_flow.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -16,14 +15,6 @@ const text_scalar = @import("../input/text_scalar.zig");
 const render_request = @import("../../ui/render_request.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
-
-fn normalizeApprovalAmendmentPasteInPlace(bytes: []u8) []u8 {
-    const normalized = text_utils.normalizeLineEndingsInPlace(bytes);
-    for (normalized) |*byte| {
-        if (byte.* == '\n' or byte.* == '\t') byte.* = ' ';
-    }
-    return normalized;
-}
 
 fn isBareImageSlashPrefix(text: []const u8) bool {
     const trimmed = std.mem.trim(u8, text, " \t");
@@ -40,13 +31,6 @@ fn pastedImageSlashPrefixLen(text: []const u8) ?usize {
         return index;
     }
     return null;
-}
-
-test "bare image slash prefix excludes image paths and other commands" {
-    try std.testing.expect(isBareImageSlashPrefix("/image "));
-    try std.testing.expect(isBareImageSlashPrefix("  /img\t"));
-    try std.testing.expect(!isBareImageSlashPrefix("/image photo.png"));
-    try std.testing.expect(!isBareImageSlashPrefix("/images clear"));
 }
 
 const ImagePasteStage = struct {
@@ -78,47 +62,17 @@ fn stripPastedImageSlashPrefix(stage: *ImagePasteStage) bool {
     return true;
 }
 
-test "pasted image slash removes only a prefix before a captured path" {
-    const alloc = std.testing.allocator;
-    var stage: ImagePasteStage = .{};
-    defer stage.deinit(alloc);
-    try stage.replacement.appendSlice(alloc, "/image [Image #1] Describe");
-    try stage.tokens.append(alloc, .{ .id = 1, .span = .{ .raw_start = 7, .raw_end = 17 } });
-    try std.testing.expect(stripPastedImageSlashPrefix(&stage));
-    try std.testing.expectEqualStrings("[Image #1] Describe", stage.replacement.items);
-    try std.testing.expectEqual(entity_spans.Span{ .raw_start = 0, .raw_end = 10 }, stage.tokens.items[0].span);
-
-    stage.replacement.clearRetainingCapacity();
-    stage.tokens.clearRetainingCapacity();
-    try stage.replacement.appendSlice(alloc, "/image missing.png");
-    try std.testing.expect(!stripPastedImageSlashPrefix(&stage));
-    try std.testing.expectEqualStrings("/image missing.png", stage.replacement.items);
-}
-
 pub fn PasteEditRuntime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
-        fn authCodeEntryActive(app: *const App) bool {
-            if (comptime !@hasField(App, "auth") or
-                !@hasDecl(@TypeOf(app.auth), "signInCodeEntryActive")) return false;
-            return app.auth.signInCodeEntryActive();
-        }
-
         pub fn beginPaste(app: *App, agent: *AppAgent, max_input_len: usize) void {
             const owner: paste_framing.Owner = if (agent.question_prompt.isActive())
                 if (agent.question_prompt.isFreeformSelected()) .question_freeform else .decision_prompt
-            else if (agent.approval_prompt.isAmending())
-                .approval_amendment
-            else if (agent.approval_prompt.isActive())
-                .decision_prompt
-            else if (authCodeEntryActive(app))
-                .auth_code
             else
                 .composer;
             const buffer_limit = switch (owner) {
                 .composer => app.input_runtime.replacementState(&agent.pending_images).availableBytesForSelectionOrInsertion(max_input_len),
-                .auth_code => login_flow.max_manual_code_bytes,
-                .none, .decision_prompt, .question_freeform, .approval_amendment => max_input_len,
+                .none, .decision_prompt, .question_freeform => max_input_len,
             };
 
             input_reset.resetPendingTextScalarWithTrace(
@@ -209,7 +163,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         pub fn finishPaste(app: *App, agent: *AppAgent, max_input_len: usize) !void {
-            // A paste into the `/connect` form fills its field, so a pasted
+            // A paste into the `/provider` form fills its field, so a pasted
             // API key never reaches the composer or its history.
             if (comptime @hasField(@TypeOf(app.input_runtime), "list_picker")) {
                 const picker = &app.input_runtime.list_picker;
@@ -236,8 +190,8 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     return;
                 }
             }
-            if (comptime @hasField(@TypeOf(app.input_runtime), "connect_menu")) {
-                const form = &app.input_runtime.connect_menu;
+            if (comptime @hasField(@TypeOf(app.input_runtime), "provider_menu")) {
+                const form = &app.input_runtime.provider_menu;
                 if (form.active) {
                     for (app.input_runtime.paste.buffer.items) |byte| {
                         if (byte != '\r' and byte != '\n') try form.appendByte(app.alloc, byte);
@@ -250,26 +204,14 @@ pub fn PasteEditRuntime(comptime App: type) type {
             }
             if (app.input_runtime.paste.overflow_bytes > 0) {
                 const attempted_bytes = app.input_runtime.paste.attemptedBytes();
-                if (app.input_runtime.paste.owner == .auth_code) {
-                    app.input_runtime.paste.resetSecretWithTrace(.{ .input_limit = .auth_code });
-                    app.shell.render_requests.request(.footer);
-                    try app.writeDomainNotice(.{
-                        .topic = "auth",
-                        .tone = .@"error",
-                        .body = "The authorization code is too long.",
-                    }, true);
-                    return;
-                }
                 const owner: text_scalar.Owner = switch (app.input_runtime.paste.owner) {
                     .composer => .composer,
                     .question_freeform => .question_freeform,
-                    .approval_amendment => .approval_amendment,
-                    .none, .decision_prompt, .auth_code => unreachable,
+                    .none, .decision_prompt => unreachable,
                 };
                 app.input_runtime.paste.resetWithTrace(.{ .input_limit = switch (owner) {
                     .composer => .composer,
                     .question_freeform => .question_freeform,
-                    .approval_amendment => .approval_amendment,
                 } });
                 try input_limit_feedback.report(App, app, owner, attempted_bytes);
                 return;
@@ -280,11 +222,6 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     const normalized = text_utils.normalizeLineEndingsInPlace(app.input_runtime.paste.buffer.items);
                     app.input_runtime.paste.buffer.items.len = normalized.len;
                 },
-                .approval_amendment => {
-                    const normalized = normalizeApprovalAmendmentPasteInPlace(app.input_runtime.paste.buffer.items);
-                    app.input_runtime.paste.buffer.items.len = normalized.len;
-                },
-                .auth_code => {},
                 else => {},
             }
 
@@ -293,7 +230,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 !text_utils.isModelSafeText(app.input_runtime.paste.buffer.items))
             {
                 const render_reason: render_request.Reason = switch (app.input_runtime.paste.owner) {
-                    .question_freeform, .approval_amendment => .modal,
+                    .question_freeform => .modal,
                     else => .footer,
                 };
                 app.input_runtime.paste.resetWithTrace(.invalid_utf8);
@@ -345,57 +282,6 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     };
                     app.input_runtime.paste.finishHandled();
                     app.shell.render_requests.request(.footer);
-                },
-                .approval_amendment => {
-                    if (comptime agents.hasAgentField(App, "approval_prompt")) {
-                        const outcome = agent.approval_prompt.decision.insertAmendmentSlice(
-                            app.alloc,
-                            app.input_runtime.paste.buffer.items,
-                            max_input_len,
-                        ) catch |err| return failPaste(app, .approval_amendment, err);
-                        switch (outcome) {
-                            .inserted => app.input_runtime.input_limit_rejection = input_limit_rejection.clear(),
-                            .inactive => {
-                                app.input_runtime.paste.resetWithTrace(.session_reset);
-                                return;
-                            },
-                            .limit_exceeded => {
-                                const attempted_bytes = app.input_runtime.paste.buffer.items.len;
-                                app.input_runtime.paste.resetWithTrace(.{ .input_limit = .approval_amendment });
-                                input_limit_feedback.report(App, app, .approval_amendment, attempted_bytes) catch |err|
-                                    return failPaste(app, .approval_amendment, err);
-                                return;
-                            },
-                        }
-                        app.input_runtime.paste.finishHandled();
-                        app.shell.render_requests.request(.modal);
-                    } else {
-                        app.input_runtime.paste.resetWithTrace(.session_reset);
-                    }
-                },
-                .auth_code => {
-                    if (comptime @hasField(App, "auth") and
-                        @hasDecl(@TypeOf(app.auth), "replaceSignInCodeInput"))
-                    {
-                        const accepted = try app.auth.replaceSignInCodeInput(
-                            app.alloc,
-                            app.input_runtime.paste.buffer.items,
-                        );
-                        if (!accepted) {
-                            app.input_runtime.paste.resetSecretWithTrace(.session_reset);
-                            try app.writeDomainNotice(.{
-                                .topic = "auth",
-                                .tone = .@"error",
-                                .body = "The authorization code is invalid.",
-                            }, true);
-                            return;
-                        }
-                        app.input_runtime.paste.beginHandling();
-                        app.input_runtime.paste.finishSecretHandled();
-                        app.shell.render_requests.request(.footer);
-                    } else {
-                        app.input_runtime.paste.resetSecretWithTrace(.session_reset);
-                    }
                 },
             }
         }
@@ -720,11 +606,4 @@ pub fn PasteEditRuntime(comptime App: type) type {
             return end;
         }
     };
-}
-
-test "approval amendment paste normalizes line and tab separators to spaces" {
-    var storage = [_]u8{ 'o', 'n', 'e', '\r', '\n', 't', 'w', 'o', '\r', 't', 'h', 'r', 'e', 'e', '\n', '\t', 'f', 'o', 'u', 'r' };
-    const normalized = normalizeApprovalAmendmentPasteInPlace(&storage);
-
-    try std.testing.expectEqualStrings("one two three  four", normalized);
 }

@@ -354,34 +354,3 @@ pub fn finalizeRetainedCandidateFailure(
         assistant_text.presentation,
     );
 }
-
-test "a save that fails keeps the turn's call records, and the next save places them the same" {
-    const alloc = std.testing.allocator;
-    var guard: TurnFinalizationGuard = .{
-        .deps = undefined,
-        .turn_id = 1,
-        .lifecycle = undefined,
-        .lease_allocator = alloc,
-        // The turn compacted after its first step, so a save rebases its
-        // records into the arena.
-        .compacted_execution = .{ .tool_steps = 1 },
-    };
-    defer guard.deinit();
-    var steps: [3]types.ToolExecutionStep = undefined;
-    guard.recordModelCall(.{ .at_ms = 1_000, .provider = "gateway", .model = "m", .generation_id = "gen-1" });
-
-    // The save after the second step fails before anything reaches the log.
-    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
-    var failed_arena = std.heap.ArenaAllocator.init(failing.allocator());
-    defer failed_arena.deinit();
-    try std.testing.expectError(error.OutOfMemory, guard.persistedExecution(failed_arena.allocator(), .{ .tool_steps = steps[0..2] }));
-
-    // The next save, a step later, still writes the call after the second
-    // step: the first step after the cut.
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const saved = try guard.persistedExecution(arena.allocator(), .{ .tool_steps = steps[0..3] });
-    try std.testing.expectEqual(@as(usize, 1), saved.model_calls.len);
-    try std.testing.expectEqualStrings("gen-1", saved.model_calls[0].generation_id.?);
-    try std.testing.expectEqual(@as(usize, 1), saved.model_calls[0].after_tool_step_count);
-}

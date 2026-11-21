@@ -1,6 +1,5 @@
 const std = @import("std");
 const question_prompt = @import("../agent/question_prompt.zig");
-const approval_decision = @import("../permissions/approval_decision.zig");
 
 /// Describes a mouse-wheel direction after terminal input has been decoded by UI.
 pub const MouseWheel = enum {
@@ -91,7 +90,8 @@ pub const Action = union(enum) {
     toggle_full_transcript,
     /// Cmd+O (or Alt+O): shows or hides the model's reasoning.
     toggle_reasoning,
-    toggle_permission_mode,
+    /// Shift+Tab: steps menus back one category.
+    back_tab,
     open_all_sessions,
     open_model_catalog,
     /// Ctrl+T: moves the current model to its next reasoning effort: from
@@ -115,7 +115,6 @@ pub const Action = union(enum) {
 pub const RawTerminalInput = struct {
     byte: u8,
     composer_shortcut: ?ShortcutAction = null,
-    approval_action: ?approval_decision.Action = null,
     question_action: ?question_prompt.Action = null,
 };
 
@@ -124,7 +123,6 @@ pub const RawTerminalInput = struct {
 pub const DecodedTerminalAction = struct {
     action: Action,
     composer_shortcut: ?ShortcutAction = null,
-    approval_focused_edit: ?approval_decision.DraftAction = null,
     question_action: ?question_prompt.Action = null,
     cancel_pending: bool = false,
 };
@@ -163,16 +161,3 @@ pub const TerminalInputIngress = struct {
             self.replay_byte_after_routing != null;
     }
 };
-
-test "TerminalInputIngress reports only effectful routing work" {
-    try std.testing.expect(!(TerminalInputIngress{}).has_routing_work());
-    try std.testing.expect((TerminalInputIngress{
-        .event = .{ .paste_byte = 'x' },
-    }).has_routing_work());
-    try std.testing.expect((TerminalInputIngress{
-        .interrupts_pending_text = true,
-    }).has_routing_work());
-    try std.testing.expect((TerminalInputIngress{
-        .replay_byte_after_routing = 0x1b,
-    }).has_routing_work());
-}

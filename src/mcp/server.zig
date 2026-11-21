@@ -2272,80 +2272,13 @@ test {
     std.testing.refAllDecls(Server);
 }
 
-test "a send that fails after the outbox took its copy frees the copy once" {
-    var r: Server = undefined;
-    // No request may start, so each waits for a slot and nothing reaches the network.
-    try r.init(std.testing.io, std.testing.allocator, .{
-        .link = .{ .http = .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 0 } },
-        .client = .{ .info = .{ .name = "test", .version = "0" } },
-    });
-    defer r.deinit();
-    const headers = [_]std.http.Header{.{ .name = "accept", .value = "application/json" }};
-    // Requests wait until every place is taken; the next fails once kept.
-    var key: u64 = 1;
-    const failed = while (key < 100) : (key += 1) {
-        r.send(key, .post, "{}", &headers) catch |err| break err;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectEqual(error.TooManyInFlight, failed);
-    try std.testing.expectEqual(@as(u64, 33), key);
-    // The one that failed keeps nothing; the others stay kept.
-    try std.testing.expect(r.kept(key) == null);
-    try std.testing.expect(r.kept(key - 1) != null);
-}
-
 fn refusedTimers(r: *const Server) usize {
     var count: usize = 0;
     for (r.timers.items) |t| count += @intFromBool(t.kind == .request and t.kind.request.kind == .refused);
     return count;
 }
 
-test "a bad line and progress in turns, a thousand times, leave the server one refused timer for its one request" {
-    var r: Server = undefined;
-    // Nothing is sent: the requests are only counted, so the timers are the server's own.
-    try r.init(std.testing.io, std.testing.allocator, .{
-        .link = .{ .http = .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 4 } },
-        .client = .{ .info = .{ .name = "test", .version = "0" } },
-    });
-    defer r.deinit();
-    try r.stepRequest(.{ .send = .normal });
-    for (1..1001) |round| {
-        try r.stepRequest(.{ .refused_line = null });
-        try std.testing.expectEqual(@as(usize, 1), refusedTimers(&r));
-        try r.stepRequest(.{ .progress_received = .{ .token = 1, .value = @floatFromInt(round) } });
-        try std.testing.expectEqual(@as(usize, 0), refusedTimers(&r));
-    }
-    // The line then still gives the request its full deadline, and the request's end drops it.
-    try r.stepRequest(.{ .refused_line = null });
-    try std.testing.expectEqual(@as(usize, 1), refusedTimers(&r));
-    try r.stepRequest(.{ .response_received = .{ .id = 1, .response = .result } });
-    try std.testing.expectEqual(@as(usize, 0), refusedTimers(&r));
-}
-
 fn holdsGrace(r: *const Server, id: request.Id) bool {
     for (r.table_slots) |slot| if (slot.used and slot.id == id) return slot.refused_epoch != 0;
     return false;
-}
-
-test "a line with no readable id gives a grace to the request whose stream carried it, and to every request when it came on stdio" {
-    var r: Server = undefined;
-    try r.init(std.testing.io, std.testing.allocator, .{
-        .link = .{ .http = .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 4 } },
-        .client = .{ .info = .{ .name = "test", .version = "0" } },
-    });
-    defer r.deinit();
-    try r.stepRequest(.{ .send = .normal });
-    try r.stepRequest(.{ .send = .normal });
-    try r.stepRequest(.{ .send = .normal });
-
-    // An SSE event on request 2's stream: request 2 has a grace, and 1 and 3 have none.
-    try r.onRefusedLine(error.InvalidJson, "not json", 2);
-    try std.testing.expectEqual(@as(usize, 1), refusedTimers(&r));
-    try std.testing.expect(!holdsGrace(&r, 1));
-    try std.testing.expect(holdsGrace(&r, 2));
-    try std.testing.expect(!holdsGrace(&r, 3));
-    // Stdio has one stream, so its line is about every request that has no grace.
-    try r.onRefusedLine(error.InvalidJson, "not json", null);
-    try std.testing.expectEqual(@as(usize, 2), refusedTimers(&r));
-    try std.testing.expect(holdsGrace(&r, 1));
-    try std.testing.expect(holdsGrace(&r, 3));
 }

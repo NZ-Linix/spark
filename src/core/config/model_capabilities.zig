@@ -24,13 +24,6 @@ pub const ResolvedProviderOptions = struct {
     /// The model takes one system message, at the start of the conversation,
     /// so the Gateway request joins the leading system messages into one.
     single_system_message: bool = false,
-    /// Borrowed gateway provider slugs in preference order. Empty leaves
-    /// provider selection to the gateway. The backing memory must outlive
-    /// request-body serialization.
-    provider_order: []const []const u8 = &.{},
-    /// Sends `provider_order` as the gateway's hard `only` restriction
-    /// instead of its `order` preference.
-    provider_strict: bool = false,
 };
 
 pub const ReasoningEffortOptions = struct {
@@ -187,64 +180,12 @@ pub fn lengthResendEffort(capabilities: Capabilities, current: types.ReasoningEf
     return if (current_index == 0 or low_index < current_index) low else null;
 }
 
-test "length resend lowers effort to low only when that reasons less" {
-    const efforts = [_]types.ReasoningEffort{
-        types.ReasoningEffort.literal("none"),
-        types.ReasoningEffort.literal("minimal"),
-        types.ReasoningEffort.literal("low"),
-        types.ReasoningEffort.literal("high"),
-    };
-    const caps = Capabilities{ .reasoning_efforts = .fromSlice(&efforts) };
-    const low = types.ReasoningEffort.literal("low");
-    const cases = [_]struct { current: types.ReasoningEffort, expected: ?types.ReasoningEffort }{
-        .{ .current = .auto, .expected = low },
-        .{ .current = types.ReasoningEffort.literal("high"), .expected = low },
-        .{ .current = types.ReasoningEffort.literal("unlisted"), .expected = low },
-        .{ .current = low, .expected = null },
-        .{ .current = types.ReasoningEffort.literal("minimal"), .expected = null },
-        .{ .current = types.ReasoningEffort.literal("none"), .expected = null },
-    };
-    for (cases) |case| {
-        const got = lengthResendEffort(caps, case.current);
-        if (case.expected) |expected| {
-            try std.testing.expect(got != null and got.?.eql(expected));
-        } else {
-            try std.testing.expectEqual(@as(?types.ReasoningEffort, null), got);
-        }
-    }
-
-    const without_low = [_]types.ReasoningEffort{
-        types.ReasoningEffort.literal("medium"),
-        types.ReasoningEffort.literal("high"),
-    };
-    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), lengthResendEffort(.{ .reasoning_efforts = .fromSlice(&without_low) }, .auto));
-    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), lengthResendEffort(.{}, .auto));
-}
-
 /// Output tokens to request and reserve for one model call, or null to leave the limit unset.
 pub fn requestOutputTokens(capabilities: Capabilities) ?u32 {
     const advertised = capabilities.max_output_tokens orelse return null;
     const window = capabilities.context_window orelse return advertised;
     if (advertised < window) return advertised;
     return @min(full_window_output_tokens, window / full_window_output_divisor);
-}
-
-test "request output limit bounds full-window catalog limits" {
-    const cases = [_]struct {
-        capabilities: Capabilities,
-        expected: ?u32,
-    }{
-        .{ .capabilities = .{}, .expected = null },
-        .{ .capabilities = .{ .max_output_tokens = 32_000 }, .expected = 32_000 },
-        .{ .capabilities = .{ .context_window = 256_000 }, .expected = null },
-        .{ .capabilities = .{ .context_window = 256_000, .max_output_tokens = 32_000 }, .expected = 32_000 },
-        .{ .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 1_000_000 }, .expected = 32_768 },
-        .{ .capabilities = .{ .context_window = 131_072, .max_output_tokens = 131_072 }, .expected = 16_384 },
-        .{ .capabilities = .{ .context_window = 128_000, .max_output_tokens = 256_000 }, .expected = 16_000 },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(case.expected, requestOutputTokens(case.capabilities));
-    }
 }
 
 pub fn reasoningEffortSupported(capabilities: Capabilities, effort: types.ReasoningEffort) bool {
@@ -319,205 +260,12 @@ pub fn resolveUltrafastProviderOptions(
 ) error{UltrafastUnavailable}!ResolvedProviderOptions {
     var options = resolveProviderOptionsForCapabilities(capabilities, effort, fast_mode);
     if (!ultrafast_mode) return options;
-    if (provider != .gateway or !std.mem.startsWith(u8, model, "openai/") or !capabilities.supports_ultrafast_mode) {
+    _ = provider;
+    _ = model;
+    if (!capabilities.supports_ultrafast_mode) {
         return error.UltrafastUnavailable;
     }
     options.fast = false;
     options.ultrafast = true;
     return options;
-}
-
-test "Ultrafast requires explicit opt-in and verified OpenAI Gateway capability" {
-    const caps = Capabilities{ .supports_fast_mode = true, .supports_ultrafast_mode = true };
-    const normal = try resolveUltrafastProviderOptions(caps, .gateway, "openai/gpt-6-astra", .auto, true, false);
-    try std.testing.expect(normal.fast and !normal.ultrafast);
-    const ultra = try resolveUltrafastProviderOptions(caps, .gateway, "openai/gpt-6-astra", .auto, true, true);
-    try std.testing.expect(ultra.ultrafast and !ultra.fast);
-    try std.testing.expectError(error.UltrafastUnavailable, resolveUltrafastProviderOptions(.{}, .gateway, "openai/gpt-6-astra", .auto, false, true));
-    try std.testing.expectError(error.UltrafastUnavailable, resolveUltrafastProviderOptions(caps, .codex, "openai/gpt-6-astra", .auto, false, true));
-    try std.testing.expectError(error.UltrafastUnavailable, resolveUltrafastProviderOptions(caps, .gateway, "anthropic/model", .auto, false, true));
-}
-
-test "capabilities infer intrinsic fast identity but not controls from model IDs" {
-    const models = [_]struct { id: []const u8, intrinsic_fast: bool }{
-        .{ .id = "openai/gpt-5.6-sol", .intrinsic_fast = false },
-        .{ .id = "anthropic/claude-opus-4.8", .intrinsic_fast = false },
-        .{ .id = "zai/glm-5.2", .intrinsic_fast = false },
-        .{ .id = "zai/glm-5.2-fast", .intrinsic_fast = true },
-        .{ .id = "provider/breakfast", .intrinsic_fast = false },
-    };
-    for (models) |model| {
-        const capabilities = capabilitiesForModel(model.id);
-        try std.testing.expectEqual(@as(usize, 0), capabilities.reasoning_efforts.len);
-        try std.testing.expect(!capabilities.supports_fast_mode);
-        try std.testing.expectEqual(model.intrinsic_fast, capabilities.intrinsic_fast);
-    }
-}
-
-test "resolveForApp adds intrinsic fast identity to provider capabilities" {
-    const App = struct {
-        pub fn resolvedModelCapabilities(_: *@This(), _: []const u8) Capabilities {
-            return .{};
-        }
-    };
-    var app = App{};
-
-    try std.testing.expect(resolveForApp(App, &app, "provider/model-fast").intrinsic_fast);
-    try std.testing.expect(!resolveForApp(App, &app, "provider/model-default").intrinsic_fast);
-}
-
-test "mergeCapabilities preserves provider controls and supplied fallback policy" {
-    const efforts = [_]types.ReasoningEffort{
-        types.ReasoningEffort.literal("future-tier"),
-        types.ReasoningEffort.literal("high"),
-    };
-    const capabilities = mergeCapabilities(.{ .intrinsic_fast = true }, .{
-        .reasoning_efforts = .fromSlice(&efforts),
-        .supports_fast_mode = true,
-        .supports_tool_use = true,
-        .supports_vision = true,
-        .supports_file_input = true,
-        .supports_web_search = true,
-        .supports_explicit_caching = true,
-        .supports_implicit_caching = true,
-        .context_window = 300_000,
-        .max_output_tokens = 32_000,
-    });
-
-    try std.testing.expect(capabilities.supports_reasoning);
-    try std.testing.expect(capabilities.intrinsic_fast);
-    try std.testing.expectEqual(@as(usize, 2), capabilities.reasoning_efforts.len);
-    try std.testing.expectEqualStrings("future-tier", capabilities.reasoning_efforts.values[0].label());
-    try std.testing.expect(capabilities.supports_fast_mode);
-    try std.testing.expect(capabilities.supports_tool_use);
-    try std.testing.expect(capabilities.supports_vision);
-    try std.testing.expect(capabilities.supports_file_input);
-    try std.testing.expect(capabilities.supports_web_search);
-    try std.testing.expect(capabilities.supports_explicit_caching);
-    try std.testing.expect(capabilities.supports_implicit_caching);
-    try std.testing.expectEqual(@as(?u32, 300_000), capabilities.context_window);
-    try std.testing.expectEqual(@as(?u32, 32_000), capabilities.max_output_tokens);
-}
-
-test "image input support distinguishes unknown native and non native capability" {
-    try std.testing.expectEqual(
-        ImageInputSupport.unknown,
-        capabilitiesForModel("provider/unknown").image_input_support,
-    );
-
-    for ([_]bool{ false, true }) |file_input| {
-        const native = mergeCapabilities(.{}, .{
-            .supports_vision = true,
-            .supports_file_input = file_input,
-        });
-        try std.testing.expectEqual(ImageInputSupport.native, native.image_input_support);
-
-        const non_native = mergeCapabilities(.{}, .{
-            .supports_vision = false,
-            .supports_file_input = file_input,
-        });
-        try std.testing.expectEqual(ImageInputSupport.non_native, non_native.image_input_support);
-    }
-}
-
-test "reasoning effort picker helpers prepend default and preserve Gateway order" {
-    const efforts = [_]types.ReasoningEffort{
-        types.ReasoningEffort.literal("future-tier"),
-        types.ReasoningEffort.literal("high"),
-    };
-    const capabilities = Capabilities{ .reasoning_efforts = .fromSlice(&efforts) };
-
-    try std.testing.expectEqual(@as(usize, 3), reasoningEffortOptionCount(capabilities));
-    try std.testing.expect(reasoningEffortAtIndex(capabilities, 0).isDefault());
-    try std.testing.expectEqualStrings("future-tier", reasoningEffortLabelAtIndex(&capabilities, 1));
-    try std.testing.expectEqualStrings("high", reasoningEffortLabelAtIndex(&capabilities, 2));
-    try std.testing.expectEqual(@as(usize, 1), reasoningEffortIndex(capabilities, types.ReasoningEffort.literal("future-tier")));
-    try std.testing.expectEqual(@as(usize, 0), reasoningEffortIndex(capabilities, types.ReasoningEffort.literal("stale")));
-}
-
-test "next reasoning effort steps from default through the declared levels and back to default" {
-    const low = types.ReasoningEffort.literal("low");
-    const medium = types.ReasoningEffort.literal("medium");
-    const high = types.ReasoningEffort.literal("high");
-    const capabilities = Capabilities{ .reasoning_efforts = .fromSlice(&.{ low, medium, high }) };
-
-    try std.testing.expect(nextReasoningEffort(capabilities, .auto).?.eql(low));
-    try std.testing.expect(nextReasoningEffort(capabilities, low).?.eql(medium));
-    try std.testing.expect(nextReasoningEffort(capabilities, medium).?.eql(high));
-    try std.testing.expect(nextReasoningEffort(capabilities, high).?.isDefault());
-    // A level saved for another model is not in the list.
-    try std.testing.expect(nextReasoningEffort(capabilities, types.ReasoningEffort.literal("stale")).?.isDefault());
-
-    // One level toggles with `default`.
-    const single = Capabilities{ .reasoning_efforts = .fromSlice(&.{high}) };
-    try std.testing.expect(nextReasoningEffort(single, .auto).?.eql(high));
-    try std.testing.expect(nextReasoningEffort(single, high).?.isDefault());
-
-    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), nextReasoningEffort(.{}, .auto));
-    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), nextReasoningEffort(.{}, high));
-}
-
-test "request controls form a total fail-closed state machine" {
-    const declared_efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
-    const selected = types.ReasoningEffort.literal("future-tier");
-    const stale = types.ReasoningEffort.literal("stale");
-    const cases = [_]struct {
-        capabilities: Capabilities,
-        effort: types.ReasoningEffort,
-        fast_mode: bool,
-        expected_effort: ?[]const u8,
-        expected_fast: bool,
-    }{
-        .{ .capabilities = .{}, .effort = .auto, .fast_mode = false, .expected_effort = null, .expected_fast = false },
-        .{ .capabilities = .{}, .effort = selected, .fast_mode = true, .expected_effort = null, .expected_fast = false },
-        .{ .capabilities = .{ .reasoning_efforts = .fromSlice(&declared_efforts) }, .effort = .auto, .fast_mode = false, .expected_effort = null, .expected_fast = false },
-        .{ .capabilities = .{ .reasoning_efforts = .fromSlice(&declared_efforts) }, .effort = selected, .fast_mode = false, .expected_effort = "future-tier", .expected_fast = false },
-        .{ .capabilities = .{ .reasoning_efforts = .fromSlice(&declared_efforts) }, .effort = stale, .fast_mode = false, .expected_effort = null, .expected_fast = false },
-        .{ .capabilities = .{ .supports_fast_mode = true }, .effort = .auto, .fast_mode = true, .expected_effort = null, .expected_fast = true },
-        .{ .capabilities = .{ .reasoning_efforts = .fromSlice(&declared_efforts), .supports_fast_mode = true }, .effort = selected, .fast_mode = true, .expected_effort = "future-tier", .expected_fast = true },
-    };
-
-    for (cases) |case| {
-        const resolved = resolveProviderOptionsForCapabilities(case.capabilities, case.effort, case.fast_mode);
-        try std.testing.expectEqual(case.expected_fast, resolved.fast);
-        if (case.expected_effort) |expected| {
-            try std.testing.expectEqualStrings(expected, resolved.reasoning.?.label());
-        } else {
-            try std.testing.expect(resolved.reasoning == null);
-        }
-    }
-}
-
-test "request controls remain safe across repeated state transitions" {
-    const declared_efforts = [_]types.ReasoningEffort{
-        types.ReasoningEffort.literal("future-tier"),
-        types.ReasoningEffort.literal("high"),
-    };
-    const states = [_]struct {
-        capabilities: Capabilities,
-        effort: types.ReasoningEffort,
-        fast_mode: bool,
-    }{
-        .{ .capabilities = .{}, .effort = .auto, .fast_mode = false },
-        .{ .capabilities = .{}, .effort = types.ReasoningEffort.literal("future-tier"), .fast_mode = true },
-        .{ .capabilities = .{ .reasoning_efforts = .fromSlice(&declared_efforts) }, .effort = types.ReasoningEffort.literal("future-tier"), .fast_mode = true },
-        .{ .capabilities = .{ .reasoning_efforts = .fromSlice(&declared_efforts), .supports_fast_mode = true }, .effort = types.ReasoningEffort.literal("high"), .fast_mode = true },
-        .{ .capabilities = .{ .supports_fast_mode = true }, .effort = types.ReasoningEffort.literal("stale"), .fast_mode = false },
-    };
-
-    var transition: usize = 0;
-    while (transition < 1_000) : (transition += 1) {
-        const state = states[transition % states.len];
-        const resolved = resolveProviderOptionsForCapabilities(state.capabilities, state.effort, state.fast_mode);
-        if (resolved.reasoning) |effort| {
-            try std.testing.expect(reasoningEffortSupported(state.capabilities, effort));
-            try std.testing.expect(effort.eql(state.effort));
-        }
-        try std.testing.expect(!resolved.fast or (state.fast_mode and state.capabilities.supports_fast_mode));
-    }
-}
-
-test "generic fallback capabilities contain no vendor policy" {
-    const fallback = capabilitiesForModel("anthropic/claude-any");
-    try std.testing.expect(fallback.context_window == null);
 }

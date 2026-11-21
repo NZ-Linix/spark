@@ -1,4 +1,4 @@
-//! `/connect`: routes keys to the connection form, saves the finished
+//! `/provider`: routes keys to the connection form, saves the finished
 //! connection under `providers` in the profile settings, reloads the
 //! connection list, and switches to the new connection.
 
@@ -18,7 +18,7 @@ pub fn Runtime(comptime App: type) type {
         /// Takes every byte while the form is open. Returns false when it is
         /// closed.
         pub fn routeByte(app: *App, agent: *AppAgent, byte: u8) !bool {
-            const form = &app.input_runtime.connect_menu;
+            const form = &app.input_runtime.provider_menu;
             if (!form.active) return false;
             // Escape starts an arrow key, a paste, or Esc itself; the input
             // decoder turns it into an action for `routeAction`.
@@ -41,7 +41,7 @@ pub fn Runtime(comptime App: type) type {
         /// or between fields. Returns false for actions the form leaves to
         /// the rest of the input path, such as Esc and pastes.
         pub fn routeAction(app: *App, agent: *AppAgent, action: anytype) !bool {
-            const form = &app.input_runtime.connect_menu;
+            const form = &app.input_runtime.provider_menu;
             if (!form.active) return false;
             switch (action) {
                 .escape, .paste_start, .paste_end, .remapped_byte => return false,
@@ -65,7 +65,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn submit(app: *App, agent: *AppAgent) !void {
-            const form = &app.input_runtime.connect_menu;
+            const form = &app.input_runtime.provider_menu;
             switch (try form.submit(app.alloc)) {
                 .next, .invalid => {},
                 .finished => try saveConnection(app, agent),
@@ -86,12 +86,12 @@ pub fn Runtime(comptime App: type) type {
             var names: std.ArrayList([]const u8) = .empty;
             defer names.deinit(app.alloc);
             for (app.provider_selection.definitions.definitions) |definition| try names.append(app.alloc, definition.id);
-            try app.input_runtime.connect_menu.open(app.alloc, names.items);
+            try app.input_runtime.provider_menu.open(app.alloc, names.items);
         }
 
         /// Closes the form without saving. Returns whether it was open.
         pub fn cancel(app: *App) bool {
-            const form = &app.input_runtime.connect_menu;
+            const form = &app.input_runtime.provider_menu;
             if (!form.active) return false;
             form.close(app.alloc);
             return true;
@@ -121,7 +121,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn deleteConnection(app: *App, agent: *AppAgent) !void {
-            const form = &app.input_runtime.connect_menu;
+            const form = &app.input_runtime.provider_menu;
             const name = form.editing orelse return;
             if (agent.stream.active) {
                 form.problem = "wait for the current turn to finish";
@@ -147,7 +147,7 @@ pub fn Runtime(comptime App: type) type {
             if (!was_active) return;
             const definitions = app.provider_selection.definitions.definitions;
             if (definitions.len == 0) {
-                try app.writeDomainNotice(.{ .topic = "connect", .tone = .warning, .body = "No connection is left. Run /connect to add one." }, true);
+                try app.writeDomainNotice(.{ .topic = "connect", .tone = .warning, .body = "No connection is left. Run /provider to add one." }, true);
                 return;
             }
             const next = model_provider.parse(definitions[0].id) orelse return;
@@ -155,7 +155,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn saveConnection(app: *App, agent: *AppAgent) !void {
-            const form = &app.input_runtime.connect_menu;
+            const form = &app.input_runtime.provider_menu;
             if (agent.stream.active) {
                 form.problem = "wait for the current turn to finish, then press enter";
                 return;

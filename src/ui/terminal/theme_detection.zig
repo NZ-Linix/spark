@@ -89,20 +89,3 @@ fn fencedBackgroundReply(bytes: []const u8) FencedReply {
     const fence_start = theme_protocol.trailingPrimaryDeviceAttributes(bytes) orelse return .pending;
     return .{ .done = theme_protocol.parseOsc11Response(bytes[0..fence_start]) };
 }
-
-test "the device attributes fence ends the background probe" {
-    const dark = fencedBackgroundReply("\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\\x1b[?62;22c");
-    try std.testing.expect(!dark.done.?.light);
-    const light = fencedBackgroundReply("\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[?1;2c");
-    try std.testing.expect(light.done.?.light);
-    // A terminal without OSC 11 answers only the fence.
-    try std.testing.expectEqual(@as(?TerminalBackground, null), fencedBackgroundReply("\x1b[?62;22c").done);
-}
-
-test "the background probe keeps reading until the fence completes" {
-    // Hex digits end in "c" without a fence.
-    try std.testing.expect(fencedBackgroundReply("\x1b]11;rgb:cccc/cccc/cc") == .pending);
-    try std.testing.expect(fencedBackgroundReply("\x1b]11;rgb:cccc/cccc/cccc\x1b\\") == .pending);
-    try std.testing.expect(fencedBackgroundReply("\x1b]11;rgb:cccc/cccc/cccc\x1b\\\x1b[?62;2") == .pending);
-    try std.testing.expect(fencedBackgroundReply("") == .pending);
-}

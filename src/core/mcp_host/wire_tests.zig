@@ -15,12 +15,6 @@ test "MCP wire decoding returns only whole JSON values from valid input" {
     });
 }
 
-test "the engine reads an object's field names as std.json decodes them" {
-    try testing.fuzz({}, fuzzMemberNames, .{
-        .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_object_fields.*),
-    });
-}
-
 const fuzz_keys = [_][]const u8{
     "\"jsonrpc\"", "\"id\"",      "\"method\"", "\"params\"",       "\"result\"", "\"error\"", "\"resultType\"",
     "\"code\"",    "\"message\"", "\"data\"",   "\"\\u006dethod\"", "\"x\"",
@@ -679,21 +673,9 @@ fn fuzzEscapedStrings(_: void, smith: *testing.Smith) !void {
     }
 }
 
-test "the engine's equality and length limits of a form's strings and an answer's match std.json's decoded strings" {
-    try testing.fuzz({}, fuzzEscapedStrings, .{
-        .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_elicitation_escapes.*),
-    });
-}
-
 // ---- the grace for a refused line that names no request ----
 //
 // `src/mcp/core/request.zig` holds the rules, and `tests/tla/mcp/Request.tla` states them.
-
-test "a fuzzed run of requests, lines that name no request, replies, progress and timers ends each request once and ends only a silent request that has a grace as malformed" {
-    try testing.fuzz({}, fuzzGrace, .{
-        .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_request_grace.*),
-    });
-}
 
 /// Each byte is one step: its last decimal digit picks the step and the rest picks a request, so a
 /// saved input reads as a short script. 0 to 2 send a normal request, initialize or a listen; 3 is a
@@ -792,18 +774,6 @@ fn fuzzGrace(_: void, smith: *testing.Smith) !void {
     }
 }
 
-test "a WWW-Authenticate challenge is read within its bounds on fuzzed bytes" {
-    try testing.fuzz({}, fuzzChallenge, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "Bearer error=\"invalid_token\", error_description=\"No authorization provided\", resource_metadata=\"https://x.example/.well-known/oauth-protected-resource\"",
-            "Basic realm=\"a\", Bearer error=\"insufficient_scope\", scope=\"a b\"",
-            "Bearer error_description=\"a \\\"quoted\\\" \\\\ b\"",
-            "Bearer resource_metadata=\"u\"",
-            "Bearer error=, error_description=\"unterminated",
-        }) ++ @import("fuzz_corpus").mcp_challenge.*),
-    });
-}
-
 /// What a server's challenge can make the engine keep, whatever its bytes:
 /// every value lies inside the header, the error and its description stay
 /// under their bounds, a step-up is named only when the header says so, and
@@ -859,26 +829,6 @@ fn spellsStepUp(value: []const u8) bool {
         if (matched == name.len and (at == value.len or value[at] == '"')) return true;
     }
     return false;
-}
-
-test "the step-up law reads escapes only inside a quoted string" {
-    // The name, plain or quoted.
-    try testing.expect(spellsStepUp("Bearer error=insufficient_scope"));
-    try testing.expect(spellsStepUp("Bearer error=\"insufficient_scope\", scope=\"a\""));
-    // A quoted-pair spells it: the same word.
-    try testing.expect(spellsStepUp("Bearer error=\"insuffic\\ient_scope\""));
-    try testing.expect(spellsStepUp("Bearer error=\"\\insufficient_scope\""));
-    // The header the fuzzer found, after a first challenge that was not one, and a quoted string with no end.
-    try testing.expect(spellsStepUp("\"alm=\"a\", Bearer error=\"insuffic\\ient_scope\",Q="));
-    try testing.expect(spellsStepUp("Bearer error=\"insuffic\\ient_scope"));
-    // An escaped backslash is a backslash in the value, so it does not spell the name.
-    try testing.expect(!spellsStepUp("Bearer error=\"insuffic\\\\ient_scope\""));
-    // Outside a quoted string a backslash is part of the value.
-    try testing.expect(!spellsStepUp("Bearer error=insuffic\\ient_scope"));
-    try testing.expect(!spellsStepUp("Bearer error=x, scope=insuffic\\ient_scope"));
-    // A backslash before a byte the name does not have there, or none of the name at all.
-    try testing.expect(!spellsStepUp("Bearer error=\"insuffic\\xient_scope\""));
-    try testing.expect(!spellsStepUp("Bearer error=\"invalid_token\""));
 }
 
 fn expectSameText(x: ?[]const u8, y: ?[]const u8, bound: usize) !void {

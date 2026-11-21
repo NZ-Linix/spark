@@ -7,7 +7,6 @@ const managed_execution = @import("../execution/managed_execution.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const diff = @import("../output/diff.zig");
-const approval_prompt = @import("../permissions/approval_prompt.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const submission_state = @import("../app/submission_state.zig");
 const session_runtime = @import("../session/session.zig");
@@ -35,7 +34,6 @@ pub const Agent = struct {
     worker_thread: ?std.Thread = null,
     worker: worker_runtime.WorkerRuntime = .{},
     stream: types.StreamState = .{},
-    approval_prompt: approval_prompt.ApprovalPrompt = .{},
     question_prompt: question_prompt.QuestionPrompt = .{},
     /// The work id the next prompt queued for this agent carries: main's
     /// message to a subagent, so its saved turn can be found. Set only
@@ -46,15 +44,6 @@ pub const Agent = struct {
     /// until chosen on its screen. Written under the app's permission
     /// authority lock, which its readers on other threads take.
     permission_mode: ?types.PermissionMode = null,
-    /// An instance's session approvals: what "always" allowed in its current
-    /// session. A subagent records none; its go to the instance at the
-    /// top of its tree (`root_instance`). Each entry owns its strings,
-    /// allocated with the app's allocator. Guarded by the app's permission
-    /// authority lock: every agent's worker adds to it, so every write and every
-    /// read holds the lock, and a reader that keeps what it reads takes a copy
-    /// (`copyGrants`). Only freeing it, after the instance's tree has stopped,
-    /// takes no lock.
-    session_grants: std.ArrayList(types.PermissionGrant) = .empty,
     submission: submission_state.State = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id: usize = 1,

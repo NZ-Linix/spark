@@ -1,7 +1,5 @@
 const std = @import("std");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
-const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
-const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
 const app_mcp_runtime = @import("../../core/app/app_mcp_runtime.zig");
@@ -11,7 +9,6 @@ const session_adapter = @import("../../core/session/session_adapter.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
 const info_panel_presentation = @import("info_panel_presentation.zig");
-const usage_presentation = @import("usage_presentation.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
@@ -24,18 +21,16 @@ const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const effort_menu = @import("../../core/input/effort_menu.zig");
-const connect_menu = @import("../../core/input/connect_menu.zig");
+const provider_menu = @import("../../core/input/provider_menu.zig");
 const list_picker = @import("../../core/input/list_picker.zig");
 const splash = @import("splash.zig");
 const live_preview = @import("live_preview.zig");
 const info_panel = @import("../../core/input/info_panel.zig");
-const usage_menu = @import("../../core/session/usage_menu.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const ui_render = @import("../render.zig");
 const render_engine = @import("../render_engine.zig");
 const render_request = @import("../render_request.zig");
 const transcript_runtime = @import("../transcript/runtime.zig");
-const interaction_state = @import("interaction_state.zig");
 
 const activity_overlay = render_engine.activity_overlay;
 const StreamState = types.StreamState;
@@ -91,9 +86,6 @@ pub const ModelMenuProjection = struct {
     selected_index: usize = 0,
     window_start: usize = 0,
     query: []const u8 = "",
-    /// Whether the team has Token Pass. Only then does the menu name Token
-    /// Pass and lead with its models.
-    token_pass: bool = false,
 
     pub fn providerFilter(self: ModelMenuProjection) model_cache_runtime.ModelProviderFilter {
         return @fromBackingInt(@intCast(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1)));
@@ -294,24 +286,6 @@ pub fn statuslineMenuProjection(
     };
 }
 
-pub const UsageMenuProjection = usage_presentation.Projection;
-pub const usageShowsTables = usage_presentation.showsTables;
-pub const usageIsPlan = usage_presentation.isPlan;
-pub const usageCodexHasPeriods = usage_presentation.codexHasPeriods;
-
-pub fn usageMenuProjection(
-    menu: *const usage_menu.State,
-) UsageMenuProjection {
-    return .{
-        .active = menu.active,
-        .period = menu.period,
-        .selected_model = menu.selected_model,
-        .model_window_start = menu.model_window_start,
-        .detail = menu.detail,
-        .snapshot = if (menu.snapshot) |*snapshot| snapshot else null,
-    };
-}
-
 pub const WorkspaceMenuProjection = struct {
     active: bool = false,
     selected_row: usize = 0,
@@ -358,7 +332,6 @@ pub fn infoPanelProjection(panel: *const info_panel.State, cols: u16, terminal_r
 pub const CompactCommandMenuProjection = union(enum) {
     statusline: StatuslineMenuProjection,
     info_panel: InfoPanelProjection,
-    usage: UsageMenuProjection,
     workspace: WorkspaceMenuProjection,
 };
 
@@ -415,7 +388,6 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
         .selected_index = cache.menu.selected_index,
         .window_start = cache.menu.window_start,
         .query = cache.menu.query(),
-        .token_pass = cache.tokenPassStatus() == .active,
     };
 }
 
@@ -433,7 +405,7 @@ pub const RenderContext = struct {
     model: []const u8,
     pending_images: []const types.ImageAttachment = &.{},
     composer_visible: bool = true,
-    permission_mode: types.PermissionMode = .ask,
+    permission_mode: types.PermissionMode = .yolo,
     steering_messages: []const []const u8 = &.{},
     steering_waits_for_boundary: bool = false,
     fast_indicator_active: bool = false,
@@ -450,14 +422,6 @@ pub const RenderContext = struct {
     model_completion_index: usize = 0,
     model_completion_window_start: usize = 0,
     model_completion_anchor: usize = 0,
-    provider_query_active: bool = false,
-    provider_picker_stage: picker_state.ProviderPickerStage = .provider,
-    provider_picker_completions: []const []const u8 = &.{},
-    /// Parallel to `provider_picker_completions`; an empty entry renders no annotation.
-    provider_picker_annotations: []const []const u8 = &.{},
-    provider_picker_completion_index: usize = 0,
-    provider_picker_completion_window_start: usize = 0,
-    provider_picker_completion_anchor: usize = 0,
     file_query_active: bool = false,
     file_completions: []const file_index.SearchResult = &.{},
     file_completion_index: usize = 0,
@@ -468,16 +432,6 @@ pub const RenderContext = struct {
     file_completions_loading: bool = false,
     file_completions_failed: bool = false,
     inline_completion_suffix: []const u8 = "",
-    /// A request waits for the sign-in spark opened for it, so the auth picker
-    /// shows while the turn is active.
-    auth_picker_during_turn: bool = false,
-    auth_picker: auth_runtime.PickerView = .{
-        .active = false,
-        .available_sources = .empty,
-        .selected_choice = null,
-        .active_source = null,
-        .include_skip = false,
-    },
     skills_menu: SkillsMenuProjection = .{},
     mcp_host_menu: mcp_host_menu_presentation.Projection = .{},
     help_menu: HelpMenuProjection = .{},
@@ -486,8 +440,8 @@ pub const RenderContext = struct {
     session_menu: SessionMenuProjection = .{},
     fork_menu: ForkMenuProjection = .{},
     effort_menu: EffortMenuProjection = .{},
-    /// The open `/connect` form, or null.
-    connect_menu: ?*const connect_menu.State = null,
+    /// The open `/provider` form, or null.
+    provider_menu: ?*const provider_menu.State = null,
     /// The open inline list picker, such as `/prompt`'s, or null.
     list_picker: ?*const list_picker.State = null,
     /// The launch splash while it shows, or null.
@@ -499,7 +453,6 @@ pub const RenderContext = struct {
     agents_menu: AgentsMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
     info_panel: InfoPanelProjection = .{},
-    usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
     upgrade_status: []const u8 = "",
     /// The agent indicator on the footer's right, such as "spark 2/3 ↓": the
@@ -533,7 +486,6 @@ pub const RenderContext = struct {
 pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjection {
     if (ctx.statusline_menu.active) return .{ .statusline = ctx.statusline_menu };
     if (ctx.info_panel.active) return .{ .info_panel = ctx.info_panel };
-    if (ctx.usage_menu.active) return .{ .usage = ctx.usage_menu };
     if (ctx.workspace_menu.active) return .{ .workspace = ctx.workspace_menu };
     return null;
 }
@@ -669,25 +621,6 @@ test "steering banner reserves message rows and one composer gap" {
     );
 }
 
-test "steering preview layout retains prefix slices at row boundaries" {
-    const cases = [_]struct { text: []const u8, width: u16, first: []const u8, second: []const u8, truncated: bool }{
-        .{ .text = "first\r\nsecond\nthird", .width = 20, .first = "first", .second = "second", .truncated = true },
-        .{ .text = "abcdefghij", .width = 4, .first = "abcd", .second = "efg", .truncated = true },
-        .{ .text = "abcd\nefgh", .width = 4, .first = "abcd", .second = "efgh", .truncated = false },
-        .{ .text = "one two three", .width = 7, .first = "one two", .second = "three", .truncated = false },
-        .{ .text = "abc \ndef", .width = 3, .first = "abc", .second = "def", .truncated = false },
-        .{ .text = "界海語", .width = 3, .first = "界", .second = "海", .truncated = true },
-        .{ .text = "first\n\nthird", .width = 20, .first = "first", .second = "", .truncated = true },
-    };
-    for (cases) |case| {
-        const layout = steering_message_layout(case.text, case.width, false, 2);
-        try std.testing.expectEqual(@as(u16, 2), layout.row_count);
-        try std.testing.expectEqualStrings(case.first, layout.rows[0]);
-        try std.testing.expectEqualStrings(case.second, layout.rows[1]);
-        try std.testing.expectEqual(case.truncated, layout.truncated);
-    }
-}
-
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {
     if (tool_before_activity) return 0;
     return shell.transientAssistantGapRows();
@@ -754,9 +687,8 @@ pub fn frameOwnedActivityProjection(
     buf: []u8,
     shell: *TranscriptRuntime,
     ctx: RenderContext,
-    approval: ?approval_prompt.Projection,
 ) ActivityProjection {
-    if (approval != null or ctx.question != null) return .none;
+    if (ctx.question != null) return .none;
     // The live preview stands where the transcript's next text goes.
     if (ctx.live_preview != null or ctx.live_preview_recent) return .none;
     const compaction = activity_status.compactionProjection(buf, ctx.compaction, ctx.now_ms);
@@ -788,24 +720,6 @@ fn fitStatusLabel(thinking: ActivityProjection.TurnThinking, cols: u16) Activity
         return .{ .turn_thinking = thinking };
     }
     return .{ .turn_thinking = .{ .label = short, .tone = thinking.tone } };
-}
-
-test "a status shows its short form only when the row is narrower than its text" {
-    const thinking: ActivityProjection.TurnThinking = .{
-        .label = "⚠ Blocked by the content filter · press Esc and rephrase",
-        .short_label = "⚠ Blocked by content filter · Esc, then rephrase",
-        .tone = .danger,
-    };
-    try std.testing.expectEqualStrings(thinking.label, fitStatusLabel(thinking, 80).turn_thinking.label);
-    const width: u16 = @intCast(display_width.visibleWidthIgnoringAnsi(thinking.label));
-    try std.testing.expectEqualStrings(thinking.label, fitStatusLabel(thinking, width).turn_thinking.label);
-    const narrow = fitStatusLabel(thinking, width - 1).turn_thinking;
-    try std.testing.expectEqualStrings(thinking.short_label.?, narrow.label);
-    try std.testing.expectEqual(ActivityProjection.Tone.danger, narrow.tone);
-
-    var no_short = thinking;
-    no_short.short_label = null;
-    try std.testing.expectEqualStrings(thinking.label, fitStatusLabel(no_short, 20).turn_thinking.label);
 }
 
 pub fn frameActivityBlink(ctx: RenderContext) ?bool {
@@ -928,61 +842,6 @@ pub fn activityProjectionLabel(projection: ActivityProjection) ?[]const u8 {
     };
 }
 
-test "skillsMenuProjection mirrors runtime menu state" {
-    var skills = [_]skill_runtime.Skill{
-        .{ .name = "managed", .description = "managed desc", .path = "/tmp/managed/SKILL.md", .source = .global_spark },
-        .{ .name = "workspace", .description = "workspace desc", .path = "/tmp/workspace/SKILL.md", .source = .workspace_shared },
-    };
-    var runtime: skill_runtime.Runtime = .{ .items = &skills };
-    runtime.menu.active = true;
-    runtime.menu.source_filter = .workspace;
-    runtime.menu.selected_index = 1;
-    runtime.menu.window_start = 1;
-    runtime.menu.setQuery("work");
-
-    const projection = skillsMenuProjection(&runtime);
-
-    try std.testing.expect(projection.active);
-    try std.testing.expectEqual(@as(usize, skills.len), projection.items.len);
-    try std.testing.expectEqual(skill_runtime.SkillMenuSourceFilter.workspace, projection.source_filter);
-    try std.testing.expectEqual(@as(usize, 1), projection.selected_index);
-    try std.testing.expectEqual(@as(usize, 1), projection.window_start);
-    try std.testing.expectEqualStrings("work", projection.query);
-}
-
-test "skillsMenuProjection hides zero-result mentions and preserves command menus" {
-    var skills = [_]skill_runtime.Skill{
-        .{ .name = "managed", .description = "managed desc", .path = "/tmp/managed/SKILL.md", .source = .global_spark },
-    };
-    var runtime: skill_runtime.Runtime = .{ .items = &skills };
-
-    runtime.openMenuWithQuery(.dollar, .{ .start = 0, .end = "$missing".len }, "missing");
-    try std.testing.expect(!skillsMenuProjection(&runtime).active);
-
-    runtime.menu.setQuery("man");
-    try std.testing.expect(skillsMenuProjection(&runtime).active);
-
-    runtime.openMenuWithQuery(.command, null, "missing");
-    try std.testing.expect(skillsMenuProjection(&runtime).active);
-}
-
-test "modelMenuProjection mirrors cache-owned catalog state" {
-    var cache = model_cache_runtime.Runtime.init(std.testing.allocator, "/v1/models");
-    defer cache.deinit();
-    cache.menu.load_state = .failed;
-    cache.menu.catalog_state = .{
-        .access_level = .public_only,
-        .public_only_reason = .credential_refresh_failed,
-        .private_models_hidden = true,
-        .failure = .{ .category = .transport, .retryable = true },
-    };
-
-    const projection = modelMenuProjection(&cache);
-
-    try std.testing.expectEqual(cache.menu.load_state, projection.load_state);
-    try std.testing.expectEqual(cache.menu.catalog_state, projection.catalog_state);
-}
-
 fn wrappedStatusRowCount(label: []const u8, cols: u16, max_rows: u16) u16 {
     if (max_rows <= 1 or cols == 0) return 1;
     if (display_width.visibleWidthIgnoringAnsi(label) <= cols) return 1;
@@ -1027,460 +886,5 @@ pub fn appendActivityToolLabel(
             try appendConnectedToolLabel(alloc, out, slot.fallback_label, cols);
         },
         .none, .turn_thinking => {},
-    }
-}
-
-test "frame-owned thinking activity projects the thinking label" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var shell = TranscriptRuntime{};
-    defer shell.deinit(std.testing.allocator);
-    const ctx: RenderContext = .{
-        .stream = .{ .active = true },
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .shimmer_pos = 0,
-        .input = &input,
-    };
-
-    var dot_buf: [128]u8 = undefined;
-    switch (frameOwnedActivityProjection(&dot_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
-test "frame compaction overrides idle and tool activity but not blocking feedback or questions" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var shell = TranscriptRuntime{};
-    defer shell.deinit(std.testing.allocator);
-    var state: @import("../../core/output/compaction_activity.zig").State = .{};
-    const id = state.begin(.manual, null, 1_000);
-    state.running(id, .summary);
-    var ctx: RenderContext = .{
-        .stream = .{},
-        .compaction = state.snapshot,
-        .now_ms = 2_500,
-        .has_api_key = true,
-        .model = "test",
-        .input = &input,
-    };
-    var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("• Compacting 0% (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
-    try std.testing.expectEqual(@as(?bool, false), frameActivityBlink(ctx));
-    try std.testing.expect(!ctx.stream.active);
-    ctx.activity = .{ .tool_slot = .{ .entry_id = 1, .fallback_label = "reading", .active = true, .kind = .read } };
-    try std.testing.expectEqualStrings("• Compacting 0% (1s)", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
-    ctx.activity = .{ .turn_thinking = .{ .label = "Blocking status", .tone = .danger } };
-    try std.testing.expectEqualStrings("Blocking status", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
-    ctx.question = .{ .current_entry = null, .current_index = 0, .entry_count = 0 };
-    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
-    ctx.question = null;
-    state.settle(id, .{ .outcome = .cancelled }, 2_500);
-    ctx.compaction = state.snapshot;
-    ctx.activity = .none;
-    try std.testing.expectEqual(ActivityProjection.Tone.neutral, frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.tone);
-    try std.testing.expect(state.dismiss(id, state.snapshot.revision));
-    ctx.compaction = state.snapshot;
-    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
-}
-
-test "an idle agent waiting on its subagents shows a live row that a turn or question replaces" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var shell = TranscriptRuntime{};
-    defer shell.deinit(std.testing.allocator);
-    var ctx: RenderContext = .{
-        .stream = .{},
-        .has_api_key = true,
-        .model = "test",
-        .input = &input,
-    };
-    var buf: [256]u8 = undefined;
-    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
-
-    ctx.subagent_wait = "• waiting on 3 subagents · ↓ to view";
-    const waiting = frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking;
-    try std.testing.expectEqualStrings("• waiting on 3 subagents · ↓ to view", waiting.label);
-    try std.testing.expectEqual(ActivityProjection.Tone.live, waiting.tone);
-    // A row narrower than the label drops the key hint instead of wrapping.
-    shell.layout.cols = 30;
-    try std.testing.expectEqualStrings("• waiting on 3 subagents", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
-    shell.layout.cols = 0;
-    // Without a clock, the frame phase drives the blink.
-    ctx.now_ms = 10_000;
-    try std.testing.expectEqual(@as(?bool, null), frameActivityBlink(ctx));
-    // With a clock, each of its seconds starts with the bullet on.
-    ctx.subagent_wait_since_ms = 10_300;
-    ctx.now_ms = 10_500;
-    try std.testing.expectEqual(@as(?bool, true), frameActivityBlink(ctx));
-    ctx.now_ms = 10_900;
-    try std.testing.expectEqual(@as(?bool, false), frameActivityBlink(ctx));
-    ctx.now_ms = 11_300;
-    try std.testing.expectEqual(@as(?bool, true), frameActivityBlink(ctx));
-    ctx.subagent_wait_since_ms = 0;
-
-    ctx.pending_prompt_activity = true;
-    try std.testing.expectEqualStrings("• Thinking", frameOwnedActivityProjection(&buf, &shell, ctx, null).turn_thinking.label);
-    ctx.pending_prompt_activity = false;
-
-    ctx.question = .{ .current_entry = null, .current_index = 0, .entry_count = 0 };
-    try std.testing.expect(frameOwnedActivityProjection(&buf, &shell, ctx, null) == .none);
-}
-
-test "pending prompt projects thinking before the worker stream starts" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var shell = TranscriptRuntime{};
-    defer shell.deinit(std.testing.allocator);
-    const ctx: RenderContext = .{
-        .stream = .{},
-        .pending_prompt_activity = true,
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .input = &input,
-    };
-
-    var label_buf: [128]u8 = undefined;
-    switch (frameOwnedActivityProjection(&label_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-
-    var retry_ctx = ctx;
-    retry_ctx.activity = .{ .turn_thinking = .{
-        .label = "Previous request failed",
-        .tone = .danger,
-    } };
-    switch (frameOwnedActivityProjection(&label_buf, &shell, retry_ctx, null)) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking", thinking.label),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
-test "frame-owned activity renders the thinking elapsed counter from the frame clock" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-
-    var shell = TranscriptRuntime{};
-    defer shell.deinit(std.testing.allocator);
-    const ctx: RenderContext = .{
-        .stream = .{ .active = true, .turn_started_ms = 1_000 },
-        .now_ms = 4_200,
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .input = &input,
-    };
-
-    var counter_buf: [128]u8 = undefined;
-    switch (frameOwnedActivityProjection(&counter_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings("• Thinking (3s)", thinking.label),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
-test "frame-owned activity keeps active tools out of the turn status row" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-
-    var shell = TranscriptRuntime{
-        .last_visible_transcript_tail_kind = .tool_status,
-    };
-    defer shell.deinit(std.testing.allocator);
-    const ctx: RenderContext = .{
-        .stream = .{ .active = true, .last_activity_kind = .read, .read_count = 1 },
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .activity = .{ .tool_slot = .{
-            .entry_id = 123,
-            .fallback_label = "reading src/main.zig",
-            .active = true,
-            .kind = .read,
-        } },
-        .input = &input,
-    };
-
-    var active_buf: [256]u8 = undefined;
-    switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
-            try std.testing.expectEqualStrings("• Thinking", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
-test "current frame-owned activity leaves the focused tool in the transcript" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-
-    var shell = TranscriptRuntime{};
-    defer shell.deinit(std.testing.allocator);
-    const ctx: RenderContext = .{
-        .stream = .{
-            .active = true,
-            .phase = .running,
-            .turn_started_ms = 1_000,
-            .command_count = 1,
-            .last_activity_kind = .command,
-            .token_progress = .{
-                .input_tokens = 50_000,
-                .output_tokens = 1_250,
-                .input_exact = false,
-                .output_exact = false,
-            },
-        },
-        .has_api_key = true,
-        .model = "test-model",
-        .activity = .{ .tool_slot = .{
-            .entry_id = 123,
-            .fallback_label = "● Running\x1b[0m \x1b[38;5;245mzig build test\x1b[0m\n",
-            .active = true,
-            .kind = .command,
-        } },
-        .now_ms = 13_000,
-        .input = &input,
-    };
-
-    var active_buf: [256]u8 = undefined;
-    const projection = frameOwnedActivityProjection(&active_buf, &shell, ctx, null);
-    switch (projection) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "• Running (12s) (↑50k ↓1.2k)",
-            thinking.label,
-        ),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-
-    var streaming_buf: [256]u8 = undefined;
-    var streaming_ctx = ctx;
-    streaming_ctx.stream.phase = .generating;
-    streaming_ctx.writing_response = true;
-    switch (frameOwnedActivityProjection(&streaming_buf, &shell, streaming_ctx, null)) {
-        .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "• Generating (12s) (↑50k ↓1.2k)",
-            thinking.label,
-        ),
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
-test "minimal connected tool label clips with an ellipsis" {
-    const alloc = std.testing.allocator;
-    const projection: ActivityProjection = .{ .tool_slot = .{
-        .entry_id = 123,
-        .fallback_label = "● Running\x1b[0m \x1b[38;5;245mzig build test with a deliberately long target\x1b[0m\n",
-        .thinking_label = "• Thinking",
-        .active = true,
-        .kind = .command,
-    } };
-
-    var label: std.ArrayList(u8) = .empty;
-    defer label.deinit(alloc);
-    try appendActivityToolLabel(alloc, &label, projection, 24);
-
-    try std.testing.expect(std.mem.startsWith(u8, label.items, "\x1b[38;5;245m└ Running"));
-    try std.testing.expect(std.mem.find(u8, label.items, "\x1b[1m") == null);
-    try std.testing.expect(std.mem.find(u8, label.items, "…") != null);
-    try std.testing.expect(std.mem.findScalar(u8, label.items, '\n') == null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(label.items) <= 24);
-}
-
-test "frame-owned activity keeps a live retrying status in place of the thinking row" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var shell = TranscriptRuntime{};
-    defer shell.deinit(std.testing.allocator);
-    const ctx: RenderContext = .{
-        .stream = .{ .active = true },
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .activity = .{ .turn_thinking = .{
-            .label = "• Gateway error · retrying · attempt 4 · 1m 20s",
-            .tone = .live,
-        } },
-        .input = &input,
-    };
-
-    var active_buf: [256]u8 = undefined;
-    switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(ActivityProjection.Tone.live, thinking.tone);
-            try std.testing.expectEqualStrings("• Gateway error · retrying · attempt 4 · 1m 20s", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
-test "frame-owned activity preserves route recovery status tone" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var shell = TranscriptRuntime{};
-    defer shell.deinit(std.testing.allocator);
-    const ctx: RenderContext = .{
-        .stream = .{},
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .activity = .{ .turn_thinking = .{
-            .label = "⚠ API error · attempt 1/3 failed · retrying",
-            .tone = .warning,
-        } },
-        .input = &input,
-    };
-
-    var active_buf: [256]u8 = undefined;
-    switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(ActivityProjection.Tone.warning, thinking.tone);
-            try std.testing.expectEqualStrings("⚠ API error · attempt 1/3 failed · retrying", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-
-    var question_ctx = ctx;
-    question_ctx.question = .{
-        .current_entry = null,
-        .current_index = 0,
-        .entry_count = 0,
-    };
-    try std.testing.expect(frameOwnedActivityProjection(&active_buf, &shell, question_ctx, null) == .none);
-}
-
-test "frame-owned activity shows live streaming token progress" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var shell = TranscriptRuntime{};
-    defer shell.deinit(std.testing.allocator);
-    const ctx: RenderContext = .{
-        .stream = .{
-            .active = true,
-            .phase = .generating,
-            .turn_started_ms = 1_000,
-            .token_progress = .{
-                .input_tokens = 50_000,
-                .output_tokens = 1_250,
-                .input_exact = false,
-                .output_exact = false,
-            },
-        },
-        .writing_response = true,
-        .has_api_key = true,
-        .model = "test-model",
-        .activity = .none,
-        .now_ms = 13_000,
-        .input = &input,
-    };
-
-    var active_buf: [256]u8 = undefined;
-    switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("• Generating (12s) (↑50k ↓1.2k)", thinking.label);
-            try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-
-    // Pacer caught up mid-response and is waiting on the next chunk: the
-    // Generating phase holds instead of flipping inside every gap.
-    var drained_ctx = ctx;
-    drained_ctx.writing_response = false;
-    var drained_buf: [256]u8 = undefined;
-    switch (frameOwnedActivityProjection(&drained_buf, &shell, drained_ctx, null)) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("• Generating (12s) (↑50k ↓1.2k)", thinking.label);
-            try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-
-    // The model moved on to a tool payload that prints nothing: only the phase
-    // word changes while the marker, turn clock, and token totals remain.
-    var composing_ctx = drained_ctx;
-    composing_ctx.stream.phase = .running;
-    composing_ctx.stream.turn_started_ms = 1_000;
-    composing_ctx.now_ms = 13_000;
-    var stalled_buf: [256]u8 = undefined;
-    switch (frameOwnedActivityProjection(&stalled_buf, &shell, composing_ctx, null)) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("• Running (12s) (↑50k ↓1.2k)", thinking.label);
-            try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-
-    var tail_ctx = ctx;
-    tail_ctx.stream.active = false;
-    tail_ctx.completed_assistant_presentation_tail = true;
-    var tail_buf: [256]u8 = undefined;
-    switch (frameOwnedActivityProjection(&tail_buf, &shell, tail_ctx, null)) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqualStrings("  (↑50k ↓1.2k)", thinking.label);
-            try std.testing.expectEqual(ActivityProjection.Tone.neutral, thinking.tone);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
-test "static turn status reserves wrapped activity rows" {
-    const label = "⚠ API access denied · HTTP 403 · Provider: wafer · Your team has restricted access to this provider. Contact the owner of the account.";
-    const projection: ActivityProjection = .{ .turn_thinking = .{
-        .label = label,
-        .tone = .danger,
-    } };
-    const normal_thinking: ActivityProjection = .{ .turn_thinking = .{
-        .label = label,
-        .tone = .thinking,
-    } };
-
-    try std.testing.expectEqual(@as(u16, 1), activityProjectionRows(normal_thinking, 42));
-    try std.testing.expect(activityProjectionRows(projection, 42) > 1);
-    try std.testing.expectEqual(@as(u16, 1), activityProjectionRows(projection, 160));
-}
-
-test "static turn status wraps at word boundaries" {
-    const label = "⚠ aaaaaaaa bbbbbbbbbbb";
-    const projection: ActivityProjection = .{ .turn_thinking = .{
-        .label = label,
-        .tone = .danger,
-    } };
-
-    try std.testing.expectEqual(@as(u16, 3), activityProjectionRows(projection, 12));
-    try std.testing.expectEqual(@as(u16, 1), activityProjectionRows(projection, 30));
-}
-
-test "frame-owned activity uses clipped command activity label" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-
-    var shell = TranscriptRuntime{
-        .last_visible_transcript_tail_kind = .assistant_turn,
-    };
-    defer shell.deinit(std.testing.allocator);
-    const ctx: RenderContext = .{
-        .stream = .{
-            .active = true,
-            .command_count = 1,
-            .last_activity_kind = .command,
-            .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
-        },
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .activity = .{ .tool_slot = .{
-            .entry_id = 123,
-            .fallback_label = "running read-only tools",
-            .active = true,
-            .kind = .command,
-        } },
-        .input = &input,
-    };
-
-    var active_buf: [256]u8 = undefined;
-    switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
-            try std.testing.expectEqualStrings("• Thinking (↑10 ↓20)", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
     }
 }

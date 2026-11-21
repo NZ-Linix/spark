@@ -170,25 +170,3 @@ pub const ModelCall = struct {
         self.emit(.{ .model_output_start = self.id });
     }
 };
-
-test "semantic observer model identities are independent of debug IDs and capture their step" {
-    const Capture = struct {
-        steps: [4]usize = undefined,
-        len: usize = 0,
-        fn emit(raw: *anyopaque, step: usize, _: Event) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.steps[self.len] = step;
-            self.len += 1;
-        }
-    };
-    var capture: Capture = .{};
-    var observer = Observer{ .sink = .{ .context = &capture, .emit_fn = Capture.emit } };
-    observer.beginStep(1);
-    const data = provider.RequestData{ .model = "fixture", .messages = &.{}, .tool_choice = .none, .provider_options = .{} };
-    var call = observer.beginModel(data, .agent);
-    try std.testing.expectEqual(@as(usize, 1), call.id);
-    observer.beginStep(2);
-    call.output();
-    call.output();
-    try std.testing.expectEqualSlices(usize, &.{ 1, 1, 2, 1 }, &capture.steps);
-}

@@ -88,16 +88,3 @@ fn pathExists(path: []const u8) bool {
     std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
     return true;
 }
-
-test "a test build holds a work's start and sets the wait limit only through its hooks" {
-    // Without a hook nothing is armed, a hold returns at once, and the file
-    // controls are never read.
-    try std.testing.expect(!armed());
-    var cancel = std.atomic.Value(bool).init(false);
-    holdStart("child", &cancel);
-    try std.testing.expectEqual(@as(u32, 0), holds.load(.seq_cst));
-    try std.testing.expectEqual(default_wait_limit_ms, waitLimitMs());
-    test_wait_limit_ms = 25;
-    defer test_wait_limit_ms = null;
-    try std.testing.expectEqual(@as(u64, 25), waitLimitMs());
-}

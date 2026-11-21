@@ -1,18 +1,18 @@
-//! The `/connect` form in the footer. On the list it shows saved
+//! The `/provider` form in the footer. On the list it shows saved
 //! connections and "Add connection", then Edit, Delete, or Back for the one
 //! picked. In the form it shows a title with the step, the fields already
 //! entered, the focused field with a cursor, and a line that says why Enter
 //! was refused. The API key is always masked.
 
 const std = @import("std");
-const connect_menu = @import("../../core/input/connect_menu.zig");
+const provider_menu = @import("../../core/input/provider_menu.zig");
 const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
 
 const Allocator = std.mem.Allocator;
-const State = connect_menu.State;
+const State = provider_menu.State;
 
-pub const max_inline_rows: u16 = 7 + connect_menu.max_models + connect_menu.max_connections;
+pub const max_inline_rows: u16 = 7 + provider_menu.max_models + provider_menu.max_connections;
 const label_width = 18;
 
 pub const hint_variants = [_][]const u8{
@@ -78,7 +78,7 @@ pub fn menuRowCount(state: *const State, row_budget: u16) u16 {
     return @min(fullRowCount(state), row_budget);
 }
 
-pub fn composeConnectMenuRow(
+pub fn composeProviderMenuRow(
     alloc: Allocator,
     state: *const State,
     row_index: u16,
@@ -111,7 +111,7 @@ pub fn composeConnectMenuRow(
     var line: usize = index - 1;
     const filled = filledFieldCount(state);
     if (line < filled) {
-        const field: connect_menu.Field = switch (line) {
+        const field: provider_menu.Field = switch (line) {
             0 => .name,
             1 => .base_url,
             else => .api_key,
@@ -173,7 +173,7 @@ fn appendListRow(alloc: Allocator, row: *std.ArrayList(u8), state: *const State,
     const selected = item == state.selected;
     const label: []const u8 = switch (state.field) {
         .pick => if (item < state.connections.items.len) state.connections.items[item] else "+ Add connection",
-        else => connect_menu.actions[item],
+        else => provider_menu.actions[item],
     };
     try row.appendSlice(alloc, if (selected) "› " else "  ");
     const delete_row = state.field == .action and item == 1;
@@ -247,7 +247,7 @@ fn appendFocused(alloc: Allocator, row: *std.ArrayList(u8), state: *const State,
     }
 }
 
-fn appendModel(alloc: Allocator, row: *std.ArrayList(u8), model: connect_menu.Model, width: u16) !void {
+fn appendModel(alloc: Allocator, row: *std.ArrayList(u8), model: provider_menu.Model, width: u16) !void {
     var buf: [512]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     writer.writeAll(model.id) catch {};

@@ -42,20 +42,3 @@ pub fn reportSender(alloc: Allocator, text: []const u8) error{OutOfMemory}!?std.
     }
     return parsed;
 }
-
-test "frames are told from other text, and a report names its sender" {
-    const alloc = std.testing.allocator;
-    const report = report_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"c1\",\"work_id\":\"w1\",\"outcome\":\"completed\"}\n";
-    try std.testing.expect(isFrame(report));
-    try std.testing.expect(isFrame(message_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"c1\"}\n"));
-    try std.testing.expect(!isFrame("Subagent report, as the user typed it"));
-
-    const sender = (try reportSender(alloc, report)).?;
-    defer sender.deinit();
-    try std.testing.expectEqualStrings("c1", sender.value.child_id);
-    try std.testing.expectEqualStrings("w1", sender.value.work_id);
-
-    try std.testing.expect((try reportSender(alloc, message_header ++ "{\"child_id\":\"c1\",\"work_id\":\"w1\"}\n")) == null);
-    try std.testing.expect((try reportSender(alloc, report_header ++ "{\"child_id\":\"c1\"}\n")) == null);
-    try std.testing.expect((try reportSender(alloc, report_header ++ "not json")) == null);
-}

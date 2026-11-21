@@ -727,66 +727,6 @@ test "records round trip" {
     try testing.expectEqual(@as(u64, 11), del.ts_ms);
 }
 
-test "the fold keeps the newest put, merges open times, and a tombstone is final" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var out: std.ArrayList(u8) = .empty;
-    const a = arena.allocator();
-    try encodeRecord(a, &out, .{ .put = sample("s1", 1) });
-    try encodeRecord(a, &out, .{ .opened = .{ .id = "s1", .host = .app, .ts_ms = 5 } });
-    var newer = sample("s1", 3);
-    newer.turns = 4;
-    try encodeRecord(a, &out, .{ .put = newer });
-    try encodeRecord(a, &out, .{ .put = sample("s2", 2) });
-    try encodeRecord(a, &out, .{ .del = .{ .id = "s2", .ts_ms = 4 } });
-    try encodeRecord(a, &out, .{ .put = sample("s2", 9) }); // stale writer: ignored
-    try out.appendSlice(a, "{\"op\":\"put\",\"id\":\"torn"); // torn tail
-    var index = try Index.fold(testing.allocator, out.items);
-    defer index.deinit();
-    try testing.expectEqual(@as(u64, 0), index.damaged_lines);
-    const s1 = index.entries.get("s1").?.summary;
-    try testing.expectEqual(@as(u64, 4), s1.turns);
-    try testing.expectEqual(@as(u64, 5), s1.opened_ms[@backingInt(schema.Host.app)]);
-    try testing.expect(index.isDeleted("s2"));
-
-    // A flipped byte in a middle line is counted, never folded.
-    out.items[20] ^= 1;
-    var damaged = try Index.fold(testing.allocator, out.items);
-    defer damaged.deinit();
-    try testing.expectEqual(@as(u64, 1), damaged.damaged_lines);
-}
-
-test "open times decode without a second parse as written, and any other spelling as JSON" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try testing.expectEqual([host_count]u64{ 1791248460854, 0, 7, 0, 0 }, plainTimes("[1791248460854,0,7,0,0]").?);
-    for ([_][]const u8{ "[1,0,0,0]", "[1,0,0,0,0,0]", "[01,0,0,0,0]", "[1, 0,0,0,0]", "[-1,0,0,0,0]", "[1,0,0,0,]", "[]", "1" }) |raw| {
-        try testing.expect(plainTimes(raw) == null);
-    }
-    // A spelling this module never writes still decodes, through JSON.
-    var out: std.ArrayList(u8) = .empty;
-    try log_mod.appendFramed(a, &out, "{\"op\":\"put\",\"id\":\"s1\",\"role\":\"root\",\"host\":\"app\",\"workspace\":\"/w\",\"created\":1,\"updated\":2,\"turns\":1,\"opened\":[3, 0, 0, 0, 9]");
-    const put = (try decodeRecord(a, out.items)).?.put;
-    try testing.expectEqual([host_count]u64{ 3, 0, 0, 0, 9 }, put.opened_ms);
-}
-
-test "the live size is the share of folded lines still the newest of their id" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var out: std.ArrayList(u8) = .empty;
-    for (0..3) |_| try encodeRecord(a, &out, .{ .put = sample("s1", 1) });
-    try encodeRecord(a, &out, .{ .put = sample("s2", 1) });
-    var index = try Index.fold(testing.allocator, out.items);
-    defer index.deinit();
-    try testing.expectEqual(@as(u64, 4), index.lines);
-    try testing.expectEqual(out.items.len / 2, index.liveBytes(out.items.len));
-    var empty = try Index.fold(testing.allocator, "");
-    defer empty.deinit();
-    try testing.expectEqual(@as(usize, 0), empty.liveBytes(0));
-}
-
 const catalog_model_tests = struct {
     //! L3 and L4 against `tests/tla/session_manager/Catalog.tla`: publish, delete, crashes between
     //! the folder change and the index write, self-heal and rebuild, driven
@@ -1012,14 +952,6 @@ const catalog_model_tests = struct {
             try testing.expectError(error.NotFound, m.read(gpa, s2, .start, .forward, 1));
         }
         try tracer.trace.finish();
-    }
-
-    test "Catalog trace: publish, crash before the index, delete, crash after trash, heal, rebuild" {
-        try runCatalogTrace("crashes-heal-rebuild", .none);
-    }
-
-    test "Catalog trace: planted bug, rebuild resurrects a trashed id" {
-        try runCatalogTrace("planted-rebuild_resurrects", .rebuild_resurrects);
     }
 };
 

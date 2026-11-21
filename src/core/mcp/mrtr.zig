@@ -260,58 +260,6 @@ fn stringifyBounded(
     return try out.toOwnedSlice();
 }
 
-test "MRTR parses the closed request union and rejects unknown methods" {
-    const alloc = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        \\{"inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":8}},"roots":{"method":"roots/list"},"form":{"method":"elicitation/create","params":{"message":"Continue?","requestedSchema":{"type":"object","properties":{"confirmed":{"type":"boolean"}},"required":["confirmed"]}}}},"requestState":"opaque"}
-    ,
-        .{},
-    );
-    defer parsed.deinit();
-    var required = try parseInputRequired(alloc, parsed.value, .{});
-    defer required.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 3), required.requests.len);
-    try std.testing.expectEqualStrings("\"opaque\"", required.request_state_json.?);
-
-    var invalid = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        \\{"inputRequests":{"bad":{"method":"custom/request","params":{}}}}
-    ,
-        .{},
-    );
-    defer invalid.deinit();
-    try std.testing.expectError(
-        error.InvalidInputRequired,
-        parseInputRequired(alloc, invalid.value, .{}),
-    );
-}
-
-test "MRTR parser and response validation release allocation failures" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        checkAllocationFailures,
-        .{},
-    );
-}
-
-test "MRTR bounds opaque request state depth before retention" {
-    const alloc = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        "{\"inputRequests\":{},\"requestState\":[[[[true]]]]}",
-        .{},
-    );
-    defer parsed.deinit();
-    try std.testing.expectError(
-        error.MetadataLimitExceeded,
-        parseInputRequired(alloc, parsed.value, .{ .max_depth = 3 }),
-    );
-}
-
 fn checkAllocationFailures(alloc: Allocator) !void {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,

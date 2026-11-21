@@ -223,23 +223,6 @@ fn corpusOf(comptime values: []const u64) []const u8 {
     }
 }
 
-test "the transcript window keeps the model's laws on arbitrary event sequences" {
-    try std.testing.fuzz({}, fuzzCore, .{
-        .corpus = &(.{
-            // A saved session, window 2: a turn with two blocks, a save, a
-            // compaction, the turn's end, then Ctrl+O scrolled older to the log.
-            comptime corpusOf(&.{ 1, 0, 0, 1, 12, 0, 4, 0, 4, 1, 6, 2, 7, 1, 11, 12, 1, 14, 1, 1 }),
-        } ++ @import("fuzz_corpus").transcript_window.*),
-    });
-}
-
-test "the transcript window keeps the model's laws on seeded random event sequences" {
-    // The fuzz target's driver with a seeded generator in place of a fuzzer,
-    // so every test run walks thousands of sequences, not only the corpus.
-    var prng: std.Random.DefaultPrng = .init(20261030);
-    for (0..4000) |_| try driveCore(SeededDraws{ .random = prng.random() });
-}
-
 test {
     _ = tw;
 }

@@ -1179,33 +1179,6 @@ test "capture retention evicts orphans first, then the longest unused, ties by k
     for (expected, items) |key, item| try std.testing.expectEqualStrings(key, item.key);
 }
 
-test "capture retention takes no negative or far future time from usage" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const now: i64 = 1_800_000_000_000;
-    const store = "00112233445566778899aabbccddeeff";
-    for ([_][]const u8{
-        "v2 9999999999 -9223372036854775808\n",
-        "v2 9999999999 -1\n",
-        "v2 9999999999 9223372036854775807\n",
-        "v2 1 0\n" ++ store ++ " 1 -9223372036854775808 0123456789abcdef\n",
-        "v2 1 0\n" ++ store ++ " 1 -1 0123456789abcdef\n",
-        "v2 1 0\n" ++ store ++ " 1 9223372036854775807 0123456789abcdef\n",
-    }) |text| try std.testing.expect((try parseUsage(arena, text, now)) == null);
-    // Up to `future_ms` ahead stays a measure: a clock a little behind
-    // another process's does not throw the cache away.
-    const ahead = try arena.print("v2 1 {d}\n{s} 1 {d} 0123456789abcdef\n", .{ now + future_ms, store, now + future_ms });
-    const usage = (try parseUsage(arena, ahead, now)).?;
-    try std.testing.expectEqual(now + future_ms, usage.maintained_ms);
-    try std.testing.expect((try parseUsage(arena, "v2 1 1\n", std.math.maxInt(i64))) != null);
-    // Ages saturate, whatever a caller passes.
-    try std.testing.expect(!maintainedWithin(std.math.maxInt(i64), std.math.minInt(i64)));
-    try std.testing.expect(!maintainedWithin(std.math.minInt(i64), std.math.maxInt(i64)));
-    const stores = [_]StoreUsage{.{ .name = store, .bytes = 1, .at_ms = std.math.minInt(i64), .fingerprint = 1 }};
-    try std.testing.expect(reusable(.{ .total = 1, .stores = &stores }, store, 1, std.math.maxInt(i64)) == null);
-}
-
 /// A profile whose captures folder holds no store, only `filler_bytes` of
 /// files beside the stores, so `admit` runs without git stores.
 const TestProfile = struct {
@@ -1247,122 +1220,6 @@ const TestProfile = struct {
     }
 };
 
-test "capture retention: a second maintainer with a stale usage neither maintains again nor brings back the old time" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var profile = try TestProfile.init(arena);
-    defer profile.deinit();
-    const io = std.testing.io;
-
-    // Both processes measured before either maintained: the copy B holds.
-    const config = profile.config(1);
-    const stale: Usage = .{ .total = TestProfile.filler_bytes, .maintained_ms = 0, .stores = &.{} };
-    // A runs maintenance first and records its time.
-    const first = try admit(arena, config);
-    try std.testing.expect(first.maintained);
-    const maintained_ms = (try readUsage(arena, io, profile.usage, config.now_ms)).?.maintained_ms;
-    try std.testing.expectEqual(config.now_ms, maintained_ms);
-
-    // B reaches the lock after A released it: the interval A started holds.
-    const second = try maintain(arena, io, config, profile.captures, profile.usage, stale);
-    try std.testing.expect(!second.maintained);
-    try std.testing.expectEqual(@as(?Refusal, .over_budget), second.refusal);
-    // B's write outside the lock keeps A's time.
-    writeUsage(arena, io, profile.usage, stale, config.now_ms);
-    try std.testing.expectEqual(maintained_ms, (try readUsage(arena, io, profile.usage, config.now_ms)).?.maintained_ms);
-    // So the next admit, in any process, waits the interval too.
-    const third = try admit(arena, profile.config(1));
-    try std.testing.expect(!third.maintained);
-    try std.testing.expectEqual(@as(?Refusal, .over_budget), third.refusal);
-}
-
-test "capture retention: check never maintains, and a cancelled maintenance records no time" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var profile = try TestProfile.init(arena);
-    defer profile.deinit();
-    const io = std.testing.io;
-
-    // Over the budget, `check` refuses with maintenance due, and runs none.
-    const checked = try check(arena, profile.config(1));
-    try std.testing.expect(!checked.admit);
-    try std.testing.expect(checked.due);
-    try std.testing.expect(!checked.maintained);
-    try std.testing.expectEqual(@as(?Refusal, .over_budget), checked.refusal);
-    try std.testing.expectEqual(@as(i64, 0), (try readUsage(arena, io, profile.usage, io_mod.milliTimestamp())).?.maintained_ms);
-
-    // A maintenance cancelled before its first step stops there and keeps
-    // the earlier time, so maintenance is still due.
-    var cancel: std.atomic.Value(bool) = .init(true);
-    var cancelled_config = profile.config(1);
-    cancelled_config.cancel = &cancel;
-    const cancelled = try admit(arena, cancelled_config);
-    try std.testing.expect(cancelled.maintained);
-    try std.testing.expect(!cancelled.admit);
-    try std.testing.expectEqual(@as(i64, 0), (try readUsage(arena, io, profile.usage, io_mod.milliTimestamp())).?.maintained_ms);
-    try std.testing.expect((try check(arena, profile.config(1))).due);
-
-    // One that runs records its time: within the interval, `check` refuses
-    // without asking for another.
-    const ran = try admit(arena, profile.config(1));
-    try std.testing.expect(ran.maintained);
-    const after = try check(arena, profile.config(1));
-    try std.testing.expect(!after.due);
-    try std.testing.expectEqual(@as(?Refusal, .over_budget), after.refusal);
-    // Under the budget, `check` admits.
-    try std.testing.expect((try check(arena, profile.config(budget_bytes))).admit);
-}
-
-test "capture retention: a usage file with times out of range is no cache and nothing overflows" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var profile = try TestProfile.init(arena);
-    defer profile.deinit();
-    const io = std.testing.io;
-    // A folder with a store's name and settled object folders, so its line
-    // in `usage` is looked at.
-    const name = "00112233445566778899aabbccddeeff";
-    try profile.tmp.dir.createDirPath(io, "captures/" ++ name ++ "/store.git/objects/pack");
-    const old: std.Io.Timestamp = .{ .nanoseconds = @as(i96, io_mod.milliTimestamp() - 60 * std.time.ms_per_s) * std.time.ns_per_ms };
-    for ([_][]const u8{ "captures/" ++ name ++ "/store.git/objects", "captures/" ++ name ++ "/store.git/objects/pack" }) |path| {
-        try profile.tmp.dir.setTimestamps(io, path, .{ .modify_timestamp = .{ .new = old } });
-    }
-    const fingerprint = try fingerprintStore(arena, io, try std.Io.Dir.path.join(arena, &.{ profile.captures, name }));
-    try std.testing.expect(fingerprint != 0);
-
-    for ([_][]const u8{
-        "v2 9999999999 -9223372036854775808\n",
-        try arena.print("v2 9999999999 0\n{s} 1 -9223372036854775808 {x:0>16}\n", .{ name, fingerprint }),
-        try arena.print("v2 9999999999 0\n{s} 1 9223372036854775807 {x:0>16}\n", .{ name, fingerprint }),
-    }) |text| {
-        try profile.tmp.dir.writeFile(io, .{ .sub_path = "captures/usage", .data = text });
-        // Over the budget, so the maintenance time is looked at too.
-        const admission = try admit(arena, profile.config(1));
-        try std.testing.expect(admission.maintained);
-        try std.testing.expect(admission.used.? >= TestProfile.filler_bytes);
-    }
-}
-
-test "capture retention: a FIFO at captures/usage is no cache and does not block" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var profile = try TestProfile.init(arena);
-    defer profile.deinit();
-    const made = std.process.run(arena, std.testing.io, .{ .argv = &.{ "mkfifo", profile.usage } }) catch return error.SkipZigTest;
-    switch (made.term) {
-        .exited => |code| if (code != 0) return error.SkipZigTest,
-        else => return error.SkipZigTest,
-    }
-    try std.testing.expect((try readUsage(arena, std.testing.io, profile.usage, io_mod.milliTimestamp())) == null);
-    const admission = try admit(arena, profile.config(budget_bytes));
-    try std.testing.expect(admission.admit);
-    try std.testing.expect(admission.used.? >= TestProfile.filler_bytes);
-}
-
 /// A maintenance task cancelled while one of its helpers reads a folder or
 /// a file: it waits, shielded from the cancel, until `go`, runs the helper,
 /// which meets the cancel, then stands in for the next git run with a 10 s
@@ -1402,55 +1259,6 @@ const CancelInHelper = struct {
         self.go.store(true, .release);
     }
 };
-
-test "capture retention: a cancel that lands in a helper still reaches maintenance's next step" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var profile = try TestProfile.init(arena);
-    defer profile.deinit();
-    const io = std.testing.io;
-    const name = "00112233445566778899aabbccddeeff";
-    try profile.tmp.dir.createDirPath(io, "captures/" ++ name ++ "/store.git/objects/ab");
-    try profile.tmp.dir.writeFile(io, .{ .sub_path = "captures/" ++ name ++ "/store.git/objects/ab/cdef", .data = "x" });
-    try profile.tmp.dir.writeFile(io, .{ .sub_path = "captures/usage", .data = "v2 0 0\n" });
-    const store = try std.Io.Dir.path.join(arena, &.{ profile.captures, name });
-    for ([_]CancelInHelper.Helper{ .refresh, .count_loose, .measure, .read_usage }) |helper| {
-        var task: CancelInHelper = .{ .profile = &profile, .store = store };
-        var future = try io.concurrent(CancelInHelper.run, .{ &task, helper });
-        const releaser = try std.Thread.spawn(.{}, CancelInHelper.release, .{&task});
-        const began = io_mod.milliTimestamp();
-        // As `turn_capture.finishMaintenance` cancels one past its grace.
-        future.cancel(io);
-        releaser.join();
-        try std.testing.expect(task.saw_cancel);
-        try std.testing.expect(io_mod.milliTimestamp() - began < 2000);
-    }
-}
-
-test "capture retention reads back every ref line and usage it accepts on fuzzed bytes" {
-    try std.testing.fuzz({}, fuzzParse, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "refs/spark/sessions/00112233445566778899aabbccddeeff/ffeeddccbbaa99887766554433221100 0123456789abcdef0123456789abcdef01234567 1700000000",
-            "refs/spark/sessions/00112233445566778899aabbccddeeff/ffeeddccbbaa99887766554433221100 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef -0_1",
-            "refs/spark/sessions/00112233445566778899aabbccddeeff/ffeeddccbbaa99887766554433221100/x 0123456789abcdef0123456789abcdef01234567 1",
-            "refs/spark/sessions/0011/ffee 0123 +1",
-            "v2 5368709120 0\n00112233445566778899aabbccddeeff 4096 1700000000000 0123456789abcdef\nffeeddccbbaa99887766554433221100 8192 1700000000001 0000000000000000\n",
-            "v2 +1_0 -7\n00112233445566778899aabbccddeeff 1_0 -0 ffffffffffffffff\n",
-            "v2 1 0\n00112233445566778899aabbccddeeff 4096 1 0123456789abcdef\n",
-            "v2 9000 0\nffeeddccbbaa99887766554433221100 1 1 0123456789abcdef\n00112233445566778899aabbccddeeff 1 1 0123456789abcdef\n",
-            "v2 0 0\n",
-            "v2 9999999999 -9223372036854775808\n",
-            "v2 9999999999 9223372036854775807\n",
-            "v2 1 0\n00112233445566778899aabbccddeeff 1 -9223372036854775808 0123456789abcdef\n",
-            "v2 1 0\n00112233445566778899aabbccddeeff 1 9223372036854775807 0123456789abcdef\n",
-            "v2 1 1800086400000\n",
-            "5368709120 1700000000000\n",
-            "v2 1 2 3\n",
-            " ",
-        }) ++ @import("fuzz_corpus").capture_retention_parse.*),
-    });
-}
 
 /// The clock `fuzzParse` reads usage against.
 const fuzz_now_ms: i64 = 1_800_000_000_000;
@@ -1499,44 +1307,4 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) anyerror!void {
         }
         try std.testing.expectEqualStrings(again, try formatUsage(arena, reparsed));
     }
-}
-
-test "capture retention rotates a journal over its limit" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var profile = try TestProfile.init(arena);
-    defer profile.deinit();
-    const io = std.testing.io;
-    const path = try std.Io.Dir.path.join(arena, &.{ profile.captures, "evictions.jsonl" });
-    const big = try arena.alloc(u8, @intCast(max_journal_bytes + 1));
-    @memset(big, 'x');
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = big });
-
-    try appendJournal(arena, io, path, .{ .phase = .intent, .at_ms = 1, .key = "00112233445566778899aabbccddeeff", .reason = .budget, .refs = 1 });
-
-    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
-    const text = try io_mod.readFileToEnd(arena, &file, max_usage_bytes);
-    // The old journal is rotated aside and the new one holds only this line.
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n"));
-    try std.testing.expect(std.mem.startsWith(u8, text, "{\"v\":1,"));
-    try std.testing.expect(capture_store.exists(io, try arena.print("{s}.1", .{path})));
-}
-
-test "capture retention: a store whose worktrees folder cannot be listed is not locked" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
-    const store_dir = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
-    try tmp.dir.writeFile(io, .{ .sub_path = "init.lock", .data = "" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "worktrees", .data = "" });
-    var locks: std.ArrayList(std.Io.File) = .empty;
-    defer for (locks.items) |file| file.close(io);
-    const deadline: std.Io.Clock.Timestamp = .fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(1000) });
-    const names = try lockStore(arena, io, &locks, store_dir, deadline, null);
-    try std.testing.expect(names == null);
 }

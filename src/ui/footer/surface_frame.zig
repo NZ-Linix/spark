@@ -4,16 +4,12 @@ const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const diff_mod = @import("../../core/output/diff.zig");
 const io_mod = @import("../../core/shared/io.zig");
-const permission_request = @import("../../core/permissions/permission_request.zig");
-const approval_prompt = @import("../../core/permissions/approval_prompt.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
 const types = @import("../../core/shared/types.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const footer_viewport = @import("viewport.zig");
-const approval_ui = @import("approval_ui.zig");
 const compact_command_menu_presentation = @import("compact_command_menu_presentation.zig");
 const input_presentation = @import("input_presentation.zig");
-const interaction_state = @import("interaction_state.zig");
 const picker_presentation = @import("picker_presentation.zig");
 const model_menu_presentation = @import("model_menu_presentation.zig");
 const skills_menu_presentation = @import("skills_menu_presentation.zig");
@@ -22,7 +18,7 @@ const settings_menu_presentation = @import("settings_menu_presentation.zig");
 const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
 const effort_menu_presentation = @import("effort_menu_presentation.zig");
-const connect_menu_presentation = @import("connect_menu_presentation.zig");
+const provider_menu_presentation = @import("provider_menu_presentation.zig");
 const list_picker_presentation = @import("list_picker_presentation.zig");
 const splash = @import("splash.zig");
 const fork_menu_presentation = @import("fork_menu_presentation.zig");
@@ -48,8 +44,6 @@ const ActivityPlacement = activity_overlay.ActivityPlacement;
 const FooterRows = footer_layout.FooterRows;
 const FrameInvalidationSet = paint_plan.FrameInvalidationSet;
 const PaintPlan = paint_plan.PaintPlan;
-const ApprovalPrompt = approval_prompt.ApprovalPrompt;
-const ApprovalProjection = approval_prompt.Projection;
 const InputRuntime = core_input_runtime.Runtime;
 const PickerKind = input_presentation.PickerKind;
 const RenderContext = render_input.RenderContext;
@@ -101,10 +95,9 @@ const FooterSurfaceActivity = struct {
     fn resolve(
         buf: []u8,
         shell: *TranscriptRuntime,
-        approval: ?ApprovalProjection,
         ctx: RenderContext,
     ) FooterSurfaceActivity {
-        const projection = render_input.frameOwnedActivityProjection(buf, shell, ctx, approval);
+        const projection = render_input.frameOwnedActivityProjection(buf, shell, ctx);
         return .{
             .projection = projection,
             .active_label = render_input.activityProjectionLabel(projection),
@@ -142,7 +135,6 @@ const FooterSurfaceProjection = struct {
     slash_menu_layout: ?picker_presentation.SlashMenuLayout,
     prepared_slash_menu: picker_presentation.PreparedSlashMenu,
     picker_start_col: u16,
-    file_approval_active: bool,
     transcript_viewer_active: bool,
     allocated_rows: ?u16,
 
@@ -159,7 +151,6 @@ const FooterSurfaceProjection = struct {
     fn framePlannerInput(
         self: *const FooterSurfaceProjection,
         ctx: RenderContext,
-        approval: ?ApprovalProjection,
         place_mid_line_active: bool,
         applied_bottom_reserved_rows: u16,
         transcript_state: ?FooterTranscriptState,
@@ -179,7 +170,6 @@ const FooterSurfaceProjection = struct {
             .footer_extra_rows = self.footer_extra,
             .allocated_rows = self.allocated_rows,
             .applied_bottom_reserved_rows = applied_bottom_reserved_rows,
-            .approval = approval,
             .input_display = self.input_display,
             .input_cursor = self.input_cursor,
             .input_summary = self.input_summary,
@@ -376,7 +366,6 @@ pub fn clampSteeringBannerRows(
 fn buildFooterSurfaceProjection(
     alloc: Allocator,
     shell: *TranscriptRuntime,
-    approval: ?ApprovalProjection,
     ctx: RenderContext,
     activity: FooterSurfaceActivity,
     mode: FooterSurfaceProjectionMode,
@@ -384,53 +373,42 @@ fn buildFooterSurfaceProjection(
     const viewer_active = ctx.transcript_depth.active();
     const activity_projection: ActivityProjection = if (viewer_active) .none else activity.projection;
     const active_label = if (viewer_active) null else activity.active_label;
-    const approval_active = approval != null;
     const question_projection = switch (mode) {
         .reservation => null,
-        .measurement, .frame => if (!viewer_active and !approval_active) ctx.question else null,
+        .measurement, .frame => if (!viewer_active) ctx.question else null,
     };
-    const compact_command_menu = if (!viewer_active and !approval_active and question_projection == null)
+    const compact_command_menu = if (!viewer_active and question_projection == null)
         render_input.activeCompactCommandMenu(ctx)
     else
         null;
     const compact_command_active = compact_command_menu != null;
     const modal_active = !viewer_active and switch (mode) {
-        .reservation => approval_active or compact_command_active,
-        .measurement, .frame => approval_active or question_projection != null or compact_command_active,
+        .reservation => compact_command_active,
+        .measurement, .frame => question_projection != null or compact_command_active,
     };
     const input_visible = ctx.composer_visible and !modal_active and !viewer_active;
     const composer_top_chrome_rows = footer_paint_plan.composerTopChromeRows();
-    // The provider flow's inline API-key field is rendered in the composer column,
-    // not as the legacy auth panel.
-    const inline_api_key = ctx.auth_picker.active and ctx.auth_picker.stage == .api_key and ctx.auth_picker.api_key_inline;
-    const show_auth_picker = !viewer_active and !modal_active and
-        (!ctx.stream.active or ctx.auth_picker_during_turn) and
-        ctx.auth_picker.active and !inline_api_key;
-    const show_settings_menu = !viewer_active and !show_auth_picker and !modal_active and ctx.settings_menu.active;
-    const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and ctx.mcp_host_menu.active();
-    const show_help_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !modal_active and ctx.help_menu.active;
-    const show_session_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !modal_active and ctx.session_menu.active;
-    const show_fork_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.fork_menu.active();
-    const show_agents_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !modal_active and ctx.agents_menu.active();
-    const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !show_agents_menu and !modal_active and ctx.model_menu.active;
-    const show_effort_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !show_agents_menu and !show_models_menu and !modal_active and ctx.effort_menu.active;
-    const show_connect_menu = !viewer_active and !modal_active and ctx.connect_menu != null;
-    const show_list_picker = !viewer_active and !modal_active and !show_connect_menu and ctx.list_picker != null;
-    const show_inline_catalog = show_connect_menu or show_list_picker or show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_fork_menu or show_agents_menu or show_models_menu or show_effort_menu;
-    const show_skills_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !modal_active and ctx.skills_menu.active;
-    const show_model_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and
+    const show_settings_menu = !viewer_active and !modal_active and ctx.settings_menu.active;
+    const show_mcp_menu = !viewer_active and !show_settings_menu and !modal_active and ctx.mcp_host_menu.active();
+    const show_help_menu = !viewer_active and !show_settings_menu and !show_mcp_menu and !modal_active and ctx.help_menu.active;
+    const show_session_menu = !viewer_active and !show_settings_menu and !show_mcp_menu and !show_help_menu and !modal_active and ctx.session_menu.active;
+    const show_fork_menu = !viewer_active and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.fork_menu.active();
+    const show_agents_menu = !viewer_active and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !modal_active and ctx.agents_menu.active();
+    const show_models_menu = !viewer_active and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !show_agents_menu and !modal_active and ctx.model_menu.active;
+    const show_effort_menu = !viewer_active and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !show_agents_menu and !show_models_menu and !modal_active and ctx.effort_menu.active;
+    const show_provider_menu = !viewer_active and !modal_active and ctx.provider_menu != null;
+    const show_list_picker = !viewer_active and !modal_active and !show_provider_menu and ctx.list_picker != null;
+    const show_inline_catalog = show_provider_menu or show_list_picker or show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_fork_menu or show_agents_menu or show_models_menu or show_effort_menu;
+    const show_skills_query = !viewer_active and !show_inline_catalog and !modal_active and ctx.skills_menu.active;
+    const show_model_query = !viewer_active and !show_inline_catalog and !show_skills_query and !modal_active and
         ctx.model_query_active;
-    const show_provider_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and !ctx.stream.active and
-        ctx.provider_query_active and !show_model_query;
-    const show_file_query = !viewer_active and !show_inline_catalog and !show_skills_query and !modal_active and ctx.file_query_active and !show_model_query and !show_provider_query;
-    const prepared_slash_prefix = if (!show_auth_picker and
-        !show_inline_catalog and
-        !show_skills_query)
+    const show_file_query = !viewer_active and !show_inline_catalog and !show_skills_query and !modal_active and ctx.file_query_active and !show_model_query;
+    const prepared_slash_prefix = if (!show_inline_catalog and !show_skills_query)
         input_presentation.slashCompletionPickerPrefix(
             ctx,
             modal_active,
             show_model_query,
-            show_provider_query or show_file_query,
+            show_file_query,
         )
     else
         null;
@@ -444,37 +422,30 @@ fn buildFooterSurfaceProjection(
     else
         picker_presentation.PreparedSlashMenu{};
     errdefer prepared_slash_menu.deinit(alloc);
-    const geometry = input_presentation.measureRawInputGeometryPreparedWithProvider(
+    const geometry = input_presentation.measureRawInputGeometryPrepared(
         ctx,
         shell.layout.cols,
         shell.layout.content_bottom,
         input_visible,
         modal_active,
         show_model_query,
-        show_provider_query,
         show_file_query,
         if (prepared_slash_prefix != null) prepared_slash_menu.resultCount() else null,
     );
     const show_slash_query = prepared_slash_prefix != null and geometry.show_slash_query;
-    const show_picker = show_auth_picker or show_inline_catalog or show_skills_query or show_model_query or show_provider_query or show_file_query or show_slash_query;
+    const show_picker = show_inline_catalog or show_skills_query or show_model_query or show_file_query or show_slash_query;
     const picker_items: []const []const u8 = if (show_model_query)
         ctx.model_completions
-    else if (show_provider_query)
-        ctx.provider_picker_completions
     else
         &.{};
-    const picker_annotations: []const []const u8 = if (show_provider_query) ctx.provider_picker_annotations else &.{};
+    const picker_annotations: []const []const u8 = &.{};
     const file_picker_items: []const file_index.SearchResult = if (show_file_query) ctx.file_completions else &.{};
     const picker_selection_index: usize = if (show_skills_query)
         ctx.skills_menu.selected_index
     else if (show_slash_query)
         ctx.input.picker.slash_completion_index
-    else if (show_auth_picker)
-        ctx.auth_picker.selectedIndex()
     else if (show_model_query)
         ctx.model_completion_index
-    else if (show_provider_query)
-        ctx.provider_picker_completion_index
     else if (show_file_query)
         ctx.file_completion_index
     else
@@ -485,8 +456,6 @@ fn buildFooterSurfaceProjection(
         ctx.input.picker.slash_completion_window_start
     else if (show_model_query)
         ctx.model_completion_window_start
-    else if (show_provider_query)
-        ctx.provider_picker_completion_window_start
     else if (show_file_query)
         ctx.file_completion_window_start
     else
@@ -503,8 +472,8 @@ fn buildFooterSurfaceProjection(
         ctx.file_completions_failed
     else
         false;
-    const picker_kind: PickerKind = if (show_connect_menu)
-        .connect
+    const picker_kind: PickerKind = if (show_provider_menu)
+        .provider
     else if (show_list_picker)
         .list
     else if (show_skills_query)
@@ -527,18 +496,12 @@ fn buildFooterSurfaceProjection(
         .effort
     else if (show_slash_query)
         .slash
-    else if (show_auth_picker)
-        .auth
     else if (show_model_query)
         .model_stage
-    else if (show_provider_query)
-        .provider_stage
     else if (show_file_query)
         .file
     else
         .model_stage;
-    const sizing_request = if (approval) |value| value.request else null;
-    const file_request = if (sizing_request) |request| request.file else null;
     // The launch splash holds the version line in the banner rows until the
     // first prompt.
     const banner_rows = if (viewer_active) 0 else if (ctx.splash != null and ctx.steering_messages.len == 0 and !modal_active) splash.banner_rows else if (ctx.live_preview != null and ctx.steering_messages.len == 0 and !modal_active) clampSteeringBannerRows(
@@ -616,11 +579,11 @@ fn buildFooterSurfaceProjection(
         banner_rows,
         effort_menu_presentation.max_inline_rows,
     );
-    const connect_picker_row_budget = picker_presentation.inlinePickerRowBudgetCapped(
+    const provider_picker_row_budget = picker_presentation.inlinePickerRowBudgetCapped(
         shell.layout.rows,
         geometry.input_extra,
         banner_rows,
-        connect_menu_presentation.max_inline_rows,
+        provider_menu_presentation.max_inline_rows,
     );
     const agents_picker_row_budget = picker_presentation.inlinePickerRowBudgetCapped(
         shell.layout.rows,
@@ -628,17 +591,7 @@ fn buildFooterSurfaceProjection(
         banner_rows,
         agents_menu_presentation.max_inline_rows,
     );
-    const picker_rows: u16 = if (sizing_request) |request|
-        if (request.file) |request_file|
-            approval_ui.fileApprovalPickerRows(request_file)
-        else
-            try inlineApprovalPanelRowsForRequest(
-                alloc,
-                request,
-                shell.layout.cols,
-                shell.layout.rows,
-            )
-    else if (question_projection) |projection|
+    const picker_rows: u16 = if (question_projection) |projection|
         try question_ui.questionPanelRowsForLayout(
             alloc,
             projection,
@@ -647,13 +600,6 @@ fn buildFooterSurfaceProjection(
         )
     else if (compact_command_menu) |menu|
         compact_command_menu_presentation.footerRowCount(menu, shell.layout.cols, shell.layout.rows)
-    else if (show_auth_picker)
-        picker_presentation.authPickerReservedRows(
-            ctx.auth_picker,
-            shell.layout.rows,
-            geometry.input_extra,
-            banner_rows,
-        )
     else if (show_settings_menu)
         settings_menu_presentation.menuRowCount(
             ctx.settings_menu,
@@ -694,8 +640,8 @@ fn buildFooterSurfaceProjection(
         )
     else if (show_effort_menu)
         effort_menu_presentation.menuRowCount(ctx.effort_menu, effort_picker_row_budget)
-    else if (show_connect_menu)
-        connect_menu_presentation.menuRowCount(ctx.connect_menu.?, connect_picker_row_budget)
+    else if (show_provider_menu)
+        provider_menu_presentation.menuRowCount(ctx.provider_menu.?, provider_picker_row_budget)
     else if (show_list_picker)
         list_picker_presentation.menuRowCount(ctx.list_picker.?, picker_presentation.inlinePickerRowBudgetCapped(
             shell.layout.rows,
@@ -720,8 +666,6 @@ fn buildFooterSurfaceProjection(
         .measurement => null,
         .reservation, .frame => if (viewer_active)
             footer_layout.transcript_viewer_rows
-        else if (file_request) |request|
-            approval_ui.fileApprovalDesiredRows(request.preview) +| banner_rows
         else
             null,
     };
@@ -756,7 +700,6 @@ fn buildFooterSurfaceProjection(
         .slash_menu_layout = slash_menu_layout,
         .prepared_slash_menu = prepared_slash_menu,
         .picker_start_col = geometry.picker_start_col,
-        .file_approval_active = file_request != null,
         .transcript_viewer_active = viewer_active,
         .allocated_rows = allocated_rows,
     };
@@ -955,7 +898,6 @@ pub const SurfaceFooterMeasurement = struct {
     slash_menu_layout: ?picker_presentation.SlashMenuLayout = null,
     prepared_slash_menu: picker_presentation.PreparedSlashMenu = .{},
     picker_start_col: u16 = 1,
-    file_approval_active: bool = false,
     transcript_viewer_active: bool = false,
 
     pub fn deinit(self: *SurfaceFooterMeasurement, alloc: Allocator) void {
@@ -1043,7 +985,7 @@ pub const SurfaceFooterMeasurement = struct {
             .picker_rows = self.picker_rows,
             .banner_active = self.banner_active,
             .banner_rows = banner_rows,
-            .allocated_rows = if (self.file_approval_active or self.transcript_viewer_active)
+            .allocated_rows = if (self.transcript_viewer_active)
                 @min(natural_rows, available_rows)
             else
                 null,
@@ -1053,7 +995,6 @@ pub const SurfaceFooterMeasurement = struct {
     fn plannerInput(
         self: *const SurfaceFooterMeasurement,
         ctx: RenderContext,
-        approval: ?ApprovalProjection,
         place_mid_line_active: bool,
         applied_bottom_reserved_rows: u16,
         transcript_state: ?FooterTranscriptState,
@@ -1075,12 +1016,11 @@ pub const SurfaceFooterMeasurement = struct {
             .banner_active = banner_active,
             .banner_rows = banner_rows,
             .footer_extra_rows = self.footer_extra,
-            .allocated_rows = if (self.file_approval_active or self.transcript_viewer_active)
+            .allocated_rows = if (self.transcript_viewer_active)
                 self.frameLayoutMeasurement().natural_rows
             else
                 null,
             .applied_bottom_reserved_rows = applied_bottom_reserved_rows,
-            .approval = approval,
             .input_display = self.input_display,
             .input_cursor = self.input_cursor,
             .input_summary = self.input_summary,
@@ -1106,14 +1046,12 @@ pub const SurfaceFooterMeasurement = struct {
     fn actualPlannerInput(
         self: *const SurfaceFooterMeasurement,
         ctx: RenderContext,
-        approval: ?ApprovalProjection,
         place_mid_line_active: bool,
         applied_bottom_reserved_rows: u16,
         transcript_state: ?FooterTranscriptState,
     ) FooterPlannerInput {
         return self.plannerInput(
             ctx,
-            approval,
             place_mid_line_active,
             applied_bottom_reserved_rows,
             transcript_state,
@@ -1124,60 +1062,19 @@ pub const SurfaceFooterMeasurement = struct {
     }
 };
 
-pub fn commandApprovalFitsInline(
-    alloc: Allocator,
-    label: []const u8,
-    command: ?[]const u8,
-    layout: types.Layout,
-    banner_row_count: usize,
-) !bool {
-    const picker_rows = try approval_ui.inlineApprovalPanelRowsForCommand(
-        alloc,
-        label,
-        command,
-        layout.cols,
-        layout.rows,
-    );
-    const banner_rows: u16 = @intCast(@min(banner_row_count, std.math.maxInt(u16)));
-    const measurement = SurfaceFooterMeasurement{
-        .input_visible = false,
-        .picker_rows = picker_rows,
-        .banner_active = banner_rows > 0,
-        .banner_rows = banner_rows,
-    };
-    return measurement.frameLayoutMeasurement().natural_rows <= layout.rows;
-}
-
-fn inlineApprovalPanelRowsForRequest(
-    alloc: Allocator,
-    request: anytype,
-    width: u16,
-    terminal_rows: u16,
-) !u16 {
-    return approval_ui.inlineApprovalPanelRowsForCommand(
-        alloc,
-        request.label,
-        request.command,
-        width,
-        terminal_rows,
-    );
-}
-
 pub noinline fn measureSurfaceFooter(
     alloc: Allocator,
     shell: *TranscriptRuntime,
-    approval: ?ApprovalProjection,
     ctx: RenderContext,
 ) !SurfaceFooterMeasurement {
     var measurement = SurfaceFooterMeasurement{};
     errdefer measurement.deinit(alloc);
 
     var active_buf: [256]u8 = undefined;
-    const activity = FooterSurfaceActivity.resolve(&active_buf, shell, approval, ctx);
+    const activity = FooterSurfaceActivity.resolve(&active_buf, shell, ctx);
     var projection = try buildFooterSurfaceProjection(
         alloc,
         shell,
-        approval,
         ctx,
         activity,
         .measurement,
@@ -1225,7 +1122,6 @@ pub noinline fn measureSurfaceFooter(
     measurement.picker_failed = projection.picker_failed;
     measurement.picker_kind = projection.picker_kind;
     measurement.picker_start_col = projection.picker_start_col;
-    measurement.file_approval_active = projection.file_approval_active;
     measurement.transcript_viewer_active = projection.transcript_viewer_active;
     measurement.picker_rows = projection.picker_rows;
     measurement.top_gap_rows = projection.top_gap_rows;
@@ -1247,7 +1143,6 @@ pub noinline fn prepareMeasuredSurfaceFooterFrameForPlan(
     alloc: Allocator,
     shell: *TranscriptRuntime,
     force_redraw: *bool,
-    approval: ?ApprovalProjection,
     ctx: RenderContext,
     measurement: *const SurfaceFooterMeasurement,
     plan: PaintPlan,
@@ -1277,7 +1172,6 @@ pub noinline fn prepareMeasuredSurfaceFooterFrameForPlan(
         .paint = paint,
         .planner_input = measurement.actualPlannerInput(
             ctx,
-            approval,
             false,
             0,
             null,
@@ -1331,19 +1225,18 @@ pub noinline fn resolveSurfaceFooterReservation(
     alloc: Allocator,
     shell: *TranscriptRuntime,
     force_redraw: *bool,
-    approval: ?ApprovalProjection,
     ctx: RenderContext,
     transcript_state: FooterTranscriptState,
 ) !SurfaceFooterReservation {
     var active_buf: [256]u8 = undefined;
-    const activity = FooterSurfaceActivity.resolve(&active_buf, shell, approval, ctx);
+    const activity = FooterSurfaceActivity.resolve(&active_buf, shell, ctx);
     const activity_projection = activity.projection;
     const active_label = activity.active_label;
     const trace = bottomReservationTraceAnchorFromTranscript(transcript_state);
 
     var bottom_reservation = BottomReservationState{};
     const input_visible_for_transient =
-        ctx.composer_visible and approval == null;
+        ctx.composer_visible and true;
     const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
     const banner_rows_for_transient = steeringBannerRowsForLayout(
         ctx,
@@ -1353,7 +1246,7 @@ pub noinline fn resolveSurfaceFooterReservation(
         composer_top_chrome_rows_for_transient,
         0,
     );
-    const banner_active_for_transient = approval != null or banner_rows_for_transient > 0;
+    const banner_active_for_transient = banner_rows_for_transient > 0;
     var frame_plan = footer_paint_plan.planFooterPaint(shell, .{
         .active_label = active_label,
         .activity_projection = activity_projection,
@@ -1372,7 +1265,6 @@ pub noinline fn resolveSurfaceFooterReservation(
     var projection = try buildFooterSurfaceProjection(
         alloc,
         shell,
-        approval,
         ctx,
         activity,
         .reservation,
@@ -1410,12 +1302,11 @@ pub noinline fn prepareSurfaceFooterFrameWithReservation(
     shell: *TranscriptRuntime,
     metrics: *Metrics,
     force_redraw: *bool,
-    approval: ?ApprovalProjection,
     ctx: RenderContext,
     reservation: SurfaceFooterReservation,
     attempt_invalidations: FrameInvalidationSet,
 ) !SurfaceFooterFrame {
-    return prepareSurfaceFooterFrameInternal(alloc, shell, metrics, force_redraw, approval, ctx, reservation, attempt_invalidations);
+    return prepareSurfaceFooterFrameInternal(alloc, shell, metrics, force_redraw, ctx, reservation, attempt_invalidations);
 }
 
 fn prepareSurfaceFooterFrameInternal(
@@ -1423,14 +1314,13 @@ fn prepareSurfaceFooterFrameInternal(
     shell: *TranscriptRuntime,
     metrics: *Metrics,
     force_redraw: *bool,
-    approval: ?ApprovalProjection,
     ctx: RenderContext,
     reservation: SurfaceFooterReservation,
     attempt_invalidations: FrameInvalidationSet,
 ) !SurfaceFooterFrame {
     _ = metrics;
     var active_buf: [256]u8 = undefined;
-    const activity = FooterSurfaceActivity.resolve(&active_buf, shell, approval, ctx);
+    const activity = FooterSurfaceActivity.resolve(&active_buf, shell, ctx);
     const activity_projection = activity.projection;
     const active_label = activity.active_label;
     const trace = bottomReservationTraceAnchorFromShell(shell);
@@ -1443,7 +1333,7 @@ fn prepareSurfaceFooterFrameInternal(
 
     if (!reservation.precomputed) {
         const input_visible_for_transient =
-            ctx.composer_visible and approval == null;
+            ctx.composer_visible and true;
         const composer_top_chrome_rows_for_transient = footer_paint_plan.composerTopChromeRows();
         const banner_rows_for_transient = steeringBannerRowsForLayout(
             ctx,
@@ -1453,7 +1343,7 @@ fn prepareSurfaceFooterFrameInternal(
             composer_top_chrome_rows_for_transient,
             0,
         );
-        const banner_active_for_transient = approval != null or banner_rows_for_transient > 0;
+        const banner_active_for_transient = banner_rows_for_transient > 0;
         const visible_banner_active_for_transient = banner_rows_for_transient > 0;
         frame_plan = footer_paint_plan.planFooterPaint(shell, .{
             .active_label = active_label,
@@ -1475,7 +1365,6 @@ fn prepareSurfaceFooterFrameInternal(
     var projection = try buildFooterSurfaceProjection(
         alloc,
         shell,
-        approval,
         ctx,
         activity,
         .frame,
@@ -1496,7 +1385,6 @@ fn prepareSurfaceFooterFrameInternal(
 
     const frame_input = projection.framePlannerInput(
         ctx,
-        null,
         bottom_reservation.place_mid_line_active,
         bottom_reservation.applied_bottom_reserved_rows,
         reservation.transcript_state,
@@ -1526,7 +1414,6 @@ fn prepareSurfaceFooterFrameInternal(
         .paint = frame_plan.paint,
         .planner_input = projection.framePlannerInput(
             ctx,
-            approval,
             bottom_reservation.place_mid_line_active,
             bottom_reservation.applied_bottom_reserved_rows,
             null,
@@ -1549,7 +1436,7 @@ fn footerGeometryForRows(rows: FooterRows, activity: ActivityPlacement) footer_v
 
 const surface_test_slash_specs = [_]command_specs.SlashSpec{
     .{ .kind = .help, .command = "/help", .help_entry = "/help", .completion_description = "show available slash commands", .presentation_category = .general },
-    .{ .kind = .feedback, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the spark feedback form", .presentation_category = .product },
+    .{ .kind = .version, .command = "/feedback", .help_entry = "/feedback", .completion_description = "open the spark feedback form", .presentation_category = .product },
 };
 const surface_test_slash_registry = command_specs.SlashRegistry{ .commands = surface_test_slash_specs[0..] };
 
@@ -1580,49 +1467,11 @@ test "surface footer frame snapshots manual compaction blink with an inactive st
         .started_at_ms = 1_000,
     } };
     ctx.now_ms = 1_500;
-    var frame = try prepareSurfaceFooterFrameWithReservation(alloc, &shell, &metrics, &force_redraw, null, ctx, .{}, FrameInvalidationSet.empty());
+    var frame = try prepareSurfaceFooterFrameWithReservation(alloc, &shell, &metrics, &force_redraw, ctx, .{}, FrameInvalidationSet.empty());
     defer frame.deinit(alloc);
     try std.testing.expectEqual(@as(?bool, false), frame.thinking_blink);
     try std.testing.expect(std.mem.find(u8, frame.activity_label.items, "Compacting 0% (0s)") != null);
     try std.testing.expect(!ctx.stream.active);
-}
-
-test "surface footer frame snapshots the thinking blink from the frame clock" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    const approval = ApprovalPrompt{};
-
-    const cases = [_]struct {
-        now_ms: i64,
-        expected: bool,
-    }{
-        .{ .now_ms = 1_000, .expected = true },
-        .{ .now_ms = 1_500, .expected = false },
-    };
-    for (cases) |case| {
-        var shell = surfaceTestShell(24, 80);
-        defer shell.deinit(alloc);
-        var metrics = Metrics{};
-        var force_redraw = false;
-        var ctx = surfaceTestContext(&input);
-        ctx.stream = .{ .active = true, .turn_started_ms = 1_000 };
-        ctx.now_ms = case.now_ms;
-
-        var frame = try prepareSurfaceFooterFrameWithReservation(
-            alloc,
-            &shell,
-            &metrics,
-            &force_redraw,
-            approval.projection(),
-            ctx,
-            .{},
-            FrameInvalidationSet.empty(),
-        );
-        defer frame.deinit(alloc);
-
-        try std.testing.expectEqual(@as(?bool, case.expected), frame.thinking_blink);
-    }
 }
 
 fn surfaceTestShell(rows: u16, cols: u16) TranscriptRuntime {
@@ -1646,917 +1495,16 @@ fn surfaceTestShell(rows: u16, cols: u16) TranscriptRuntime {
 fn expectMeasuredPickerRows(
     alloc: Allocator,
     shell: *TranscriptRuntime,
-    approval: ?ApprovalProjection,
     ctx: RenderContext,
     expected_kind: PickerKind,
     expected_rows: u16,
 ) !void {
-    var measurement = try measureSurfaceFooter(alloc, shell, approval, ctx);
+    var measurement = try measureSurfaceFooter(alloc, shell, ctx);
     defer measurement.deinit(alloc);
 
     try std.testing.expect(measurement.show_picker);
     try std.testing.expectEqual(expected_kind, measurement.picker_kind);
     try std.testing.expectEqual(expected_rows, measurement.picker_rows);
-}
-
-test "surface footer measurement preserves the narrow tool activity projection" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 20,
-            .divider_top_row = 21,
-            .input_row = 22,
-            .divider_bottom_row = 23,
-            .hint_row = 24,
-        },
-        .last_visible_transcript_tail_kind = .tool_status,
-    };
-    defer shell.deinit(alloc);
-
-    const approval = ApprovalPrompt{};
-    const ctx: RenderContext = .{
-        .stream = .{ .active = true, .last_activity_kind = .read, .read_count = 1 },
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .activity = .{ .tool_slot = .{
-            .entry_id = 123,
-            .fallback_label = "reading src/main.zig",
-            .active = true,
-            .kind = .read,
-        } },
-        .input = &input,
-    };
-
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer measurement.deinit(alloc);
-
-    try std.testing.expect(measurement.active_label_present);
-    switch (measurement.activity_projection) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
-            try std.testing.expectEqualStrings("• Thinking", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
-test "surface footer measurement preserves route recovery status tone" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-
-    var shell = TranscriptRuntime{};
-    defer shell.deinit(alloc);
-
-    const approval = ApprovalPrompt{};
-    const ctx = RenderContext{
-        .stream = .{},
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .activity = .{ .turn_thinking = .{
-            .label = "⚠ blocked · content filter",
-            .tone = .danger,
-        } },
-        .input = &input,
-    };
-
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer measurement.deinit(alloc);
-
-    try std.testing.expect(measurement.active_label_present);
-    switch (measurement.activity_projection) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(ActivityProjection.Tone.danger, thinking.tone);
-            try std.testing.expectEqualStrings("⚠ blocked · content filter", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
-test "surface footer measurement keeps clipped command status transcript-owned" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 20,
-            .divider_top_row = 21,
-            .input_row = 22,
-            .divider_bottom_row = 23,
-            .hint_row = 24,
-        },
-        .last_visible_transcript_tail_kind = .assistant_turn,
-    };
-    defer shell.deinit(alloc);
-
-    var metrics = Metrics{};
-    try shell.writeTranscript(alloc, &metrics, "one\ntwo\nthree\nfour\n", true);
-    const status_id = try shell.appendRawTranscriptEntryClassified(alloc, "running read-only tools\n", .tool_status);
-    shell.last_viewport_selection = .{
-        .top_row = 1,
-        .bottom_row = 20,
-        .start_line = 6,
-        .partial_skip_rows = 0,
-        .line_count = 1,
-        .last_visible_row = 1,
-        .tail_kind = .assistant_turn,
-    };
-    try std.testing.expect(shell.rowForEntryId(status_id) == null);
-
-    const approval = ApprovalPrompt{};
-    const ctx: RenderContext = .{
-        .stream = .{
-            .active = true,
-            .command_count = 1,
-            .last_activity_kind = .command,
-            .token_progress = .{ .input_tokens = 10, .output_tokens = 20 },
-        },
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .activity = .{ .tool_slot = .{
-            .entry_id = status_id,
-            .fallback_label = "running read-only tools",
-            .active = true,
-            .kind = .command,
-        } },
-        .input = &input,
-    };
-
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer measurement.deinit(alloc);
-
-    try std.testing.expect(measurement.active_label_present);
-    switch (measurement.activity_projection) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(ActivityProjection.Tone.thinking, thinking.tone);
-            try std.testing.expectEqualStrings("• Thinking (↑10 ↓20)", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-}
-
-test "surface footer measurement reserves rows for vertical slash completions" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "/");
-    input.edit_state.cursor = input.edit_state.input.items.len;
-
-    var approval = ApprovalPrompt{};
-    defer approval.deinit(alloc);
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 20,
-            .divider_top_row = 21,
-            .input_row = 22,
-            .divider_bottom_row = 23,
-            .hint_row = 24,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 10,
-        .cursor_col = 1,
-    };
-    defer shell.deinit(alloc);
-
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), surfaceTestContext(&input));
-    defer measurement.deinit(alloc);
-
-    try std.testing.expect(measurement.show_picker);
-    try std.testing.expectEqual(PickerKind.slash, measurement.picker_kind);
-    try std.testing.expect(measurement.picker_rows > 1);
-    try std.testing.expect(measurement.footer_extra >= measurement.picker_rows + 1);
-}
-
-test "surface footer measurement reserves six inline skill choices" {
-    const alloc = std.testing.allocator;
-    const skills = [_]@import("../../core/skills/skill_runtime.zig").Skill{
-        .{ .name = "one", .description = "", .path = "/tmp/one", .source = .global_spark },
-        .{ .name = "two", .description = "", .path = "/tmp/two", .source = .global_spark },
-        .{ .name = "three", .description = "", .path = "/tmp/three", .source = .global_spark },
-        .{ .name = "four", .description = "", .path = "/tmp/four", .source = .global_spark },
-        .{ .name = "five", .description = "", .path = "/tmp/five", .source = .global_spark },
-        .{ .name = "six", .description = "", .path = "/tmp/six", .source = .global_spark },
-        .{ .name = "seven", .description = "", .path = "/tmp/seven", .source = .global_spark },
-    };
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "$");
-    input.edit_state.cursor = input.edit_state.input.items.len;
-
-    var approval = ApprovalPrompt{};
-    defer approval.deinit(alloc);
-    var shell = surfaceTestShell(24, 80);
-    defer shell.deinit(alloc);
-    var ctx = surfaceTestContext(&input);
-    ctx.skills_menu = .{
-        .active = true,
-        .items = &skills,
-    };
-
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer measurement.deinit(alloc);
-    try std.testing.expect(measurement.show_picker);
-    try std.testing.expectEqual(PickerKind.skills, measurement.picker_kind);
-    try std.testing.expectEqual(@as(u16, 8), measurement.picker_rows);
-}
-
-test "surface footer omits the picker for zero slash results" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "/not-a-command");
-    input.edit_state.cursor = input.edit_state.input.items.len;
-
-    var approval = ApprovalPrompt{};
-    defer approval.deinit(alloc);
-    var shell = surfaceTestShell(24, 80);
-    defer shell.deinit(alloc);
-
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), surfaceTestContext(&input));
-    defer measurement.deinit(alloc);
-
-    try std.testing.expect(!measurement.show_picker);
-    try std.testing.expectEqual(@as(usize, 0), measurement.slash_completion_count);
-    try std.testing.expectEqual(@as(u16, 0), measurement.picker_rows);
-    try std.testing.expectEqual(@as(u16, 0), measurement.footer_extra);
-    try std.testing.expect(measurement.slash_menu_layout == null);
-}
-
-test "surface footer measurement reserves capped picker rows for active list pickers" {
-    const alloc = std.testing.allocator;
-    var approval = ApprovalPrompt{};
-    defer approval.deinit(alloc);
-
-    const expected_rows = input_presentation.max_model_picker_rows;
-
-    var slash_input = InputRuntime{};
-    defer slash_input.deinit(alloc);
-    try slash_input.edit_state.input.appendSlice(alloc, "/fe");
-    slash_input.edit_state.cursor = slash_input.edit_state.input.items.len;
-    var slash_shell = surfaceTestShell(24, 80);
-    defer slash_shell.deinit(alloc);
-    try expectMeasuredPickerRows(
-        alloc,
-        &slash_shell,
-        approval.projection(),
-        surfaceTestContext(&slash_input),
-        .slash,
-        input_presentation.max_model_picker_rows + 2,
-    );
-
-    var model_input = InputRuntime{};
-    defer model_input.deinit(alloc);
-    var model_shell = surfaceTestShell(24, 80);
-    defer model_shell.deinit(alloc);
-    var model_ctx = surfaceTestContext(&model_input);
-    model_ctx.model_query_active = true;
-    model_ctx.model_completions = &.{"gpt-test-model"};
-    try expectMeasuredPickerRows(alloc, &model_shell, approval.projection(), model_ctx, .model_stage, expected_rows);
-
-    var model_empty_shell = surfaceTestShell(24, 80);
-    defer model_empty_shell.deinit(alloc);
-    model_ctx.model_completions = &.{};
-    model_ctx.model_completions_loading = true;
-    try expectMeasuredPickerRows(alloc, &model_empty_shell, approval.projection(), model_ctx, .model_stage, expected_rows);
-
-    var file_input = InputRuntime{};
-    defer file_input.deinit(alloc);
-    var file_shell = surfaceTestShell(24, 80);
-    defer file_shell.deinit(alloc);
-    var file_ctx = surfaceTestContext(&file_input);
-    file_ctx.file_query_active = true;
-    file_ctx.file_completions = &.{.{ .path = "src/main.zig", .kind = .file, .matched_spans = &.{} }};
-    // The file picker grows to ten rows on a 24-row terminal.
-    const file_rows: u16 = 10;
-    try expectMeasuredPickerRows(alloc, &file_shell, approval.projection(), file_ctx, .file, file_rows);
-
-    var file_empty_shell = surfaceTestShell(24, 80);
-    defer file_empty_shell.deinit(alloc);
-    file_ctx.file_completions = &.{};
-    file_ctx.file_completions_failed = true;
-    try expectMeasuredPickerRows(alloc, &file_empty_shell, approval.projection(), file_ctx, .file, file_rows);
-}
-
-test "surface footer exposes file picker while a response streams" {
-    const alloc = std.testing.allocator;
-    var approval = ApprovalPrompt{};
-    defer approval.deinit(alloc);
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    var shell = surfaceTestShell(24, 80);
-    defer shell.deinit(alloc);
-    var ctx = surfaceTestContext(&input);
-    ctx.stream.active = true;
-    ctx.file_query_active = true;
-    ctx.file_completions = &.{.{ .path = "src/main.zig", .kind = .file, .matched_spans = &.{} }};
-
-    var visible = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer visible.deinit(alloc);
-    try std.testing.expect(visible.show_picker);
-    try std.testing.expectEqual(PickerKind.file, visible.picker_kind);
-    try std.testing.expect(visible.picker_rows > 0);
-}
-
-test "surface footer exposes model picker while a response streams" {
-    const alloc = std.testing.allocator;
-    var approval = ApprovalPrompt{};
-    defer approval.deinit(alloc);
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    var shell = surfaceTestShell(24, 80);
-    defer shell.deinit(alloc);
-    var ctx = surfaceTestContext(&input);
-    ctx.stream.active = true;
-    ctx.model_query_active = true;
-    ctx.model_completions = &.{"provider/visible-model"};
-
-    var visible = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer visible.deinit(alloc);
-    try std.testing.expect(visible.show_picker);
-    try std.testing.expectEqual(PickerKind.model_stage, visible.picker_kind);
-    try std.testing.expect(visible.picker_rows > 0);
-}
-
-test "surface footer measurement reserves only the compact auth picker rows" {
-    const auth_runtime = @import("../../core/auth/auth_runtime.zig");
-    const alloc = std.testing.allocator;
-    var approval = ApprovalPrompt{};
-    defer approval.deinit(alloc);
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    var shell = surfaceTestShell(24, 80);
-    defer shell.deinit(alloc);
-    var ctx = surfaceTestContext(&input);
-    ctx.auth_picker = auth_runtime.PickerView{
-        .active = true,
-        .available_sources = auth_runtime.SourceSet.initMany(&.{ .ai_gateway_api_key, .spark_login }),
-        .selected_choice = .{ .source = .spark_login },
-        .active_source = .spark_login,
-        .include_skip = false,
-    };
-
-    try expectMeasuredPickerRows(
-        alloc,
-        &shell,
-        approval.projection(),
-        ctx,
-        .auth,
-        picker_presentation.authPickerReservedRows(ctx.auth_picker, 24, 0, 0),
-    );
-}
-
-test "surface footer places the cursor after the Vercel team query" {
-    const auth_runtime = @import("../../core/auth/auth_runtime.zig");
-    const login_flow = @import("../../core/auth/login_flow.zig");
-    const alloc = std.testing.allocator;
-    var approval = ApprovalPrompt{};
-    defer approval.deinit(alloc);
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    var shell = surfaceTestShell(24, 80);
-    defer shell.deinit(alloc);
-    var team_id = "team_123".*;
-    var team_slug = "example-internal-team".*;
-    var team_name = "Example Internal Team".*;
-    const teams = [_]login_flow.Team{.{
-        .id = &team_id,
-        .slug = &team_slug,
-        .name = &team_name,
-    }};
-    var ctx = surfaceTestContext(&input);
-    ctx.auth_picker = auth_runtime.PickerView{
-        .active = true,
-        .available_sources = auth_runtime.SourceSet.initOne(.spark_login),
-        .selected_choice = .{ .team = 0 },
-        .active_source = .spark_login,
-        .include_skip = false,
-        .stage = .change_team,
-        .spark_login_session_available = true,
-        .teams = &teams,
-        .team_query = "play",
-    };
-
-    var metrics = Metrics{};
-    var force_redraw = false;
-    var frame = try prepareSurfaceFooterFrameWithReservation(
-        alloc,
-        &shell,
-        &metrics,
-        &force_redraw,
-        approval.projection(),
-        ctx,
-        .{},
-        FrameInvalidationSet.empty(),
-    );
-    defer frame.deinit(alloc);
-
-    try std.testing.expectEqual(frame.paint.footer.picker_start, frame.composed.cursor.row);
-    try std.testing.expectEqual(@as(u16, 27), frame.composed.cursor.col);
-    try std.testing.expect(frame.composed.cursor_visible);
-}
-
-test "surface footer keeps the Vercel team query and cursor visible at minimum height" {
-    const auth_runtime = @import("../../core/auth/auth_runtime.zig");
-    const alloc = std.testing.allocator;
-    var approval = ApprovalPrompt{};
-    defer approval.deinit(alloc);
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    var shell = surfaceTestShell(5, 80);
-    defer shell.deinit(alloc);
-    var ctx = surfaceTestContext(&input);
-    ctx.auth_picker = auth_runtime.PickerView{
-        .active = true,
-        .available_sources = .empty,
-        .selected_choice = null,
-        .active_source = .spark_login,
-        .include_skip = false,
-        .stage = .change_team,
-        .spark_login_session_available = true,
-        .team_query = "play",
-    };
-
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer measurement.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 1), measurement.picker_rows);
-
-    var metrics = Metrics{};
-    var force_redraw = false;
-    const reservation = try resolveSurfaceFooterReservation(
-        alloc,
-        &shell,
-        &force_redraw,
-        approval.projection(),
-        ctx,
-        currentSurfaceFooterTranscriptState(&shell),
-    );
-    var frame = try prepareSurfaceFooterFrameWithReservation(
-        alloc,
-        &shell,
-        &metrics,
-        &force_redraw,
-        approval.projection(),
-        ctx,
-        reservation,
-        FrameInvalidationSet.empty(),
-    );
-    defer frame.deinit(alloc);
-
-    var query_visible = false;
-    for (frame.composed.rows.items) |row| {
-        if (row.row == frame.paint.footer.picker_start) {
-            query_visible = std.mem.find(u8, row.text.items, "Search: play") != null;
-            break;
-        }
-    }
-    try std.testing.expect(query_visible);
-    try std.testing.expectEqual(frame.paint.footer.picker_start, frame.composed.cursor.row);
-    try std.testing.expectEqual(@as(u16, 27), frame.composed.cursor.col);
-    try std.testing.expect(frame.composed.cursor_visible);
-}
-
-test "surface footer keeps the selected auth source visible at minimum height" {
-    const auth_runtime = @import("../../core/auth/auth_runtime.zig");
-    const alloc = std.testing.allocator;
-    var approval = ApprovalPrompt{};
-    defer approval.deinit(alloc);
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    var ctx = surfaceTestContext(&input);
-    ctx.auth_picker = auth_runtime.PickerView{
-        .active = true,
-        .available_sources = auth_runtime.SourceSet.initMany(&.{ .ai_gateway_api_key, .spark_login }),
-        .selected_choice = .{ .source = .spark_login },
-        .active_source = .ai_gateway_api_key,
-        .include_skip = false,
-        .stage = .switch_credential,
-    };
-
-    var shell = surfaceTestShell(5, 80);
-    defer shell.deinit(alloc);
-    shell.cursor_row = 1;
-
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer measurement.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 1), measurement.picker_rows);
-
-    var metrics = Metrics{};
-    var force_redraw = false;
-    const reservation = try resolveSurfaceFooterReservation(
-        alloc,
-        &shell,
-        &force_redraw,
-        approval.projection(),
-        ctx,
-        currentSurfaceFooterTranscriptState(&shell),
-    );
-    var frame = try prepareSurfaceFooterFrameWithReservation(
-        alloc,
-        &shell,
-        &metrics,
-        &force_redraw,
-        approval.projection(),
-        ctx,
-        reservation,
-        FrameInvalidationSet.empty(),
-    );
-    defer frame.deinit(alloc);
-
-    for (frame.composed.rows.items) |row| {
-        if (std.mem.find(u8, row.text.items, "spark login") != null) return;
-    }
-    return error.SelectedAuthSourceNotVisible;
-}
-
-test "surface footer measurement caps active picker reservation in tiny terminals" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "/");
-    input.edit_state.cursor = input.edit_state.input.items.len;
-
-    var approval = ApprovalPrompt{};
-    defer approval.deinit(alloc);
-    var shell = surfaceTestShell(8, 80);
-    defer shell.deinit(alloc);
-
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), surfaceTestContext(&input));
-    defer measurement.deinit(alloc);
-
-    try std.testing.expect(measurement.show_picker);
-    try std.testing.expectEqual(PickerKind.slash, measurement.picker_kind);
-    try std.testing.expect(measurement.picker_rows < input_presentation.max_model_picker_rows);
-    try std.testing.expectEqual(@as(u16, 1), measurement.picker_rows);
-    try std.testing.expect(!measurement.slash_menu_layout.?.show_header);
-    try std.testing.expect(measurement.frameLayoutMeasurement().natural_rows <= shell.layout.rows);
-
-    const rows = measurement.frameLayoutRows(shell.layout.rows, 1);
-    try std.testing.expect(rows.hint <= shell.layout.rows);
-}
-
-test "footer reservation traces stale off-screen external clear" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
-    defer alloc.free(trace_path);
-
-    debug_trace.resetForTest();
-    defer debug_trace.resetForTest();
-    try debug_trace.configureForTestWithScopes(alloc, trace_path, "frame_plan");
-
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    const approval = ApprovalPrompt{};
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 6,
-            .cols = 8,
-            .content_bottom = 2,
-            .divider_top_row = 3,
-            .input_row = 4,
-            .divider_bottom_row = 5,
-            .hint_row = 6,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 1,
-        .cursor_col = 1,
-        .extra_input_rows = 1,
-    };
-    defer shell.deinit(alloc);
-    shell.footer_viewport.has_frame = true;
-    shell.footer_viewport.geometry.top = 9;
-
-    var force_redraw = false;
-    _ = try resolveSurfaceFooterReservation(
-        alloc,
-        &shell,
-        &force_redraw,
-        approval.projection(),
-        surfaceTestContext(&input),
-        currentSurfaceFooterTranscriptState(&shell),
-    );
-
-    try std.testing.expectEqual(@as(u16, 0), shell.extra_input_rows);
-    try std.testing.expect(shell.footer_viewport.externally_invalidated);
-    try std.testing.expect(shell.render_requests.pendingInvalidations().isEmpty());
-    try std.testing.expect(force_redraw);
-
-    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
-    defer file.close(std.testing.io);
-    const trace = try io_mod.readFileToEnd(alloc, &file, 4096);
-    defer alloc.free(trace);
-    try std.testing.expect(std.mem.find(u8, trace, "footer_extra_invalidation_skip reason=external_clear top=9 rows=6 skip=off_screen_stale_footer") != null);
-}
-
-test "measured footer preparation skips stale off-screen invalidation and stays dirty" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "a\nb");
-    input.edit_state.cursor = input.edit_state.input.items.len;
-
-    const approval = ApprovalPrompt{};
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 6,
-            .cols = 8,
-            .content_bottom = 2,
-            .divider_top_row = 3,
-            .input_row = 4,
-            .divider_bottom_row = 5,
-            .hint_row = 6,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 1,
-        .cursor_col = 1,
-        .extra_input_rows = 1,
-    };
-    defer shell.deinit(alloc);
-    shell.footer_viewport.has_frame = true;
-    shell.footer_viewport.geometry.top = 9;
-
-    const ctx = surfaceTestContext(&input);
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer measurement.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 0), measurement.footer_extra);
-    try std.testing.expectEqual(@as(u16, 2), measurement.footerReservedBaseRows());
-
-    const solved = render_engine.frame_layout.solve(.{
-        .terminal = shell.layout,
-        .owned_top = shell.owned_top_row,
-        .footer = measurement.frameLayoutMeasurement(),
-        .transcript = .{ .natural_visual_rows = 0 },
-    });
-    const footer_rows = measurement.frameLayoutRows(shell.layout.rows, solved.footer_area.top);
-    const plan = solved.toPaintPlan(.{
-        .footer_rows = footer_rows,
-        .viewport = currentSurfaceFooterTranscriptState(&shell).selection,
-        .activity = .none,
-        .cursor_target = .{ .row = footer_rows.input_base, .col = 1, .visible = true },
-    });
-    try plan.validate();
-
-    var force_redraw = false;
-    var frame = try prepareMeasuredSurfaceFooterFrameForPlan(
-        alloc,
-        &shell,
-        &force_redraw,
-        approval.projection(),
-        ctx,
-        &measurement,
-        plan,
-        FrameInvalidationSet.empty(),
-    );
-    defer frame.deinit(alloc);
-
-    try std.testing.expect(frame.paint.invalidation.isEmpty());
-    try std.testing.expect(!frame.paint.footer_clean_allowed);
-    try std.testing.expectEqual(@as(u16, 3), shell.footer_reserved_base_rows);
-    try std.testing.expect(force_redraw);
-}
-
-test "measured footer preparation propagates invalid zero geometry" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "a\nb");
-    input.edit_state.cursor = input.edit_state.input.items.len;
-
-    const approval = ApprovalPrompt{};
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 6,
-            .cols = 8,
-            .content_bottom = 2,
-            .divider_top_row = 3,
-            .input_row = 4,
-            .divider_bottom_row = 5,
-            .hint_row = 6,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 1,
-        .cursor_col = 1,
-        .extra_input_rows = 1,
-    };
-    defer shell.deinit(alloc);
-    shell.footer_viewport.has_frame = true;
-    shell.footer_viewport.geometry.top = 0;
-
-    const ctx = surfaceTestContext(&input);
-    var measurement = try measureSurfaceFooter(alloc, &shell, approval.projection(), ctx);
-    defer measurement.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 0), measurement.footer_extra);
-    try std.testing.expectEqual(@as(u16, 2), measurement.footerReservedBaseRows());
-
-    const solved = render_engine.frame_layout.solve(.{
-        .terminal = shell.layout,
-        .owned_top = shell.owned_top_row,
-        .footer = measurement.frameLayoutMeasurement(),
-        .transcript = .{ .natural_visual_rows = 0 },
-    });
-    const footer_rows = measurement.frameLayoutRows(shell.layout.rows, solved.footer_area.top);
-    const plan = solved.toPaintPlan(.{
-        .footer_rows = footer_rows,
-        .viewport = currentSurfaceFooterTranscriptState(&shell).selection,
-        .activity = .none,
-        .cursor_target = .{ .row = footer_rows.input_base, .col = 1, .visible = true },
-    });
-
-    var force_redraw = false;
-    try std.testing.expectError(
-        error.InvalidFooterInvalidationGeometry,
-        prepareMeasuredSurfaceFooterFrameForPlan(
-            alloc,
-            &shell,
-            &force_redraw,
-            approval.projection(),
-            ctx,
-            &measurement,
-            plan,
-            FrameInvalidationSet.empty(),
-        ),
-    );
-
-    try std.testing.expectEqual(@as(u16, 1), shell.extra_input_rows);
-    try std.testing.expectEqual(@as(u16, 3), shell.footer_reserved_base_rows);
-    try std.testing.expect(shell.render_requests.pendingInvalidations().isEmpty());
-    try std.testing.expect(!force_redraw);
-}
-
-test "surface footer reservation rejects zero invalidation geometry before mutation" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-
-    const approval = ApprovalPrompt{};
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 6,
-            .cols = 8,
-            .content_bottom = 2,
-            .divider_top_row = 3,
-            .input_row = 4,
-            .divider_bottom_row = 5,
-            .hint_row = 6,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 1,
-        .cursor_col = 1,
-        .extra_input_rows = 1,
-    };
-    defer shell.deinit(alloc);
-    shell.footer_viewport.has_frame = true;
-    shell.footer_viewport.geometry.top = 0;
-
-    var force_redraw = false;
-    const ctx = surfaceTestContext(&input);
-    try std.testing.expectError(
-        error.InvalidFooterInvalidationGeometry,
-        resolveSurfaceFooterReservation(
-            alloc,
-            &shell,
-            &force_redraw,
-            approval.projection(),
-            ctx,
-            currentSurfaceFooterTranscriptState(&shell),
-        ),
-    );
-
-    try std.testing.expectEqual(@as(u16, 1), shell.extra_input_rows);
-    try std.testing.expectEqual(@as(u16, 3), shell.footer_reserved_base_rows);
-    try std.testing.expect(!shell.footer_viewport.externally_invalidated);
-    try std.testing.expect(shell.render_requests.pendingInvalidations().isEmpty());
-    try std.testing.expect(!force_redraw);
-}
-
-test "surface footer preparation rejects zero invalidation geometry before mutation" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-
-    const approval = ApprovalPrompt{};
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 6,
-            .cols = 8,
-            .content_bottom = 2,
-            .divider_top_row = 3,
-            .input_row = 4,
-            .divider_bottom_row = 5,
-            .hint_row = 6,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 1,
-        .cursor_col = 1,
-        .extra_input_rows = 1,
-    };
-    defer shell.deinit(alloc);
-    shell.footer_viewport.has_frame = true;
-    shell.footer_viewport.geometry.top = 0;
-
-    var metrics = Metrics{};
-    var force_redraw = false;
-    const ctx = surfaceTestContext(&input);
-    const result = prepareSurfaceFooterFrameWithReservation(
-        alloc,
-        &shell,
-        &metrics,
-        &force_redraw,
-        approval.projection(),
-        ctx,
-        .{ .precomputed = true },
-        FrameInvalidationSet.empty(),
-    );
-    if (result) |frame_value| {
-        var frame = frame_value;
-        defer frame.deinit(alloc);
-        return error.TestExpectedError;
-    } else |err| {
-        try std.testing.expectEqual(error.InvalidFooterInvalidationGeometry, err);
-    }
-
-    try std.testing.expectEqual(@as(u16, 1), shell.extra_input_rows);
-    try std.testing.expectEqual(@as(u16, 3), shell.footer_reserved_base_rows);
-    try std.testing.expect(!shell.footer_viewport.externally_invalidated);
-    try std.testing.expect(shell.render_requests.pendingInvalidations().isEmpty());
-    try std.testing.expect(!force_redraw);
-}
-
-test "surface footer preparation retains stale and current footer invalidations" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-
-    const approval = ApprovalPrompt{};
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 20,
-            .divider_top_row = 21,
-            .input_row = 22,
-            .divider_bottom_row = 23,
-            .hint_row = 24,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 1,
-        .cursor_col = 1,
-        .extra_input_rows = 1,
-    };
-    defer shell.deinit(alloc);
-    shell.footer_viewport.has_frame = true;
-    shell.footer_viewport.geometry.top = 3;
-
-    var metrics = Metrics{};
-    var force_redraw = false;
-    var frame = try prepareSurfaceFooterFrameWithReservation(
-        alloc,
-        &shell,
-        &metrics,
-        &force_redraw,
-        approval.projection(),
-        surfaceTestContext(&input),
-        .{ .precomputed = true },
-        FrameInvalidationSet.empty(),
-    );
-    defer frame.deinit(alloc);
-
-    try frame.paint.validate();
-    try std.testing.expect(surfaceHasInvalidation(
-        frame.paint.invalidation,
-        .external_clear,
-        1,
-        3,
-    ));
-    try std.testing.expect(surfaceHasInvalidation(
-        frame.paint.invalidation,
-        .external_clear,
-        3,
-        24,
-    ));
-    try std.testing.expectEqual(@as(u16, 0), shell.extra_input_rows);
-    try std.testing.expect(shell.footer_viewport.externally_invalidated);
-    try std.testing.expect(force_redraw);
 }
 
 fn surfaceHasInvalidation(
@@ -2569,435 +1517,6 @@ fn surfaceHasInvalidation(
         if (range.reason == reason and range.top == top and range.bottom == bottom) return true;
     }
     return false;
-}
-
-test "surface footer measurement exposes neutral frame layout measurement" {
-    const measurement = SurfaceFooterMeasurement{
-        .input_extra = 2,
-        .picker_rows = 3,
-        .banner_active = true,
-        .total_lines = 3,
-        .show_picker = true,
-    };
-
-    const neutral = measurement.frameLayoutMeasurement();
-
-    try std.testing.expectEqual(@as(u16, 11), neutral.natural_rows);
-    try std.testing.expectEqual(@as(u16, 1), neutral.min_rows);
-    try std.testing.expectEqual(@as(u16, 11), neutral.max_rows);
-    try std.testing.expectEqual(@as(u16, 3), neutral.input_rows);
-    try std.testing.expectEqual(@as(u16, 3), neutral.picker_rows);
-    try std.testing.expectEqual(@as(u16, 1), neutral.banner_rows);
-    try std.testing.expectEqual(@as(u16, 0), neutral.top_gap_rows);
-}
-
-test "surface footer measurement collapses tint top chrome only for visible input" {
-    const lines = SurfaceFooterMeasurement{
-        .input_extra = 0,
-        .total_lines = 1,
-        .composer_top_chrome_rows = 1,
-    };
-    const tint = SurfaceFooterMeasurement{
-        .input_extra = 0,
-        .total_lines = 1,
-        .composer_top_chrome_rows = 0,
-    };
-    const multiline_tint = SurfaceFooterMeasurement{
-        .input_extra = 1,
-        .total_lines = 2,
-        .composer_top_chrome_rows = 0,
-        .show_picker = true,
-        .picker_rows = 3,
-        .footer_extra = 5,
-    };
-    const modal = SurfaceFooterMeasurement{
-        .input_visible = false,
-        .composer_top_chrome_rows = 0,
-        .picker_rows = 7,
-        .footer_extra = 7,
-        .top_gap_rows = 1,
-    };
-
-    try std.testing.expectEqual(@as(u16, 4), lines.frameLayoutMeasurement().natural_rows);
-    try std.testing.expectEqual(@as(u16, 3), tint.frameLayoutMeasurement().natural_rows);
-    try std.testing.expectEqual(@as(u16, 8), multiline_tint.frameLayoutMeasurement().natural_rows);
-    try std.testing.expectEqual(@as(u16, 10), modal.frameLayoutMeasurement().natural_rows);
-    try std.testing.expectEqual(@as(u16, 1), modal.frameLayoutMeasurement().top_gap_rows);
-
-    const tint_rows = tint.frameLayoutRows(24, 20);
-    try std.testing.expectEqual(tint_rows.top_divider, tint_rows.input_base);
-    try std.testing.expectEqual(@as(u16, 3), tint_rows.total_rows);
-
-    const multiline_rows = multiline_tint.frameLayoutRows(24, 17);
-    try std.testing.expectEqual(@as(u16, 17), multiline_rows.top_divider);
-    try std.testing.expectEqual(@as(u16, 18), multiline_rows.input_base);
-    try std.testing.expectEqual(@as(u16, 19), multiline_rows.picker_divider);
-
-    const modal_rows = modal.frameLayoutRows(24, 14);
-    try std.testing.expectEqual(@as(u16, 14), modal_rows.top_divider);
-    try std.testing.expectEqual(@as(u16, 14), modal_rows.input_base);
-    try std.testing.expectEqual(@as(u16, 15), modal_rows.picker_start);
-}
-
-test "approval surface footer measurement accounts for both divider rails" {
-    const measurement = SurfaceFooterMeasurement{
-        .input_visible = false,
-        .picker_rows = interaction_state.approval_panel_rows_spacious,
-    };
-
-    const neutral = measurement.frameLayoutMeasurement();
-
-    try std.testing.expectEqual(interaction_state.approval_panel_rows_spacious + 3, neutral.natural_rows);
-    try std.testing.expectEqual(@as(u16, 1), neutral.min_rows);
-    try std.testing.expectEqual(interaction_state.approval_panel_rows_spacious + 3, neutral.max_rows);
-    try std.testing.expectEqual(@as(u16, 0), neutral.input_rows);
-    try std.testing.expectEqual(interaction_state.approval_panel_rows_spacious, neutral.picker_rows);
-}
-
-test "command approval fit includes the steering banner" {
-    const layout: types.Layout = .{
-        .rows = 11,
-        .cols = 20,
-        .content_bottom = 7,
-        .divider_top_row = 8,
-        .input_row = 9,
-        .divider_bottom_row = 10,
-        .hint_row = 11,
-    };
-    const label = "shell.run 12345678901234567";
-
-    try std.testing.expect(try commandApprovalFitsInline(
-        std.testing.allocator,
-        label,
-        null,
-        layout,
-        0,
-    ));
-    try std.testing.expect(!try commandApprovalFitsInline(
-        std.testing.allocator,
-        label,
-        null,
-        layout,
-        1,
-    ));
-}
-
-test "command approval footer sizing paths use the complete command" {
-    const alloc = std.testing.allocator;
-    const command = "printf 'SURFACE_COMMAND_START_" ++ text_utils.repeat("x", 88) ++ "_SURFACE_COMMAND_END'";
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    var prompt = ApprovalPrompt{};
-    defer prompt.deinit(alloc);
-    try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "shell.run printf 'SURFACE_COMMAND_START...",
-        .command = command,
-    }));
-
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 30,
-            .cols = 80,
-            .content_bottom = 26,
-            .divider_top_row = 27,
-            .input_row = 28,
-            .divider_bottom_row = 29,
-            .hint_row = 30,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 10,
-        .cursor_col = 1,
-    };
-    defer shell.deinit(alloc);
-
-    const request = prompt.request.?.view();
-    const label_only_rows = try approval_ui.inlineApprovalPanelRows(
-        alloc,
-        request.label,
-        shell.layout.cols,
-        shell.layout.rows,
-    );
-    const expected_rows = try approval_ui.inlineApprovalPanelRowsForCommand(
-        alloc,
-        request.label,
-        request.command,
-        shell.layout.cols,
-        shell.layout.rows,
-    );
-    try std.testing.expect(expected_rows > label_only_rows);
-
-    try std.testing.expect(try commandApprovalFitsInline(
-        alloc,
-        request.label,
-        request.command,
-        shell.layout,
-        0,
-    ));
-
-    const ctx = surfaceTestContext(&input);
-    var measured = try measureSurfaceFooter(
-        alloc,
-        &shell,
-        prompt.projection(),
-        ctx,
-    );
-    defer measured.deinit(alloc);
-    try std.testing.expect(!measured.input_visible);
-    try std.testing.expectEqual(@as(u16, 3), measured.footerReservedBaseRows());
-    try std.testing.expectEqual(expected_rows + 3, measured.frameLayoutMeasurement().natural_rows);
-    try std.testing.expectEqual(expected_rows, measured.picker_rows);
-
-    var force_redraw = false;
-    _ = try resolveSurfaceFooterReservation(
-        alloc,
-        &shell,
-        &force_redraw,
-        prompt.projection(),
-        ctx,
-        currentSurfaceFooterTranscriptState(&shell),
-    );
-    try std.testing.expectEqual(expected_rows, shell.extra_input_rows);
-    try std.testing.expectEqual(@as(u16, 3), shell.footer_reserved_base_rows);
-
-    shell.extra_input_rows = 0;
-    shell.footer_viewport.has_frame = true;
-    shell.footer_viewport.geometry = .{
-        .top = 27,
-        .top_divider = 27,
-        .input_base = 28,
-        .bottom_divider = 29,
-        .hint = 30,
-    };
-    var metrics = Metrics{};
-    var frame = try prepareSurfaceFooterFrameWithReservation(
-        alloc,
-        &shell,
-        &metrics,
-        &force_redraw,
-        prompt.projection(),
-        ctx,
-        .{ .precomputed = true },
-        FrameInvalidationSet.empty(),
-    );
-    defer frame.deinit(alloc);
-
-    try std.testing.expectEqual(expected_rows, shell.extra_input_rows);
-    try std.testing.expectEqual(@as(u16, 3), shell.footer_reserved_base_rows);
-    var saw_end = false;
-    for (frame.composed.rows.items) |row| {
-        saw_end = saw_end or std.mem.find(u8, row.text.items, "SURFACE_COMMAND_END") != null;
-    }
-    try std.testing.expect(saw_end);
-}
-
-test "surface footer measurement rows do not reserve activity space" {
-    const measurement = SurfaceFooterMeasurement{
-        .active_label_present = true,
-        .input_extra = 1,
-        .footer_extra = 1,
-    };
-
-    const rows = measurement.frameLayoutRows(46, 38);
-
-    try std.testing.expectEqual(@as(u16, 38), rows.top);
-    try std.testing.expectEqual(@as(u16, 38), rows.top_divider);
-    try std.testing.expectEqual(@as(u16, 40), rows.input_base);
-    try std.testing.expectEqual(@as(u16, 42), rows.hint);
-}
-
-test "current footer transcript state clamps stale viewport selection after shrink" {
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 8,
-            .cols = 80,
-            .content_bottom = 4,
-            .divider_top_row = 5,
-            .input_row = 6,
-            .divider_bottom_row = 7,
-            .hint_row = 8,
-        },
-        .viewport_top_row = 1,
-        .owned_top_row = 1,
-        .last_visible_transcript_top_row = 1,
-        .last_visible_transcript_last_row = 21,
-        .last_viewport_selection = .{
-            .top_row = 1,
-            .bottom_row = 21,
-            .start_line = 0,
-            .partial_skip_rows = 0,
-            .line_count = 3,
-            .last_visible_row = 21,
-        },
-    };
-    defer shell.deinit(std.testing.allocator);
-
-    const state = currentSurfaceFooterTranscriptState(&shell);
-
-    try std.testing.expectEqual(@as(u16, 1), state.selection.top_row);
-    try std.testing.expectEqual(@as(u16, 4), state.selection.bottom_row);
-    try std.testing.expectEqual(@as(u16, 4), state.selection.last_visible_row);
-}
-
-test "retargetSurfaceFooterFrame moves composed rows to solved footer plan" {
-    const alloc = std.testing.allocator;
-    var first = std.ArrayList(u8).empty;
-    try first.appendSlice(alloc, "top");
-    var input = std.ArrayList(u8).empty;
-    try input.appendSlice(alloc, "input");
-
-    var frame = SurfaceFooterFrame{
-        .paint = surfaceTestRetargetPaintPlan(10),
-        .composed = .{},
-    };
-    defer frame.deinit(alloc);
-    try frame.composed.pushComposedRow(alloc, 10, &first);
-    try frame.composed.pushComposedRow(alloc, 11, &input);
-    frame.composed.cursor = .{ .row = 11, .col = 4 };
-
-    var solved_plan = surfaceTestRetargetPaintPlan(20);
-    solved_plan.cursor_target = .{
-        .row = 41,
-        .col = 81,
-        .visible = true,
-    };
-    retargetSurfaceFooterFrame(&frame, solved_plan);
-
-    try std.testing.expectEqual(@as(u16, 20), frame.paint.footer.top);
-    try std.testing.expectEqual(@as(u16, 20), frame.composed.rows.items[0].row);
-    try std.testing.expectEqual(@as(u16, 21), frame.composed.rows.items[1].row);
-    try std.testing.expectEqual(@as(u16, 21), frame.composed.cursor.row);
-    try std.testing.expectEqual(
-        paint_plan.FrameCursorTarget{
-            .row = 21,
-            .col = 4,
-            .visible = true,
-        },
-        frame.paint.cursor_target.?,
-    );
-    try frame.paint.validate();
-}
-
-test "commitSurfaceFooterFrame can commit footer viewport without measurement" {
-    const alloc = std.testing.allocator;
-    var input = std.ArrayList(u8).empty;
-    try input.appendSlice(alloc, "input");
-
-    var frame = SurfaceFooterFrame{
-        .paint = surfaceTestRetargetPaintPlan(20),
-        .composed = .{},
-    };
-    defer frame.deinit(alloc);
-    try frame.composed.pushComposedRow(alloc, 21, &input);
-    frame.composed.cursor = .{ .row = 21, .col = 6 };
-
-    var shell = TranscriptRuntime{
-        .layout = frame.paint.layout,
-        .owned_top_row = 1,
-        .extra_input_rows = 7,
-    };
-    defer shell.deinit(alloc);
-
-    commitSurfaceFooterFrame(alloc, &shell, &frame, null);
-
-    try std.testing.expectEqual(@as(u16, 7), shell.extra_input_rows);
-    try std.testing.expect(shell.footer_viewport.has_frame);
-    try std.testing.expectEqual(@as(u16, 21), shell.footer_viewport.cursor.row);
-    try std.testing.expectEqual(@as(u16, 6), shell.footer_viewport.cursor.col);
-}
-
-test "commitSurfaceFooterFrame commits measured reserved base rows" {
-    const alloc = std.testing.allocator;
-    var input = std.ArrayList(u8).empty;
-    try input.appendSlice(alloc, "input");
-
-    var frame = SurfaceFooterFrame{
-        .paint = surfaceTestRetargetPaintPlan(20),
-        .composed = .{},
-    };
-    defer frame.deinit(alloc);
-    try frame.composed.pushComposedRow(alloc, 20, &input);
-
-    var shell = TranscriptRuntime{
-        .layout = frame.paint.layout,
-        .owned_top_row = 1,
-        .extra_input_rows = 4,
-        .footer_reserved_base_rows = 3,
-    };
-    defer shell.deinit(alloc);
-
-    const measurement = SurfaceFooterMeasurement{
-        .footer_extra = 0,
-        .composer_top_chrome_rows = 0,
-    };
-
-    commitSurfaceFooterFrame(alloc, &shell, &frame, &measurement);
-
-    try std.testing.expectEqual(@as(u16, 0), shell.extra_input_rows);
-    try std.testing.expectEqual(@as(u16, 2), shell.footer_reserved_base_rows);
-    try std.testing.expect(shell.footer_viewport.has_frame);
-}
-
-test "commitSurfaceFooterFrame preserves hidden composed cursor" {
-    const alloc = std.testing.allocator;
-    var title = std.ArrayList(u8).empty;
-    try title.appendSlice(alloc, "  Bash command");
-
-    var frame = SurfaceFooterFrame{
-        .paint = surfaceTestRetargetPaintPlan(20),
-        .composed = .{},
-    };
-    defer frame.deinit(alloc);
-    try frame.composed.pushComposedRow(alloc, 20, &title);
-    frame.composed.cursor = .{ .row = 20, .col = 1 };
-    frame.composed.cursor_visible = false;
-
-    var shell = TranscriptRuntime{
-        .layout = frame.paint.layout,
-        .owned_top_row = 1,
-        .extra_input_rows = 7,
-    };
-    defer shell.deinit(alloc);
-
-    commitSurfaceFooterFrame(alloc, &shell, &frame, null);
-
-    try std.testing.expect(shell.footer_viewport.has_frame);
-    try std.testing.expect(!shell.footer_viewport.cursor_visible);
-}
-
-test "transcript viewer reserves a blank row above its navigation footer" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    var prompt = ApprovalPrompt{};
-    defer prompt.deinit(alloc);
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 24,
-            .cols = 96,
-            .content_bottom = 20,
-            .divider_top_row = 21,
-            .input_row = 22,
-            .divider_bottom_row = 23,
-            .hint_row = 24,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 20,
-        .cursor_col = 1,
-    };
-    defer shell.deinit(alloc);
-
-    var ctx = surfaceTestContext(&input);
-    ctx.transcript_depth = .full;
-    var review = try measureSurfaceFooter(alloc, &shell, prompt.projection(), ctx);
-    defer review.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 1), review.frameLayoutMeasurement().top_gap_rows);
-
-    ctx.transcript_depth = .full;
-    var full = try measureSurfaceFooter(alloc, &shell, prompt.projection(), ctx);
-    defer full.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 1), full.frameLayoutMeasurement().top_gap_rows);
 }
 
 fn surfaceTestRetargetPaintPlan(top: u16) PaintPlan {
@@ -3043,153 +1562,4 @@ fn surfaceTestRetargetPaintPlan(top: u16) PaintPlan {
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
-}
-
-fn surfaceTestApprovalProfilePreview() diff_mod.FileChangePreview {
-    return .{
-        .path = "src/profile.txt",
-        .lines = &.{
-            .{ .op = .deletion, .old_line = 1, .text = "old one" },
-            .{ .op = .addition, .new_line = 1, .text = "new one" },
-            .{ .op = .deletion, .old_line = 2, .text = "old two" },
-            .{ .op = .addition, .new_line = 2, .text = "new two" },
-            .{ .op = .deletion, .old_line = 3, .text = "old three" },
-            .{ .op = .addition, .new_line = 3, .text = "new three" },
-        },
-        .additions = 3,
-        .deletions = 3,
-        .truncated = false,
-    };
-}
-
-fn surfaceTestApprovalFileRequest(
-    preview: diff_mod.FileChangePreview,
-) permission_request.FileApprovalRequest {
-    return .{
-        .kind = .edit,
-        .intent = .mutation,
-        .preview = preview,
-        .scope = .workspace_files,
-    };
-}
-
-test "file approval reservation-only sizing matches measured subagent view" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    var prompt = ApprovalPrompt{};
-    defer prompt.deinit(alloc);
-    try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "ignored",
-        .file = surfaceTestApprovalFileRequest(surfaceTestApprovalProfilePreview()),
-    }));
-
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 24,
-            .cols = 96,
-            .content_bottom = 20,
-            .divider_top_row = 21,
-            .input_row = 22,
-            .divider_bottom_row = 23,
-            .hint_row = 24,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 10,
-        .cursor_col = 1,
-    };
-    defer shell.deinit(alloc);
-
-    const ctx = surfaceTestContext(&input);
-
-    var measured = try measureSurfaceFooter(
-        alloc,
-        &shell,
-        prompt.projection(),
-        ctx,
-    );
-    defer measured.deinit(alloc);
-    var force_redraw = false;
-    _ = try resolveSurfaceFooterReservation(
-        alloc,
-        &shell,
-        &force_redraw,
-        prompt.projection(),
-        ctx,
-        currentSurfaceFooterTranscriptState(&shell),
-    );
-    try std.testing.expectEqual(
-        measured.footer_extra,
-        shell.extra_input_rows,
-    );
-    try std.testing.expectEqual(
-        approval_ui.fileApprovalPickerRows(prompt.request.?.file.?),
-        measured.picker_rows,
-    );
-}
-
-test "file approval preparation over active subagent view keeps a valid footer invalidation" {
-    const alloc = std.testing.allocator;
-    var input = InputRuntime{};
-    defer input.deinit(alloc);
-    var prompt = ApprovalPrompt{};
-    defer prompt.deinit(alloc);
-    try std.testing.expect(try prompt.syncRequest(alloc, .{
-        .label = "ignored",
-        .file = surfaceTestApprovalFileRequest(surfaceTestApprovalProfilePreview()),
-    }));
-
-    var shell = TranscriptRuntime{
-        .layout = .{
-            .rows = 40,
-            .cols = 120,
-            .content_bottom = 36,
-            .divider_top_row = 37,
-            .input_row = 38,
-            .divider_bottom_row = 39,
-            .hint_row = 40,
-        },
-        .owned_top_row = 1,
-        .viewport_top_row = 1,
-        .cursor_row = 41,
-        .cursor_col = 121,
-    };
-    defer shell.deinit(alloc);
-    shell.footer_viewport.has_frame = true;
-    shell.footer_viewport.geometry = .{
-        .top = 37,
-        .top_divider = 37,
-        .input_base = 38,
-        .bottom_divider = 39,
-        .hint = 40,
-    };
-
-    const ctx = surfaceTestContext(&input);
-
-    var metrics = Metrics{};
-    var force_redraw = false;
-    var frame = try prepareSurfaceFooterFrameWithReservation(
-        alloc,
-        &shell,
-        &metrics,
-        &force_redraw,
-        prompt.projection(),
-        ctx,
-        .{ .precomputed = true },
-        FrameInvalidationSet.empty(),
-    );
-    defer frame.deinit(alloc);
-
-    try frame.paint.validate();
-    try std.testing.expect(surfaceHasInvalidation(
-        frame.paint.invalidation,
-        .reserved_gap_clear,
-        37,
-        40,
-    ));
-    try std.testing.expectEqual(
-        approval_ui.fileApprovalPickerRows(prompt.request.?.file.?),
-        shell.extra_input_rows,
-    );
 }

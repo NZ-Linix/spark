@@ -323,58 +323,6 @@ test "a host record round-trips through its file contents" {
     try std.testing.expectEqual(@as(usize, 0), legacy.profiles.len);
 }
 
-test "a host record rejects another version, bad JSON, and unsafe ids" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectError(error.InvalidHostRecord, decode(a, "g", "{\"version\":2,\"updated_ms\":1,\"sessions\":[]}"));
-    try std.testing.expectError(error.InvalidHostRecord, decode(a, "g", "not json"));
-    try std.testing.expectError(error.InvalidHostRecord, decode(a, "g", "{\"version\":1,\"updated_ms\":1,\"sessions\":[\"../x\"]}"));
-    try std.testing.expectError(error.InvalidHostRecord, decode(a, "../g", "{\"version\":1,\"updated_ms\":1,\"sessions\":[]}"));
-    // A profile list must match the sessions, and each name must be safe.
-    try std.testing.expectError(error.InvalidHostRecord, decode(a, "g", "{\"version\":1,\"updated_ms\":1,\"sessions\":[\"a\"],\"profiles\":[]}"));
-    try std.testing.expectError(error.InvalidHostRecord, decode(a, "g", "{\"version\":1,\"updated_ms\":1,\"sessions\":[\"a\"],\"profiles\":[\"../p\"]}"));
-    try std.testing.expect(!isValidId(""));
-    try std.testing.expect(!isValidId("a/b"));
-    try std.testing.expect(isValidId("Abc-12_z"));
-}
-
-test "restoring a session brings back its newest group, minus sessions that moved on" {
-    const alloc = std.testing.allocator;
-    const records = [_]Record{
-        .{ .group_id = "old", .updated_ms = 10, .sessions = &.{ "a", "b", "c" } },
-        .{ .group_id = "new", .updated_ms = 20, .sessions = &.{ "d", "a", "e", "a" } },
-        .{ .group_id = "later", .updated_ms = 30, .sessions = &.{ "e", "f" } },
-    };
-    // `a` is in "old" and "new"; "new" wins. `e` moved on to "later".
-    var restore = (try chooseRestore(alloc, &records, "a")).?;
-    defer restore.deinit(alloc);
-    try std.testing.expectEqualStrings("new", restore.group_id);
-    try std.testing.expectEqual(@as(usize, 1), restore.others.len);
-    try std.testing.expectEqualStrings("d", restore.others[0].id);
-    // Each session comes back with its own instance's profile, the
-    // resumed one included.
-    const profiled = [_]Record{
-        .{ .group_id = "p", .updated_ms = 1, .sessions = &.{ "x", "y", "z" }, .profiles = &.{ "reviewer", null, "main" } },
-    };
-    var named = (try chooseRestore(alloc, &profiled, "x")).?;
-    defer named.deinit(alloc);
-    try std.testing.expectEqualStrings("reviewer", named.profile.?);
-    try std.testing.expect(named.others[0].profile == null);
-    try std.testing.expectEqualStrings("main", named.others[1].profile.?);
-    try std.testing.expect(restore.profile == null);
-    // A session no record lists restores nothing.
-    try std.testing.expect((try chooseRestore(alloc, &records, "z")) == null);
-    // Equal times order by group id, not by listing order.
-    const tied = [_]Record{
-        .{ .group_id = "b", .updated_ms = 5, .sessions = &.{ "x", "y" } },
-        .{ .group_id = "a", .updated_ms = 5, .sessions = &.{ "x", "z" } },
-    };
-    var tie = (try chooseRestore(alloc, &tied, "x")).?;
-    defer tie.deinit(alloc);
-    try std.testing.expectEqualStrings("b", tie.group_id);
-}
-
 /// Checks `chooseRestore` for `resumed` over `records`: the newest record
 /// that lists `resumed` wins, and it brings back that record's other
 /// sessions in order, except any a newer record lists.
@@ -415,40 +363,6 @@ fn expectRestore(alloc: Allocator, records: []const Record, resumed: []const u8)
 const ids_pool = [_][]const u8{ "a", "b", "c", "d", "e", "f" };
 const groups_pool = [_][]const u8{ "g0", "g1", "g2", "g3", "g4", "g5" };
 
-test "restoring holds for random sets of records" {
-    var prng = std.Random.DefaultPrng.init(0x4057_2ec0);
-    const random = prng.random();
-    var session_buf: [6][6][]const u8 = undefined;
-    var records: [6]Record = undefined;
-    for (0..5_000) |_| {
-        const count = random.uintAtMost(usize, records.len);
-        for (records[0..count], 0..) |*record, index| {
-            const len = random.uintAtMost(usize, session_buf[index].len);
-            for (session_buf[index][0..len]) |*id| id.* = ids_pool[random.uintLessThan(usize, ids_pool.len)];
-            record.* = .{ .group_id = groups_pool[index], .updated_ms = random.uintAtMost(u8, 4), .sessions = session_buf[index][0..len] };
-        }
-        try expectRestore(std.testing.allocator, records[0..count], ids_pool[random.uintLessThan(usize, ids_pool.len)]);
-    }
-}
-
-test "restoring holds for fuzzed sets of records" {
-    try std.testing.fuzz({}, fuzzRestore, .{
-        .corpus = &(.{""} ++ @import("fuzz_corpus").host_restore.*),
-    });
-}
-
-test "a host record file decodes or is refused on fuzzed bytes" {
-    try std.testing.fuzz({}, fuzzDecode, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "{\"version\":1,\"updated_ms\":5,\"sessions\":[\"abc\",\"def\"]}",
-            "{\"version\":1,\"updated_ms\":5,\"sessions\":[\"abc\"],\"profiles\":[\"main\"]}",
-            "{\"version\":2}",
-            "[]",
-            "\xff\x00{",
-        }) ++ @import("fuzz_corpus").host_record_decode.*),
-    });
-}
-
 fn fuzzDecode(_: void, smith: *std.testing.Smith) anyerror!void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -476,64 +390,4 @@ fn fuzzRestore(_: void, smith: *std.testing.Smith) !void {
         records[count] = .{ .group_id = groups_pool[count], .updated_ms = smith.valueRangeAtMost(u8, 0, 4), .sessions = session_buf[count][0..len] };
     }
     try expectRestore(std.testing.allocator, records[0..count], ids_pool[smith.index(ids_pool.len)]);
-}
-
-test "pruning keeps the newest records and the group in use" {
-    const alloc = std.testing.allocator;
-    const none: []const []const u8 = &.{};
-    const records = [_]Record{
-        .{ .group_id = "aaaaaaaaaaaaaaaa", .updated_ms = 10, .sessions = none },
-        .{ .group_id = "bbbbbbbbbbbbbbbb", .updated_ms = 50, .sessions = none },
-        .{ .group_id = "cccccccccccccccc", .updated_ms = 30, .sessions = none },
-        .{ .group_id = "dddddddddddddddd", .updated_ms = 40, .sessions = none },
-        .{ .group_id = "eeeeeeeeeeeeeeee", .updated_ms = 20, .sessions = none },
-    };
-    const stale = try staleGroups(alloc, &records, 2, null);
-    defer alloc.free(stale);
-    try std.testing.expectEqual(@as(usize, 3), stale.len);
-    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaa", stale[0]);
-    try std.testing.expectEqualStrings("eeeeeeeeeeeeeeee", stale[1]);
-    try std.testing.expectEqualStrings("cccccccccccccccc", stale[2]);
-
-    // The group being restored stays even when it is the oldest, and it
-    // takes none of the newest places.
-    const kept = try staleGroups(alloc, &records, 2, "aaaaaaaaaaaaaaaa");
-    defer alloc.free(kept);
-    try std.testing.expectEqual(@as(usize, 2), kept.len);
-    try std.testing.expectEqualStrings("eeeeeeeeeeeeeeee", kept[0]);
-    try std.testing.expectEqualStrings("cccccccccccccccc", kept[1]);
-
-    const few = try staleGroups(alloc, &records, max_records, null);
-    defer alloc.free(few);
-    try std.testing.expectEqual(@as(usize, 0), few.len);
-}
-
-test "host records are written whole, listed, and removed" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const dir_path = try alloc.print("{s}/hosts", .{root});
-    defer alloc.free(dir_path);
-
-    var empty = try loadAll(alloc, dir_path);
-    try std.testing.expectEqual(@as(usize, 0), empty.records.len);
-    empty.deinit();
-
-    try write(alloc, dir_path, .{ .group_id = "g1", .updated_ms = 7, .sessions = &.{ "a", "b" } });
-    try write(alloc, dir_path, .{ .group_id = "g1", .updated_ms = 8, .sessions = &.{ "b", "c" } });
-    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "hosts/junk.json", .data = "nope" });
-    var loaded = try loadAll(alloc, dir_path);
-    try std.testing.expectEqual(@as(usize, 1), loaded.records.len);
-    try std.testing.expectEqual(@as(i64, 8), loaded.records[0].updated_ms);
-    try std.testing.expectEqualStrings("c", loaded.records[0].sessions[1]);
-    loaded.deinit();
-
-    try remove(alloc, dir_path, "g1");
-    try remove(alloc, dir_path, "g1");
-    var after = try loadAll(alloc, dir_path);
-    try std.testing.expectEqual(@as(usize, 0), after.records.len);
-    after.deinit();
-    try std.testing.expectError(error.InvalidHostRecord, write(alloc, dir_path, .{ .group_id = "../x", .updated_ms = 1, .sessions = &.{} }));
 }

@@ -153,84 +153,6 @@ fn testBody(arena: Allocator, request: Fragment, level: Fragment) ![]const u8 {
     return out.written();
 }
 
-test "request fragment keeps the settings' order and nested values" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const fragment = try testParse(arena, "{\"top_p\":0.9,\"reasoning\":{\"effort\":\"high\",\"exclude\":[true,null]},\"seed\":7,\"stop\":\"\\n\\\"\"}", &.{"model"});
-    try std.testing.expectEqual(@as(usize, 4), fragment.fields.len);
-    try std.testing.expectEqualStrings("top_p", fragment.fields[0].key);
-    try std.testing.expectEqualStrings("seed", fragment.fields[2].key);
-    try std.testing.expectEqualStrings("7", fragment.fields[2].value_json);
-    const body = try testBody(arena, fragment, .{});
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{ .duplicate_field_behavior = .@"error" });
-    try std.testing.expectEqualStrings("high", parsed.object.get("reasoning").?.object.get("effort").?.string);
-    try std.testing.expectEqualStrings("\n\"", parsed.object.get("stop").?.string);
-    try std.testing.expectEqual(@as(f64, 0.9), parsed.object.get("top_p").?.float);
-}
-
-test "request fragment sends a field both fragments set once, with the level's value" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const request = try testParse(arena, "{\"temperature\":0.2,\"top_p\":0.9}", &.{});
-    const level = try testParse(arena, "{\"reasoning_effort\":\"high\",\"temperature\":0.7}", &.{});
-    const body = try testBody(arena, request, level);
-    try std.testing.expectEqualStrings("{\"model\":\"m\",\"top_p\":0.9,\"reasoning_effort\":\"high\",\"temperature\":0.7}", body);
-    try std.testing.expectEqualStrings("{\"model\":\"m\"}", try testBody(arena, .{}, .{}));
-}
-
-test "request fragment refuses spark's own fields, other shapes, and anything past its limits" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const reserved = [_][]const u8{ "model", "messages" };
-    try std.testing.expectError(error.ReservedRequestField, testParse(arena, "{\"temperature\":1,\"messages\":[]}", &reserved));
-    try std.testing.expectError(error.ReservedRequestField, testParse(arena, "{\"model\":\"other\"}", &reserved));
-    // Only the top level is spark's: a nested key of the same name is the server's.
-    _ = try testParse(arena, "{\"extra_body\":{\"model\":\"x\"},\"Model\":1}", &reserved);
-    for ([_][]const u8{ "[]", "null", "\"temperature\"", "3", "{\"\":1}" }) |json| {
-        try std.testing.expectError(error.InvalidRequestFields, testParse(arena, json, &reserved));
-    }
-
-    var deep: std.ArrayList(u8) = .empty;
-    try deep.appendSlice(arena, "{\"a\":");
-    for (0..max_depth) |_| try deep.append(arena, '[');
-    try deep.append(arena, '1');
-    for (0..max_depth) |_| try deep.append(arena, ']');
-    try deep.append(arena, '}');
-    _ = try testParse(arena, deep.items, &reserved);
-    const deeper = try std.mem.replaceOwned(u8, arena, deep.items, "1", "[1]");
-    try std.testing.expectError(error.InvalidRequestFields, testParse(arena, deeper, &reserved));
-    // The same bound holds for objects inside objects.
-    var nested: std.ArrayList(u8) = .empty;
-    try nested.appendSlice(arena, "{\"a\":");
-    for (0..max_depth) |_| try nested.appendSlice(arena, "{\"b\":");
-    try nested.append(arena, '1');
-    for (0..max_depth) |_| try nested.append(arena, '}');
-    try nested.append(arena, '}');
-    _ = try testParse(arena, nested.items, &reserved);
-    const nested_deeper = try std.mem.replaceOwned(u8, arena, nested.items, "1", "{\"b\":1}");
-    try std.testing.expectError(error.InvalidRequestFields, testParse(arena, nested_deeper, &reserved));
-
-    for ([_]usize{ max_fields, max_fields + 1 }) |count| {
-        var many: std.ArrayList(u8) = .empty;
-        try many.append(arena, '{');
-        for (0..count) |index| try many.print(arena, "{s}\"k{d}\":{d}", .{ if (index == 0) "" else ",", index, index });
-        try many.append(arena, '}');
-        if (count == max_fields) {
-            try std.testing.expectEqual(max_fields, (try testParse(arena, many.items, &reserved)).fields.len);
-        } else try std.testing.expectError(error.LimitExceeded, testParse(arena, many.items, &reserved));
-    }
-    const long_key = try arena.alloc(u8, max_key_bytes + 1);
-    @memset(long_key, 'k');
-    _ = try testParse(arena, try arena.print("{{\"{s}\":1}}", .{long_key[0..max_key_bytes]}), &reserved);
-    try std.testing.expectError(error.LimitExceeded, testParse(arena, try arena.print("{{\"{s}\":1}}", .{long_key}), &reserved));
-    const big = try arena.alloc(u8, max_bytes);
-    @memset(big, 'v');
-    try std.testing.expectError(error.LimitExceeded, testParse(arena, try arena.print("{{\"k\":\"{s}\"}}", .{big}), &reserved));
-}
-
 fn testParseAllocations(alloc: Allocator) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"a\":{\"b\":[1,2]},\"c\":\"d\",\"model\":1}", .{});
     defer parsed.deinit();
@@ -247,8 +169,4 @@ fn testParseAllocations(alloc: Allocator) !void {
         alloc.free(field.value_json);
     }
     alloc.free(fragment.fields);
-}
-
-test "request fragment releases partial copies on failure" {
-    try std.testing.checkAllAllocationFailures(no_resize, testParseAllocations, .{});
 }

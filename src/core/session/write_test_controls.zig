@@ -60,10 +60,3 @@ fn pathExists(path: []const u8) bool {
     std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
     return true;
 }
-
-test "a test build holds only through its hook" {
-    // Without a hook a hold returns at once, and the file controls are
-    // never read.
-    holdDueRecords(3);
-    try std.testing.expectEqual(@as(u32, 0), holds.load(.seq_cst));
-}

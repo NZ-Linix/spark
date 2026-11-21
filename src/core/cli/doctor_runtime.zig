@@ -1,6 +1,7 @@
 const std = @import("std");
 const profile_paths = @import("../shared/profile_paths.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const credentials = @import("../auth/credentials.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
@@ -46,9 +47,8 @@ pub const Check = struct {
 pub const Snapshot = struct {
     workspace_root: []u8,
     model: []const u8,
-    provider: model_provider.ProviderId = .gateway,
+    provider: model_provider.ProviderId = .none,
     owned_model: ?[]u8 = null,
-    auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: types.PermissionMode,
     agent_step_limit: usize,
     checks: []Check,
@@ -58,7 +58,6 @@ pub const Snapshot = struct {
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         alloc.free(self.workspace_root);
         if (self.owned_model) |model| alloc.free(model);
-        self.auth.deinit(alloc);
         for (self.checks) |*entry| entry.deinit(alloc);
         alloc.free(self.checks);
         self.* = undefined;
@@ -76,7 +75,7 @@ const CollectOptions = struct {
 /// `doctor_probes.zig`.
 pub fn collect(
     alloc: Allocator,
-    secret_store: host.SecretStore,
+    _: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
     mcp_config_diagnostic: mcp_contract.ProfileConfigDiagnostic,
@@ -102,7 +101,6 @@ pub fn collect(
     errdefer {
         alloc.free(snapshot.workspace_root);
         if (snapshot.owned_model) |model| alloc.free(model);
-        snapshot.auth.deinit(alloc);
     }
 
     const workspace_detail = try alloc.print("using workspace {s}", .{snapshot.workspace_root});
@@ -117,11 +115,10 @@ pub fn collect(
 
     var detailed = config_runtime.loadMergedSettingsDetailed(alloc, snapshot.workspace_root) catch |err| {
         // Settings are unreadable, so no remembered choice is available to honour.
-        snapshot.auth = try auth_runtime.loadStatusSnapshot(alloc, secret_store, null);
         try appendConfigLoadFailureCheck(&checks, alloc, "config", "failed to load config", err);
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
         try appendMcpIssueChecks(&checks, alloc, mcp_issues);
-        try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
+        try appendAuthCheck(&checks, alloc, snapshot.provider);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
         snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
@@ -130,14 +127,7 @@ pub fn collect(
         return snapshot;
     };
     defer detailed.deinit(alloc);
-    snapshot.provider = detailed.settings.provider orelse .gateway;
-
-    snapshot.auth = try auth_runtime.loadStatusSnapshotForProvider(
-        alloc,
-        secret_store,
-        snapshot.provider,
-        detailed.settings.credential_source,
-    );
+    snapshot.provider = detailed.settings.provider orelse .none;
 
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
     try appendConfigDiagnosticChecks(&checks, alloc, detailed.diagnostics);
@@ -145,7 +135,7 @@ pub fn collect(
     try appendEnvChecks(&checks, alloc, detailed.settings.permission_mode, detailed.settings.max_agent_steps, default_agent_step_limit);
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendMcpIssueChecks(&checks, alloc, mcp_issues);
-    try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
+    try appendAuthCheck(&checks, alloc, snapshot.provider);
     const selection = config_runtime.selectProviderModel(
         default_model,
         &detailed.settings,
@@ -320,28 +310,34 @@ fn causeRejectsLayer(cause: @FieldType(config_runtime.ConfigDiagnostic, "cause")
     }
 }
 
-/// The command that signs in to `provider`.
-pub fn loginCommand(provider: model_provider.ProviderId) []const u8 {
+/// The step that fixes the credential for `provider`.
+pub fn providerFix(provider: model_provider.ProviderId) []const u8 {
     return switch (provider) {
-        .gateway => "spark login",
-        .codex => "spark login codex",
-        .grok => "spark login grok",
-        .configured => profile_paths.displayText("check the connection's auth in ~/.spark/settings.json"),
+        .none => "run spark provider <name>, or /provider in a session",
+        .configured => profile_paths.displayText("check the provider's key in ~/.spark/settings.json, or run /provider"),
     };
 }
 
-fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_runtime.StatusSnapshot, provider: model_provider.ProviderId) !void {
-    if (auth.missingHelp(.cli)) |help| {
-        try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = help, .fix = loginCommand(provider) });
+fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, provider: model_provider.ProviderId) !void {
+    if (provider == .none) {
+        try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = credentials.missing_credential_message, .fix = providerFix(provider) });
         return;
     }
-
-    const detail = try auth.formatDoctorDetail(alloc);
-    if (auth.expired) {
+    var resolution = credentials.resolveForProvider(alloc, provider) catch |err| {
+        const detail = try alloc.print("spark could not read the provider's settings ({s})", .{@errorName(err)});
         errdefer alloc.free(detail);
-        try checks.append(alloc, .{ .name = "auth", .status = .warn, .detail = detail, .owned_detail = detail, .fix = loginCommand(provider) });
+        try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = detail, .owned_detail = detail, .fix = providerFix(provider) });
         return;
-    }
+    };
+    const credential = if (resolution.credential) |*value| value else {
+        try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = auth_runtime.missingCredentialText(provider), .fix = providerFix(provider) });
+        return;
+    };
+    defer credential.deinit(alloc);
+    const detail = if (credential.token.len == 0)
+        try alloc.print("{s} needs no API key", .{provider.label()})
+    else
+        try alloc.print("{s} has an API key", .{provider.label()});
     try appendCheckOwned(checks, alloc, "auth", .ok, detail);
 }
 
@@ -361,8 +357,6 @@ fn appendResolvedStartupCheck(
         // Startup refuses this provider, so no model would run.
         snapshot.model = "";
         const fix: []const u8 = switch (err) {
-            error.CodexModelNotSelected => "spark provider codex",
-            error.GrokModelNotSelected => "spark provider grok",
             error.ConfiguredModelNotSelected => profile_paths.displayText("save a model under \"models\" in ~/.spark/settings.json"),
         };
         try checks.append(alloc, .{ .name = "startup", .status = .fail, .detail = config_runtime.modelNotSelectedMessage(err) orelse @errorName(err), .fix = fix });
@@ -631,7 +625,7 @@ fn appendEnvChecks(
 ) !void {
     if (io_mod.getenv("SPARK_PERMISSION_MODE")) |raw| if (config_runtime.parsePermissionMode(raw) == null) {
         const used = permissionModeLabel(configured_mode orelse config_runtime.default_permission_mode);
-        try appendCheckOwnedFix(checks, alloc, "env", .warn, try alloc.print("SPARK_PERMISSION_MODE={s} is not a mode; spark uses {s}", .{ raw, used }), try alloc.dupe(u8, "set it to ask, auto, or full-access, or unset it"));
+        try appendCheckOwnedFix(checks, alloc, "env", .warn, try alloc.print("SPARK_PERMISSION_MODE={s} is not a mode; spark uses {s}", .{ raw, used }), try alloc.dupe(u8, "set it to full-access, or unset it"));
     };
     if (io_mod.getenv("SPARK_MAX_AGENT_STEPS")) |raw| if (agent_steps.parseMaxAgentSteps(raw) == null) {
         const used = agent_steps.resolveMaxAgentSteps(configured_steps, default_steps);
@@ -828,11 +822,8 @@ fn accessPath(path: []const u8) !bool {
 }
 
 fn permissionModeLabel(mode: types.PermissionMode) []const u8 {
-    return switch (mode) {
-        .ask => "ask",
-        .auto => "auto",
-        .yolo => "full access",
-    };
+    _ = mode;
+    return "full access";
 }
 
 test "format config presence names existing layers" {
@@ -842,202 +833,8 @@ test "format config presence names existing layers" {
     try std.testing.expectEqualStrings("loaded config from ~/.spark/settings.json", detail);
 }
 
-test "MCP config diagnostic maps only failures to one doctor check" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-
-    try appendMcpConfigCheck(&checks, alloc, .clear);
-    try std.testing.expectEqual(@as(usize, 0), checks.items.len);
-
-    try appendMcpConfigCheck(
-        &checks,
-        alloc,
-        .{ .failed = error.McpConfigInvalidJson },
-    );
-    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
-    try std.testing.expectEqualStrings("mcp_config", checks.items[0].name);
-    try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
-    try std.testing.expectEqualStrings(
-        "failed to load ~/.spark/mcp.json: McpConfigInvalidJson",
-        checks.items[0].detail,
-    );
-}
-
-test "config check handles user and workspace config files together" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.spark");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeDoctorFixtureFile(tmp.dir, "home/.spark/settings.json", "{\"permission_mode\":\"ask\"}");
-    try writeDoctorFixtureFile(tmp.dir, "workspace/.spark.json", "{\"permission_mode\":\"auto\"}");
-
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    var paths = try config_runtime.discoverPathsFromHome(std.testing.allocator, home_root, workspace_root);
-    defer paths.deinit(std.testing.allocator);
-
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(std.testing.allocator);
-        checks.deinit(std.testing.allocator);
-    }
-
-    try appendConfigCheck(&checks, std.testing.allocator, paths, &.{});
-
-    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
-    try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.spark/settings.json") != null);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".spark.json") != null);
-}
-
-test "config check does not claim rejected user settings loaded" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.spark");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeDoctorFixtureFile(tmp.dir, "home/.spark/settings.json", "{\"permission_mode\":\"ask\"}");
-    try writeDoctorFixtureFile(tmp.dir, "workspace/.spark.json", "{\"permission_mode\":\"auto\"}");
-
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    var paths = try config_runtime.discoverPathsFromHome(std.testing.allocator, home_root, workspace_root);
-    defer paths.deinit(std.testing.allocator);
-
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(std.testing.allocator);
-        checks.deinit(std.testing.allocator);
-    }
-
-    const diagnostics = [_]config_runtime.ConfigDiagnostic{
-        .{
-            .layer = .user,
-            .cause = .private_state_permissions_unsupported,
-        },
-    };
-    try appendConfigCheck(&checks, std.testing.allocator, paths, &diagnostics);
-
-    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
-    try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.spark/settings.json") == null);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".spark.json") != null);
-}
-
-test "session count check preserves empty and latest details" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-
-    try appendSessionsCountCheck(&checks, alloc, 0, "", false);
-    try appendSessionsCountCheck(&checks, alloc, 2, "session-2", false);
-    // Sessions only an older spark saved are not "no sessions" (D73).
-    try appendSessionsCountCheck(&checks, alloc, 0, "", true);
-
-    try std.testing.expectEqual(@as(usize, 2), checks.items.len);
-    try std.testing.expectEqualStrings("sessions", checks.items[0].name);
-    try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
-    try std.testing.expectEqualStrings("no saved sessions yet", checks.items[0].detail);
-    try std.testing.expectEqualStrings("sessions", checks.items[1].name);
-    try std.testing.expectEqual(CheckStatus.ok, checks.items[1].status);
-    try std.testing.expectEqualStrings("2 saved session(s); latest=session-2", checks.items[1].detail);
-}
-
-test "doctor startup check fails when the provider has no model to run" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-    var snapshot = Snapshot{
-        .workspace_root = "",
-        .model = "default/model",
-        .permission_mode = config_runtime.default_permission_mode,
-        .agent_step_limit = 25,
-        .checks = &.{},
-    };
-
-    try appendResolvedStartupCheck(&snapshot, &checks, alloc, error.CodexModelNotSelected, .{ .max_agent_steps = 7 }, 25);
-    try std.testing.expectEqualStrings("", snapshot.model);
-    try std.testing.expectEqual(@as(usize, 7), snapshot.agent_step_limit);
-    try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
-    try std.testing.expect(std.mem.startsWith(u8, checks.items[0].detail, "no Codex model is selected;"));
-
-    try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{ .provider = .codex, .model = "gpt-saved" }, .{}, 25);
-    defer if (snapshot.owned_model) |model| alloc.free(model);
-    try std.testing.expectEqualStrings("gpt-saved", snapshot.model);
-    try std.testing.expectEqual(CheckStatus.ok, checks.items[1].status);
-}
-
-test "bounded doctor warnings use existing check stream" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-
-    try appendSessionDiagnosticsTruncatedCheck(&checks, alloc, 64);
-
-    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
-    try std.testing.expectEqualStrings("session", checks.items[0].name);
-    try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[0].detail,
-        "truncated after 64 session directories",
-    ) != null);
-}
-
 fn writeDoctorFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(std.testing.io, sub_path, .{});
     defer file.close(std.testing.io);
     try file.writeStreamingAll(std.testing.io, text);
-}
-
-test "has git metadata detects .git file or directory" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace/.git");
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    try std.testing.expect(try hasGitMetadata(std.testing.allocator, workspace_root));
-}
-
-test "each MCP config issue is a failure with a fix" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-    const issues = [_]mcp_health.ConfigurationIssue{
-        .{ .message = @constCast(".mcp.json server 'unknown' was skipped: invalid_json.") },
-        .{ .message = @constCast(".mcp.json server 'odd' was skipped: its \"type\" isn't valid.") },
-    };
-    try appendMcpIssueChecks(&checks, alloc, &issues);
-    try std.testing.expectEqual(issues.len, checks.items.len);
-    for (issues, checks.items) |issue, check| {
-        try std.testing.expectEqualStrings("mcp_config", check.name);
-        try std.testing.expectEqual(CheckStatus.fail, check.status);
-        try std.testing.expectEqualStrings(issue.message, check.detail);
-        try std.testing.expectEqualStrings("fix .mcp.json, then run spark doctor again", check.fix.?);
-    }
 }

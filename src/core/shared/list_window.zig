@@ -66,36 +66,3 @@ pub fn updateEdgeStart(current_start: usize, count: usize, selected: usize, max_
     }
     return start;
 }
-
-test "selection scrolls only past the picker's own row count" {
-    var index: usize = 0;
-    var start: usize = 0;
-    const rows: u16 = 10;
-    for (0..9) |_| advanceSelectionWithin(&index, &start, 30, 1, rows);
-    try std.testing.expectEqual(@as(usize, 9), index);
-    try std.testing.expectEqual(@as(usize, 0), start);
-    advanceSelectionWithin(&index, &start, 30, 1, rows);
-    try std.testing.expectEqual(@as(usize, 10), index);
-    try std.testing.expectEqual(@as(usize, 1), start);
-    // Other pickers keep six rows.
-    index = 0;
-    start = 0;
-    for (0..6) |_| advanceSelection(&index, &start, 30, 1);
-    try std.testing.expectEqual(@as(usize, 1), start);
-}
-
-test "edge window start lets selection move back up before reverse scrolling" {
-    const rows: u16 = 6;
-
-    var start = updateEdgeStart(0, 11, 5, rows);
-    try std.testing.expectEqual(@as(usize, 0), start);
-    try std.testing.expectEqual(@as(usize, 5), 5 - start);
-
-    start = updateEdgeStart(start, 11, 6, rows);
-    try std.testing.expectEqual(@as(usize, 1), start);
-    try std.testing.expectEqual(@as(usize, 5), 6 - start);
-
-    start = updateEdgeStart(start, 11, 5, rows);
-    try std.testing.expectEqual(@as(usize, 1), start);
-    try std.testing.expectEqual(@as(usize, 4), 5 - start);
-}

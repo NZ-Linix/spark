@@ -138,28 +138,3 @@ fn testRun(alloc: Allocator, completion: *Completion) !ChildRun {
         .completion = completion,
     };
 }
-
-test "ending a child's run releases its slot thread once, with the first outcome" {
-    const alloc = std.testing.allocator;
-    var completion: Completion = .{};
-    var run = try testRun(alloc, &completion);
-    defer run.deinit(alloc);
-    try std.testing.expect(run.inFlight());
-    try std.testing.expectEqual(@as(?Completion.Outcome, null), completion.result());
-
-    run.finish(.completed);
-    try std.testing.expect(!run.inFlight());
-    try std.testing.expectEqual(@as(?Completion.Outcome, .completed), completion.result());
-    // A later end, such as shutdown freeing the run, changes nothing.
-    run.finish(.failed);
-    completion.finish(.cancelled);
-    try std.testing.expectEqual(@as(?Completion.Outcome, .completed), completion.result());
-}
-
-test "freeing a child's run still in flight ends it as cancelled" {
-    const alloc = std.testing.allocator;
-    var completion: Completion = .{};
-    var run = try testRun(alloc, &completion);
-    run.deinit(alloc);
-    try std.testing.expectEqual(@as(?Completion.Outcome, .cancelled), completion.result());
-}

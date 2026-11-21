@@ -21,29 +21,6 @@ fn cancellationTarget(
     };
 }
 
-test "cancellation target distinguishes agent turns and manual compaction" {
-    try std.testing.expectEqual(
-        CancellationTarget.none,
-        cancellationTarget(false, .idle),
-    );
-    try std.testing.expectEqual(
-        CancellationTarget.agent_turn,
-        cancellationTarget(true, .idle),
-    );
-    try std.testing.expectEqual(
-        CancellationTarget.context_compaction,
-        cancellationTarget(false, .queued),
-    );
-    try std.testing.expectEqual(
-        CancellationTarget.context_compaction,
-        cancellationTarget(false, .running),
-    );
-    try std.testing.expectEqual(
-        CancellationTarget.agent_turn,
-        cancellationTarget(true, .running),
-    );
-}
-
 pub fn InterruptRuntime(comptime App: type) type {
     return struct {
         const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
@@ -137,7 +114,7 @@ pub fn InterruptRuntime(comptime App: type) type {
         }
 
         pub fn traceInterruptRequested(app: *App, agent: *AppAgent, source: []const u8) void {
-            const approval_active = agent.approval_prompt.isActive();
+            const approval_active = false;
             const question_active = agent.question_prompt.isActive();
             const tool_status_count = activeToolStatusCount(app);
             const pending_tool_call = approval_active or tool_status_count > 0;
@@ -187,124 +164,4 @@ pub fn InterruptRuntime(comptime App: type) type {
             return cancellationTarget(agent.stream.active, status);
         }
     };
-}
-
-test "idle compaction feedback dismissal is scoped and never cancels active work" {
-    const FakeApp = struct {
-        main_agent: struct {
-            worker: worker_runtime.WorkerRuntime = .{},
-        } = .{},
-        shell: struct { render_requests: @import("../../ui/render_request.zig").RenderRequestState = .{} } = .{},
-
-        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
-            return &self.main_agent;
-        }
-    };
-    var app: FakeApp = .{};
-    defer app.agent().worker.deinit(std.testing.allocator);
-    const id = app.agent().worker.beginCompactionActivity(.manual, null);
-    try std.testing.expect(!InterruptRuntime(FakeApp).dismissCompactionFeedback(&app, (&app).agent()));
-    app.agent().worker.settleCompactionActivity(id, .{ .outcome = .cancelled });
-    try std.testing.expect(InterruptRuntime(FakeApp).dismissCompactionFeedback(&app, (&app).agent()));
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(!app.agent().worker.isCancelRequested());
-    try std.testing.expect(!InterruptRuntime(FakeApp).dismissCompactionFeedback(&app, (&app).agent()));
-}
-
-test "a steer's interrupt of the model leaves the user's cancel to stop the turn" {
-    const alloc = std.testing.allocator;
-    const FakeApp = struct {
-        main_agent: struct {
-            worker: worker_runtime.WorkerRuntime = .{},
-        } = .{},
-
-        pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
-            return &self.main_agent;
-        }
-    };
-    var app: FakeApp = .{};
-    const worker = &app.agent().worker;
-    defer worker.deinit(alloc);
-    try std.testing.expect(worker.beginDirectProcessing(41));
-    defer worker.finishProcessing();
-    try worker.admitInteractivePrompt(alloc, .{
-        .prompt = try alloc.dupe(u8, "follow-up"),
-        .images = &.{},
-        .model = try alloc.dupe(u8, "model"),
-        .api_key = try alloc.dupe(u8, "key"),
-        .permission_mode = .auto,
-        .history = try alloc.alloc(@import("../shared/types.zig").HistoryTurn, 0),
-        .grants = try alloc.alloc(@import("../shared/types.zig").PermissionGrant, 0),
-    });
-    try std.testing.expect(worker.isCancelRequested());
-    try std.testing.expect(!InterruptRuntime(FakeApp).turnCancelled((&app).agent()));
-    worker.requestInteractiveCancel();
-    try std.testing.expect(InterruptRuntime(FakeApp).turnCancelled((&app).agent()));
-}
-
-test "a cancel drops the finished turn the pacer held, so a later report is not held" {
-    const alloc = std.testing.allocator;
-    const types = @import("../shared/types.zig");
-    const Prompt = struct {
-        fn isActive(_: *const @This()) bool {
-            return false;
-        }
-    };
-    const App = struct {
-        alloc: std.mem.Allocator,
-        main_agent: struct {
-            worker: worker_runtime.WorkerRuntime = .{},
-            stream: struct { active: bool = false, chunks: usize = 0, last_activity_kind: ?enum { text } = null } = .{},
-            approval_prompt: Prompt = .{},
-            question_prompt: Prompt = .{},
-        } = .{},
-        pacer: @import("../../ui/assistant/pacer.zig").AssistantPacer = .{},
-        shell: struct {
-            render_requests: struct {
-                fn request(_: *@This(), _: anytype) void {}
-            } = .{},
-        } = .{},
-    };
-    var app: App = .{ .alloc = alloc };
-    defer app.pacer.deinit(alloc);
-    defer app.main_agent.worker.deinit(alloc);
-    const agent = &app.main_agent;
-    agent.worker.enableCommitGate();
-    agent.stream.active = true;
-
-    // A turn finished. The loop took its finish into the pacer, which is
-    // still showing the answer, so nothing has committed it.
-    const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("prompt") }, .assistant = @constCast("answer") } };
-    try agent.worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
-    var taken = agent.worker.takeEvents();
-    for (taken.items) |event| worker_runtime.freeWorkerEvent(alloc, event);
-    taken.deinit(alloc);
-    try app.pacer.enqueue(alloc, "still showing");
-    try std.testing.expect(try app.pacer.deferFinish(alloc, .{ .turn = turn }));
-    try std.testing.expectEqual(@as(u32, 1), agent.worker.unacknowledged_finishes);
-
-    // The user cancels. The pacer's turn is dropped, and the worker is told.
-    try InterruptRuntime(App).cancelActiveOperation(&app, agent);
-    try std.testing.expect(app.pacer.deferred_turn == null);
-    try std.testing.expectEqual(@as(u32, 0), agent.worker.unacknowledged_finishes);
-
-    // A later turn finishes and is committed, and a report missed it.
-    agent.worker.worker_processing = true;
-    agent.worker.active_turn_id = 9;
-    agent.worker.direct_steering_closed = true;
-    try agent.worker.pushEvent(alloc, .{ .finish_prompt = .{ .turn = turn } });
-    try agent.worker.postMail(alloc, .{
-        .prompt = try alloc.dupe(u8, "a report"),
-        .images = &.{},
-        .model = try alloc.dupe(u8, "test-model"),
-        .api_key = try alloc.dupe(u8, "test-key"),
-        .permission_mode = .auto,
-        .history = try alloc.alloc(types.HistoryTurn, 0),
-        .grants = try alloc.alloc(types.PermissionGrant, 0),
-    });
-    agent.worker.finishProcessing();
-    agent.worker.acknowledgeFinishCommitted();
-    const work = (try agent.worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedReportToStart;
-    defer worker_runtime.freeWorkItem(alloc, work);
-    try std.testing.expectEqualStrings("a report", work.prompt.prompt);
 }

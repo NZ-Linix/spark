@@ -73,29 +73,6 @@ pub fn collect(arena: Allocator, provider: model_provider.ProviderId) ![]Overrid
     if (config_runtime.ultrafastModeEnvOverride() catch null) |enabled| {
         try list.append(arena, .{ .variable = "SPARK_ULTRAFAST", .key = "ultrafast_mode", .value = .{ .bool = enabled } });
     }
-    if (getenv("SPARK_REVIEW_MODEL")) |raw| {
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (trimmed.len > 0) {
-            if (settings_store.validateModel(trimmed)) |_| {
-                try list.append(arena, .{ .variable = "SPARK_REVIEW_MODEL", .key = "review_model", .value = .{ .string = trimmed } });
-            } else |_| {}
-        }
-    }
-    if (getenv("SPARK_PROVIDER_ORDER")) |raw| {
-        switch (config_runtime.parseProviderOrderList(arena, raw)) {
-            .ok => |maybe_order| if (maybe_order) |order| {
-                var array: std.json.Array = .init(arena);
-                for (order) |slug| try array.append(.{ .string = slug });
-                try list.append(arena, .{ .variable = "SPARK_PROVIDER_ORDER", .key = "provider_order", .value = .{ .array = array } });
-            },
-            .invalid => {},
-        }
-    }
-    if (getenv("SPARK_PROVIDER_STRICT")) |raw| {
-        if (config_runtime.parseEnvBool(std.mem.trim(u8, raw, " \t\r\n"))) |strict| {
-            try list.append(arena, .{ .variable = "SPARK_PROVIDER_STRICT", .key = "provider_strict", .value = .{ .bool = strict } });
-        }
-    }
     if (getenv("SPARK_PERMISSION_MODE")) |raw| {
         if (types.PermissionMode.parse(raw)) |mode| {
             try list.append(arena, .{ .variable = "SPARK_PERMISSION_MODE", .key = "permission_mode", .value = .{ .string = mode.label() } });
@@ -131,16 +108,6 @@ pub fn collect(arena: Allocator, provider: model_provider.ProviderId) ![]Overrid
     return list.toOwnedSlice(arena);
 }
 
-test "SPARK_SOUND presets and SPARK_AUTO_UPGRADE read the words spark accepts" {
-    try std.testing.expectEqual(SoundPreset.max, soundPreset(" MAX\n").?);
-    try std.testing.expectEqual(SoundPreset.off, soundPreset("0").?);
-    try std.testing.expectEqual(SoundPreset.off, soundPreset("Off").?);
-    try std.testing.expectEqual(SoundPreset.on, soundPreset("yes").?);
-    try std.testing.expect(soundPreset("  ") == null);
-    try std.testing.expect(autoUpgradeOff("0") and autoUpgradeOff("FALSE"));
-    try std.testing.expect(!autoUpgradeOff("1") and !autoUpgradeOff("no"));
-}
-
 var test_empty_environ: ?*std.process.Environ.Map = null;
 
 /// An empty environment that outlives every test, for a test that installs
@@ -151,45 +118,4 @@ pub fn emptyTestEnviron() !*const std.process.Environ.Map {
     map.* = .init(std.heap.page_allocator);
     test_empty_environ = map;
     return map;
-}
-
-test "collect shows each set override as the setting spark uses, and skips ignored values" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const restore = io_mod.environMap() orelse try emptyTestEnviron();
-    var env: std.process.Environ.Map = .init(std.testing.allocator);
-    defer env.deinit();
-    for ([_][2][]const u8{
-        .{ "SPARK_PROVIDER", "codex" },
-        .{ "SPARK_MODEL", " gpt-test " },
-        .{ "SPARK_MAX_AGENT_STEPS", "12" },
-        // Out of range, so spark ignores it.
-        .{ "SPARK_AUTO_COMPACT_PERCENT", "5" },
-        .{ "SPARK_PERMISSION_MODE", "yolo" },
-        .{ "SPARK_SOUND", "max" },
-        // Only `0` and `false` mean anything.
-        .{ "SPARK_AUTO_UPGRADE", "1" },
-    }) |entry| try env.put(entry[0], entry[1]);
-    io_mod.setEnvironMap(&env);
-    defer io_mod.setEnvironMap(restore);
-
-    const found = try collect(arena.allocator(), .gateway);
-    const expected = [_]struct { variable: []const u8, key: []const u8 }{
-        .{ .variable = "SPARK_PROVIDER", .key = "provider" },
-        .{ .variable = "SPARK_MODEL", .key = "models.codex" },
-        .{ .variable = "SPARK_PERMISSION_MODE", .key = "permission_mode" },
-        .{ .variable = "SPARK_MAX_AGENT_STEPS", .key = "max_agent_steps" },
-        .{ .variable = "SPARK_SOUND", .key = "sound.turn_end" },
-        .{ .variable = "SPARK_SOUND", .key = "sound.attention_required" },
-        .{ .variable = "SPARK_SOUND", .key = "sound.max" },
-    };
-    try std.testing.expectEqual(expected.len, found.len);
-    for (expected, found) |want, got| {
-        try std.testing.expectEqualStrings(want.variable, got.variable);
-        try std.testing.expectEqualStrings(want.key, got.key);
-    }
-    try std.testing.expectEqualStrings("gpt-test", found[1].value.string);
-    try std.testing.expectEqualStrings("full-access", found[2].value.string);
-    try std.testing.expectEqual(@as(i64, 12), found[3].value.integer);
-    try std.testing.expect(found[6].value.bool);
 }

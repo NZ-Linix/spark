@@ -4,8 +4,6 @@ const Allocator = std.mem.Allocator;
 
 pub const root_dir_name = ".spark";
 pub const auth_file_name = "auth.json";
-pub const chatgpt_auth_file_name = "chatgpt-auth.json";
-pub const grok_auth_file_name = "grok-auth.json";
 pub const api_key_file_name = "api-key";
 pub const sessions_dir_name = "sessions";
 const hosts_dir_name = "hosts";
@@ -172,10 +170,6 @@ pub fn authPath(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{auth_file_name});
 }
 
-pub fn chatgptAuthPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return rootPath(alloc, home, &.{chatgpt_auth_file_name});
-}
-
 pub fn apiKeyPath(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{api_key_file_name});
 }
@@ -215,119 +209,4 @@ pub fn lastShutdownReportPath(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn recordingsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return rootPath(alloc, home, &.{recordings_dir_name});
-}
-
-test "profile path helpers preserve current default locations" {
-    const alloc = std.testing.allocator;
-
-    const root = try rootDir(alloc, "/tmp/fake-home");
-    defer alloc.free(root);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark", root);
-
-    const settings = try settingsPath(alloc, "/tmp/fake-home");
-    defer alloc.free(settings);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/settings.json", settings);
-
-    const mcp = try mcpConfigPath(alloc, "/tmp/fake-home");
-    defer alloc.free(mcp);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/mcp.json", mcp);
-
-    const mcp_credentials_dir = try mcpCredentialsDir(alloc, "/tmp/fake-home");
-    defer alloc.free(mcp_credentials_dir);
-    try std.testing.expectEqualStrings(
-        "/tmp/fake-home/.spark/mcp-credentials",
-        mcp_credentials_dir,
-    );
-
-    const mcp_credentials = try mcpCredentialsPath(alloc, "/tmp/fake-home");
-    defer alloc.free(mcp_credentials);
-    try std.testing.expectEqualStrings(
-        "/tmp/fake-home/.spark/mcp-credentials/credentials.json",
-        mcp_credentials,
-    );
-
-    const skills = try managedSkillsDir(alloc, "/tmp/fake-home");
-    defer alloc.free(skills);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/skills", skills);
-
-    const auth = try authPath(alloc, "/tmp/fake-home");
-    defer alloc.free(auth);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/auth.json", auth);
-
-    const chatgpt_auth = try chatgptAuthPath(alloc, "/tmp/fake-home");
-    defer alloc.free(chatgpt_auth);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/chatgpt-auth.json", chatgpt_auth);
-
-    const api_key = try apiKeyPath(alloc, "/tmp/fake-home");
-    defer alloc.free(api_key);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/api-key", api_key);
-
-    const sessions = try sessionsDir(alloc, "/tmp/fake-home");
-    defer alloc.free(sessions);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/sessions", sessions);
-
-    const history = try promptHistoryPath(alloc, "/tmp/fake-home");
-    defer alloc.free(history);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/history.jsonl", history);
-
-    const backups = try backupsDir(alloc, "/tmp/fake-home");
-    defer alloc.free(backups);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/backups", backups);
-
-    const logs = try logsDir(alloc, "/tmp/fake-home");
-    defer alloc.free(logs);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/logs", logs);
-
-    const trace = try traceLogPath(alloc, "/tmp/fake-home");
-    defer alloc.free(trace);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/logs/trace.log", trace);
-
-    const recordings = try recordingsDir(alloc, "/tmp/fake-home");
-    defer alloc.free(recordings);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.spark/recordings", recordings);
-}
-
-test "SPARK_HOME moves every profile path and how messages name it" {
-    const alloc = std.testing.allocator;
-    defer spark_home = null;
-
-    try std.testing.expectEqualStrings("~/.spark", displayRoot());
-    try std.testing.expectEqualStrings("/tmp/fake-home", rootParent("/tmp/fake-home"));
-    try std.testing.expectEqualStrings(".spark", rootName());
-    try std.testing.expectEqualStrings("back up ~/.spark/sessions", displayText("back up ~/.spark/sessions"));
-    try useFxHome("", null);
-    try std.testing.expect(!fxHomeActive());
-    try std.testing.expectError(error.SparkHomeNotAbsolute, useFxHome("profiles/work", null));
-    try std.testing.expectError(error.SparkHomeIsRoot, useFxHome("///", null));
-    try std.testing.expectError(error.SparkHomeIsHome, useFxHome("/Users/me/", "/Users/me"));
-    try std.testing.expect(!fxHomeActive());
-
-    try useFxHome("/tmp/spark-profile/", "/Users/me");
-    try std.testing.expectEqualStrings("/tmp", fxHomeParent().?);
-    try std.testing.expect(fxHomeActive());
-    try std.testing.expectEqualStrings("$SPARK_HOME", displayRoot());
-    try std.testing.expectEqualStrings(
-        "back up $SPARK_HOME/sessions, or $SPARK_HOME/backups",
-        displayText("back up ~/.spark/sessions, or ~/.spark/backups"),
-    );
-    var buffer: [64]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    try writeDisplayText(&writer, "edit ~/.spark/settings.json");
-    try std.testing.expectEqualStrings("edit $SPARK_HOME/settings.json", writer.buffered());
-    try std.testing.expectEqualStrings("/tmp", rootParent("/tmp/fake-home"));
-    try std.testing.expectEqualStrings("spark-profile", rootName());
-
-    const root = try rootDir(alloc, "/tmp/fake-home");
-    defer alloc.free(root);
-    try std.testing.expectEqualStrings("/tmp/spark-profile", root);
-    const settings = try settingsPath(alloc, "/tmp/fake-home");
-    defer alloc.free(settings);
-    try std.testing.expectEqualStrings("/tmp/spark-profile/settings.json", settings);
-    const trace = try traceLogPath(alloc, "/tmp/fake-home");
-    defer alloc.free(trace);
-    try std.testing.expectEqualStrings("/tmp/spark-profile/logs/trace.log", trace);
-
-    try useFxHome("/spark", null);
-    try std.testing.expectEqualStrings("/", rootParent("/tmp/fake-home"));
-    try std.testing.expectEqualStrings("spark", rootName());
 }

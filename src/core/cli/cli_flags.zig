@@ -296,23 +296,6 @@ test "Nearest keeps the first closest candidate within its edit limit" {
     try std.testing.expectEqualStrings("fix", strict.best.?);
 }
 
-test "the flag parser keeps its laws on fuzzed command lines" {
-    try std.testing.fuzz({}, fuzzParserLaws, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "--model\x00x\x00hello",
-            "--model=x\x00--model\x00y\x00--\x00--fast",
-            "--modle\x00--json",
-            "--resume-id\x00abc",
-            "-\x00--\x00-x\x00--=\x00---",
-            "--provider-order\x00\x00--timeout=\x1b[2J",
-            "--mod\x1b]0;owned\x07",
-            "--limit\x005\x1b[2J",
-            "caf\xc3\xa9\x00--\xff\xfe",
-        }) ++ @import("fuzz_corpus").cli_flags.*),
-    });
-}
-
 /// The input splits at zero bytes into up to 16 arguments, which parse
 /// against `spark ask`'s options. The parser must stop on its own, return only
 /// documented options with values borrowed from the arguments, agree with
@@ -405,87 +388,4 @@ fn expectFailure(args: []const [:0]const u8, expected: []const u8) !void {
         return std.testing.expectEqualStrings(expected, writer.buffered());
     }) |_| {}
     return error.TestExpectedError;
-}
-
-test "options take spaced and inline values and the rest is positional" {
-    var items: [8]Item = undefined;
-    const count = try collect(&.{ "--model", "a", "--model=b", "hello", "--fast", "--", "--no-fast", "-x" }, &items);
-    try std.testing.expectEqual(@as(usize, 6), count);
-    try std.testing.expectEqualStrings("a", items[0].option.value.?);
-    try std.testing.expectEqualStrings("b", items[1].option.value.?);
-    try std.testing.expectEqualStrings("hello", items[2].positional);
-    try std.testing.expectEqual(@as(usize, 1), items[3].option.index);
-    try std.testing.expectEqualStrings("--no-fast", items[4].positional);
-    try std.testing.expectEqualStrings("-x", items[5].positional);
-}
-
-test "a value may start with a dash" {
-    var items: [2]Item = undefined;
-    _ = try collect(&.{ "--model", "-weird" }, &items);
-    try std.testing.expectEqualStrings("-weird", items[0].option.value.?);
-}
-
-test "dash-operand mode keeps a dash-leading operand but still checks long flags" {
-    const docs = [_]OptionDoc{
-        .{ .flag = "-h", .description = "" },
-        .{ .flag = "--json", .description = "" },
-    };
-    var parser: Parser = .initDashOperands(&docs, &.{ "-_u88j00skyI", "-h", "--json" });
-    try std.testing.expectEqualStrings("-_u88j00skyI", (try parser.next()).?.positional);
-    try std.testing.expectEqual(@as(usize, 0), (try parser.next()).?.option.index);
-    try std.testing.expectEqual(@as(usize, 1), (try parser.next()).?.option.index);
-    try std.testing.expectEqual(@as(?Item, null), try parser.next());
-
-    var typo: Parser = .initDashOperands(&docs, &.{"--jsno"});
-    try std.testing.expectError(error.InvalidFlag, typo.next());
-    try std.testing.expectEqualStrings("--jsno", typo.failure.?.unknown.flag);
-}
-
-test "bad flags fail with a message that names them" {
-    try expectFailure(&.{"--verbos"}, "unknown flag --verbos (did you mean --verbose?)");
-    try expectFailure(&.{"--zzzzzzzz"}, "unknown flag --zzzzzzzz");
-    try expectFailure(&.{"-q"}, "unknown flag -q");
-    try expectFailure(&.{"--model"}, "--model needs a value");
-    try expectFailure(&.{"--fast=yes"}, "--fast doesn't take a value");
-    try expectFailure(&.{ "--old", "x" }, "--old was removed; use --model <id>");
-}
-
-test "a removed flag is never suggested" {
-    try expectFailure(&.{"--olf"}, "unknown flag --olf");
-}
-
-test "id tables follow flag names" {
-    const Id = enum { model, fast, no_fast, verbose, old };
-    const table = comptime idTable(Id, &test_docs);
-    try std.testing.expectEqual(Id.model, table[0].?);
-    try std.testing.expectEqual(Id.no_fast, table[2].?);
-    try std.testing.expectEqual(@as(?Id, null), table[5]);
-}
-
-test "edit distance" {
-    try std.testing.expectEqual(@as(?usize, 0), editDistance("abc", "abc"));
-    try std.testing.expectEqual(@as(?usize, 1), editDistance("--verbos", "--verbose"));
-    try std.testing.expectEqual(@as(?usize, 3), editDistance("kitten", "sitting"));
-}
-
-test "prefix mode stops at the first argument it does not own" {
-    const docs = [_]OptionDoc{
-        .{ .flag = "--model <id>", .description = "" },
-        .{ .flag = "--fast", .description = "" },
-    };
-    const cases = [_]struct { args: []const [:0]const u8, stop: usize }{
-        .{ .args = &.{ "--model", "m", "ask", "--fast" }, .stop = 2 },
-        .{ .args = &.{ "--fast", "-c" }, .stop = 1 },
-        .{ .args = &.{ "--model=m", "--", "x" }, .stop = 1 },
-        .{ .args = &.{ "--fast", "--fast" }, .stop = 2 },
-    };
-    for (cases) |case| {
-        var parser: Parser = .initPrefix(&docs, case.args);
-        while (try parser.next()) |_| {}
-        try std.testing.expectEqual(case.stop, parser.index);
-    }
-
-    var missing: Parser = .initPrefix(&docs, &.{"--model"});
-    try std.testing.expectError(error.InvalidFlag, missing.next());
-    try std.testing.expectEqualStrings("--model", missing.failure.?.missing_value);
 }

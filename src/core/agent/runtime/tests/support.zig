@@ -2,13 +2,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../../stream_provider.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
-const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const types = @import("../../../shared/types.zig");
 const cache_warmer = @import("../cache_warmer.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
-const builtin_gateway = @import("../../../../builtins/gateway.zig");
 const gateway_client = @import("../../../../gateway/client.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
@@ -38,6 +36,20 @@ else
     struct {};
 
 const runtime_config = @import("../config.zig");
+const chat_completions = @import("../../../../gateway/chat_completions.zig");
+
+/// The configured connection the fake model stands in for.
+pub const test_definition: @import("../../../config/configured_provider.zig").Definition = .{
+    .id = "local",
+    .protocol = .@"openai-chat-completions",
+    .base_url = "http://127.0.0.1:1/v1",
+    .auth = .none,
+};
+pub const test_bundle = chat_completions.bundle(&test_definition);
+
+fn buildTestRequest(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.RequestData) anyerror![]u8 {
+    return (try test_bundle.agent_stream.?.buildRequest(alloc, request)).?;
+}
 const runtime_deps = @import("../deps.zig");
 const runtime_lifecycle = @import("../lifecycle.zig");
 const runtime_agent = @import("../agent.zig");
@@ -47,7 +59,6 @@ const runtime_tool_contracts = @import("../tool_contracts.zig");
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;
-const PermissionGrant = types.PermissionGrant;
 const PermissionMode = types.PermissionMode;
 const ToolCall = types.ToolCall;
 const ToolPermissionDecision = types.ToolPermissionDecision;
@@ -123,9 +134,7 @@ pub const VisionAgentToolRuntime = struct {
             .gateway_chat_url = "https://example.invalid",
             .agent_step_limit = 8,
             .tool_registry = .{ .tools = vision_agent_test_tools[0..] },
-            .permission_mode = .ask,
-            .permission_grants = &.{},
-            .permission_rules = .{},
+            .permission_mode = .yolo,
             .worker = &self.worker,
             .session = &self.session,
             .session_allocator = self.alloc,
@@ -277,9 +286,10 @@ pub const FakeGateway = struct {
     }
 
     pub fn provider(self: *FakeGateway) agent_stream_provider.Provider {
-        var result = builtin_gateway.agent_stream_provider;
+        var result = test_bundle.agent_stream.?;
         result.context = self;
         result.stream_fn = fakeGatewayStream;
+        result.build_request_fn = buildTestRequest;
         return result;
     }
 
@@ -290,7 +300,7 @@ pub const FakeGateway = struct {
     ) !agent_stream_provider.Result {
         if (self.observe_request) |observe| try observe(request);
         const payload = request.prepared_request_body orelse
-            try builtin_gateway.buildAgentRequest(alloc, request.data());
+            (try test_bundle.agent_stream.?.buildRequest(alloc, request.data())).?;
         defer if (request.prepared_request_body == null) alloc.free(payload);
         try expectReplyablePromptTail(alloc, payload, self.allow_assistant_tail_continuation);
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
@@ -429,11 +439,8 @@ pub const PermissionRequestOverride = struct {
         *anyopaque,
         Allocator,
         ToolCall,
-        permission_auto_classifier.ReviewTurnContext,
-        PermissionMode,
-        []const PermissionGrant,
         ?runtime_tool_contracts.LiveToolAuthority,
-        ?runtime_tool_contracts.LivePermissionRevalidation,
+        ?command_admission.ToolExecutionAuthority,
         []const []const u8,
     ) anyerror!command_admission.PermissionOutcome,
 };
@@ -445,21 +452,6 @@ pub const ToolExecutionOverride = struct {
         ToolExecutionRequest,
     ) anyerror!ToolExecutionResult,
 };
-
-fn captureReviewAuthority(
-    alloc: Allocator,
-    review_turn: permission_auto_classifier.ReviewTurnContext,
-) ![]u8 {
-    var captured: std.ArrayList(u8) = .empty;
-    errdefer captured.deinit(alloc);
-    if (review_turn.trusted_root_context.len > 0) {
-        try captured.appendSlice(alloc, review_turn.trusted_root_context);
-        if (!std.mem.endsWith(u8, review_turn.trusted_root_context, "\n")) {
-            try captured.append(alloc, '\n');
-        }
-    }
-    return captured.toOwnedSlice(alloc);
-}
 
 pub const FakeAgentRuntimeDeps = struct {
     alloc: Allocator,
@@ -488,12 +480,6 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_names: std.ArrayList([]u8) = .empty,
     permission_call_ids: std.ArrayList([]u8) = .empty,
     permission_user_intent_contexts: std.ArrayList([]u8) = .empty,
-    permission_review_models: std.ArrayList([]u8) = .empty,
-    permission_review_target_call_ids: std.ArrayList([]u8) = .empty,
-    permission_review_origins: std.ArrayList(permission_auto_classifier.ReviewOrigin) = .empty,
-    permission_review_root_authority_counts: std.ArrayList(usize) = .empty,
-    permission_review_feedback_counts: std.ArrayList(usize) = .empty,
-    permission_review_pending_call_counts: std.ArrayList(usize) = .empty,
     executed_names: std.ArrayList([]u8) = .empty,
     executed_call_ids: std.ArrayList([]u8) = .empty,
     rejected_names: std.ArrayList([]u8) = .empty,
@@ -513,17 +499,10 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_root_user_messages: std.ArrayList([]u8) = .empty,
     last_execute_root_user_evidence_complete: bool = false,
     last_execute_permission_mode: ?PermissionMode = null,
-    propagated_grants: std.ArrayList(PermissionGrant) = .empty,
-    event_grants: std.ArrayList(PermissionGrant) = .empty,
-    last_execute_grants: std.ArrayList(PermissionGrant) = .empty,
     last_live_authority_generation: ?u64 = null,
     last_live_authority_tool_count: usize = 0,
     last_live_authority_integration_count: usize = 0,
-    last_live_authority_rule_count: usize = 0,
-    last_live_authority_grant_count: usize = 0,
-    last_frozen_file_grants: std.ArrayList(PermissionGrant) = .empty,
     permission_decisions: []const ToolPermissionDecision = &.{},
-    permission_auto_review_results: []const ?permission_auto_classifier.Result = &.{},
     permission_denial_reasons: []const types.ToolPermissionDenialReason = &.{},
     permission_feedback: []const []const u8 = &.{},
     permission_errors: []const ?anyerror = &.{},
@@ -556,7 +535,6 @@ pub const FakeAgentRuntimeDeps = struct {
     runtime_context_texts: []const []const u8 = &.{},
     runtime_context_index: usize = 0,
     runtime_context_error: ?anyerror = null,
-    last_execute_grant_count: usize = 0,
     command_complete_count: usize = 0,
     route_recovery_clear_count: usize = 0,
     model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
@@ -722,12 +700,6 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.permission_names);
         freeStringList(self.alloc, &self.permission_call_ids);
         freeStringList(self.alloc, &self.permission_user_intent_contexts);
-        freeStringList(self.alloc, &self.permission_review_models);
-        freeStringList(self.alloc, &self.permission_review_target_call_ids);
-        self.permission_review_origins.deinit(self.alloc);
-        self.permission_review_root_authority_counts.deinit(self.alloc);
-        self.permission_review_feedback_counts.deinit(self.alloc);
-        self.permission_review_pending_call_counts.deinit(self.alloc);
         freeStringList(self.alloc, &self.executed_names);
         freeStringList(self.alloc, &self.executed_call_ids);
         freeStringList(self.alloc, &self.rejected_names);
@@ -745,10 +717,6 @@ pub const FakeAgentRuntimeDeps = struct {
         if (self.last_execute_credential) |value| self.alloc.free(value);
         if (self.last_execute_root_user_intent_context) |value| self.alloc.free(value);
         freeStringList(self.alloc, &self.last_execute_root_user_messages);
-        freeGrantList(self.alloc, &self.propagated_grants);
-        freeGrantList(self.alloc, &self.event_grants);
-        freeGrantList(self.alloc, &self.last_execute_grants);
-        freeGrantList(self.alloc, &self.last_frozen_file_grants);
         self.execute_timeout_started_ms.deinit(self.alloc);
         if (self.finish_assistant_text) |value| self.alloc.free(value);
         if (self.finish_presentation_text) |value| self.alloc.free(value);
@@ -816,7 +784,6 @@ pub const FakeAgentRuntimeDeps = struct {
             } else null,
             .restore_failed_prompt = if (self.capture_restored_prompts or self.record_restored_prompt) restoreFailedPrompt else null,
             .confirm_session_writer = confirmSessionWriter,
-            .propagate_grant = @This().propagateGrant,
             .push_event = pushEvent,
             .push_text = pushText,
             .push_tool_lifecycle = pushToolLifecycle,
@@ -1151,31 +1118,13 @@ pub const FakeAgentRuntimeDeps = struct {
         return null;
     }
 
-    fn scriptedAutoReview(
-        arena: Allocator,
-        results: []const ?permission_auto_classifier.Result,
-        index: usize,
-    ) !?permission_auto_classifier.Result {
-        if (index >= results.len) return null;
-        const result = results[index] orelse return null;
-        return permission_auto_classifier.Result{
-            .risk = result.risk,
-            .decision = result.decision,
-            .rationale = try arena.dupe(u8, result.rationale),
-        };
-    }
-
     fn requestPermission(
         raw: *anyopaque,
         arena: Allocator,
         call: ToolCall,
-        review_turn: permission_auto_classifier.ReviewTurnContext,
-        permission_mode: PermissionMode,
-        local_grants: []const PermissionGrant,
         live_authority: ?runtime_tool_contracts.LiveToolAuthority,
-        revalidation: ?runtime_tool_contracts.LivePermissionRevalidation,
+        revalidation: ?command_admission.ToolExecutionAuthority,
         advertised_dynamic_tool_names: []const []const u8,
-        _: ?[]const u8,
     ) !command_admission.PermissionOutcome {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         if (self.permission_request_override) |override| {
@@ -1183,9 +1132,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 override.context,
                 arena,
                 call,
-                review_turn,
-                permission_mode,
-                local_grants,
                 live_authority,
                 revalidation,
                 advertised_dynamic_tool_names,
@@ -1196,36 +1142,6 @@ pub const FakeAgentRuntimeDeps = struct {
         const permission_name = if (call.toolbox_lookup) |lookup| lookup.permission else call.name;
         try self.permission_names.append(self.alloc, try self.alloc.dupe(u8, permission_name));
         try self.permission_call_ids.append(self.alloc, try self.alloc.dupe(u8, call.id));
-        try self.permission_user_intent_contexts.append(
-            self.alloc,
-            try captureReviewAuthority(self.alloc, review_turn),
-        );
-        try self.permission_review_models.append(
-            self.alloc,
-            try self.alloc.dupe(u8, review_turn.model),
-        );
-        try self.permission_review_target_call_ids.append(
-            self.alloc,
-            try self.alloc.dupe(u8, review_turn.target_call_id),
-        );
-        try self.permission_review_origins.append(self.alloc, review_turn.origin);
-        try self.permission_review_root_authority_counts.append(
-            self.alloc,
-            @intFromBool(review_turn.trusted_root_context.len > 0),
-        );
-        try self.permission_review_feedback_counts.append(
-            self.alloc,
-            0,
-        );
-        try self.permission_review_pending_call_counts.append(
-            self.alloc,
-            review_turn.pending_assistant.tool_calls.len,
-        );
-        if (self.last_permission_credential) |value| self.alloc.free(value);
-        self.last_permission_credential = try self.alloc.dupe(
-            u8,
-            review_turn.credential.secret() orelse "",
-        );
         if (self.last_permission_arguments) |value| self.alloc.free(value);
         self.last_permission_arguments = try self.alloc.dupe(u8, call.arguments_json);
         try self.record("permission:{s}", .{call.name});
@@ -1250,11 +1166,6 @@ pub const FakeAgentRuntimeDeps = struct {
             self.permission_denial_reasons[permission_index]
         else
             null;
-        const auto_review_result = try scriptedAutoReview(
-            arena,
-            self.permission_auto_review_results,
-            permission_index,
-        );
         self.permission_index += 1;
         if (self.permission_wait_index == permission_index) {
             if (self.permission_waiting) |waiting| waiting.store(true, .seq_cst);
@@ -1264,15 +1175,12 @@ pub const FakeAgentRuntimeDeps = struct {
                 std.Thread.yield() catch std.atomic.spinLoopHint();
             }
         }
-        const execution_authority = if (decision.isDenied()) null else if (revalidation) |request| switch (request) {
-            .action => |action| action.authority,
-        } else if (file_mutation_contract.isToolName(call.name))
+        const execution_authority = if (decision.isDenied()) null else if (revalidation) |authority| authority else if (file_mutation_contract.isToolName(call.name))
             command_admission.ToolExecutionAuthority{
                 .file_mutation = try self.fileMutationAuthorization(
                     arena,
                     call,
-                    permission_mode,
-                    local_grants,
+                    .yolo,
                 ),
             }
         else if (try self.testVisionPathAuthority(arena, call)) |authority|
@@ -1311,7 +1219,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 .none,
             .denial_reason = denial_reason,
             .feedback = if (feedback.len == 0) null else try arena.dupe(u8, feedback),
-            .auto_review_result = auto_review_result,
         };
     }
 
@@ -1365,7 +1272,6 @@ pub const FakeAgentRuntimeDeps = struct {
         arena: Allocator,
         call: ToolCall,
         permission_mode: PermissionMode,
-        local_grants: []const PermissionGrant,
     ) !file_mutation_contract.FileExecutionAuthorization {
         const kind: file_mutation_contract.Kind =
             if (std.mem.eql(u8, call.name, "write_file"))
@@ -1402,9 +1308,6 @@ pub const FakeAgentRuntimeDeps = struct {
             self.workspace_root,
             input,
             permission_mode,
-            .{},
-            &.{},
-            local_grants,
         );
         const policy_targets = switch (evaluated) {
             .evaluated => |targets| targets,
@@ -1416,26 +1319,8 @@ pub const FakeAgentRuntimeDeps = struct {
         const authorization: file_mutation_contract.FileExecutionAuthorization = .{
             .input = input,
             .policy_targets = policy_targets,
-            .grant_offer = try permissions.structuredFileGrantOffer(
-                arena,
-                self.workspace_root,
-                call.name,
-                policy_targets,
-            ),
             .approval_intent = .mutation,
         };
-        for (self.last_frozen_file_grants.items) |grant| {
-            self.alloc.free(grant.tool_name);
-            self.alloc.free(grant.target_path);
-        }
-        self.last_frozen_file_grants.clearRetainingCapacity();
-        for (authorization.grant_offer.?.grants) |grant| {
-            try appendGrant(
-                self.alloc,
-                &self.last_frozen_file_grants,
-                grant,
-            );
-        }
         return authorization;
     }
 
@@ -1531,30 +1416,14 @@ pub const FakeAgentRuntimeDeps = struct {
                 request.root_user_evidence_complete;
             self.last_execute_permission_mode = request.permission_mode;
             try self.record("execute:{s}", .{call.name});
-            self.last_execute_grant_count = request.session_grants.len;
-            for (self.last_execute_grants.items) |grant| {
-                self.alloc.free(grant.tool_name);
-                self.alloc.free(grant.target_path);
-            }
-            self.last_execute_grants.clearRetainingCapacity();
-            for (request.session_grants) |grant| {
-                try self.last_execute_grants.append(self.alloc, .{
-                    .tool_name = try self.alloc.dupe(u8, grant.tool_name),
-                    .target_path = try self.alloc.dupe(u8, grant.target_path),
-                });
-            }
             if (request.live_authority) |live| {
                 self.last_live_authority_generation = live.generation;
                 self.last_live_authority_tool_count = live.tools.len;
                 self.last_live_authority_integration_count = live.integrations.len;
-                self.last_live_authority_rule_count = live.rules.rules.len;
-                self.last_live_authority_grant_count = live.grants.len;
             } else {
                 self.last_live_authority_generation = null;
                 self.last_live_authority_tool_count = 0;
                 self.last_live_authority_integration_count = 0;
-                self.last_live_authority_rule_count = 0;
-                self.last_live_authority_grant_count = 0;
             }
             const execution_index = self.exec_index;
             plan = if (execution_index < self.exec_plans.len)
@@ -1715,15 +1584,6 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn propagateGrant(raw: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        try appendGrant(self.alloc, &self.propagated_grants, .{
-            .tool_name = @constCast(tool_name),
-            .target_path = @constCast(target_path),
-        });
-        try self.record("propagate_grant:{s}:{s}", .{ tool_name, target_path });
-    }
-
     fn pushEvent(raw: *anyopaque, event: WorkerEvent) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
@@ -1762,10 +1622,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 }
                 try self.record("event:finish_prompt", .{});
             },
-            .session_grant => |grant| {
-                try appendGrant(self.alloc, &self.event_grants, grant);
-                try self.record("event:session_grant:{s}:{s}", .{ grant.tool_name, grant.target_path });
-            },
             .turn_token_update => |update| {
                 if (update.output_tokens > 0) {
                     if (self.stream_output_token_error) |err| return err;
@@ -1788,7 +1644,7 @@ pub const FakeAgentRuntimeDeps = struct {
     fn pushText(raw: *anyopaque, emission: runtime_deps.TextEmission) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const text = switch (emission) {
-            .assistant_started => return,
+            .assistant_started, .assistant_pending => return,
             .assistant_source => |text| {
                 try self.assistant_sources.append(self.alloc, try self.alloc.dupe(u8, text));
                 return;
@@ -1913,7 +1769,6 @@ pub const FakeAgentRuntimeDeps = struct {
 pub const PromptFixture = struct {
     images: [0]types.ImageAttachment = .{},
     history: [0]HistoryTurn = .{},
-    grants: [0]PermissionGrant = .{},
     cancel_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     workspace_root: []const u8 = "/tmp/workspace",
 
@@ -1923,10 +1778,9 @@ pub const PromptFixture = struct {
             .images = self.images[0..],
             .model = @constCast("anthropic/claude-opus-4.6"),
             .api_key = @constCast("key"),
-            .credential_source = .ai_gateway_api_key,
-            .permission_mode = .ask,
+            .credential_source = .configured,
+            .permission_mode = .yolo,
             .history = self.history[0..],
-            .grants = self.grants[0..],
         };
     }
 
@@ -2137,8 +1991,6 @@ fn syntheticFileMutationTargets(
         .disposition = .target_entry,
         .path_end = canonical_target_path.len,
         .expected_identity = null,
-        .rule = .ask,
-        .session_grant_allowed = true,
     };
     return .{
         .canonical_target_path = canonical_target_path,
@@ -2160,21 +2012,6 @@ fn syntheticFileMutationTargets(
 
 fn freeStringList(alloc: Allocator, list: *std.ArrayList([]u8)) void {
     for (list.items) |item| alloc.free(item);
-    list.deinit(alloc);
-}
-
-fn appendGrant(alloc: Allocator, list: *std.ArrayList(PermissionGrant), grant: PermissionGrant) !void {
-    try list.append(alloc, .{
-        .tool_name = try alloc.dupe(u8, grant.tool_name),
-        .target_path = try alloc.dupe(u8, grant.target_path),
-    });
-}
-
-fn freeGrantList(alloc: Allocator, list: *std.ArrayList(PermissionGrant)) void {
-    for (list.items) |grant| {
-        alloc.free(grant.tool_name);
-        alloc.free(grant.target_path);
-    }
     list.deinit(alloc);
 }
 

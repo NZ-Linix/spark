@@ -32,7 +32,6 @@ pub const SettingId = enum {
     effort,
     fast_mode,
     ultrafast_mode,
-    permission_mode,
     sound_level,
     startup_scrollback,
     prompt_history,
@@ -53,7 +52,6 @@ pub const Snapshot = struct {
     supports_fast_mode: bool = false,
     ultrafast_mode: bool = false,
     supports_ultrafast_mode: bool = false,
-    permission_mode: []const u8 = "ask",
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
@@ -70,7 +68,6 @@ pub const Snapshot = struct {
             .effort => self.effort,
             .fast_mode => onOff(self.fast_mode),
             .ultrafast_mode => onOff(self.ultrafast_mode),
-            .permission_mode => if (std.mem.eql(u8, self.permission_mode, "yolo")) "full access" else self.permission_mode,
             .statusline_context => onOff(self.statusline_context),
             .statusline_session => onOff(self.statusline_session),
             .statusline_workspace => onOff(self.statusline_workspace),
@@ -270,7 +267,6 @@ const specs = [_]Spec{
 };
 
 const on_off_options = [_][]const u8{ "off", "on" };
-const permission_options = [_][]const u8{ "ask", "auto", "full access" };
 const sound_level_options = [_][]const u8{ "off", "on", "max" };
 
 pub fn filteredCount(snapshot: Snapshot, category: Category, query: []const u8) usize {
@@ -355,7 +351,6 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         .prompt_history,
         => &on_off_options,
         .sound_level => &sound_level_options,
-        .permission_mode => &permission_options,
     };
 }
 
@@ -406,7 +401,6 @@ test "settings catalog projects grouped searchable preferences" {
         .model = "zai/glm-5.2",
         .effort = "default",
         .fast_mode = true,
-        .permission_mode = "ask",
         .statusline_context = true,
         .statusline_workspace = false,
         .startup_scrollback = true,
@@ -414,10 +408,9 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 14), filteredCount(snapshot, .all, ""));
-    try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
-    try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .agent, ""));
-    try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
+    try std.testing.expectEqual(specs.len, filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .interface, ""));
+    try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
 
     const current_model = itemAt(snapshot, .all, "glm 5.2", 0).?;
@@ -428,143 +421,4 @@ test "settings catalog projects grouped searchable preferences" {
     try std.testing.expectEqual(SettingId.startup_scrollback, startup.id);
     try std.testing.expectEqualStrings("on", startup.value);
     try std.testing.expect(itemAt(snapshot, .all, "missing preference", 0) == null);
-}
-
-test "settings catalog displays legacy yolo as full access and cycles from it" {
-    const snapshot: Snapshot = .{ .permission_mode = "yolo" };
-    try std.testing.expectEqualStrings("full access", snapshot.value(.permission_mode));
-    try std.testing.expectEqual(@as(usize, 2), selectedOptionIndex(&snapshot, .permission_mode).?);
-    try std.testing.expectEqualStrings("ask", cycleChange(&snapshot, .permission_mode, 1).?.value);
-    try std.testing.expectEqualStrings("auto", cycleChange(&snapshot, .permission_mode, -1).?.value);
-}
-
-test "settings catalog returns typed edit choices without effects" {
-    const efforts = [_]types.ReasoningEffort{
-        types.ReasoningEffort.literal("future-tier"),
-        types.ReasoningEffort.literal("high"),
-    };
-    const snapshot: Snapshot = .{
-        .model = "zai/glm-5.2",
-        .effort = "future-tier",
-        .reasoning_efforts = .fromSlice(&efforts),
-        .fast_mode = true,
-        .supports_fast_mode = true,
-        .permission_mode = "ask",
-        .statusline_context = true,
-        .startup_scrollback = true,
-        .prompt_history = true,
-        .sound_level = "on",
-    };
-
-    try std.testing.expect(changeAt(&snapshot, .model, 0) == null);
-    try std.testing.expectEqual(@as(usize, 3), optionCount(&snapshot, .permission_mode));
-    try std.testing.expectEqualStrings("full access", optionAt(&snapshot, .permission_mode, 2).?);
-    try std.testing.expectEqual(@as(usize, 3), optionCount(&snapshot, .effort));
-    try std.testing.expectEqualStrings("default", optionAt(&snapshot, .effort, 0).?);
-    try std.testing.expectEqualStrings("future-tier", optionAt(&snapshot, .effort, 1).?);
-    try std.testing.expectEqualStrings("high", optionAt(&snapshot, .effort, 2).?);
-    try std.testing.expectEqual(@as(usize, 1), selectedOptionIndex(&snapshot, .effort).?);
-}
-
-test "settings catalog exposes collapse tool calls as an interface toggle" {
-    const expanded: Snapshot = .{ .collapse_tool_calls = false };
-    const item = itemAt(expanded, .interface, "collapse tool calls", 0).?;
-
-    try std.testing.expectEqual(SettingId.collapse_tool_calls, item.id);
-    try std.testing.expectEqualStrings("Collapse tool calls", item.label);
-    try std.testing.expectEqualStrings("off", item.value);
-    const collapse = changeAt(&expanded, .collapse_tool_calls, 1).?;
-    try std.testing.expectEqual(SettingId.collapse_tool_calls, collapse.setting);
-    try std.testing.expectEqualStrings("on", collapse.value);
-}
-
-test "settings catalog exposes slash menu categories as an interface toggle" {
-    const shown: Snapshot = .{ .slash_menu_categories = true };
-    const item = itemAt(shown, .interface, "slash menu categories", 0).?;
-
-    try std.testing.expectEqual(SettingId.slash_menu_categories, item.id);
-    try std.testing.expectEqualStrings("Slash menu categories", item.label);
-    try std.testing.expectEqualStrings("on", item.value);
-    try std.testing.expectEqual(@as(usize, 2), optionCount(&shown, .slash_menu_categories));
-    try std.testing.expectEqualStrings("off", optionAt(&shown, .slash_menu_categories, 0).?);
-    try std.testing.expectEqualStrings("on", optionAt(&shown, .slash_menu_categories, 1).?);
-
-    const hide = changeAt(&shown, .slash_menu_categories, 0).?;
-    try std.testing.expectEqual(SettingId.slash_menu_categories, hide.setting);
-    try std.testing.expectEqualStrings("off", hide.value);
-}
-
-test "settings menu navigates rows and changes selected values inline" {
-    const snapshot: Snapshot = .{
-        .model = "zai/glm-5.2",
-        .effort = "default",
-        .fast_mode = true,
-        .permission_mode = "ask",
-        .statusline_context = true,
-        .startup_scrollback = true,
-        .prompt_history = true,
-        .sound_level = "on",
-    };
-
-    var menu: Menu = .{};
-    menu.open();
-    try std.testing.expect(menu.active);
-    try std.testing.expectEqual(Category.all, menu.category);
-    try std.testing.expect(menu.move(&snapshot, "", 1, 5));
-    try std.testing.expectEqual(SettingId.statusline_session, menu.selectedItem(&snapshot, "").?.id);
-
-    try std.testing.expect(menu.cycleCategory(1));
-    try std.testing.expectEqual(Category.interface, menu.category);
-    try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
-
-    const previous = menu.changeSelectedOption(&snapshot, "", -1).?;
-    try std.testing.expectEqual(SettingId.statusline_context, previous.setting);
-    try std.testing.expectEqualStrings("off", previous.value);
-    const next = menu.changeSelectedOption(&snapshot, "", 1).?;
-    try std.testing.expectEqualStrings("off", next.value);
-
-    menu.category = .agent;
-    menu.selected_index = 0;
-    try std.testing.expect(menu.changeSelectedOption(&snapshot, "", 1) == null);
-
-    menu.openWithStartupScrollback(false);
-    try std.testing.expect(!menu.startup_scrollback);
-}
-
-test "notification level keeps the existing off on and max policy" {
-    try std.testing.expectEqualStrings("off", notificationLevel(false, false, false));
-    try std.testing.expectEqualStrings("on", notificationLevel(true, true, false));
-    try std.testing.expectEqualStrings("max", notificationLevel(true, true, true));
-    try std.testing.expectEqualStrings("custom", notificationLevel(true, false, false));
-}
-
-test "status line menu describes toggle changes without performing effects" {
-    var menu: StatuslineMenu = .{};
-    menu.open();
-
-    const disabled: Snapshot = .{
-        .statusline_context = false,
-        .statusline_workspace = false,
-    };
-    const enable_context = menu.selectedChange(disabled).?;
-    try std.testing.expectEqual(SettingId.statusline_context, enable_context.setting);
-    try std.testing.expectEqualStrings("on", enable_context.value);
-
-    const enabled: Snapshot = .{
-        .statusline_context = true,
-    };
-    try std.testing.expectEqualStrings("off", menu.selectedChange(enabled).?.value);
-
-    try std.testing.expect(menu.move(1));
-    const enable_session = menu.selectedChange(enabled).?;
-    try std.testing.expectEqual(SettingId.statusline_session, enable_session.setting);
-    try std.testing.expectEqualStrings("on", enable_session.value);
-
-    try std.testing.expect(menu.move(1));
-    const enable_workspace = menu.selectedChange(enabled).?;
-    try std.testing.expectEqual(SettingId.statusline_workspace, enable_workspace.setting);
-    try std.testing.expectEqualStrings("on", enable_workspace.value);
-
-    menu.close();
-    try std.testing.expect(menu.selectedChange(enabled) == null);
 }

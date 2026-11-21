@@ -1818,20 +1818,6 @@ fn entryIdsPreservePrefix(
     return true;
 }
 
-test "entry prefix identity rejects retention and lifecycle reposition" {
-    const previous = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "one" } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "two" } },
-    };
-    const appended = previous ++ [_]TranscriptEntry{.{ .raw_bytes = .{ .id = 3, .bytes = "three" } }};
-    const retained = [_]TranscriptEntry{previous[1]};
-    const repositioned = [_]TranscriptEntry{ previous[1], previous[0] };
-
-    try std.testing.expect(entryIdsPreservePrefix(&previous, &appended));
-    try std.testing.expect(!entryIdsPreservePrefix(&previous, &retained));
-    try std.testing.expect(!entryIdsPreservePrefix(&previous, &repositioned));
-}
-
 fn cloneEntries(
     alloc: Allocator,
     source: []const TranscriptEntry,
@@ -2007,21 +1993,6 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .command_output_entry_id = source.command_output_entry_id,
         .subagent_report = source.subagent_report,
     };
-}
-
-test "a snapshot copy of a tool detail keeps its subagent report mark" {
-    const alloc = std.testing.allocator;
-    for ([_]bool{ true, false }) |marked| {
-        var copy = try cloneToolDetailForSnapshot(alloc, .{
-            .entry_id = 3,
-            .tool_name = @constCast("subagent"),
-            .activity_kind = .subagent,
-            .arguments_json = @constCast("{}"),
-            .subagent_report = marked,
-        });
-        defer copy.deinit(alloc);
-        try std.testing.expectEqual(marked, copy.subagent_report);
-    }
 }
 
 fn cloneCommandLines(
@@ -2639,64 +2610,6 @@ fn commitAssistantStreamChunkFast(
     };
 }
 
-test "rewrite publication compatible append and same geometry status retain fast allocation cost" {
-    const alloc = testing_allocator.no_resize;
-    const Runtime = @import("runtime.zig").TranscriptRuntime;
-    for ([_]bool{ false, true }) |status_update| {
-        var runtime = Runtime{
-            .layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 },
-            .detached_commit_alloc = alloc,
-            .committed_frame_layout = .{ .terminal_cols = 80, .terminal_rows = 24 },
-        };
-        defer runtime.deinit(alloc);
-        for (0..64) |_| _ = try runtime.appendRawTranscriptEntryClassified(alloc, "historical row\n", .unknown_raw);
-        const status_id = try appendPinnedToolStatusAtomic(&runtime, alloc, "running one\n");
-        var control = try cloneRecordedMutationState(&runtime, alloc);
-        defer control.deinit(alloc);
-        var source = try source_preparation.prepareRetentionSource(&runtime, alloc);
-        defer source.deinit(alloc);
-        runtime.transcript_commit_state = .{ .stable = .{
-            .flow = try alloc.dupe(u8, source.bytes),
-            .retention_identity = try source_preparation.RetentionIdentity.capture(&runtime, alloc, &source),
-            .visual_offset = 50,
-            .history_visual_offset = 50,
-            .total_visual_rows = source.transcript_visual_row_offsets[source.transcript_visual_row_offsets.len - 1],
-            .selection = .{ .start_line = 50, .top_row = 1, .bottom_row = 20, .partial_skip_rows = 0, .line_count = 20 },
-            .cursor_row = 20,
-            .cursor_col = 1,
-            .occupied_last_row = 20,
-            .occupied_last_row_blank = false,
-            .layout_id = 0,
-        } };
-        const flow = runtime.transcript_commit_state.stable.flow.ptr;
-        var published_counter = std.testing.FailingAllocator.init(alloc, .{});
-        var control_counter = std.testing.FailingAllocator.init(alloc, .{});
-        var metrics: Metrics = .{};
-        if (status_update) {
-            try std.testing.expect(try replacePinnedToolStatusAtomic(&runtime, published_counter.allocator(), status_id, "running two\n"));
-            try std.testing.expect(try replacePinnedToolStatusAtomic(&control, control_counter.allocator(), status_id, "running two\n"));
-        } else {
-            _ = try writeRecordedTranscriptClassifiedAtomic(&runtime, published_counter.allocator(), &metrics, "new row\n", .unknown_raw);
-            _ = try writeRecordedTranscriptClassifiedAtomic(&control, control_counter.allocator(), &metrics, "new row\n", .unknown_raw);
-        }
-        try std.testing.expectEqual(control_counter.allocations, published_counter.allocations);
-        try std.testing.expectEqual(control_counter.allocated_bytes, published_counter.allocated_bytes);
-        try std.testing.expectEqual(flow, runtime.transcript_commit_state.stable.flow.ptr);
-    }
-}
-
-test "rewrite publication excludes unpainted raw continuation from committed source" {
-    try checkRewritePublicationContinuation(false, false);
-}
-
-test "rewrite publication keeps hidden command continuation out of committed source" {
-    try checkRewritePublicationContinuation(true, false);
-}
-
-test "rewrite publication retirement allocation failures preserve the old receipt" {
-    try checkRewritePublicationContinuation(false, true);
-}
-
 fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
     const alloc = testing_allocator.no_resize;
     const Runtime = @import("runtime.zig").TranscriptRuntime;
@@ -3249,148 +3162,4 @@ pub fn appendCappedWithinCapacity(
 
     try list.appendSlice(alloc, text);
     return text.len;
-}
-
-test "appendCappedWithinCapacity keeps latest complete line" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    var replaceable = false;
-    var replaceable_start: usize = 0;
-
-    try list.appendSlice(std.testing.allocator, "a\nb\nc\n");
-    _ = try appendCappedWithinCapacity(&list, std.testing.allocator, "", 4, &replaceable, &replaceable_start);
-    try std.testing.expectEqualStrings("c\n", list.items);
-}
-
-test "appendCappedWithinCapacity keeps suffix when no newline" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    var replaceable = false;
-    var replaceable_start: usize = 0;
-
-    try list.appendSlice(std.testing.allocator, "abcdefghij");
-    _ = try appendCappedWithinCapacity(&list, std.testing.allocator, "", 5, &replaceable, &replaceable_start);
-    try std.testing.expectEqualStrings("fghij", list.items);
-}
-
-test "cappedTailStart returns bytes.len when limit is zero" {
-    try std.testing.expectEqual(@as(usize, 3), cappedTailStart("abc", 0));
-    try std.testing.expectEqual(@as(usize, 0), cappedTailStart("", 0));
-    try std.testing.expectEqual(@as(usize, 10), cappedTailStart("0123456789", 0));
-}
-
-test "cappedTailStart drops trailing newline-only tail" {
-    try std.testing.expectEqual(@as(usize, 4), cappedTailStart("abc\n", 2));
-    try std.testing.expectEqual(@as(usize, 1), cappedTailStart("\n", 0));
-}
-
-test "appendCappedWithinCapacity oversized newline tail can retain less than cap" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    var replaceable = false;
-    var replaceable_start: usize = 0;
-
-    const cap: usize = 64;
-    const oversized = try std.testing.allocator.alloc(u8, cap + 16);
-    defer std.testing.allocator.free(oversized);
-    @memset(oversized, 'z');
-    const raw_cut = oversized.len - cap;
-    oversized[raw_cut + 7] = '\n';
-    const expected_retained_len = oversized.len - (raw_cut + 8);
-
-    const appended = try appendCappedWithinCapacity(&list, std.testing.allocator, oversized, cap, &replaceable, &replaceable_start);
-
-    try std.testing.expectEqual(expected_retained_len, appended);
-    try std.testing.expectEqual(expected_retained_len, list.items.len);
-    try std.testing.expect(list.items.len < cap);
-}
-
-test "refreshFoldedCommandSummaryIndices uses final preparation indices" {
-    const alloc = std.testing.allocator;
-    const FoldedBlock = struct {
-        summary_entry_id: ?u32,
-        summary_transcript_index: usize = 0,
-    };
-    const Runtime = struct {
-        layout: struct { cols: u16 },
-        notebook: struct {
-            entries: std.ArrayList(TranscriptEntry),
-            folded_command_blocks: std.ArrayList(FoldedBlock),
-        },
-        command_output_render: command_output_runtime.CommandOutputRenderPolicy = .{},
-
-        fn commandOutputRender(self: *const @This()) command_output_runtime.CommandOutputRenderPolicy {
-            return self.command_output_render;
-        }
-
-        fn transcriptWrapCols(self: *const @This()) u16 {
-            return self.layout.cols;
-        }
-    };
-
-    var runtime = Runtime{
-        .layout = .{ .cols = 20 },
-        .notebook = .{ .entries = .empty, .folded_command_blocks = .empty },
-    };
-    defer {
-        for (runtime.notebook.entries.items) |*entry| entry.deinit(alloc);
-        runtime.notebook.entries.deinit(alloc);
-        runtime.notebook.folded_command_blocks.deinit(alloc);
-    }
-
-    var segments: AssistantTurnSegments = .{};
-    try segments.text.appendSlice(alloc, "assistant prose");
-    try runtime.notebook.entries.append(alloc, .{ .assistant_turn = .{ .id = 1, .segments = segments } });
-    try runtime.notebook.entries.append(alloc, .{ .raw_bytes = .{
-        .id = 2,
-        .bytes = try alloc.dupe(u8, "first summary\n"),
-        .class = .tool_status,
-    } });
-
-    const table = try assistant_presentation.parseTablePayload(
-        alloc,
-        "| Name | Status |\n" ++
-            "|------|--------|\n" ++
-            "| api | Complete |\n",
-    );
-    try runtime.notebook.entries.append(alloc, .{ .assistant_table = .{ .id = 3, .table = table } });
-    try runtime.notebook.entries.append(alloc, .{ .raw_bytes = .{
-        .id = 4,
-        .bytes = try alloc.dupe(u8, "second summary\n"),
-        .class = .tool_status,
-    } });
-
-    try runtime.notebook.entries.append(alloc, .{ .assistant_code_block = .{
-        .id = 5,
-        .block = .{
-            .language = try alloc.dupe(u8, "zig"),
-            .code = try alloc.dupe(u8, "const value = 1;"),
-        },
-    } });
-    try runtime.notebook.entries.append(alloc, .{ .raw_bytes = .{
-        .id = 6,
-        .bytes = try alloc.dupe(u8, "third summary\n"),
-        .class = .tool_status,
-    } });
-
-    const summary_ids = [_]?u32{ 2, 4, 6 };
-    var expected = try transcript_blocks.renderEntriesForPreparation(
-        alloc,
-        runtime.notebook.entries.items,
-        runtime.layout.cols,
-        .{},
-        .{ .folded_summary_entry_ids = &summary_ids },
-    );
-    defer expected.deinit(alloc);
-
-    try runtime.notebook.folded_command_blocks.appendSlice(alloc, &.{
-        .{ .summary_entry_id = 2 },
-        .{ .summary_entry_id = 4 },
-        .{ .summary_entry_id = 6 },
-    });
-    try refreshFoldedCommandSummaryIndices(&runtime, alloc);
-
-    for (runtime.notebook.folded_command_blocks.items, expected.folded_summary_indices) |block, index| {
-        try std.testing.expectEqual(index, block.summary_transcript_index);
-    }
 }

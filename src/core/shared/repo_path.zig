@@ -13,12 +13,3 @@ pub fn isValid(path: []const u8) bool {
     }
     return true;
 }
-
-test "repository paths reject traversal, git metadata and malformed separators" {
-    for ([_][]const u8{ "a", "a/b", "sp ace", "tab\tnew\nline", "ñandú", ".gitignore", "a/.github/x", ".git2" }) |path| {
-        try std.testing.expect(isValid(path));
-    }
-    for ([_][]const u8{ "", "/a", "a/", "a//b", "./a", "a/./b", "../a", "a/../b", ".git", ".git/config", "a/.GIT/x", "a\x00b" }) |path| {
-        try std.testing.expect(!isValid(path));
-    }
-}

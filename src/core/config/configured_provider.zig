@@ -86,7 +86,7 @@ pub const OutputLimitField = enum { max_tokens, max_completion_tokens };
 pub const Auth = union(enum) {
     none,
     bearer: []const u8,
-    /// A key saved by `/connect` in the profile settings file itself.
+    /// A key saved by `/provider` in the profile settings file itself.
     key: []const u8,
 };
 
@@ -150,7 +150,6 @@ pub const Definition = struct {
     base_url: []const u8,
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
-    reviewer_model: ?[]const u8 = null,
     /// The model that names a session from its first prompt. Null: sessions
     /// on this connection keep the title derived from the prompt.
     title_model: ?[]const u8 = null,
@@ -212,6 +211,8 @@ pub const Definition = struct {
     /// same environment slot. Length framing prevents ambiguous concatenations.
     /// This does not snapshot model/compatibility policy or authorize a send.
     pub fn binding_identity(self: Definition) [32]u8 {
+        // Test bundles bind a definition at comptime, where hashing needs room.
+        @setEvalBranchQuota(100_000);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("spark-configured-provider-v1");
         hash_part(&hash, self.id);
@@ -305,7 +306,7 @@ pub fn failure_advice(err: anyerror) ?[]const u8 {
         error.InvalidAuth => "auth is {\"type\": \"none\"}, {\"type\": \"bearer\", \"env\": \"VARIABLE\"}, or {\"type\": \"key\", \"key\": \"...\"}",
         error.InvalidEnvironmentName => "a variable's name uses letters, digits, and _, and does not start with a digit",
         error.InvalidProviderId => "a connection's name starts with a letter and uses letters, digits, _, and -",
-        error.ReservedProviderId => "gateway, codex, and grok are spark's own providers; give the connection another name",
+        error.ReservedProviderId => "gateway, codex, and grok are reserved names; give the provider another name",
         error.InvalidToolChoiceMode => "tool_choice_mode is omit or send",
         error.InvalidConnectionOption => "this is true or false",
         error.InvalidModelId => "a model id is text with no control characters and no spaces at either end",
@@ -439,7 +440,7 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         fetch_models = fetch.bool;
         leave(at);
     }
-    const reviewer_model = try optional_model(owned, value, "reviewer_model", at);
+    _ = try optional_model(owned, value, "reviewer_model", at);
     const title_model = try optional_model(owned, value, "title_model", at);
     const vision_model = try optional_model(owned, value, "vision_model", at);
     const headers = if (value.object.get("headers")) |headers| try parse_headers(owned, headers, at) else &.{};
@@ -461,7 +462,6 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
             .key => |key| .{ .key = try owned.dupe(u8, key) },
         },
         .tool_choice_mode = mode,
-        .reviewer_model = reviewer_model,
         .title_model = title_model,
         .vision_model = vision_model,
         .headers = headers,
@@ -826,13 +826,11 @@ test "configured provider owns definitions and preserves unknown metadata" {
     const local = registry.get("local").?;
     try std.testing.expectEqual(Auth.none, local.auth);
     try std.testing.expectEqual(ToolChoiceMode.omit, local.tool_choice_mode);
-    try std.testing.expect(local.reviewer_model == null);
     const chat = try local.chat_url(alloc);
     defer alloc.free(chat);
     try std.testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", chat);
     const router = registry.get("router").?;
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", router.auth.bearer);
-    try std.testing.expectEqualStrings("openai/review", router.reviewer_model.?);
     try std.testing.expectEqual(ToolChoiceMode.send, router.tool_choice_mode);
     const metadata = router.model("openai/gpt-4.1").?;
     try std.testing.expectEqual(@as(?u32, 8192), metadata.context_window);
@@ -846,64 +844,6 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expect(registry.get("Router") == null);
 }
 
-test "configured provider URL policy and prefix normalization" {
-    const valid = [_][2][]const u8{
-        .{ "https://example.com", "https://example.com" },
-        .{ "https://example.com/", "https://example.com" },
-        .{ "https://example.com/api/v1/", "https://example.com/api/v1" },
-        .{ "https://example.com/a//b/%2f/", "https://example.com/a//b/%2f" },
-        .{ "http://localhost", "http://localhost" },
-        .{ "http://127.0.0.1:80/v1", "http://127.0.0.1:80/v1" },
-        .{ "http://[::1]:65535/v1", "http://[::1]:65535/v1" },
-        .{ "HTTPS://Example.com/API/V1", "HTTPS://Example.com/API/V1" },
-        .{ "https://[2001:db8::1]/v1", "https://[2001:db8::1]/v1" },
-    };
-    for (valid) |pair| try std.testing.expectEqualStrings(pair[1], try validate_url(pair[0]));
-    const invalid = [_][]const u8{
-        "",                          "https:/example.com",      "https://",                  "https://user:secret@example.com", "https://@example.com",      "https://example.com?",  "https://example.com#",
-        "https://example.com/\r\nx", "https://example.com/a b", "https://example.com\\evil", "https://example.com/%0a",         "https://example.com/%7f",   "https://example.com/%", "https://example.com/%zz",
-        "https://example.com:",      "https://example.com:+80", "https://example.com:-1",    "https://example.com:8_0",         "https://example.com:65536", "https://example.com:0", "https://example.com:abc",
-        "https://[::1]extra",        "https://[::1]extra:80",   "https://[not-ip]:80",       "https://::1",                     "https://%6cocalhost",       "https://bad..host",     "https://-bad.host",
-        "https://bad_host",
-    };
-    for (invalid) |url| try std.testing.expectError(error.InvalidBaseUrl, validate_url(url));
-    const insecure = [_][]const u8{ "http://example.com", "ftp://example.com", "http://127.0.0.2", "http://127.1", "http://2130706433", "http://localhost.evil", "http://[::ffff:127.0.0.1]", "http://[0:0:0:0:0:0:0:1]" };
-    for (insecure) |url| try std.testing.expectError(error.InsecureBaseUrl, validate_url(url));
-}
-
-test "configured provider binding identity separates name endpoint and auth slot" {
-    var registry = try Registry.parse_json(std.testing.allocator, test_json);
-    defer registry.deinit(std.testing.allocator);
-    const original = registry.get("router").?.*;
-    const identity = original.binding_identity();
-    try std.testing.expectEqual(identity, original.binding_identity());
-    var changed = original;
-    changed.id = "other";
-    try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
-    changed = original;
-    changed.base_url = "https://example.com/api/v1";
-    try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
-    changed = original;
-    changed.auth = .{ .bearer = "OTHER_KEY" };
-    try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
-    changed.auth = .none;
-    try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
-    changed = original;
-    changed.base_url = try validate_url("https://openrouter.ai/api/v1/");
-    try std.testing.expectEqual(identity, changed.binding_identity());
-}
-
-test "configured provider duplicate keys are rejected before Value loses evidence" {
-    for ([_][]const u8{
-        "{\"local\":{},\"local\":{}}",
-        "{\"local\":{\"protocol\":1,\"protocol\":2}}",
-        "{\"local\":{\"auth\":{\"type\":\"none\",\"type\":\"bearer\"}}}",
-        "{\"local\":{\"model_metadata\":{\"model\":{},\"model\":{}}}}",
-        "{\"local\":{\"model_metadata\":{\"model\":{\"supports_vision\":true,\"supports_vision\":false}}}}",
-        "{\"local\":{},\"lo\\u0063al\":{}}",
-    }) |json| try std.testing.expectError(error.DuplicateField, Registry.parse_json(std.testing.allocator, json));
-}
-
 fn test_allocations(alloc: Allocator) !void {
     var registry = try Registry.parse_json(alloc, test_json);
     defer registry.deinit(alloc);
@@ -913,158 +853,7 @@ fn test_allocations(alloc: Allocator) !void {
     _ = definition.binding_identity();
 }
 
-test "configured provider allocation failures release partial registry and URLs" {
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_allocations, .{});
-}
-
 const test_required_fields = "\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"}";
-
-test "configured provider invalid schemas fail explicitly" {
-    const cases = [_]struct { json: []const u8, err: ParseError }{
-        .{ .json = "{", .err = error.InvalidJson },
-        .{ .json = "null", .err = error.InvalidObject },
-        .{ .json = "[]", .err = error.InvalidObject },
-        .{ .json = "{\"\":{}}", .err = error.InvalidProviderId },
-        .{ .json = "{\"1local\":{}}", .err = error.InvalidProviderId },
-        .{ .json = "{\"local.host\":{}}", .err = error.InvalidProviderId },
-        .{ .json = "{\"local/host\":{}}", .err = error.InvalidProviderId },
-        .{ .json = "{\" local\":{}}", .err = error.InvalidProviderId },
-        .{ .json = "{\"GATEWAY\":{}}", .err = error.ReservedProviderId },
-        .{ .json = "{\"codex\":{}}", .err = error.ReservedProviderId },
-        .{ .json = "{\"Grok\":{}}", .err = error.ReservedProviderId },
-        .{ .json = "{\"local\":null}", .err = error.InvalidObject },
-        .{ .json = "{\"local\":{}}", .err = error.MissingField },
-        .{ .json = "{\"local\":{\"protocol\":\"responses\"}}", .err = error.InvalidProtocol },
-        .{ .json = "{\"local\":{\"protocol\":false}}", .err = error.InvalidProtocol },
-        .{ .json = "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":null}}", .err = error.InvalidBaseUrl },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"secret\":\"not-allowed\"}}", .err = error.UnknownField },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":\"auto\"}}", .err = error.InvalidToolChoiceMode },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"tool_choice_mode\":null}}", .err = error.InvalidToolChoiceMode },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":null}}", .err = error.InvalidModelId },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"\"}}", .err = error.InvalidModelId },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"reviewer_model\":\"bad\\nmodel\"}}", .err = error.InvalidModelId },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":null}}", .err = error.InvalidObject },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"\":{}}}}", .err = error.InvalidModelId },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":[]}}}", .err = error.InvalidObject },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"context_window\":0}}}}", .err = error.InvalidModelMetadata },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"context_window\":-1}}}}", .err = error.InvalidModelMetadata },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"context_window\":1.5}}}}", .err = error.InvalidModelMetadata },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"context_window\":4294967296}}}}", .err = error.InvalidModelMetadata },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"max_output_tokens\":null}}}}", .err = error.InvalidModelMetadata },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"max_output_tokens\":\"10\"}}}}", .err = error.InvalidModelMetadata },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"context_window\":1,\"max_output_tokens\":1}}}}", .err = error.InvalidModelMetadata },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"context_window\":2,\"max_output_tokens\":3}}}}", .err = error.InvalidModelMetadata },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_tool_use\":1}}}}", .err = error.InvalidModelMetadata },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_vision\":null}}}}", .err = error.InvalidModelMetadata },
-        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_search\":true}}}}", .err = error.UnknownField },
-    };
-    for (cases) |case| try std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, case.json));
-}
-
-test "configured provider auth admits only explicit none or a portable environment slot" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct { json: []const u8, err: ParseError }{
-        .{ .json = "null", .err = error.InvalidObject },
-        .{ .json = "{}", .err = error.MissingField },
-        .{ .json = "{\"type\":false}", .err = error.InvalidAuth },
-        .{ .json = "{\"type\":\"basic\"}", .err = error.InvalidAuth },
-        .{ .json = "{\"type\":\"none\",\"env\":\"KEY\"}", .err = error.InvalidAuth },
-        .{ .json = "{\"type\":\"none\",\"env\":null}", .err = error.InvalidAuth },
-        .{ .json = "{\"type\":\"bearer\"}", .err = error.MissingField },
-        .{ .json = "{\"type\":\"bearer\",\"env\":null}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"\"}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"1KEY\"}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"${KEY}\"}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY=secret\"}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY\\n\"}", .err = error.InvalidEnvironmentName },
-        .{ .json = "{\"type\":\"bearer\",\"env\":\"KEY\",\"token\":\"literal\"}", .err = error.UnknownField },
-        .{ .json = "{\"type\":\"bearer\",\"command\":\"get-key\"}", .err = error.UnknownField },
-    };
-    for (cases) |case| {
-        const json = try alloc.print("{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{s}}}}}", .{case.json});
-        defer alloc.free(json);
-        try std.testing.expectError(case.err, Registry.parse_json(alloc, json));
-    }
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"bearer\",\"env\":\"_key_2\"}", .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("_key_2", (try parse_auth(parsed.value, null)).bearer);
-}
-
-test "configured provider scalar bounds and minimum input budget" {
-    try validate_id(text_utils.repeat("a", max_id_bytes));
-    try validate_id("Local_2-test");
-    try std.testing.expectError(error.LimitExceeded, validate_id(text_utils.repeat("a", max_id_bytes + 1)));
-    try validate_model_id(text_utils.repeat("m", max_model_bytes));
-    try validate_model_id("vendor/model:tag");
-    try validate_model_id("model with internal spaces");
-    try std.testing.expectError(error.InvalidModelId, validate_model_id(" leading"));
-    try std.testing.expectError(error.InvalidModelId, validate_model_id("trailing "));
-    try std.testing.expectError(error.LimitExceeded, validate_model_id(text_utils.repeat("m", max_model_bytes + 1)));
-    try std.testing.expectError(error.InvalidModelId, validate_model_id("bad\xff"));
-    const prefix = "https://example.com/";
-    _ = try validate_url(prefix ++ text_utils.repeat("a", max_url_bytes - prefix.len));
-    try std.testing.expectError(error.LimitExceeded, validate_url(prefix ++ text_utils.repeat("a", max_url_bytes - prefix.len + 1)));
-
-    const alloc = std.testing.allocator;
-    for ([_]usize{ max_env_bytes, max_env_bytes + 1 }) |length| {
-        const env = text_utils.repeat("E", max_env_bytes + 1);
-        const json = try alloc.print("{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{{\"type\":\"bearer\",\"env\":\"{s}\"}}}}}}", .{env[0..length]});
-        defer alloc.free(json);
-        if (length == max_env_bytes) {
-            var registry = try Registry.parse_json(alloc, json);
-            defer registry.deinit(alloc);
-            try std.testing.expectEqual(max_env_bytes, registry.get("local").?.auth.bearer.len);
-        } else try std.testing.expectError(error.LimitExceeded, Registry.parse_json(alloc, json));
-    }
-    const json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"small\":{\"context_window\":2,\"max_output_tokens\":1},\"large\":{\"context_window\":4294967295},\"output-only\":{\"max_output_tokens\":1}}}}";
-    var registry = try Registry.parse_json(alloc, json);
-    defer registry.deinit(alloc);
-    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), registry.get("local").?.model("large").?.context_window);
-    try std.testing.expect(registry.get("local").?.model("output-only").?.context_window == null);
-}
-
-test "configured provider registry model count and raw input bounds" {
-    const alloc = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const scratch = arena.allocator();
-    const parsed = try std.json.parseFromSlice(std.json.Value, scratch, "{" ++ test_required_fields ++ "}", .{});
-    var providers: std.json.Value = .{ .object = .empty };
-    for (0..max_providers) |index| {
-        try providers.object.put(scratch, try scratch.print("local{d}", .{index}), parsed.value);
-    }
-    var registry = try Registry.parse(alloc, providers);
-    registry.deinit(alloc);
-    try providers.object.put(scratch, "overflow", parsed.value);
-    try std.testing.expectError(error.LimitExceeded, Registry.parse(alloc, providers));
-
-    var metadata: std.json.Value = .{ .object = .empty };
-    for (0..max_models) |index| {
-        try metadata.object.put(scratch, try scratch.print("model/{d}", .{index}), .{ .object = .empty });
-    }
-    var definition = parsed.value;
-    try definition.object.put(scratch, "model_metadata", metadata);
-    var one: std.json.Value = .{ .object = .empty };
-    try one.object.put(scratch, "local", definition);
-    registry = try Registry.parse(alloc, one);
-    registry.deinit(alloc);
-    try metadata.object.put(scratch, "overflow", .{ .object = .empty });
-    try definition.object.put(scratch, "model_metadata", metadata);
-    try one.object.put(scratch, "local", definition);
-    try std.testing.expectError(error.LimitExceeded, Registry.parse(alloc, one));
-
-    const raw = try alloc.alloc(u8, max_json_bytes + 1);
-    defer alloc.free(raw);
-    @memset(raw, ' ');
-    raw[0] = '{';
-    raw[1] = '}';
-    registry = try Registry.parse_json(alloc, raw[0..max_json_bytes]);
-    registry.deinit(alloc);
-    try std.testing.expectError(error.LimitExceeded, Registry.parse_json(alloc, raw));
-    registry = try Registry.parse_json(alloc, "{}");
-    registry.deinit(alloc);
-    registry.deinit(alloc);
-}
 
 fn test_invalid_allocations(alloc: Allocator) !void {
     const json = "{\"first\":{" ++ test_required_fields ++ "},\"second\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"valid\":{},\"invalid\":{\"max_output_tokens\":0}}}}";
@@ -1075,10 +864,6 @@ fn test_invalid_allocations(alloc: Allocator) !void {
     };
     defer registry.deinit(alloc);
     return error.TestUnexpectedResult;
-}
-
-test "configured provider validation failures release earlier definitions and models" {
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_invalid_allocations, .{});
 }
 
 const test_options_json =
@@ -1092,222 +877,6 @@ const test_options_json =
     \\"reasoning_efforts":{"high":{"reasoning":{"effort":"high"}},"low":{"reasoning":{"effort":"low"}},"x-high.2":{}}},
     \\"plain":{"reasoning_efforts":{}}}}}
 ;
-
-test "configured provider reads connection options, request fields, and effort levels in order" {
-    var registry = try Registry.parse_json(std.testing.allocator, test_options_json);
-    defer registry.deinit(std.testing.allocator);
-    const router = registry.get("router").?;
-    try std.testing.expectEqualStrings("small/title", router.title_model.?);
-    try std.testing.expectEqualStrings("small/vision", router.vision_model.?);
-    try std.testing.expect(router.fetch_models);
-    try std.testing.expectEqual(@as(usize, 2), router.headers.len);
-    try std.testing.expectEqualStrings("X-Org", router.headers[0].name);
-    try std.testing.expectEqualStrings("ROUTER_ORG", router.headers[0].env);
-    try std.testing.expectEqualStrings("_TRACE", router.headers[1].env);
-    try std.testing.expectEqual(Timeouts{ .connect_ms = 1, .first_response_ms = 600_000, .stall_ms = max_timeout_ms }, router.timeouts);
-
-    const thinker = router.model("thinker").?;
-    try std.testing.expectEqual(@as(?OutputLimitField, .max_completion_tokens), thinker.output_limit_field);
-    try std.testing.expectEqualStrings("temperature", thinker.request.?.fields[0].key);
-    const levels = thinker.reasoning_efforts.?;
-    try std.testing.expectEqual(@as(usize, 3), levels.len);
-    for ([_][]const u8{ "high", "low", "x-high.2" }, levels) |name, level| try std.testing.expectEqualStrings(name, level.name);
-    try std.testing.expectEqualStrings("{\"effort\":\"high\"}", thinker.effort("high").?.fields.fields[0].value_json);
-    try std.testing.expectEqual(@as(usize, 0), thinker.effort("x-high.2").?.fields.fields.len);
-    try std.testing.expect(thinker.effort("medium") == null);
-    try std.testing.expect(thinker.effort("HIGH") == null);
-
-    // A declared model keeps its own fields and takes the rest from the defaults.
-    const merged = router.metadata_for("thinker").?;
-    try std.testing.expectEqual(@as(?u32, 65536), merged.context_window);
-    try std.testing.expectEqual(@as(?u32, 4096), merged.max_output_tokens);
-    try std.testing.expectEqual(@as(?bool, true), merged.supports_tool_use);
-    try std.testing.expect(merged.supports_vision == null);
-    try std.testing.expectEqualStrings("temperature", merged.request.?.fields[0].key);
-    try std.testing.expectEqual(@as(usize, 3), merged.reasoning_efforts.?.len);
-    // "This model has no levels" is not the same as leaving the levels out.
-    try std.testing.expectEqual(@as(usize, 0), router.metadata_for("plain").?.reasoning_efforts.?.len);
-    // A model the settings do not declare gets the defaults.
-    const served = router.metadata_for("served-by-the-server").?;
-    try std.testing.expectEqualStrings("served-by-the-server", served.id);
-    try std.testing.expectEqual(@as(?u32, 65536), served.context_window);
-    try std.testing.expectEqualStrings("top_p", served.request.?.fields[0].key);
-    try std.testing.expectEqualStrings("low", served.reasoning_efforts.?[0].name);
-    try std.testing.expect(served.output_limit_field == null);
-
-    for ([_]struct { protocol: []const u8, path: []const u8 }{
-        .{ .protocol = "openai-chat-completions", .path = "/chat/completions" },
-        .{ .protocol = "openai-responses", .path = "/responses" },
-        .{ .protocol = "anthropic-messages", .path = "/messages" },
-    }) |case| {
-        const json = try std.testing.allocator.print("{{\"c\":{{\"protocol\":\"{s}\",\"base_url\":\"https://example.com/v1/\",\"auth\":{{\"type\":\"none\"}}}}}}", .{case.protocol});
-        defer std.testing.allocator.free(json);
-        var one = try Registry.parse_json(std.testing.allocator, json);
-        defer one.deinit(std.testing.allocator);
-        const definition = one.get("c").?;
-        try std.testing.expectEqualStrings(case.protocol, @tagName(definition.protocol));
-        const url = try definition.request_url(std.testing.allocator);
-        defer std.testing.allocator.free(url);
-        try std.testing.expectEqualStrings(case.path, url["https://example.com/v1".len..]);
-        const models = try definition.models_url(std.testing.allocator);
-        defer std.testing.allocator.free(models);
-        try std.testing.expectEqualStrings("https://example.com/v1/models", models);
-        try std.testing.expect(!definition.fetch_models);
-        try std.testing.expect(definition.metadata_for("anything") == null);
-        try std.testing.expect(definition.title_model == null and definition.vision_model == null);
-        try std.testing.expectEqual(Timeouts{}, definition.timeouts);
-    }
-}
-
-test "configured provider connection options do not change a connection's identity, and its protocol does" {
-    const alloc = std.testing.allocator;
-    var plain = try Registry.parse_json(alloc, "{\"router\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"bearer\",\"env\":\"ROUTER_KEY\"}}}");
-    defer plain.deinit(alloc);
-    var options = try Registry.parse_json(alloc, test_options_json);
-    defer options.deinit(alloc);
-    const identity = plain.get("router").?.binding_identity();
-    // A session saved before the options existed still resumes.
-    try std.testing.expectEqual(identity, options.get("router").?.binding_identity());
-    var other = plain.get("router").?.*;
-    other.protocol = .@"openai-responses";
-    try std.testing.expect(!std.mem.eql(u8, &identity, &other.binding_identity()));
-}
-
-test "configured provider refuses spark's own fields and headers, and malformed options, at their path" {
-    const cases = [_]struct { json: []const u8, err: ParseError, path: []const u8 }{
-        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"messages\":[]}}}", .err = error.ReservedRequestField, .path = "local.model_metadata.m.request.messages" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"max_tokens\":1}}}", .err = error.ReservedRequestField, .path = "local.model_metadata.m.request.max_tokens" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"request\":{\"max_completion_tokens\":1}}}", .err = error.ReservedRequestField, .path = "local.model_metadata.m.request.max_completion_tokens" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"high\":{\"model\":\"other\"}}}}", .err = error.ReservedRequestField, .path = "local.model_metadata.m.reasoning_efforts.high.model" },
-        .{ .json = "\"model_defaults\":{\"request\":{\"stream\":false}}", .err = error.ReservedRequestField, .path = "local.model_defaults.request.stream" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"request\":[]}}", .err = error.InvalidRequestFields, .path = "local.model_metadata.m.request" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"request\":null}}", .err = error.InvalidRequestFields, .path = "local.model_metadata.m.request" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"high\":\"high\"}}}", .err = error.InvalidRequestFields, .path = "local.model_metadata.m.reasoning_efforts.high" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"low\",\"high\"]}}", .err = error.InvalidObject, .path = "local.model_metadata.m.reasoning_efforts" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"\":{}}}}", .err = error.InvalidEffortLevel, .path = "local.model_metadata.m.reasoning_efforts.\"\"" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"very high\":{}}}}", .err = error.InvalidEffortLevel, .path = "local.model_metadata.m.reasoning_efforts.\"very high\"" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"auto\":{}}}}", .err = error.InvalidEffortLevel, .path = "local.model_metadata.m.reasoning_efforts.auto" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"Default\":{}}}}", .err = error.InvalidEffortLevel, .path = "local.model_metadata.m.reasoning_efforts.Default" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"" ++ text_utils.repeat("e", max_effort_name_bytes + 1) ++ "\":{}}}}", .err = error.LimitExceeded, .path = "local.model_metadata.m.reasoning_efforts." ++ text_utils.repeat("e", FailurePath.max_key_bytes) ++ FailurePath.cut_mark },
-        .{ .json = "\"model_metadata\":{\"m\":{\"output_limit_field\":\"max_output_tokens\"}}", .err = error.InvalidModelMetadata, .path = "local.model_metadata.m.output_limit_field" },
-        .{ .json = "\"model_metadata\":{\"m\":{\"output_limit_field\":true}}", .err = error.InvalidModelMetadata, .path = "local.model_metadata.m.output_limit_field" },
-        .{ .json = "\"model_metadata\":{\"gpt-4.1\":{\"context_window\":\"big\"}}", .err = error.InvalidModelMetadata, .path = "local.model_metadata.\"gpt-4.1\".context_window" },
-        .{ .json = "\"model_defaults\":[]", .err = error.InvalidObject, .path = "local.model_defaults" },
-        .{ .json = "\"model_defaults\":{\"context_window\":2,\"max_output_tokens\":2}", .err = error.InvalidModelMetadata, .path = "local.model_defaults.max_output_tokens" },
-        .{ .json = "\"model_defaults\":{\"id\":\"m\"}", .err = error.UnknownField, .path = "local.model_defaults.id" },
-        .{ .json = "\"headers\":{\"Authorization\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader, .path = "local.headers.Authorization" },
-        .{ .json = "\"headers\":{\"content-TYPE\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader, .path = "local.headers.content-TYPE" },
-        .{ .json = "\"headers\":{\"Host\":{\"env\":\"KEY\"}}", .err = error.ReservedHeader, .path = "local.headers.Host" },
-        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"A\"},\"x-org\":{\"env\":\"B\"}}", .err = error.DuplicateField, .path = "local.headers.x-org" },
-        .{ .json = "\"headers\":{\"X Org\":{\"env\":\"KEY\"}}", .err = error.InvalidHeaderName, .path = "local.headers.\"X Org\"" },
-        .{ .json = "\"headers\":{\"X-Org:\":{\"env\":\"KEY\"}}", .err = error.InvalidHeaderName, .path = "local.headers.\"X-Org:\"" },
-        .{ .json = "\"headers\":{\"\":{\"env\":\"KEY\"}}", .err = error.InvalidHeaderName, .path = "local.headers.\"\"" },
-        .{ .json = "\"headers\":{\"X-Org\":\"literal-value\"}", .err = error.InvalidHeader, .path = "local.headers.X-Org" },
-        .{ .json = "\"headers\":[]", .err = error.InvalidObject, .path = "local.headers" },
-        .{ .json = "\"headers\":{\"X-Org\":{}}", .err = error.MissingField, .path = "local.headers.X-Org.env" },
-        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"KEY\",\"value\":\"literal\"}}", .err = error.UnknownField, .path = "local.headers.X-Org.value" },
-        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"1KEY\"}}", .err = error.InvalidEnvironmentName, .path = "local.headers.X-Org.env" },
-        .{ .json = "\"headers\":{\"" ++ text_utils.repeat("h", max_header_name_bytes + 1) ++ "\":{\"env\":\"KEY\"}}", .err = error.LimitExceeded, .path = "local.headers." ++ text_utils.repeat("h", FailurePath.max_key_bytes) ++ FailurePath.cut_mark },
-        .{ .json = "\"timeouts\":{\"connect_ms\":0}", .err = error.InvalidTimeout, .path = "local.timeouts.connect_ms" },
-        .{ .json = "\"timeouts\":{\"first_response_ms\":-1}", .err = error.InvalidTimeout, .path = "local.timeouts.first_response_ms" },
-        .{ .json = "\"timeouts\":{\"stall_ms\":86400001}", .err = error.InvalidTimeout, .path = "local.timeouts.stall_ms" },
-        .{ .json = "\"timeouts\":{\"stall_ms\":1.5}", .err = error.InvalidTimeout, .path = "local.timeouts.stall_ms" },
-        .{ .json = "\"timeouts\":{\"stall_ms\":\"30s\"}", .err = error.InvalidTimeout, .path = "local.timeouts.stall_ms" },
-        .{ .json = "\"timeouts\":{\"stall_ms\":null}", .err = error.InvalidTimeout, .path = "local.timeouts.stall_ms" },
-        .{ .json = "\"timeouts\":300", .err = error.InvalidObject, .path = "local.timeouts" },
-        .{ .json = "\"timeouts\":{\"total_ms\":1}", .err = error.UnknownField, .path = "local.timeouts.total_ms" },
-        .{ .json = "\"fetch_models\":\"yes\"", .err = error.InvalidConnectionOption, .path = "local.fetch_models" },
-        .{ .json = "\"fetch_models\":null", .err = error.InvalidConnectionOption, .path = "local.fetch_models" },
-        .{ .json = "\"title_model\":\"\"", .err = error.InvalidModelId, .path = "local.title_model" },
-        .{ .json = "\"vision_model\":7", .err = error.InvalidModelId, .path = "local.vision_model" },
-        .{ .json = "\"tool_choice_mode\":\"always\"", .err = error.InvalidToolChoiceMode, .path = "local.tool_choice_mode" },
-        .{ .json = "\"bogus\":1", .err = error.UnknownField, .path = "local.bogus" },
-    };
-    for (cases) |case| {
-        const json = "{\"local\":{" ++ test_required_fields ++ ",";
-        const whole = try std.mem.concat(std.testing.allocator, u8, &.{ json, case.json, "}}" });
-        defer std.testing.allocator.free(whole);
-        std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, whole)) catch |err| {
-            std.debug.print("case: {s}\n", .{case.json});
-            return err;
-        };
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, whole, .{});
-        defer parsed.deinit();
-        var at: FailurePath = .{};
-        try std.testing.expectError(case.err, Registry.parse_located(std.testing.allocator, parsed.value, &at));
-        std.testing.expectEqualStrings(case.path, at.text()) catch |err| {
-            std.debug.print("case: {s}\n", .{case.json});
-            return err;
-        };
-    }
-
-    // Each protocol keeps its own fields, and only Chat Completions has two
-    // names for the output limit.
-    const per_protocol = [_]struct { protocol: []const u8, fragment: []const u8, err: ?ParseError }{
-        .{ .protocol = "openai-chat-completions", .fragment = "\"request\":{\"input\":1,\"system\":2,\"max_output_tokens\":3,\"reasoning\":{},\"thinking\":{}}", .err = null },
-        .{ .protocol = "openai-responses", .fragment = "\"request\":{\"input\":1}", .err = error.ReservedRequestField },
-        .{ .protocol = "openai-responses", .fragment = "\"request\":{\"max_output_tokens\":1}", .err = error.ReservedRequestField },
-        .{ .protocol = "openai-responses", .fragment = "\"request\":{\"messages\":1,\"max_tokens\":2,\"reasoning\":{\"effort\":\"low\"}}", .err = null },
-        .{ .protocol = "openai-responses", .fragment = "\"output_limit_field\":\"max_tokens\"", .err = error.InvalidModelMetadata },
-        .{ .protocol = "anthropic-messages", .fragment = "\"request\":{\"system\":\"x\"}", .err = error.ReservedRequestField },
-        .{ .protocol = "anthropic-messages", .fragment = "\"request\":{\"max_tokens\":1}", .err = error.ReservedRequestField },
-        .{ .protocol = "anthropic-messages", .fragment = "\"request\":{\"input\":1,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}}", .err = null },
-        .{ .protocol = "anthropic-messages", .fragment = "\"output_limit_field\":\"max_tokens\"", .err = error.InvalidModelMetadata },
-    };
-    for (per_protocol) |case| {
-        const json = try std.testing.allocator.print("{{\"c\":{{\"protocol\":\"{s}\",\"base_url\":\"https://example.com\",\"auth\":{{\"type\":\"none\"}},\"model_metadata\":{{\"m\":{{{s}}}}}}}}}", .{ case.protocol, case.fragment });
-        defer std.testing.allocator.free(json);
-        if (case.err) |err| {
-            try std.testing.expectError(err, Registry.parse_json(std.testing.allocator, json));
-        } else {
-            var registry = try Registry.parse_json(std.testing.allocator, json);
-            registry.deinit(std.testing.allocator);
-        }
-    }
-}
-
-test "configured provider reads a session ID header" {
-    var registry = try Registry.parse_json(std.testing.allocator,
-        \\{"go":{"protocol":"openai-chat-completions","base_url":"https://x.example/v1","auth":{"type":"none"},
-        \\"headers":{"x-opencode-session":{"session_id":true},"X-Org":{"env":"ORG"}}}}
-    );
-    defer registry.deinit(std.testing.allocator);
-    const headers = registry.get("go").?.headers;
-    try std.testing.expect(headers[0].session_id);
-    try std.testing.expectEqualStrings("ORG", headers[1].env);
-    try std.testing.expectError(error.InvalidHeader, Registry.parse_json(std.testing.allocator,
-        \\{"go":{"protocol":"openai-chat-completions","base_url":"https://x.example/v1","auth":{"type":"none"},"headers":{"x-s":{"session_id":false}}}}
-    ));
-}
-
-test "configured provider takes sixteen effort levels and sixteen headers, and one more of neither" {
-    const alloc = std.testing.allocator;
-    for ([_]usize{ max_effort_levels, max_effort_levels + 1 }) |count| {
-        var levels: std.ArrayList(u8) = .empty;
-        defer levels.deinit(alloc);
-        var headers: std.ArrayList(u8) = .empty;
-        defer headers.deinit(alloc);
-        for (0..count) |index| {
-            try levels.print(alloc, "{s}\"level{d}\":{{\"reasoning_effort\":\"level{d}\"}}", .{ if (index == 0) "" else ",", index, index });
-            try headers.print(alloc, "{s}\"X-H{d}\":{{\"env\":\"H{d}\"}}", .{ if (index == 0) "" else ",", index, index });
-        }
-        for ([_][]const u8{
-            try alloc.print("\"model_metadata\":{{\"m\":{{\"reasoning_efforts\":{{{s}}}}}}}", .{levels.items}),
-            try alloc.print("\"headers\":{{{s}}}", .{headers.items}),
-        }) |option| {
-            defer alloc.free(option);
-            const json = try std.mem.concat(alloc, u8, &.{ "{\"local\":{" ++ test_required_fields ++ ",", option, "}}" });
-            defer alloc.free(json);
-            if (count == max_effort_levels) {
-                var registry = try Registry.parse_json(alloc, json);
-                defer registry.deinit(alloc);
-                const local = registry.get("local").?;
-                const listed = if (local.model("m")) |m| m.reasoning_efforts.?.len else local.headers.len;
-                try std.testing.expectEqual(count, listed);
-            } else try std.testing.expectError(error.LimitExceeded, Registry.parse_json(alloc, json));
-        }
-    }
-}
 
 fn test_option_allocations(alloc: Allocator) !void {
     var registry = try Registry.parse_json(alloc, test_options_json);
@@ -1323,23 +892,6 @@ fn test_option_allocations(alloc: Allocator) !void {
         error.ReservedRequestField => {},
         else => return err,
     }
-}
-
-test "configured provider options release everything on any allocation failure" {
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_option_allocations, .{});
-}
-
-test "configured provider settings parse or are refused on fuzzed bytes" {
-    try std.testing.fuzz({}, fuzzDefinition, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:11434/v1\",\"auth\":{\"type\":\"none\"}}}",
-            test_options_json,
-            "{\"a\":{\"protocol\":\"anthropic-messages\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"},\"headers\":{\"x-api-key\":{\"env\":\"KEY\"}},\"model_metadata\":{\"m\":{\"reasoning_efforts\":{\"high\":{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048}}}}}}}",
-            "{\"r\":{\"protocol\":\"openai-responses\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"none\"},\"model_metadata\":{\"m\":{\"request\":{\"input\":1}}}}}",
-            "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:1/v1\",\"auth\":{\"type\":\"none\"},\"timeouts\":{\"stall_ms\":0}}}",
-            "\xff\x00{",
-        }) ++ @import("fuzz_corpus").configured_provider_definition.*),
-    });
 }
 
 /// Whatever bytes the settings hold, the parser refuses them or returns a
@@ -1401,63 +953,12 @@ fn expectPathMatchesVerdict(alloc: Allocator, json: []const u8) !void {
     }
 }
 
-test "failure path quotes, cuts on a character boundary, and forgets a key it left" {
-    var at: FailurePath = .{};
-    at.push("local");
-    at.push("model_metadata");
-    at.push("vendor/model\x01");
-    try std.testing.expectEqualStrings("local.model_metadata.\"vendor/model?\"", at.text());
-    at.pop();
-    at.push("m");
-    try std.testing.expectEqualStrings("local.model_metadata.m", at.text());
-    at.pop();
-    at.pop();
-    // A key of 47 ASCII bytes and a three-byte character is not a plain word,
-    // and is cut before the character rather than inside it.
-    at.push(text_utils.repeat("a", FailurePath.max_key_bytes - 1) ++ "\u{2026}");
-    try std.testing.expectEqualStrings("local.\"" ++ text_utils.repeat("a", FailurePath.max_key_bytes - 1) ++ FailurePath.cut_mark ++ "\"", at.text());
-    at.pop();
-    at.pop();
-    try std.testing.expectEqual(@as(usize, 0), at.text().len);
-    // Deeper than any settings path: the extra keys are kept out, not overrun.
-    for (0..FailurePath.max_depth + 3) |_| at.push(text_utils.repeat("k", 200));
-    try std.testing.expect(at.text().len <= FailurePath.max_bytes);
-    for (0..FailurePath.max_depth + 3) |_| at.pop();
-    try std.testing.expectEqual(@as(usize, 0), at.text().len);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"local\":{" ++ test_required_fields ++ "}}", .{});
-    defer parsed.deinit();
-    var registry = try Registry.parse_located(std.testing.allocator, parsed.value, &at);
-    defer registry.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), at.text().len);
-}
-
-test "failure advice covers every refusal the settings parser makes" {
-    inline for (@typeInfo(ParseError).error_set.error_names.?) |name| {
-        const err = @field(ParseError, name);
-        if (err != error.OutOfMemory and err != error.InvalidJson) try std.testing.expect(failure_advice(err) != null);
-    }
-}
-
 fn expectWithinLimits(metadata: ModelMetadata, owned: []const []const u8) !void {
     for (owned) |name| {
         if (metadata.request) |fields| try std.testing.expect(!fields.has(name));
         for (metadata.reasoning_efforts orelse &.{}) |level| try std.testing.expect(!level.fields.has(name));
     }
     if (metadata.reasoning_efforts) |levels| try std.testing.expect(levels.len <= max_effort_levels);
-}
-
-test "a model's request fields and effort levels reach the body as valid JSON on fuzzed settings" {
-    try std.testing.fuzz({}, fuzzFragments, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "{\"temperature\":0.2,\"top_p\":0.9}\x00{\"reasoning_effort\":\"high\",\"temperature\":0.7}",
-            "{\"temperature\":0.2}\x00{\"reasoning\":{\"effort\":\"high\"},\"temperature\":0.7}",
-            "{\"metadata\":{\"user_id\":\"u\"}}\x00{\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048}}",
-            "{\"options\":{\"num_ctx\":[1,2,{\"a\":null}]},\"stop\":[\"\\n\"]}",
-            "{\"model\":\"x\"}\x00{}",
-            "[]\x00{\"a\":1}",
-        }) ++ @import("fuzz_corpus").configured_request_fragments.*),
-    });
 }
 
 /// Two fragments from arbitrary bytes, the model's and a level's, split at

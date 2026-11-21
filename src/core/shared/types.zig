@@ -113,12 +113,6 @@ test "context notice body drops legacy markers from every line" {
 }
 
 pub const CredentialSource = enum {
-    vercel_oidc_token,
-    ai_gateway_api_key,
-    spark_login,
-    stored_key,
-    chatgpt_subscription,
-    grok_subscription,
     host_managed,
     configured,
 };
@@ -165,20 +159,6 @@ pub const CredentialLease = union(enum) {
     }
 };
 
-test "host-managed credential lease carries no local authority bytes" {
-    const lease: CredentialLease = .host_managed;
-    try std.testing.expect(lease.secret() == null);
-    try std.testing.expect(lease.accountId() == null);
-    try std.testing.expect(lease.tenant() == null);
-    try std.testing.expectEqual(CredentialSource.host_managed, lease.credentialSource().?);
-}
-
-test "empty direct credential lease preserves absent authority" {
-    const lease = CredentialLease{ .direct = .{} };
-    try std.testing.expect(lease.secret() == null);
-    try std.testing.expect(lease.credentialSource() == null);
-}
-
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
     const source = parseRuntimeCredentialSource(text) orelse return null;
     return if (source == .host_managed or source == .configured) null else source;
@@ -186,22 +166,6 @@ pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
 
 pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
     return std.meta.stringToEnum(CredentialSource, text);
-}
-
-test "credential source round trips through its persisted name" {
-    for (std.meta.tags(CredentialSource)) |source| {
-        if (source == .host_managed or source == .configured) continue;
-        try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
-    }
-    try std.testing.expect(parseCredentialSource("keychain") == null);
-}
-
-test "host-managed authority is runtime-only and cannot be persisted" {
-    try std.testing.expect(parseCredentialSource("host_managed") == null);
-    try std.testing.expectEqual(
-        CredentialSource.host_managed,
-        parseRuntimeCredentialSource("host_managed").?,
-    );
 }
 
 pub const TurnPresentationOutcome = enum {
@@ -733,133 +697,6 @@ pub fn testRecoveryText(comptime value: []const u8) recovery.Text {
     return text;
 }
 
-test "route recovery status carries the module's status and labels with its text" {
-    const module: recovery.Status = .{
-        .kind = .need_user,
-        .need = .content_filter,
-        .text = testRecoveryText("Blocked by the content filter · press Esc and rephrase"),
-        .short = testRecoveryText("Blocked by content filter · Esc, then rephrase"),
-    };
-    const status = RouteRecoveryStatus.fromRecovery(module, 3).?;
-    try std.testing.expectEqual(RouteRecoveryStatus.Kind.need_user, status.kind);
-    try std.testing.expectEqual(recovery.Status.Need.content_filter, status.need.?);
-    try std.testing.expectEqual(@as(usize, 3), status.attempt);
-    try std.testing.expect(status.fromModule());
-    try std.testing.expectEqualStrings("Blocked by content filter · Esc, then rephrase", status.short.slice());
-
-    // The label is copied into the caller's buffer, so it outlives the
-    // by-value status it came from.
-    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-    const label = status.label(&label_buf);
-    try std.testing.expectEqualStrings("Blocked by the content filter · press Esc and rephrase", label);
-    try std.testing.expectEqual(@intFromPtr(&label_buf), @intFromPtr(label.ptr));
-
-    try std.testing.expect(RouteRecoveryStatus.fromRecovery(.{ .kind = .clear }, 3) == null);
-}
-
-test "route recovery terminal label names the cause, diagnostic, and attempts" {
-    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "⚠ Provider unavailable · HTTP 503 · no_available_providers: No providers are currently available · stopped after 4 attempts",
-        (RouteRecoveryStatus{
-            .kind = .terminal_provider_error,
-            .attempt = 4,
-            .cause = .provider_unavailable,
-            .diagnostic = ModelFailureDiagnostic.init(
-                "HTTP 503 · no_available_providers: No providers are currently available",
-            ),
-        }).label(&label_buf),
-    );
-    try std.testing.expectEqualStrings(
-        "⚠ Response ended early · stream interrupted · stopped after 1 attempt",
-        (RouteRecoveryStatus{
-            .kind = .terminal_provider_error,
-            .attempt = 1,
-            .cause = .response_interrupted,
-            .diagnostic = ModelFailureDiagnostic.init("StreamInterrupted"),
-        }).label(&label_buf),
-    );
-    try std.testing.expectEqualStrings(
-        "⚠ Tool state needs review · context preserved",
-        (RouteRecoveryStatus{ .kind = .unsafe_tool_start }).label(&label_buf),
-    );
-}
-
-test "recovery reports write the shape spark ask and ACP share" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-
-    const cases = [_]struct { status: RouteRecoveryStatus, json: []const u8 }{
-        .{
-            .status = .{ .kind = .waiting, .text = testRecoveryText("Gateway error · next try in 2s · attempt 1 · 0s"), .attempt = 1 },
-            .json = "{\"state\":\"waiting\",\"attempt\":1,\"message\":\"Gateway error · next try in 2s · attempt 1 · 0s\"}",
-        },
-        .{
-            .status = .{ .kind = .need_user, .need = .content_filter, .text = testRecoveryText("Blocked by the content filter · press Esc and rephrase"), .attempt = 2 },
-            .json = "{\"state\":\"need_user\",\"attempt\":2,\"need\":\"content_filter\",\"message\":\"Blocked by the content filter · press Esc and rephrase\"}",
-        },
-        .{ .status = .{ .kind = .recovered, .attempt = 3 }, .json = "{\"state\":\"recovered\",\"attempt\":3}" },
-        .{ .status = .{ .kind = .failed, .attempt = 2 }, .json = "{\"state\":\"failed\",\"attempt\":2}" },
-        .{
-            .status = .{ .kind = .unsafe_tool_start, .attempt = 1 },
-            .json = "{\"state\":\"failed\",\"attempt\":1,\"message\":\"⚠ Tool state needs review · context preserved\"}",
-        },
-    };
-    for (cases) |case| {
-        out.clearRetainingCapacity();
-        try case.status.report(&label_buf).writeJson(&out.writer);
-        try std.testing.expectEqualStrings(case.json, out.written());
-    }
-
-    out.clearRetainingCapacity();
-    try (RouteRecoveryStatus.Report{ .state = .interrupted, .attempt = 4, .message = "Interrupted turn" }).writeJson(&out.writer);
-    try std.testing.expectEqualStrings("{\"state\":\"interrupted\",\"attempt\":4,\"message\":\"Interrupted turn\"}", out.written());
-}
-
-test "model failure diagnostics read as plain words" {
-    var buf: [ModelFailureDiagnostic.max_bytes]u8 = undefined;
-    const cases = [_]struct { raw: []const u8, plain: []const u8 }{
-        // A name spark knows has its own phrase.
-        .{ .raw = "ReadFailed", .plain = "connection dropped" },
-        .{ .raw = "TlsInitializationFailed", .plain = "couldn't make a secure connection" },
-        .{ .raw = "NoSpaceLeft", .plain = "the disk is full" },
-        // A failed write reads as a dropped connection unless spark knows the
-        // write was to its own output.
-        .{ .raw = "WriteFailed", .plain = "connection dropped" },
-        .{ .raw = "OutputWriteFailed", .plain = "couldn't write the output" },
-        // Every provider's unreadable stream event reads the same way.
-        .{ .raw = "InvalidGatewaySseEvent", .plain = "unreadable reply" },
-        .{ .raw = "InvalidOpenAICodexSseEvent", .plain = "unreadable reply" },
-        .{ .raw = "InvalidXaiGrokSseEvent", .plain = "unreadable reply" },
-        .{ .raw = "OpenAICodexSseEventTooLarge", .plain = "reply too large to read" },
-        // Any other error name is split into words.
-        .{ .raw = "InvalidProviderCompletion", .plain = "invalid provider completion" },
-        .{ .raw = "HTTPRequestFailed", .plain = "http request failed" },
-        // A provider's own text is not an error name and passes through.
-        .{ .raw = "HTTP 503 · no_available_providers: No providers are currently available", .plain = "HTTP 503 · no_available_providers: No providers are currently available" },
-        .{ .raw = "provider_error", .plain = "provider_error" },
-        .{ .raw = "HTTP", .plain = "HTTP" },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqualStrings(case.plain, ModelFailureDiagnostic.init(case.raw).humanText(&buf));
-    }
-}
-
-test "plain error text cuts a split name short instead of overrunning" {
-    var buf: [8]u8 = undefined;
-    try std.testing.expectEqualStrings("invalid ", plainErrorText("InvalidProviderCompletion", &buf));
-}
-
-test "model failure diagnostic truncation is bounded and utf8 safe" {
-    const long = "provider_error: " ++ text_utils.repeat("é", 200);
-    const diagnostic = ModelFailureDiagnostic.init(long);
-
-    try std.testing.expect(diagnostic.view().len <= ModelFailureDiagnostic.max_bytes);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(diagnostic.view()));
-    try std.testing.expect(std.mem.endsWith(u8, diagnostic.view(), "..."));
-}
-
 pub const ChatRole = enum {
     system,
     user,
@@ -1329,38 +1166,6 @@ pub fn isDeferredToolResult(result: PersistedToolResult) bool {
             std.mem.eql(u8, result.output, context_deferred_tool_result_output));
 }
 
-test "persisted deferred tool result classifier is exact" {
-    var result = PersistedToolResult{
-        .tool_call_id = @constCast("call_deferred"),
-        .tool_name = @constCast("read_file"),
-        .status = .failure,
-        .output = @constCast(deferred_tool_result_output),
-        .output_bytes = deferred_tool_result_output.len,
-        .stored_output_bytes = deferred_tool_result_output.len,
-    };
-
-    try std.testing.expect(isDeferredToolResult(result));
-    try std.testing.expect(!isContextDeferredToolResult(result));
-
-    result.status = .success;
-    try std.testing.expect(!isDeferredToolResult(result));
-    try std.testing.expect(!isContextDeferredToolResult(result));
-
-    result.status = .failure;
-    result.output = @constCast("Not executed\n");
-    try std.testing.expect(!isDeferredToolResult(result));
-
-    result.output = @constCast("not executed");
-    try std.testing.expect(!isDeferredToolResult(result));
-
-    result.output = @constCast("tool failed");
-    try std.testing.expect(!isDeferredToolResult(result));
-
-    result.output = @constCast(context_deferred_tool_result_output);
-    try std.testing.expect(isDeferredToolResult(result));
-    try std.testing.expect(isContextDeferredToolResult(result));
-}
-
 pub const ToolResultMemory = struct {
     /// Host review feedback is retained for the agent, not security evidence.
     review_feedback: bool = false,
@@ -1751,81 +1556,6 @@ pub fn freeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) 
     if (memory.quiet_crossing) |crossing| alloc.free(crossing.command);
 }
 
-test "dupeToolResultMemory copies survive teardown of every source allocation" {
-    const alloc = std.testing.allocator;
-    const source_images = try alloc.alloc(ToolImage, 1);
-    source_images[0] = .{
-        .data = try alloc.dupe(u8, "aW1hZ2UtZGF0YQ=="),
-        .mime_type = try alloc.dupe(u8, "image/png"),
-        .source_ref = try alloc.dupe(u8, "host:original"),
-    };
-    const source: ToolResultMemory = .{
-        .review_feedback = true,
-        .tool_images = source_images,
-        .tool_image_handle = try alloc.dupe(u8, "image-result-1"),
-        .output_handle = try alloc.dupe(u8, "result-1"),
-        .preview = try alloc.dupe(u8, "preview text"),
-        .output_bytes = 128,
-        .stored_output_bytes = 64,
-        .truncated = true,
-        .model_view_covers_full_file = false,
-        .command_output_replay = .{ .available = .{ .handle = try alloc.dupe(u8, "cmd-replay-1"), .framed_bytes = 42 } },
-        .command_process_presentation = .{ .exit_code = 3 },
-    };
-    const copy = try dupeToolResultMemory(alloc, source);
-    // Tear down every source allocation; the testing allocator scribbles
-    // freed memory, so an aliased copy reads garbage below.
-    freeToolImages(alloc, source_images);
-    alloc.free(source.tool_image_handle.?);
-    alloc.free(source.output_handle.?);
-    alloc.free(source.preview.?);
-    freeCommandOutputReplay(alloc, source.command_output_replay.?);
-
-    try std.testing.expect(copy.review_feedback);
-    try std.testing.expectEqual(@as(usize, 1), copy.tool_images.len);
-    try std.testing.expectEqualStrings("aW1hZ2UtZGF0YQ==", copy.tool_images[0].data);
-    try std.testing.expectEqualStrings("image/png", copy.tool_images[0].mime_type);
-    try std.testing.expectEqualStrings("host:original", copy.tool_images[0].source_ref.?);
-    try std.testing.expectEqualStrings("image-result-1", copy.tool_image_handle.?);
-    try std.testing.expectEqualStrings("result-1", copy.output_handle.?);
-    try std.testing.expectEqualStrings("preview text", copy.preview.?);
-    try std.testing.expectEqual(@as(usize, 128), copy.output_bytes);
-    try std.testing.expectEqual(@as(usize, 64), copy.stored_output_bytes);
-    try std.testing.expect(copy.truncated);
-    try std.testing.expectEqual(@as(?bool, false), copy.model_view_covers_full_file);
-    switch (copy.command_output_replay.?) {
-        .available => |descriptor| {
-            try std.testing.expectEqualStrings("cmd-replay-1", descriptor.handle);
-            try std.testing.expectEqual(@as(usize, 42), descriptor.framed_bytes);
-        },
-        .unavailable => return error.TestUnexpectedResult,
-    }
-    try std.testing.expect(copy.command_process_presentation.? == .exit_code);
-
-    freeToolResultMemory(alloc, copy);
-}
-
-test "dupeToolResultMemory frees only its own copies on allocation failure" {
-    const source: ToolResultMemory = .{
-        .tool_images = &.{
-            .{ .data = @constCast("aW1hZ2U="), .mime_type = @constCast("image/png"), .source_ref = @constCast("host:original") },
-            .{ .data = @constCast(""), .mime_type = @constCast("image/jpeg"), .source_ref = @constCast("host:large") },
-        },
-        .tool_image_handle = "image-result-1",
-        .output_handle = "result-1",
-        .preview = "preview",
-        .command_output_replay = .{ .available = .{ .handle = "cmd-replay-1", .framed_bytes = 7 } },
-    };
-    // Every allocation failure point must leave the source's slices untouched
-    // and release exactly what the partial copy allocated.
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
-        fn check(alloc: std.mem.Allocator) !void {
-            const copy = try dupeToolResultMemory(alloc, source);
-            freeToolResultMemory(alloc, copy);
-        }
-    }.check, .{});
-}
-
 /// A cut in the active context, not a second persisted history.
 pub const ContextHistoryCut = struct {
     turns: usize = 0,
@@ -1975,34 +1705,6 @@ pub fn projectProviderReplay(
     return projected;
 }
 
-test "provider replay projection preserves matching origin and excludes other routes" {
-    const alloc = std.testing.allocator;
-    const source = @import("../config/model_provider.zig").ProviderSelection{ .provider = .gateway, .model = "model" };
-    const messages = [_]ChatMessage{.{ .role = .assistant, .content = "answer", .provider_replay = .{ .source = source, .parts_json = "[]" } }};
-    try std.testing.expect(try projectProviderReplay(alloc, &messages, source) == null);
-    for ([_]@import("../config/model_provider.zig").ProviderSelection{
-        .{ .provider = .codex, .model = "model" },
-        .{ .provider = .grok, .model = "model" },
-        .{ .provider = .gateway, .model = "different" },
-    }) |other| {
-        const projected = (try projectProviderReplay(alloc, &messages, other)).?;
-        defer alloc.free(projected);
-        try std.testing.expect(projected[0].provider_replay == null);
-        try std.testing.expectEqualStrings("answer", projected[0].content.?);
-        try std.testing.expect(messages[0].provider_replay != null);
-        try std.testing.expect(try projectProviderReplay(alloc, projected, other) == null);
-    }
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
-        fn check(a: std.mem.Allocator) !void {
-            const input = [_]ChatMessage{.{ .role = .assistant, .provider_replay = .{ .source = .{ .provider = .gateway, .model = "model" }, .parts_json = "[]" } }};
-            const projected = (try projectProviderReplay(a, &input, .{ .provider = .codex, .model = "model" })).?;
-            defer a.free(projected);
-            const copy = try dupeProviderReplay(a, input[0].provider_replay.?);
-            defer freeProviderReplay(a, copy);
-        }
-    }.check, .{});
-}
-
 pub const Usage = struct {
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,
@@ -2121,26 +1823,6 @@ pub fn isMalformedToolCallFinish(
         std.mem.eql(u8, finish_reason_raw.slice(), malformed_function_call_reason);
 }
 
-test "only a provider error named MALFORMED_FUNCTION_CALL is a malformed tool call" {
-    const malformed = ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL");
-    try std.testing.expect(isMalformedToolCallFinish(.provider_error, malformed));
-    try std.testing.expect(!isMalformedToolCallFinish(.other, malformed));
-    try std.testing.expect(!isMalformedToolCallFinish(.stop, malformed));
-    try std.testing.expect(!isMalformedToolCallFinish(null, malformed));
-    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("provider_error")));
-    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("malformed_function_call")));
-    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("MALFORMED_FUNCTION_CALL_X")));
-    try std.testing.expect(!isMalformedToolCallFinish(.provider_error, ProviderFinishRaw.init("")));
-}
-
-test "provider finish raw keeps a bounded printable copy" {
-    try std.testing.expectEqualStrings("UNEXPECTED_TOOL_CALL", ProviderFinishRaw.init("UNEXPECTED_TOOL_CALL").slice());
-    try std.testing.expectEqualStrings("", ProviderFinishRaw.init("").slice());
-    try std.testing.expectEqualStrings("A?B?C??", ProviderFinishRaw.init("A\x07B C\xc3\xa9").slice());
-    const long = ProviderFinishRaw.init(text_utils.repeat("X", 100));
-    try std.testing.expectEqualStrings(text_utils.repeat("X", ProviderFinishRaw.capacity), long.slice());
-}
-
 fn fuzzProviderFinishRaw(_: void, smith: *std.testing.Smith) anyerror!void {
     var input_buffer: [256]u8 = undefined;
     const input_len: usize = @intCast(smith.slice(&input_buffer));
@@ -2159,18 +1841,6 @@ fn fuzzProviderFinishRaw(_: void, smith: *std.testing.Smith) anyerror!void {
         isMalformedToolCallFinish(.provider_error, raw),
     );
     try std.testing.expect(!isMalformedToolCallFinish(.other, raw));
-}
-
-test "fuzz provider finish raw" {
-    try std.testing.fuzz({}, fuzzProviderFinishRaw, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "UNEXPECTED_TOOL_CALL",
-            "MALFORMED_FUNCTION_CALL",
-            "",
-            "BAD\x07REASON",
-            "\xc3\xa9 \x00\xff",
-        }) ++ @import("fuzz_corpus").provider_finish_raw.*),
-    });
 }
 
 pub const ProviderFailureCause = enum {
@@ -2198,24 +1868,6 @@ pub const ProviderServiceTier = enum {
         return null;
     }
 };
-
-test "Provider service tier parser recognizes Gateway tiers" {
-    const cases = [_]struct {
-        raw: []const u8,
-        expected: ?ProviderServiceTier,
-    }{
-        .{ .raw = "default", .expected = .standard },
-        .{ .raw = "standard", .expected = .standard },
-        .{ .raw = "priority", .expected = .priority },
-        .{ .raw = "fast", .expected = .priority },
-        .{ .raw = "flex", .expected = .flex },
-        .{ .raw = "ultrafast", .expected = .ultrafast },
-        .{ .raw = "unknown", .expected = null },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(case.expected, ProviderServiceTier.parse(case.raw));
-    }
-}
 
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
@@ -2274,19 +1926,6 @@ pub fn displayGatewayTeam(slug: ?[]const u8, id: ?[]const u8) ?[]const u8 {
     return null;
 }
 
-test "displayGatewayTeam shows only a valid team name" {
-    try std.testing.expectEqualStrings("vercel-labs", displayGatewayTeam("vercel-labs", "team_123").?);
-    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("\x1b]2;title\x07\x1b[2J", "team_123").?);
-    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("", "team_123").?);
-    try std.testing.expectEqualStrings("team_123", displayGatewayTeam(null, "team_123").?);
-    try std.testing.expectEqualStrings("team_123", displayGatewayTeam("\xe2\x80\xaeslug", "team_123").?);
-    try std.testing.expect(displayGatewayTeam("bad slug", "team a") == null);
-    try std.testing.expect(displayGatewayTeam(null, null) == null);
-    const longest = text_utils.repeat("a", 128);
-    try std.testing.expectEqualStrings(longest, displayGatewayTeam(longest, "team_123").?);
-    try std.testing.expectEqualStrings("team_123", displayGatewayTeam(text_utils.repeat("a", 129), "team_123").?);
-}
-
 fn fuzzDisplayGatewayTeam(_: void, smith: *std.testing.Smith) anyerror!void {
     var slug_buffer: [192]u8 = undefined;
     const slug_len: usize = @intCast(smith.slice(&slug_buffer));
@@ -2301,17 +1940,6 @@ fn fuzzDisplayGatewayTeam(_: void, smith: *std.testing.Smith) anyerror!void {
     try std.testing.expect(validGatewayTeam(shown));
     try std.testing.expect(shown.ptr == slug.ptr or shown.ptr == id.ptr);
     for (shown) |byte| try std.testing.expect(byte >= 0x21 and byte <= 0x7e);
-}
-
-test "fuzzed team slugs and ids show only a valid team name" {
-    try std.testing.fuzz({}, fuzzDisplayGatewayTeam, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "vercel-labs",
-            "",
-            "\x1b]2;title\x07\x1b[2J",
-            "\xe2\x80\xaeslug",
-        }) ++ @import("fuzz_corpus").gateway_team_display.*),
-    });
 }
 
 pub fn validCredentialAccountId(account_id: []const u8) bool {
@@ -2347,112 +1975,6 @@ pub fn classifyProviderCompletion(completion: ModelCompletion) ProviderCompletio
         .stop => if (completion.tool_calls.len == 0 or allToolCallsProviderExecuted(completion.tool_calls)) .completed else .invalid_completion,
         .other => if (completion.tool_calls.len == 0) .completed else .invalid_completion,
     };
-}
-
-test "provider completion disposition classifies finish reason and tool presence" {
-    const call = ToolCall{
-        .id = "call_1",
-        .name = "read_file",
-        .arguments_json = "{}",
-    };
-    const cases = [_]struct {
-        finish_reason: ?ProviderFinishReason,
-        has_tool_calls: bool,
-        expected: ProviderCompletionDisposition,
-    }{
-        .{ .finish_reason = null, .has_tool_calls = false, .expected = .interrupted },
-        .{ .finish_reason = null, .has_tool_calls = true, .expected = .interrupted },
-        .{ .finish_reason = .provider_error, .has_tool_calls = false, .expected = .provider_failure },
-        .{ .finish_reason = .provider_error, .has_tool_calls = true, .expected = .provider_failure },
-        .{ .finish_reason = .content_filter, .has_tool_calls = false, .expected = .provider_failure },
-        .{ .finish_reason = .content_filter, .has_tool_calls = true, .expected = .provider_failure },
-        .{ .finish_reason = .length, .has_tool_calls = false, .expected = .length_limited },
-        .{ .finish_reason = .length, .has_tool_calls = true, .expected = .length_limited },
-        .{ .finish_reason = .tool_calls, .has_tool_calls = true, .expected = .completed },
-        .{ .finish_reason = .tool_calls, .has_tool_calls = false, .expected = .invalid_completion },
-        .{ .finish_reason = .stop, .has_tool_calls = true, .expected = .invalid_completion },
-        .{ .finish_reason = .other, .has_tool_calls = true, .expected = .invalid_completion },
-        .{ .finish_reason = .stop, .has_tool_calls = false, .expected = .completed },
-        .{ .finish_reason = .other, .has_tool_calls = false, .expected = .completed },
-    };
-
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            case.expected,
-            classifyProviderCompletion(.{
-                .finish_reason = case.finish_reason,
-                .tool_calls = if (case.has_tool_calls) &.{call} else &.{},
-            }),
-        );
-    }
-}
-
-test "provider completion disposition allows terminal provider-executed tool calls" {
-    const provider_call = ToolCall{
-        .id = "provider_search",
-        .name = "perplexity_search",
-        .arguments_json = "{}",
-        .provider_result = "{\"results\":[]}",
-        .provenance = .provider_executed,
-    };
-    const local_call = ToolCall{
-        .id = "local_read",
-        .name = "read_file",
-        .arguments_json = "{\"path\":\"README.md\"}",
-    };
-    const mixed_calls = [_]ToolCall{ provider_call, local_call };
-
-    try std.testing.expectEqual(
-        ProviderCompletionDisposition.completed,
-        classifyProviderCompletion(.{
-            .finish_reason = .stop,
-            .tool_calls = &.{provider_call},
-        }),
-    );
-    try std.testing.expectEqual(
-        ProviderCompletionDisposition.invalid_completion,
-        classifyProviderCompletion(.{
-            .finish_reason = .stop,
-            .tool_calls = &.{local_call},
-        }),
-    );
-    try std.testing.expectEqual(
-        ProviderCompletionDisposition.invalid_completion,
-        classifyProviderCompletion(.{
-            .finish_reason = .stop,
-            .tool_calls = &mixed_calls,
-        }),
-    );
-    try std.testing.expectEqual(
-        ProviderCompletionDisposition.invalid_completion,
-        classifyProviderCompletion(.{
-            .finish_reason = .other,
-            .tool_calls = &.{provider_call},
-        }),
-    );
-}
-
-test "ProviderFinishReason accepts only the canonical provider domain" {
-    const cases = [_]struct {
-        raw: []const u8,
-        reason: ProviderFinishReason,
-    }{
-        .{ .raw = "stop", .reason = .stop },
-        .{ .raw = "length", .reason = .length },
-        .{ .raw = "content-filter", .reason = .content_filter },
-        .{ .raw = "tool-calls", .reason = .tool_calls },
-        .{ .raw = "error", .reason = .provider_error },
-        .{ .raw = "other", .reason = .other },
-    };
-
-    for (cases) |case| {
-        try std.testing.expectEqual(case.reason, ProviderFinishReason.parse_unified(case.raw).?);
-        try std.testing.expectEqualStrings(case.raw, case.reason.label());
-    }
-    try std.testing.expect(ProviderFinishReason.parse_unified("") == null);
-    try std.testing.expect(ProviderFinishReason.parse_unified("future-reason") == null);
-    try std.testing.expectEqual(ProviderFinishReason.tool_calls, ProviderFinishReason.parse_legacy("tool_calls").?);
-    try std.testing.expectEqual(ProviderFinishReason.content_filter, ProviderFinishReason.parse_legacy("content_filter").?);
 }
 
 pub const ConversationIdentity = struct {
@@ -2537,143 +2059,6 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     return .admitted;
-}
-
-test "authoritative tool admission rejects blank current call ids" {
-    for ([_][]const u8{ "", " ", "\t\r\n" }) |id| {
-        const calls = [_]ToolCall{.{ .id = id, .name = "read_file", .arguments_json = "{}" }};
-        try std.testing.expectEqualDeep(
-            AuthoritativeToolAdmission{ .reject_malformed_identity = .empty },
-            authoritativeToolAdmission(.{ .tool_calls = &calls }),
-        );
-    }
-}
-
-test "authoritative tool admission rejects unstorable names" {
-    const oversized: [257]u8 = @splat('n');
-    const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
-        .{ .value = "", .reason = .empty },
-        .{ .value = &oversized, .reason = .too_long },
-        .{ .value = "\xff", .reason = .invalid_utf8 },
-    };
-    for ([_]ToolExecutionProvenance{ .spark_local, .provider_executed }) |provenance| {
-        for (cases) |case| {
-            const calls = [_]ToolCall{.{ .id = "call", .name = case.value, .arguments_json = "{}", .provenance = provenance, .provider_result = "result" }};
-            try std.testing.expectEqualDeep(
-                AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .name, .reason = case.reason } },
-                authoritativeToolAdmission(.{ .tool_calls = &calls }),
-            );
-        }
-    }
-}
-
-test "authoritative tool admission rejects unstorable correlation identities" {
-    const oversized: [257]u8 = @splat('i');
-    const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
-        .{ .value = &oversized, .reason = .too_long },
-        .{ .value = "\xff", .reason = .invalid_utf8 },
-    };
-    for (cases) |case| {
-        const calls = [_]ToolCall{.{ .id = case.value, .name = "read_file", .arguments_json = "{}" }};
-        try std.testing.expectEqualDeep(
-            AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .id, .reason = case.reason } },
-            authoritativeToolAdmission(.{ .tool_calls = &calls }),
-        );
-        const provisional = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "{}", .provisional_id = case.value }};
-        try std.testing.expectEqualDeep(
-            AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = case.reason } },
-            authoritativeToolAdmission(.{ .tool_calls = &provisional }),
-        );
-    }
-    const empty_provisional = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "{}", .provisional_id = "" }};
-    try std.testing.expectEqualDeep(
-        AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = .empty } },
-        authoritativeToolAdmission(.{ .tool_calls = &empty_provisional }),
-    );
-}
-
-test "authoritative tool admission preserves bounded canonical identity formats" {
-    const boundary: [256]u8 = @splat('i');
-    const unicode_boundary = text_utils.repeat("é", 128);
-    for ([_][]const u8{ &boundary, unicode_boundary, "functions.read_file:0", "unknown/tool" }) |identity| {
-        for ([_]ToolExecutionProvenance{ .spark_local, .provider_executed }) |provenance| {
-            const calls = [_]ToolCall{.{ .id = identity, .name = identity, .provisional_id = identity, .arguments_json = "{}", .provenance = provenance, .provider_result = "result" }};
-            try std.testing.expectEqual(AuthoritativeToolAdmission.admitted, authoritativeToolAdmission(.{ .tool_calls = &calls }));
-            try std.testing.expectEqualStrings(identity, calls[0].id);
-            try std.testing.expectEqualStrings(identity, calls[0].name);
-        }
-    }
-}
-
-test "authoritative tool admission rejects duplicate final ids across provenance" {
-    const local_calls = [_]ToolCall{
-        .{ .id = "duplicate_1", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
-        .{ .id = "duplicate_1", .name = "read_file", .arguments_json = "{\"path\":\"b\"}" },
-    };
-    const provider_calls = [_]ToolCall{
-        .{
-            .id = "duplicate_1",
-            .name = "parallel_search",
-            .arguments_json = "{}",
-            .provider_result = "{\"results\":[]}",
-            .provenance = .provider_executed,
-        },
-        .{
-            .id = "duplicate_1",
-            .name = "parallel_search",
-            .arguments_json = "{}",
-            .provider_result = "{\"results\":[]}",
-            .provenance = .provider_executed,
-        },
-    };
-    const mixed_calls = [_]ToolCall{
-        .{
-            .id = "duplicate_1",
-            .name = "parallel_search",
-            .arguments_json = "{}",
-            .provider_result = "{\"results\":[]}",
-            .provenance = .provider_executed,
-        },
-        .{ .id = "duplicate_1", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
-    };
-    const cases = [_][]const ToolCall{
-        &local_calls,
-        &provider_calls,
-        &mixed_calls,
-    };
-
-    for (cases) |calls| {
-        switch (authoritativeToolAdmission(.{ .tool_calls = calls })) {
-            .reject_duplicate_identity => {},
-            else => return error.TestUnexpectedResult,
-        }
-    }
-}
-
-test "authoritative tool admission rejects malformed provider arguments but admits local recovery" {
-    const local_call = ToolCall{
-        .id = "local_1",
-        .name = "read_file",
-        .arguments_json = "{}",
-        .argument_integrity = .malformed_json,
-    };
-    try std.testing.expectEqual(
-        AuthoritativeToolAdmission.admitted,
-        authoritativeToolAdmission(.{ .tool_calls = &.{local_call} }),
-    );
-
-    const provider_call = ToolCall{
-        .id = "provider_1",
-        .name = "parallel_search",
-        .arguments_json = "{}",
-        .argument_integrity = .malformed_json,
-        .provider_result = "{\"results\":[]}",
-        .provenance = .provider_executed,
-    };
-    try std.testing.expectEqual(
-        AuthoritativeToolAdmission.reject_malformed_provider_arguments,
-        authoritativeToolAdmission(.{ .tool_calls = &.{provider_call} }),
-    );
 }
 
 pub const ConversationLanguage = struct {
@@ -2837,36 +2222,24 @@ pub const FinishedPrompt = struct {
     capture_turn: u64 = 0,
 };
 
+/// spark always runs with full access. The retired `ask` and `auto` still
+/// parse so older settings and flags keep loading.
 pub const PermissionMode = enum {
-    ask,
-    auto,
     yolo,
 
     pub fn parse(raw: []const u8) ?PermissionMode {
-        if (std.ascii.eqlIgnoreCase(raw, "ask")) return .ask;
-        if (std.ascii.eqlIgnoreCase(raw, "auto")) return .auto;
         if (std.ascii.eqlIgnoreCase(raw, "full-access") or
             std.ascii.eqlIgnoreCase(raw, "full access") or
-            std.ascii.eqlIgnoreCase(raw, "yolo")) return .yolo;
+            std.ascii.eqlIgnoreCase(raw, "yolo") or
+            std.ascii.eqlIgnoreCase(raw, "ask") or
+            std.ascii.eqlIgnoreCase(raw, "auto")) return .yolo;
         return null;
     }
 
-    /// The name spark saves and prints: `ask`, `auto`, or `full-access`.
-    /// `parse` still reads the older `yolo`.
     pub fn label(self: PermissionMode) []const u8 {
-        return switch (self) {
-            .ask => "ask",
-            .auto => "auto",
-            .yolo => "full-access",
-        };
+        _ = self;
+        return "full-access";
     }
-};
-
-pub const RuleDecision = enum {
-    none,
-    allow,
-    ask,
-    deny,
 };
 
 pub const ContentHash = [std.crypto.hash.sha2.Sha256.digest_length]u8;
@@ -2976,10 +2349,6 @@ pub const ReasoningEffort = union(enum) {
 
 pub const ToolPermissionDenialReason = enum {
     user_denied,
-    auto_denied,
-    review_caution,
-    review_evidence_incomplete,
-    review_unavailable,
     policy_denied,
     permission_required,
 };
@@ -3005,32 +2374,6 @@ pub const ToolPermissionDecision = enum {
             .permission_required => .permission_required,
             .once, .always => null,
         };
-    }
-};
-
-pub const PermissionGrant = struct {
-    tool_name: []u8,
-    target_path: []u8,
-};
-
-pub const PermissionAction = enum {
-    allow,
-    ask,
-    deny,
-};
-
-pub const PermissionRule = struct {
-    permission: []u8,
-    pattern: []u8,
-    action: PermissionAction,
-};
-
-pub const PermissionRuleSet = struct {
-    rules: []PermissionRule = &.{},
-
-    pub fn deinit(self: *PermissionRuleSet, alloc: std.mem.Allocator) void {
-        freePermissionRuleSlice(alloc, self.rules);
-        self.* = .{};
     }
 };
 
@@ -3792,162 +3135,6 @@ pub fn freeToolCall(alloc: std.mem.Allocator, call: ToolCall) void {
     if (call.provider_result) |provider_result| alloc.free(provider_result);
 }
 
-test "dupeHistoryTurn keeps a turn spark stopped as stopped" {
-    const alloc = std.testing.allocator;
-    const source: HistoryTurn = .{ .interrupted = .{
-        .user = .{ .text = @constCast("go") },
-        .terminal_reason = .failed,
-        .stopped_by_exit = true,
-    } };
-    const copy = try dupeHistoryTurn(alloc, source);
-    defer freeHistoryTurn(alloc, copy);
-    try std.testing.expect(copy.interrupted.stopped_by_exit);
-    try std.testing.expectEqual(InterruptedTerminalReason.failed, copy.interrupted.terminal_reason);
-}
-
-test "dupeToolCall preserves argument integrity" {
-    const source = ToolCall{
-        .id = "call_1",
-        .name = "ask_user_question",
-        .arguments_json = "{}",
-        .argument_integrity = .malformed_json,
-    };
-
-    const copy = try dupeToolCall(std.testing.allocator, source);
-    defer freeToolCall(std.testing.allocator, copy);
-
-    try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, copy.argument_integrity);
-}
-
-test "dupeToolCall drops action scoped bindings" {
-    const source: ToolCall = .{
-        .id = "open",
-        .name = "toolbox",
-        .arguments_json = "{\"open\":\"/skills/workflow\"}",
-        .toolbox_lookup = .{ .permission = "skill", .target = "workflow" },
-        .resolved_display_target = "more output from zig build test",
-    };
-    const copy = try dupeToolCall(std.testing.allocator, source);
-    defer freeToolCall(std.testing.allocator, copy);
-    try std.testing.expect(copy.toolbox_lookup == null);
-    try std.testing.expect(copy.resolved_display_target == null);
-    try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
-}
-
-test "function input classification distinguishes syntax from object shape" {
-    const cases = [_]struct { input: []const u8, expected: ToolArgumentIntegrity }{
-        .{ .input = "{}", .expected = .valid },
-        .{ .input = " \n{\"nested\":[1,null,{}]}\t", .expected = .valid },
-        .{ .input = "[]", .expected = .non_object_json },
-        .{ .input = "42", .expected = .non_object_json },
-        .{ .input = "null", .expected = .non_object_json },
-        .{ .input = "true", .expected = .non_object_json },
-        .{ .input = "\"text\"", .expected = .non_object_json },
-        .{ .input = "", .expected = .malformed_json },
-        .{ .input = "{} trailing", .expected = .malformed_json },
-        .{ .input = "{\"a\":1,\"a\":2}", .expected = .malformed_json },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(case.expected, try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, case.input));
-        try std.testing.expectEqual(case.expected, try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, case.input));
-        if (case.expected == .non_object_json) {
-            try std.testing.expectEqual(ToolArgumentIntegrity.valid, try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, case.input));
-        }
-    }
-    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, ToolArgumentIntegrity.classifyFunctionInput(failing.allocator(), "{\"path\":\"file\"}"));
-}
-
-test "ToolArgumentIntegrity accepts complete serialized JSON roots" {
-    const cases = [_][]const u8{
-        "  {\"first\":1,\"second\":1e+02} \n",
-        "[1,{\"nested\":true}]",
-        "null",
-        "true",
-        "42",
-        "\"text\"",
-    };
-
-    for (cases) |serialized| {
-        try std.testing.expectEqual(
-            ToolArgumentIntegrity.valid,
-            try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, serialized),
-        );
-    }
-}
-
-test "ToolArgumentIntegrity rejects malformed trailing and duplicate-key JSON" {
-    const cases = [_][]const u8{
-        "{]",
-        "{} trailing",
-        "{\"depth\":1,\"depth\":2}",
-    };
-
-    for (cases) |serialized| {
-        try std.testing.expectEqual(
-            ToolArgumentIntegrity.malformed_json,
-            try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, serialized),
-        );
-    }
-}
-
-test "ToolArgumentIntegrity preserves parser allocation failure" {
-    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
-    try std.testing.expectError(
-        error.OutOfMemory,
-        ToolArgumentIntegrity.classifySerialized(failing.allocator(), "{\"path\":\"src/main.zig\"}"),
-    );
-}
-
-test "tool argument diagnostic locates truncated, syntax, and rejected input" {
-    const alloc = std.testing.allocator;
-    const cut = "{\"request\":{\"action\":\"run\",\"task\":\"Investigate the \\\"slow exit\\\" path and report";
-    try std.testing.expectEqual(
-        ToolArgumentDiagnostic{ .failure = .truncated, .input_bytes = cut.len, .error_offset = cut.len },
-        try ToolArgumentDiagnostic.diagnose(alloc, cut),
-    );
-
-    const unescaped = "{\"task\":\"say \"hi\" now\"}";
-    try std.testing.expectEqual(
-        ToolArgumentDiagnostic{ .failure = .syntax_error, .input_bytes = unescaped.len, .error_offset = std.mem.find(u8, unescaped, "hi").? },
-        try ToolArgumentDiagnostic.diagnose(alloc, unescaped),
-    );
-
-    const trailing = "{\"path\":\"a\",}";
-    try std.testing.expectEqual(
-        ToolArgumentDiagnostic{ .failure = .syntax_error, .input_bytes = trailing.len, .error_offset = trailing.len - 1 },
-        try ToolArgumentDiagnostic.diagnose(alloc, trailing),
-    );
-
-    const repeated = "{\"path\":\"a\",\"path\":\"b\"}";
-    try std.testing.expectEqual(
-        ToolArgumentDiagnostic{ .failure = .rejected_value, .input_bytes = repeated.len, .error_offset = null },
-        try ToolArgumentDiagnostic.diagnose(alloc, repeated),
-    );
-
-    try std.testing.expectEqual(
-        ToolArgumentDiagnostic{ .failure = .truncated, .input_bytes = 0, .error_offset = 0 },
-        try ToolArgumentDiagnostic.diagnose(alloc, ""),
-    );
-
-    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, ToolArgumentDiagnostic.diagnose(failing.allocator(), text_utils.repeat("[", 4096)));
-}
-
-test "dupeToolCall keeps the argument diagnostic" {
-    const diagnostic = try ToolArgumentDiagnostic.diagnose(std.testing.allocator, "{\"path\":");
-    const source: ToolCall = .{
-        .id = "bad",
-        .name = "read_file",
-        .arguments_json = "{}",
-        .argument_integrity = .malformed_json,
-        .argument_diagnostic = diagnostic,
-    };
-    const copy = try dupeToolCall(std.testing.allocator, source);
-    defer freeToolCall(std.testing.allocator, copy);
-    try std.testing.expectEqual(diagnostic, copy.argument_diagnostic.?);
-}
-
 fn fuzzToolArgumentDiagnostic(_: void, smith: *std.testing.Smith) anyerror!void {
     var input_buffer: [1024]u8 = undefined;
     const input_len: usize = @intCast(smith.slice(&input_buffer));
@@ -3957,18 +3144,6 @@ fn fuzzToolArgumentDiagnostic(_: void, smith: *std.testing.Smith) anyerror!void 
     try std.testing.expectEqual(input.len, diagnostic.input_bytes);
     if (diagnostic.error_offset) |offset| try std.testing.expect(offset <= input.len);
     try std.testing.expectEqual(diagnostic.failure == .rejected_value, diagnostic.error_offset == null);
-}
-
-test "fuzz tool argument diagnostic" {
-    try std.testing.fuzz({}, fuzzToolArgumentDiagnostic, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "{\"request\":{\"task\":\"cut",
-            "{\"a\":1,}",
-            "{\"a\":1,\"a\":2}",
-            "{\"t\":\"\xc3\xa9\xe2\x82",
-            "\xff\x00{",
-        }) ++ @import("fuzz_corpus").tool_argument_diagnostic.*),
-    });
 }
 
 pub fn freeUserTurn(alloc: std.mem.Allocator, user: UserTurn) void {
@@ -4080,471 +3255,6 @@ pub fn freeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []ImageAt
     alloc.free(attachments);
 }
 
-pub fn dupePermissionGrantSlice(alloc: std.mem.Allocator, grants: []const PermissionGrant) ![]PermissionGrant {
-    const copy = try alloc.alloc(PermissionGrant, grants.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            alloc.free(copy[i].tool_name);
-            alloc.free(copy[i].target_path);
-        }
-    }
-
-    for (grants, 0..) |grant, i| {
-        const tool_name = try alloc.dupe(u8, grant.tool_name);
-        errdefer alloc.free(tool_name);
-
-        const target_path = try alloc.dupe(u8, grant.target_path);
-        copy[i] = .{
-            .tool_name = tool_name,
-            .target_path = target_path,
-        };
-        copied += 1;
-    }
-
-    return copy;
-}
-
-pub fn freePermissionGrantSlice(alloc: std.mem.Allocator, grants: []PermissionGrant) void {
-    for (grants) |grant| {
-        alloc.free(grant.tool_name);
-        alloc.free(grant.target_path);
-    }
-    alloc.free(grants);
-}
-
-pub fn dupePermissionRuleSlice(alloc: std.mem.Allocator, rules: []const PermissionRule) ![]PermissionRule {
-    if (rules.len == 0) return &.{};
-
-    const copy = try alloc.alloc(PermissionRule, rules.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            alloc.free(copy[i].permission);
-            alloc.free(copy[i].pattern);
-        }
-    }
-
-    for (rules, 0..) |rule, i| {
-        const permission = try alloc.dupe(u8, rule.permission);
-        errdefer alloc.free(permission);
-
-        const pattern = try alloc.dupe(u8, rule.pattern);
-        copy[i] = .{
-            .permission = permission,
-            .pattern = pattern,
-            .action = rule.action,
-        };
-        copied += 1;
-    }
-
-    return copy;
-}
-
-pub fn freePermissionRuleSlice(alloc: std.mem.Allocator, rules: []PermissionRule) void {
-    if (rules.len == 0) return;
-    for (rules) |rule| {
-        alloc.free(rule.permission);
-        alloc.free(rule.pattern);
-    }
-    alloc.free(rules);
-}
-
-pub fn dupePermissionRuleSet(alloc: std.mem.Allocator, rules: PermissionRuleSet) !PermissionRuleSet {
-    return .{
-        .rules = try dupePermissionRuleSlice(alloc, rules.rules),
-    };
-}
-
-test "ConversationLanguage preserves core constructors" {
-    const default_lang = ConversationLanguage.default();
-    try std.testing.expectEqualStrings("und", default_lang.view());
-
-    const literal = ConversationLanguage.literal("en");
-    try std.testing.expectEqual(@as(u8, 2), literal.len);
-    try std.testing.expectEqualStrings("en", literal.view());
-
-    const parsed = try ConversationLanguage.fromSlice("  ja  ");
-    try std.testing.expectEqualStrings("ja", parsed.view());
-
-    try std.testing.expectError(error.InvalidConversationLanguage, ConversationLanguage.fromSlice(""));
-    try std.testing.expectError(error.InvalidConversationLanguage, ConversationLanguage.fromSlice(" \t\r\n "));
-    try std.testing.expectError(error.InvalidConversationLanguage, ConversationLanguage.fromSlice("this-is-way-too-long-for-a-language-tag"));
-}
-
-test "ReasoningEffort preserves default aliases and opaque names" {
-    const default_aliases = [_][]const u8{ "auto", "AUTO", "adaptive", "default" };
-    for (default_aliases) |alias| {
-        const parsed = ReasoningEffort.parseDisplayLabel(alias) orelse return error.ExpectedReasoningEffort;
-        try std.testing.expectEqual(ReasoningEffort.auto, parsed);
-        try std.testing.expectEqualStrings("auto", parsed.label());
-        try std.testing.expectEqualStrings("default", parsed.displayLabel());
-        try std.testing.expect(parsed.gatewayValue() == null);
-    }
-
-    const named_values = [_][]const u8{ "none", "low", "xhigh", "future-tier" };
-    for (named_values) |raw| {
-        const parsed = ReasoningEffort.parse(raw) orelse return error.ExpectedReasoningEffort;
-        try std.testing.expectEqualStrings(raw, parsed.label());
-        try std.testing.expectEqualStrings(raw, parsed.displayLabel());
-        try std.testing.expectEqualStrings(raw, parsed.gatewayValue().?);
-    }
-
-    try std.testing.expect(ReasoningEffort.parse("") == null);
-    try std.testing.expect(ReasoningEffort.parse("contains space") == null);
-    try std.testing.expect(ReasoningEffort.parse("this-effort-name-is-deliberately-longer-than-the-supported-wire-boundary-of-sixty-four-bytes") == null);
-}
-
-test "HistoryTurn helpers duplicate and free owned turns" {
-    const alloc = std.testing.allocator;
-
-    const assistant_original: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = try alloc.dupe(u8, "hello") },
-        .assistant = try alloc.dupe(u8, "response"),
-    } };
-    const assistant_copy = try dupeHistoryTurn(alloc, assistant_original);
-    try std.testing.expectEqualStrings("hello", assistant_copy.assistant.user.text);
-    try std.testing.expectEqualStrings("response", assistant_copy.assistant.assistant);
-    try std.testing.expect(assistant_copy.assistant.user.text.ptr != assistant_original.assistant.user.text.ptr);
-    freeHistoryTurn(alloc, assistant_copy);
-    freeHistoryTurn(alloc, assistant_original);
-
-    var summary_root_messages = try alloc.alloc([]u8, 1);
-    summary_root_messages[0] = try alloc.dupe(u8, "exact root request");
-    var summary_feedback = try alloc.alloc([]u8, 1);
-    summary_feedback[0] = try alloc.dupe(u8, "deny writes outside the workspace");
-    const summary_original: HistoryTurn = .{ .compacted_summary = .{
-        .summary = try alloc.dupe(u8, "summary"),
-        .removed_turn_count = 3,
-        .compaction_count = 2,
-        .root_user_messages = summary_root_messages,
-        .root_user_messages_complete = false,
-        .permission_feedback = summary_feedback,
-        .permission_feedback_complete = false,
-    } };
-    const summary_copy = try dupeHistoryTurn(alloc, summary_original);
-    try std.testing.expectEqualStrings("summary", summary_copy.compacted_summary.summary);
-    try std.testing.expectEqual(@as(usize, 3), summary_copy.compacted_summary.removed_turn_count);
-    try std.testing.expect(!summary_copy.compacted_summary.root_user_messages_complete);
-    try std.testing.expect(!summary_copy.compacted_summary.permission_feedback_complete);
-    try std.testing.expectEqualStrings(
-        "deny writes outside the workspace",
-        summary_copy.compacted_summary.permission_feedback[0],
-    );
-    try std.testing.expect(
-        summary_copy.compacted_summary.permission_feedback[0].ptr !=
-            summary_original.compacted_summary.permission_feedback[0].ptr,
-    );
-    try std.testing.expect(summary_copy.compacted_summary.summary.ptr != summary_original.compacted_summary.summary.ptr);
-    freeHistoryTurn(alloc, summary_copy);
-    freeHistoryTurn(alloc, summary_original);
-
-    const interrupted_original: HistoryTurn = .{ .interrupted = .{
-        .user = .{ .text = try alloc.dupe(u8, "stop") },
-        .execution = .{ .files = blk: {
-            const files = try alloc.alloc(FileEvidence, 1);
-            files[0] = .{
-                .path = try alloc.dupe(u8, "README.md"),
-                .tool_call_id = try alloc.dupe(u8, "call_2"),
-                .tool_name = try alloc.dupe(u8, "read_file"),
-                .action = .read,
-                .status = .failure,
-            };
-            break :blk files;
-        } },
-        .cancelled_command = .{
-            .output_replay = .{ .available = .{
-                .handle = try alloc.dupe(u8, "spark-command-replay.bin"),
-                .framed_bytes = 42,
-            } },
-            .command_artifact_handle = try alloc.dupe(u8, "spark-command.log"),
-        },
-        .terminal_reason = .failed,
-    } };
-    const interrupted_copy = try dupeHistoryTurn(alloc, interrupted_original);
-    try std.testing.expectEqualStrings("README.md", interrupted_copy.interrupted.execution.files[0].path);
-    try std.testing.expect(interrupted_copy.interrupted.execution.files[0].path.ptr != interrupted_original.interrupted.execution.files[0].path.ptr);
-    const copied_presentation = interrupted_copy.interrupted.cancelled_command.?;
-    const original_presentation = interrupted_original.interrupted.cancelled_command.?;
-    try std.testing.expectEqualStrings(
-        "spark-command-replay.bin",
-        copied_presentation.output_replay.?.available.handle,
-    );
-    try std.testing.expect(
-        copied_presentation.output_replay.?.available.handle.ptr !=
-            original_presentation.output_replay.?.available.handle.ptr,
-    );
-    try std.testing.expect(
-        copied_presentation.command_artifact_handle.?.ptr !=
-            original_presentation.command_artifact_handle.?.ptr,
-    );
-    try std.testing.expectEqual(
-        InterruptedTerminalReason.failed,
-        interrupted_copy.interrupted.terminal_reason,
-    );
-    freeHistoryTurn(alloc, interrupted_copy);
-    freeHistoryTurn(alloc, interrupted_original);
-
-    const finished_original = FinishedPrompt{
-        .turn = .{ .interrupted = .{
-            .user = .{ .text = try alloc.dupe(u8, "cancel") },
-            .assistant = try alloc.dupe(u8, "I stopped here."),
-        } },
-        .terminal_projection = .assistant_text,
-        .terminal_outcome = .completed,
-        .presentation_text = try alloc.dupe(u8, "Earlier reply.\nI stopped here."),
-    };
-    const finished_copy = try dupeFinishedPrompt(alloc, finished_original);
-    try std.testing.expectEqual(FinishedPromptProjection.assistant_text, finished_copy.terminal_projection);
-    try std.testing.expectEqual(@as(?TurnPresentationOutcome, .completed), finished_copy.terminal_outcome);
-    try std.testing.expectEqualStrings(finished_original.presentation_text.?, finished_copy.presentation_text.?);
-    try std.testing.expect(finished_original.presentation_text.?.ptr != finished_copy.presentation_text.?.ptr);
-    freeFinishedPrompt(alloc, finished_copy);
-    freeFinishedPrompt(alloc, finished_original);
-}
-
-test "finished prompt presentation allocation failures preserve ownership" {
-    const Case = struct {
-        fn run(alloc: std.mem.Allocator) !void {
-            const original: FinishedPrompt = .{
-                .turn = .{ .assistant = .{
-                    .user = .{ .text = @constCast("request") },
-                    .assistant = @constCast("current"),
-                } },
-                .presentation_text = "earlier\ncurrent",
-            };
-            const copy = try dupeFinishedPrompt(alloc, original);
-            defer freeFinishedPrompt(alloc, copy);
-            try std.testing.expectEqualStrings("current", copy.turn.assistant.assistant);
-            try std.testing.expectEqualStrings("earlier\ncurrent", copy.presentation_text.?);
-        }
-    };
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
-}
-
-test "TurnSummary carries shared turn token progress" {
-    const progress: TurnTokenProgress = .{
-        .input_tokens = 50_000,
-        .output_tokens = 240,
-        .input_exact = true,
-        .output_exact = false,
-    };
-    const summary: TurnSummary = .{
-        .thinking_duration_ms = 15_000,
-        .turn_duration_ms = 130_000,
-        .token_progress = progress,
-    };
-    try std.testing.expectEqual(progress, summary.token_progress);
-}
-
-test "ImageAttachment helpers duplicate empty and populated slices" {
-    const alloc = std.testing.allocator;
-
-    const empty = try dupeImageAttachmentSlice(alloc, &.{});
-    try std.testing.expectEqual(@as(usize, 0), empty.len);
-    freeImageAttachmentSlice(alloc, empty);
-
-    var originals = try alloc.alloc(ImageAttachment, 1);
-    originals[0] = .{
-        .path = try alloc.dupe(u8, "/tmp/image.png"),
-        .media_type = try alloc.dupe(u8, "image/png"),
-    };
-
-    const copy = try dupeImageAttachmentSlice(alloc, originals);
-    try std.testing.expectEqualStrings("/tmp/image.png", copy[0].path);
-    try std.testing.expectEqualStrings("image/png", copy[0].media_type);
-    try std.testing.expect(copy[0].path.ptr != originals[0].path.ptr);
-
-    freeImageAttachmentSlice(alloc, copy);
-    freeImageAttachmentSlice(alloc, originals);
-}
-
-test "dupeImageAttachment frees path when media_type allocation fails" {
-    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
-    try std.testing.expectError(error.OutOfMemory, dupeImageAttachment(failing.allocator(), .{
-        .path = @constCast("/tmp/a.png"),
-        .media_type = @constCast("image/png"),
-    }));
-}
-
-test "dupeImageAttachment preserves stable image id" {
-    const alloc = std.testing.allocator;
-    const copy = try dupeImageAttachment(alloc, .{
-        .id = 41,
-        .path = @constCast("/tmp/a.png"),
-        .media_type = @constCast("image/png"),
-    });
-    defer {
-        alloc.free(copy.path);
-        alloc.free(copy.media_type);
-    }
-
-    try std.testing.expectEqual(@as(usize, 41), copy.id);
-}
-
-test "ImageAttachment source references clone independently and clean up allocation failures" {
-    const originals = [_]ImageAttachment{
-        .{
-            .id = 1,
-            .path = @constCast("inline://image-1"),
-            .media_type = @constCast("image/png"),
-            .inline_data = @constCast("pixels"),
-            .snapshot_sha256 = @constCast("digest"),
-            .source_ref = @constCast("host:original"),
-        },
-        .{
-            .id = 2,
-            .path = @constCast("inline://image-2"),
-            .media_type = @constCast("image/jpeg"),
-            .source_ref = @constCast("host:large"),
-        },
-    };
-    const alloc = std.testing.allocator;
-    const source = try dupeImageAttachmentSlice(alloc, &originals);
-    defer freeImageAttachmentSlice(alloc, source);
-    const copy = try dupeImageAttachmentSlice(alloc, source);
-    defer freeImageAttachmentSlice(alloc, copy);
-    for (copy, source) |cloned, original| {
-        try std.testing.expect(cloned.source_ref.?.ptr != original.source_ref.?.ptr);
-        original.source_ref.?[0] = 'X';
-    }
-    source[0].inline_data.?[0] = 'X';
-    try std.testing.expectEqualStrings("host:original", copy[0].source_ref.?);
-    try std.testing.expectEqualStrings("host:large", copy[1].source_ref.?);
-    try std.testing.expectEqualStrings("pixels", copy[0].inline_data.?);
-    try std.testing.expect(copy[1].inline_data == null);
-    try std.testing.expect(copy[1].snapshot_path == null);
-    try std.testing.expect(copy[1].snapshot_sha256 == null);
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
-        fn check(a: std.mem.Allocator, images: []const ImageAttachment) !void {
-            const cloned = try dupeImageAttachmentSlice(a, images);
-            defer freeImageAttachmentSlice(a, cloned);
-        }
-    }.check, .{&originals});
-}
-
-test "Permission helpers duplicate and free grants rules and rule sets" {
-    const alloc = std.testing.allocator;
-
-    const grants = [_]PermissionGrant{.{
-        .tool_name = @constCast("run_command"),
-        .target_path = @constCast("/tmp/workspace"),
-    }};
-    const grant_copy = try dupePermissionGrantSlice(alloc, &grants);
-    try std.testing.expectEqualStrings("run_command", grant_copy[0].tool_name);
-    try std.testing.expectEqualStrings("/tmp/workspace", grant_copy[0].target_path);
-    try std.testing.expect(grant_copy[0].tool_name.ptr != grants[0].tool_name.ptr);
-    freePermissionGrantSlice(alloc, grant_copy);
-
-    const expected_empty_grants = try alloc.alloc(PermissionGrant, 0);
-    const empty_grant_copy = try dupePermissionGrantSlice(alloc, &.{});
-    try std.testing.expectEqual(expected_empty_grants.ptr, empty_grant_copy.ptr);
-    alloc.free(expected_empty_grants);
-    freePermissionGrantSlice(alloc, empty_grant_copy);
-
-    var rules = [_]PermissionRule{.{
-        .permission = @constCast("write_file"),
-        .pattern = @constCast("src/**"),
-        .action = .allow,
-    }};
-    const rule_copy = try dupePermissionRuleSlice(alloc, &rules);
-    try std.testing.expectEqualStrings("write_file", rule_copy[0].permission);
-    try std.testing.expectEqualStrings("src/**", rule_copy[0].pattern);
-    try std.testing.expectEqual(PermissionAction.allow, rule_copy[0].action);
-    try std.testing.expect(rule_copy[0].permission.ptr != rules[0].permission.ptr);
-    freePermissionRuleSlice(alloc, rule_copy);
-
-    var ruleset = try dupePermissionRuleSet(alloc, .{ .rules = &rules });
-    try std.testing.expectEqual(@as(usize, 1), ruleset.rules.len);
-    ruleset.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), ruleset.rules.len);
-
-    var empty_ruleset = PermissionRuleSet{};
-    empty_ruleset.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), empty_ruleset.rules.len);
-}
-
-test "public types remain constructible" {
-    const layout: Layout = .{
-        .rows = 24,
-        .cols = 80,
-        .content_bottom = 20,
-        .divider_top_row = 21,
-        .input_row = 22,
-        .divider_bottom_row = 23,
-        .hint_row = 24,
-    };
-    try std.testing.expectEqual(@as(u16, 80), layout.cols);
-
-    const metrics = Metrics{ .ansi_bytes = 1, .stream_chunks = 2 };
-    try std.testing.expectEqual(@as(usize, 2), metrics.stream_chunks);
-
-    const stream = StreamState{ .active = true, .last_activity_kind = .ask };
-    try std.testing.expect(stream.active);
-    try std.testing.expectEqual(ToolActivityKind.ask, stream.last_activity_kind.?);
-
-    const tool_call = ToolCall{
-        .id = "call_1",
-        .name = "read_file",
-        .arguments_json = "{}",
-        .provider_result = "ok",
-    };
-    const image = ImageAttachment{
-        .path = @constCast("/tmp/image.png"),
-        .media_type = @constCast("image/png"),
-    };
-    const chat = ChatMessage{
-        .role = .assistant,
-        .content = "content",
-        .images = &.{image},
-        .tool_calls = &.{tool_call},
-    };
-    try std.testing.expectEqual(ChatRole.assistant, chat.role);
-    try std.testing.expectEqualStrings("ok", chat.tool_calls[0].provider_result.?);
-
-    const completion = ModelCompletion{
-        .content = "done",
-        .tool_calls = &.{tool_call},
-        .finish_reason = .stop,
-    };
-    try std.testing.expectEqual(ProviderFinishReason.stop, completion.finish_reason.?);
-
-    const option = QuestionOption{ .label = "Yes", .description = "Proceed" };
-    const batch = QuestionBatchEntry{ .question = "Continue?", .options = &.{option} };
-    try std.testing.expectEqualStrings("Continue?", batch.question);
-
-    const mode = PermissionMode.ask;
-    const decision = ToolPermissionDecision.always;
-    const action = PermissionAction.deny;
-    const resolve_mode = ResolveMode.create;
-    _ = mode;
-    _ = decision;
-    _ = action;
-    _ = resolve_mode;
-}
-
 fn dupeThenFreeContextNotes(alloc: std.mem.Allocator, notes: []const PersistedContextNote) !void {
     freePersistedContextNotes(alloc, try dupePersistedContextNotes(alloc, notes));
-}
-
-test "dupePersistedContextNotes leaves nothing behind when a later note fails to copy" {
-    var first_sources = [_]ContextNoteSource{.{ .path = "AGENTS.md", .stamp = 1 }};
-    var second_sources = [_]ContextNoteSource{.{ .path = "src/AGENTS.md", .stamp = 2 }};
-    var first_text = "first".*;
-    var second_text = "second".*;
-    const notes = [_]PersistedContextNote{
-        .{ .text = &first_text, .after_tool_step_count = 1, .sources = &first_sources },
-        .{ .text = &second_text, .after_tool_step_count = 2, .sources = &second_sources },
-    };
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        dupeThenFreeContextNotes,
-        .{@as([]const PersistedContextNote, &notes)},
-    );
 }

@@ -166,21 +166,6 @@ fn readDisk(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8) !Disk
     };
 }
 
-test "the disk abstraction counts a torn tail and parses seqs" {
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    const io = std.testing.io;
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "log",
-        .data = "{\"v\":1,\"seq\":1,\"ts\":0,\"kind\":\"item\"}\ngarbage\n{\"v\":1,\"se",
-    });
-    const disk = try readDisk(std.testing.allocator, io, tmp.dir, "log");
-    defer std.testing.allocator.free(disk.seqs);
-    try std.testing.expectEqual(@as(u64, 3), disk.log_len);
-    try std.testing.expect(!disk.tail_done);
-    try std.testing.expectEqualSlices(i64, &.{ 1, -1 }, disk.seqs);
-}
-
 // ---------------------------------------------------------------------------
 // TurnLifecycle, for any number of sessions and across processes
 

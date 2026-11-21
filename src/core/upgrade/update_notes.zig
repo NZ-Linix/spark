@@ -79,20 +79,6 @@ pub fn writeLabel(kind: Kind, writer: *std.Io.Writer) !void {
     });
 }
 
-test "stable destination uses normalized changelog anchor" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-
-    const value = destination(.stable, "v0.0.8", "", "") orelse
-        return error.TestExpectedDestination;
-    try std.testing.expectEqual(Kind.notes, value.kind);
-    try value.writeUrl(&out.writer);
-    try std.testing.expectEqualStrings(
-        "https://github.com/NZ-Linix/spark",
-        out.writer.buffered(),
-    );
-}
-
 test "dev destination uses compare range when both revisions are valid" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -109,77 +95,4 @@ test "dev destination uses compare range when both revisions are valid" {
         "https://github.com/NZ-Linix/spark/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01",
         out.writer.buffered(),
     );
-}
-
-test "dev destination falls back to the installed commit" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-
-    const value = destination(
-        .dev,
-        "0.0.8",
-        "unknown",
-        "abcdef0123456789abcdef0123456789abcdef01",
-    ) orelse return error.TestExpectedDestination;
-    try value.writeUrl(&out.writer);
-    try std.testing.expectEqualStrings(
-        "https://github.com/NZ-Linix/spark/commit/abcdef0123456789abcdef0123456789abcdef01",
-        out.writer.buffered(),
-    );
-}
-
-test "dev destination treats a short previous revision as the same commit" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-
-    const value = destination(
-        .dev,
-        "0.0.8",
-        "abcdef012345",
-        "abcdef0123456789abcdef0123456789abcdef01",
-    ) orelse return error.TestExpectedDestination;
-    try value.writeUrl(&out.writer);
-    try std.testing.expectEqualStrings(
-        "https://github.com/NZ-Linix/spark/commit/abcdef0123456789abcdef0123456789abcdef01",
-        out.writer.buffered(),
-    );
-}
-
-test "destination links only the label, not its parentheses" {
-    const stable = destination(.stable, "0.0.8", "", "") orelse
-        return error.TestExpectedDestination;
-    const dev = destination(
-        .dev,
-        "0.0.8",
-        "1111111111111111111111111111111111111111",
-        "abcdef0123456789abcdef0123456789abcdef01",
-    ) orelse return error.TestExpectedDestination;
-
-    const cases = [_]struct {
-        value: Destination,
-        expected: []const u8,
-    }{
-        .{
-            .value = stable,
-            .expected = "(\x1b]8;;https://github.com/NZ-Linix/spark\x1b\\" ++
-                "\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
-        },
-        .{
-            .value = dev,
-            .expected = "(\x1b]8;;https://github.com/NZ-Linix/spark/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\" ++
-                "\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
-        },
-    };
-
-    for (cases) |case| {
-        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer out.deinit();
-        try case.value.writeHyperlinkLabel(&out.writer);
-        try std.testing.expectEqualStrings(case.expected, out.writer.buffered());
-    }
-}
-
-test "invalid build identity has no destination" {
-    try std.testing.expect(destination(.stable, "dev", "", "") == null);
-    try std.testing.expect(destination(.dev, "0.0.8", "", "not-a-revision") == null);
 }

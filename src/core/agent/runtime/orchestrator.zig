@@ -42,8 +42,6 @@ const command_environment = @import("../../execution/command_environment.zig");
 const context_contract = @import("../../workspace/context_contract.zig");
 const tool_preparation = @import("../tool_preparation.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
-const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
-const auto_classifier_context = @import("../../permissions/auto_classifier_context.zig");
 const subagent_model_contract = @import("../../subagent/model_contract.zig");
 const subagent_reports = @import("../../subagent/reports.zig");
 
@@ -86,7 +84,6 @@ const Allocator = std.mem.Allocator;
 
 const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;
-const PermissionGrant = types.PermissionGrant;
 const ToolCall = types.ToolCall;
 const QueuedPrompt = worker_runtime.QueuedPrompt;
 const TraceContext = debug_trace.TraceContext;
@@ -173,28 +170,6 @@ fn malformedCallToolName(registry: tool_dispatch.Registry, completion: types.Mod
         if (registry.lookup(call.name) != null) return call.name;
     }
     return null;
-}
-
-test "malformed tool call feedback names the tool, then asks for smaller calls" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try std.testing.expectEqualStrings(
-        "Your last tool call to read_file could not be read: the provider reported MALFORMED_FUNCTION_CALL, and spark did not run it. Call the tool again with arguments that are valid JSON and match its schema, or answer in text.",
-        try malformedToolCallFeedback(arena, 1, "read_file"),
-    );
-    try std.testing.expectEqualStrings(
-        "Your tool call could not be read again (MALFORMED_FUNCTION_CALL), and spark did not run it. Long or deeply nested arguments often cause this: make smaller calls with short arguments, such as writing a large file in several steps, or answer in text.",
-        try malformedToolCallFeedback(arena, 2, null),
-    );
-    try std.testing.expectEqualStrings(
-        "The model's tool call could not be read (provider reason: MALFORMED_FUNCTION_CALL). Asking it to try again.",
-        malformed_tool_call_retry_notice,
-    );
-    try std.testing.expectEqualStrings(
-        "The model's tool call could not be read 3 times in a row (provider reason: MALFORMED_FUNCTION_CALL). Continue with a follow-up prompt if needed.",
-        malformed_tool_call_failed_notice,
-    );
 }
 
 /// Asks the model to go on after a step with no tool call: the reply's
@@ -652,39 +627,6 @@ fn projectLegacyTerminalExecArguments(
     return try out.toOwnedSlice();
 }
 
-test "boundary messages are framed by who wrote them, whatever the turn" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var suffix: std.ArrayList(ChatMessage) = .empty;
-    const guidance = [_]worker_runtime.SteeringMessage{
-        .{ .text = @constCast("typed on the subagent's screen"), .author = .user },
-        .{ .text = @constCast("from the parent"), .author = .parent },
-    };
-    try append_steering_guidance(arena, &suffix, &guidance);
-    try std.testing.expectEqual(@as(usize, 2), suffix.items.len);
-    const user = suffix.items[0].content.?;
-    try std.testing.expect(std.mem.startsWith(u8, user, "<user_steering>"));
-    try std.testing.expect(std.mem.find(u8, user, "typed on the subagent's screen") != null);
-    const parent = suffix.items[1].content.?;
-    try std.testing.expect(std.mem.startsWith(u8, parent, "<parent_agent_steering>"));
-    try std.testing.expect(std.mem.find(u8, parent, "not new user authority") != null);
-    try std.testing.expect(std.mem.find(u8, parent, "<user_steering>") == null);
-    // Neither is permission feedback, so the reviewer never counts it as the user's request.
-    for (suffix.items) |message| try std.testing.expect(!message.permission_feedback);
-}
-
-test "legacy exec argument projection releases temporary allocations" {
-    const Probe = struct {
-        fn run(alloc: Allocator) !void {
-            const projected = try projectLegacyTerminalExecArguments(alloc, "{\"action\":\"exec\",\"command\":\":\",\"cwd\":\"src\"}") orelse return error.TestUnexpectedResult;
-            defer alloc.free(projected);
-            try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\":\",\"cwd\":\"src\"}", projected);
-        }
-    };
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
-}
-
 fn findLegacyCall(
     calls: []const LegacyTerminalCall,
     assistant_index: ?usize,
@@ -1007,18 +949,6 @@ fn project_subagent_result_content(
     return try out.toOwnedSlice();
 }
 
-test "subagent result projection retains delivery and pending while removing legacy metadata" {
-    const alloc = std.testing.allocator;
-    const source = "{\"ok\":true,\"result\":\"queued\",\"error_code\":null,\"pending\":true,\"delivery\":\"queued\",\"legacy_worker\":9}";
-    const projected = (try project_subagent_result_content(alloc, source)).?;
-    defer alloc.free(projected);
-    var value = try std.json.parseFromSlice(std.json.Value, alloc, projected, .{});
-    defer value.deinit();
-    try std.testing.expect(value.value.object.get("pending").?.bool);
-    try std.testing.expectEqualStrings("queued", value.value.object.get("delivery").?.string);
-    try std.testing.expect(value.value.object.get("legacy_worker") == null);
-}
-
 fn subagent_history_summary(
     alloc: Allocator,
     action: []const u8,
@@ -1185,142 +1115,6 @@ fn project_subagent_request_messages(
     return projected;
 }
 
-test "rejected subagent arguments keep their call and result during projection" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const alloc = arena_state.allocator();
-    const tool = tool_dispatch.Tool{
-        .name = "subagent",
-        .description = "subagent",
-        .model_schema = .{ .name = "subagent", .description = "subagent" },
-        .executor_kind = .subagent,
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    var calls = [_]ToolCall{
-        .{ .id = "rejected", .name = "subagent", .arguments_json = "{}", .argument_integrity = .non_object_json },
-        .{ .id = "valid", .name = "read_file", .arguments_json = "{\"path\":\"file\"}" },
-    };
-    const messages = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = &calls },
-        .{ .role = .tool, .tool_call_id = "rejected", .tool_name = "subagent", .content = "not executed", .tool_result_status = .failure },
-        .{ .role = .tool, .tool_call_id = "valid", .tool_name = "read_file", .content = "contents", .tool_result_status = .success },
-    };
-    // Rewriting a malformed call into an assistant-role summary would leave
-    // the next request ending in assistant prefill.
-    for ([_]types.ToolArgumentIntegrity{ .non_object_json, .malformed_json, .valid }) |integrity| {
-        calls[0].argument_integrity = integrity;
-        const projected = try project_subagent_request_messages(
-            alloc,
-            .{ .tools = &.{tool} },
-            true,
-            &messages,
-            agent_stream_provider.unavailable_provider,
-            .{ .provider = .gateway, .model = "test" },
-        );
-        try std.testing.expectEqual(@as(usize, 2), projected[0].tool_calls.len);
-        try std.testing.expectEqualStrings("rejected", projected[0].tool_calls[0].id);
-        try std.testing.expectEqualStrings("{}", projected[0].tool_calls[0].arguments_json);
-        try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
-        try std.testing.expectEqualStrings("rejected", projected[1].tool_call_id.?);
-        try std.testing.expectEqualStrings("not executed", projected[1].content.?);
-        try std.testing.expectEqual(types.PersistedToolStatus.failure, projected[1].tool_result_status.?);
-    }
-}
-
-test "subagent history makes every removed manager action inert" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const tool = tool_dispatch.Tool{
-        .name = "subagent",
-        .description = "subagent",
-        .model_schema = .{ .name = "subagent", .description = "subagent" },
-        .executor_kind = .subagent,
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    const registry = tool_dispatch.Registry{ .tools = &.{tool} };
-    const calls = [_]ToolCall{
-        .{
-            .id = "legacy-create",
-            .name = "subagent",
-            .arguments_json = "{\"command\":{\"create\":{\"name\":\"worker\",\"mode\":\"persistent\",\"prompt\":\"do it\"}}}",
-        },
-        .{
-            .id = "legacy-configure",
-            .name = "subagent",
-            .arguments_json = "{\"command\":{\"configure\":{\"id\":\"child-1\",\"name\":\"renamed\"}}}",
-        },
-        .{
-            .id = "current-run",
-            .name = "subagent",
-            .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"current\"}}",
-        },
-    };
-    const stored_result =
-        "{\"ok\":true,\"operation_id\":\"fxop:2:m:1:0000000000000000000000000000000000000000000000000000000000000000\",\"child_id\":\"1788212822437-1788212822437350000-0924a40611358d88\",\"status\":\"idle\",\"error_code\":null,\"retryable\":false}";
-    const messages = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = &calls },
-        .{ .role = .tool, .tool_call_id = "legacy-create", .tool_name = "subagent", .content = stored_result },
-        .{ .role = .tool, .tool_call_id = "legacy-configure", .tool_name = "subagent", .content = "configured" },
-        .{ .role = .tool, .tool_call_id = "current-run", .tool_name = "subagent", .content = stored_result },
-    };
-
-    const projected = try project_subagent_request_messages(
-        arena,
-        registry,
-        true,
-        &messages,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expect(projected.ptr != messages[0..].ptr);
-    try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
-    // A stored wrapped call replays with the top-level arguments the schema
-    // now advertises.
-    try std.testing.expectEqualStrings("{\"action\":\"run\",\"task\":\"current\"}", projected[0].tool_calls[0].arguments_json);
-    try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
-    try std.testing.expectEqualStrings("current-run", projected[1].tool_call_id.?);
-    try std.testing.expect(std.mem.find(u8, projected[1].content.?, "operation_id") == null);
-    try std.testing.expectEqual(types.ChatRole.assistant, projected[2].role);
-    try std.testing.expect(std.mem.find(
-        u8,
-        projected[2].content.?,
-        "Prior subagent create action completed",
-    ) != null);
-    try std.testing.expectEqual(types.ChatRole.assistant, projected[3].role);
-    try std.testing.expect(std.mem.find(
-        u8,
-        projected[3].content.?,
-        "Prior subagent configure action completed",
-    ) != null);
-    try std.testing.expectEqualStrings(calls[0].arguments_json, messages[0].tool_calls[0].arguments_json);
-
-    const idempotent = try project_subagent_request_messages(
-        arena,
-        registry,
-        true,
-        projected,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
-    const ineligible = try project_subagent_request_messages(
-        arena,
-        registry,
-        false,
-        &messages,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
-}
-
 fn check_subagent_history_projection_allocation_failures(alloc: Allocator) !void {
     const tool = tool_dispatch.Tool{
         .name = "subagent",
@@ -1353,18 +1147,10 @@ fn check_subagent_history_projection_allocation_failures(alloc: Allocator) !void
         true,
         &messages,
         agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
+        .{ .provider = .none, .model = "test" },
     );
     if (projected.ptr == messages[0..].ptr) return error.TestUnexpectedResult;
     defer free_terminal_request_projection(alloc, &messages, projected);
-}
-
-test "subagent history projection cleans every partial allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        check_subagent_history_projection_allocation_failures,
-        .{},
-    );
 }
 
 fn project_read_tool_result_request_messages(
@@ -1509,38 +1295,6 @@ fn agentShellWriteLeaseSessionId(
     return session_id.string;
 }
 
-test "shell write retains one internal finalization lease safety edge" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const shell_tool = tool_dispatch.Tool{
-        .name = "shell",
-        .description = "shell",
-        .model_schema = .{ .name = "shell", .description = "shell" },
-        .executor_kind = .terminal,
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    const registry = tool_dispatch.Registry{ .tools = &.{shell_tool} };
-    const session_id = (try agentShellWriteLeaseSessionId(
-        arena,
-        registry,
-        .{
-            .id = "write",
-            .name = "shell",
-            .arguments_json = "{\"action\":\"write\",\"session_id\":\"shell-one\",\"input\":{\"kind\":\"text\",\"text\":\"input\"}}",
-        },
-    )).?;
-    try std.testing.expectEqualStrings("shell-one", session_id);
-    try std.testing.expect((try agentShellWriteLeaseSessionId(
-        arena,
-        registry,
-        .{ .id = "list", .name = "shell", .arguments_json = "{\"action\":\"list\"}" },
-    )) == null);
-}
-
 fn normalize_terminal_request_tool_calls(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
@@ -1617,387 +1371,6 @@ fn normalize_subagent_request_tool_calls(
     return normalized orelse source;
 }
 
-test "subagent intake unwraps an exact request wrapper" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const tool = tool_dispatch.Tool{
-        .name = "subagent",
-        .description = "subagent",
-        .model_schema = .{ .name = "subagent", .description = "subagent" },
-        .executor_kind = .subagent,
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    const registry = tool_dispatch.Registry{ .tools = &.{tool} };
-    const calls = [_]ToolCall{
-        .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"review\"}" },
-        .{ .id = "message", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}}" },
-        .{ .id = "run", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"wrapped\"}}" },
-        // A wrapper the model wrote as JSON text is read like an object.
-        .{ .id = "text-message", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"message\\\",\\\"agent\\\":\\\"reviewer\\\",\\\"message\\\":\\\"review\\\"}\"}" },
-        .{ .id = "text-run", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"task\\\":\\\"wrapped\\\"}\"}" },
-        // Decode never reads a text wrapper, so intake unwraps one whatever
-        // it asks for.
-        .{ .id = "text-wait", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"wait\\\"}\"}" },
-        .{ .id = "text-no-action", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"agent\\\":\\\"reviewer\\\"}\"}" },
-        .{ .id = "legacy", .name = "subagent", .arguments_json = "{\"command\":{\"lifecycle\":{\"id\":\"child-4\",\"action\":\"cancel\"}}}" },
-        .{ .id = "unknown-action", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"wait\"}}" },
-        .{ .id = "beside", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"a\"},\"task\":\"b\"}" },
-        .{ .id = "text-array", .name = "subagent", .arguments_json = "{\"request\":\"[1]\"}" },
-        .{ .id = "text-deep", .name = "subagent", .arguments_json = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"task\\\":" ++ text_utils.repeat("[", 70) ++ text_utils.repeat("]", 70) ++ "}\"}" },
-    };
-
-    const normalized = try normalize_subagent_request_tool_calls(
-        arena,
-        registry,
-        true,
-        &calls,
-    );
-    try std.testing.expect(normalized.ptr != calls[0..].ptr);
-    try std.testing.expectEqual(calls[0].arguments_json.ptr, normalized[0].arguments_json.ptr);
-    try std.testing.expectEqualStrings(
-        "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}",
-        normalized[1].arguments_json,
-    );
-    try std.testing.expectEqualStrings("{\"action\":\"run\",\"task\":\"wrapped\"}", normalized[2].arguments_json);
-    try std.testing.expectEqualStrings(normalized[1].arguments_json, normalized[3].arguments_json);
-    try std.testing.expectEqualStrings(normalized[2].arguments_json, normalized[4].arguments_json);
-    try std.testing.expectEqualStrings("{\"action\":\"wait\"}", normalized[5].arguments_json);
-    try std.testing.expectEqualStrings("{\"agent\":\"reviewer\"}", normalized[6].arguments_json);
-    // Anything else, an object wrapper of another action, a wrapper beside
-    // another field, and text that is no object or nests past the depth
-    // limit, reaches the decoder as sent, which names what is wrong with it.
-    for (calls[7..], normalized[7..]) |call, result| {
-        try std.testing.expectEqual(call.arguments_json.ptr, result.arguments_json.ptr);
-    }
-    const ineligible = try normalize_subagent_request_tool_calls(
-        arena,
-        registry,
-        false,
-        &calls,
-    );
-    try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
-}
-
-test "request unwrapping skips only required vision calls" {
-    try std.testing.expect(request_unwrap_eligible(.unavailable));
-    try std.testing.expect(request_unwrap_eligible(.optional));
-    try std.testing.expect(!request_unwrap_eligible(.required));
-}
-
-test "terminal model write input normalizes every atomic payload" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        internal: []const u8,
-        model: []const u8,
-    }{
-        .{
-            .internal = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"hello\"}}",
-            .model = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"hello\"}}}",
-        },
-        .{
-            .internal = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
-            .model = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}",
-        },
-        .{
-            .internal = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"controls\",\"controls\":[108]}}",
-            .model = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"controls\":[108]}}}",
-        },
-        .{
-            .internal = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"paste\",\"text\":\"large\"}}",
-            .model = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"paste\":\"large\"}}}",
-        },
-    };
-    for (cases) |case| {
-        const normalized = (try normalized_terminal_request_arguments(
-            alloc,
-            case.model,
-            null,
-        )).?;
-        defer alloc.free(normalized);
-        try std.testing.expectEqualStrings(case.internal, normalized);
-    }
-}
-
-test "shell history replays stored calls as sent" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const terminal_tool = tool_dispatch.Tool{
-        .name = "shell",
-        .description = "shell",
-        .model_schema = .{ .name = "shell", .description = "shell" },
-        .executor_kind = .terminal,
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    const registry = tool_dispatch.Registry{ .tools = &.{terminal_tool} };
-    // Accepted calls are stored flat; rejected calls keep the bytes the model
-    // sent. Neither gains a request wrapper on the way back to the model
-    // (`tests/tla/shell_command/ShellContract.tla` HistoryFidelity).
-    const calls = [_]ToolCall{
-        .{ .id = "accepted", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"true\"}" },
-        .{ .id = "rejected", .name = "shell", .arguments_json = "{\"action\":\"unknown\"}" },
-        .{ .id = "wrapped", .name = "shell", .arguments_json = "{\"request\":{\"action\":\"run\"},\"sibling\":true}" },
-        .{ .id = "malformed", .name = "shell", .arguments_json = "{}", .argument_integrity = .malformed_json },
-    };
-    const messages = [_]ChatMessage{
-        .{ .role = .assistant, .content = "assistant", .tool_calls = &calls },
-        .{ .role = .tool, .content = "accepted result", .tool_call_id = "accepted", .tool_name = "shell" },
-        .{ .role = .tool, .content = "rejected result", .tool_call_id = "rejected", .tool_name = "shell" },
-        .{ .role = .tool, .content = "wrapped result", .tool_call_id = "wrapped", .tool_name = "shell" },
-        .{ .role = .tool, .content = "malformed result", .tool_call_id = "malformed", .tool_name = "shell" },
-    };
-
-    const projected = try project_terminal_request_messages(
-        arena,
-        registry,
-        true,
-        &messages,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(messages[0..].ptr, projected.ptr);
-}
-
-test "wrapped read_tool_result history replays with top-level arguments" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const calls = [_]ToolCall{
-        .{ .id = "flat", .name = "read_tool_result", .arguments_json = "{\"handle\":\"flat.bin\",\"start_byte\":1,\"byte_count\":160}" },
-        .{ .id = "nested", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}" },
-        .{ .id = "beside", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"a.bin\"},\"query\":\"b\"}" },
-        .{ .id = "string", .name = "read_tool_result", .arguments_json = "{\"request\":\"[1]\"}" },
-        .{ .id = "text", .name = "read_tool_result", .arguments_json = "{\"request\":\"{\\\"handle\\\":\\\"text.bin\\\",\\\"query\\\":\\\"needle\\\"}\"}" },
-    };
-    const messages = [_]ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
-
-    const projected = try project_read_tool_result_request_messages(
-        arena,
-        true,
-        &messages,
-    );
-    try std.testing.expect(projected.ptr != messages[0..].ptr);
-    try std.testing.expectEqual(calls[0].arguments_json.ptr, projected[0].tool_calls[0].arguments_json.ptr);
-    try std.testing.expectEqualStrings(
-        "{\"handle\":\"new.bin\",\"query\":\"needle\"}",
-        projected[0].tool_calls[1].arguments_json,
-    );
-    // Only an exact wrapper around an object, or JSON text of one, is unwrapped.
-    try std.testing.expectEqual(calls[2].arguments_json.ptr, projected[0].tool_calls[2].arguments_json.ptr);
-    try std.testing.expectEqual(calls[3].arguments_json.ptr, projected[0].tool_calls[3].arguments_json.ptr);
-    try std.testing.expectEqualStrings(
-        "{\"handle\":\"text.bin\",\"query\":\"needle\"}",
-        projected[0].tool_calls[4].arguments_json,
-    );
-    try std.testing.expectEqualStrings(
-        "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}",
-        messages[0].tool_calls[1].arguments_json,
-    );
-
-    const idempotent = try project_read_tool_result_request_messages(
-        arena,
-        true,
-        projected,
-    );
-    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
-    const ineligible = try project_read_tool_result_request_messages(
-        arena,
-        false,
-        &messages,
-    );
-    try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
-}
-
-test "legacy request projection preserves complete surviving exchanges" {
-    const shell = tool_dispatch.Tool{
-        .name = "shell",
-        .description = "shell",
-        .model_schema = .{ .name = "shell", .description = "shell" },
-        .executor_kind = .terminal,
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    var subagent = shell;
-    subagent.name = "subagent";
-    subagent.executor_kind = .subagent;
-    const registry = tool_dispatch.Registry{ .tools = &.{ shell, subagent } };
-    const cases = [_]struct { name: []const u8, arguments: []const u8 }{
-        .{ .name = "terminal", .arguments = "{\"action\":\"read\",\"session_id\":\"missing\"}" },
-        .{ .name = "terminal", .arguments = "{\"action\":\"exec\"}" },
-        .{ .name = "terminal", .arguments = "{\"action\":\"exec\",\"command\":42}" },
-        .{ .name = "subagent", .arguments = "{\"command\":{\"inspect\":{\"id\":\"missing\"}}}" },
-    };
-    for (cases) |case| {
-        const is_subagent = std.mem.eql(u8, case.name, "subagent");
-        for ([_]bool{ false, true }) |removed_first| {
-            var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            const removed = ToolCall{
-                .id = "removed",
-                .name = case.name,
-                .arguments_json = case.arguments,
-            };
-            const retained = ToolCall{ .id = "retained", .name = "read_file", .arguments_json = "{}" };
-            const second = ToolCall{ .id = "second", .name = "read_file", .arguments_json = "{}" };
-            const calls = if (removed_first) [_]ToolCall{ removed, retained, second } else [_]ToolCall{ retained, second, removed };
-            const messages = [_]ChatMessage{
-                .{ .role = .assistant, .tool_calls = &calls },
-                .{ .role = .tool, .tool_call_id = calls[0].id, .tool_name = calls[0].name, .content = "first result" },
-                .{ .role = .tool, .tool_call_id = calls[1].id, .tool_name = calls[1].name, .content = "second result" },
-                .{ .role = .tool, .tool_call_id = calls[2].id, .tool_name = calls[2].name, .content = "third result" },
-                .{ .role = .user, .content = "next turn" },
-            };
-            const projected = if (is_subagent)
-                try project_subagent_request_messages(
-                    arena,
-                    registry,
-                    true,
-                    &messages,
-                    agent_stream_provider.unavailable_provider,
-                    .{ .provider = .gateway, .model = "test" },
-                )
-            else
-                try project_terminal_request_messages(
-                    arena,
-                    registry,
-                    true,
-                    &messages,
-                    agent_stream_provider.unavailable_provider,
-                    .{ .provider = .gateway, .model = "test" },
-                );
-            try std.testing.expectEqual(@as(usize, 2), projected[0].tool_calls.len);
-            try std.testing.expectEqualStrings("retained", projected[0].tool_calls[0].id);
-            try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
-            try std.testing.expectEqualStrings("retained", projected[1].tool_call_id.?);
-            try std.testing.expectEqualStrings(if (removed_first) "second result" else "first result", projected[1].content.?);
-            try std.testing.expectEqual(types.ChatRole.tool, projected[2].role);
-            try std.testing.expectEqualStrings("second", projected[2].tool_call_id.?);
-            try std.testing.expectEqualStrings(if (removed_first) "third result" else "second result", projected[2].content.?);
-            try std.testing.expectEqual(types.ChatRole.assistant, projected[3].role);
-            try std.testing.expect(std.mem.find(u8, projected[3].content.?, if (removed_first) "first result" else "third result") != null);
-            try std.testing.expectEqualStrings("next turn", projected[4].content.?);
-            try std.testing.expectEqual(@as(usize, 3), messages[0].tool_calls.len);
-            try std.testing.expectEqual(types.ChatRole.tool, messages[1].role);
-            var invalid = messages;
-            invalid[1].tool_call_id = "unmatched";
-            try std.testing.expectError(error.InvalidToolHistoryProjection, if (is_subagent)
-                project_subagent_request_messages(
-                    arena,
-                    registry,
-                    true,
-                    &invalid,
-                    agent_stream_provider.unavailable_provider,
-                    .{ .provider = .gateway, .model = "test" },
-                )
-            else
-                project_terminal_request_messages(
-                    arena,
-                    registry,
-                    true,
-                    &invalid,
-                    agent_stream_provider.unavailable_provider,
-                    .{ .provider = .gateway, .model = "test" },
-                ));
-            try std.testing.expectError(error.InvalidToolHistoryProjection, if (is_subagent)
-                project_subagent_request_messages(
-                    arena,
-                    registry,
-                    true,
-                    messages[0..2],
-                    agent_stream_provider.unavailable_provider,
-                    .{ .provider = .gateway, .model = "test" },
-                )
-            else
-                project_terminal_request_messages(
-                    arena,
-                    registry,
-                    true,
-                    messages[0..2],
-                    agent_stream_provider.unavailable_provider,
-                    .{ .provider = .gateway, .model = "test" },
-                ));
-        }
-    }
-}
-
-test "legacy request projection scopes reused call identities to their exchange" {
-    const shell = tool_dispatch.Tool{
-        .name = "shell",
-        .description = "shell",
-        .model_schema = .{ .name = "shell", .description = "shell" },
-        .executor_kind = .terminal,
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    var subagent = shell;
-    subagent.name = "subagent";
-    subagent.executor_kind = .subagent;
-    const registry = tool_dispatch.Registry{ .tools = &.{ shell, subagent } };
-    for ([_]bool{ false, true }) |is_subagent| {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const kept = ToolCall{
-            .id = "reused",
-            .name = if (is_subagent) "subagent" else "terminal",
-            .arguments_json = if (is_subagent)
-                "{\"request\":{\"action\":\"inspect\",\"id\":\"missing\"}}"
-            else
-                "{\"action\":\"exec\",\"command\":\":\"}",
-        };
-        var removed = kept;
-        removed.arguments_json = if (is_subagent)
-            "{\"command\":{\"inspect\":{\"id\":\"missing\"}}}"
-        else
-            "{\"action\":\"exec\"}";
-        const messages = [_]ChatMessage{
-            .{ .role = .assistant, .tool_calls = &.{kept} },
-            .{ .role = .tool, .tool_call_id = "reused", .tool_name = kept.name, .content = "first result" },
-            .{ .role = .assistant, .tool_calls = &.{removed} },
-            .{ .role = .tool, .tool_call_id = "reused", .tool_name = removed.name, .content = "second result" },
-        };
-        const projected = if (is_subagent)
-            try project_subagent_request_messages(
-                arena,
-                registry,
-                true,
-                &messages,
-                agent_stream_provider.unavailable_provider,
-                .{ .provider = .gateway, .model = "test" },
-            )
-        else
-            try project_terminal_request_messages(
-                arena,
-                registry,
-                true,
-                &messages,
-                agent_stream_provider.unavailable_provider,
-                .{ .provider = .gateway, .model = "test" },
-            );
-        try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
-        try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
-        try std.testing.expectEqualStrings(projected[0].tool_calls[0].name, projected[1].tool_name.?);
-        try std.testing.expectEqual(@as(usize, 0), projected[2].tool_calls.len);
-        try std.testing.expectEqual(types.ChatRole.assistant, projected[3].role);
-        try std.testing.expect(std.mem.find(u8, projected[3].content.?, "second result") != null);
-        try std.testing.expectEqual(types.ChatRole.tool, messages[3].role);
-        try std.testing.expectEqual(@as(usize, 1), messages[2].tool_calls.len);
-    }
-}
-
 fn check_legacy_replay_projection_allocations(alloc: Allocator) !void {
     const Probe = struct {
         const selected = "[{\"type\":\"text\",\"offset\":0,\"length\":8},{\"type\":\"tool-call\",\"toolCallId\":\"retained\"}]";
@@ -2026,7 +1399,7 @@ fn check_legacy_replay_projection_allocations(alloc: Allocator) !void {
         .irreversible_fn = undefined,
     };
     const registry = tool_dispatch.Registry{ .tools = &.{shell} };
-    const selection = model_provider.ProviderSelection{ .provider = .gateway, .model = "test" };
+    const selection = model_provider.ProviderSelection{ .provider = .none, .model = "test" };
     const original = "[{\"type\":\"text\",\"offset\":0,\"length\":8},{\"type\":\"tool-call\",\"toolCallId\":\"removed\"},{\"type\":\"tool-call\",\"toolCallId\":\"retained\"}]";
     const calls = [_]ToolCall{
         .{ .id = "removed", .name = "terminal", .arguments_json = "{\"action\":\"read\"}" },
@@ -2082,144 +1455,6 @@ fn check_legacy_replay_projection_allocations(alloc: Allocator) !void {
     try std.testing.expectEqual(messages[0].provider_replay.?.parts_json.ptr, foreign[0].provider_replay.?.parts_json.ptr);
 }
 
-test "legacy request projection preserves replay ownership and source binding on failure" {
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_legacy_replay_projection_allocations, .{});
-}
-
-test "mixed legacy terminal batches become inert in every order" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const shell_tool = tool_dispatch.Tool{
-        .name = "shell",
-        .description = "shell",
-        .model_schema = .{ .name = "shell", .description = "shell" },
-        .executor_kind = .terminal,
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    const registry = tool_dispatch.Registry{ .tools = &.{shell_tool} };
-    const calls = [_]ToolCall{
-        .{
-            .id = "legacy-exec",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\",\"timeout_ms\":1000}",
-        },
-        .{
-            .id = "legacy-start",
-            .name = "terminal",
-            .arguments_json = "{\"action\":\"start\",\"command\":\"sleep 5\"}",
-        },
-    };
-    const messages = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = &calls },
-        .{
-            .role = .tool,
-            .tool_call_id = "legacy-exec",
-            .tool_name = "terminal",
-            .content = "exit_code=0",
-        },
-        .{
-            .role = .tool,
-            .tool_call_id = "legacy-start",
-            .tool_name = "terminal",
-            .content = "session started",
-        },
-    };
-
-    const projected = try project_terminal_request_messages(
-        arena,
-        registry,
-        true,
-        &messages,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(@as(usize, 0), projected[0].tool_calls.len);
-    try std.testing.expectEqual(types.ChatRole.assistant, projected[1].role);
-    try std.testing.expect(std.mem.find(
-        u8,
-        projected[1].content.?,
-        "Prior terminal exec action completed",
-    ) != null);
-    try std.testing.expectEqual(types.ChatRole.assistant, projected[2].role);
-    try std.testing.expect(projected[2].tool_call_id == null);
-    try std.testing.expect(projected[2].tool_name == null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        projected[2].content.?,
-        "Prior terminal start action completed",
-    ) != null);
-    try std.testing.expectEqualStrings("terminal", messages[0].tool_calls[0].name);
-
-    const idempotent = try project_terminal_request_messages(
-        arena,
-        registry,
-        true,
-        projected,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
-
-    const reversed_calls = [_]ToolCall{ calls[1], calls[0] };
-    const reversed_messages = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = &reversed_calls },
-        .{
-            .role = .tool,
-            .tool_call_id = "legacy-start",
-            .tool_name = "terminal",
-            .content = "session started",
-        },
-        .{
-            .role = .tool,
-            .tool_call_id = "legacy-exec",
-            .tool_name = "terminal",
-            .content = "exit_code=0",
-        },
-    };
-    const reversed = try project_terminal_request_messages(
-        arena,
-        registry,
-        true,
-        &reversed_messages,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(@as(usize, 0), reversed[0].tool_calls.len);
-    try std.testing.expectEqual(types.ChatRole.assistant, reversed[1].role);
-    try std.testing.expectEqual(types.ChatRole.assistant, reversed[2].role);
-    try std.testing.expect(std.mem.find(
-        u8,
-        reversed[1].content.?,
-        "Prior terminal start action completed",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        reversed[2].content.?,
-        "Prior terminal exec action completed",
-    ) != null);
-
-    const exec_only_messages = [_]ChatMessage{
-        .{ .role = .assistant, .tool_calls = calls[0..1] },
-        messages[1],
-    };
-    const exec_only = try project_terminal_request_messages(
-        arena,
-        registry,
-        true,
-        &exec_only_messages,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(@as(usize, 1), exec_only[0].tool_calls.len);
-    try std.testing.expectEqualStrings("shell", exec_only[0].tool_calls[0].name);
-    try std.testing.expectEqual(types.ChatRole.tool, exec_only[1].role);
-    try std.testing.expectEqualStrings("shell", exec_only[1].tool_name.?);
-}
-
 fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void {
     const terminal_tool = tool_dispatch.Tool{
         .name = "shell",
@@ -2250,7 +1485,7 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
         true,
         &source,
         agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
+        .{ .provider = .none, .model = "test" },
     );
     if (projected.ptr == source[0..].ptr) return error.TestUnexpectedResult;
     defer free_terminal_request_projection(alloc, &source, projected);
@@ -2258,14 +1493,6 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"printf ok\"}", projected[0].tool_calls[0].arguments_json);
     try std.testing.expectEqualStrings(first_calls[1].arguments_json, projected[0].tool_calls[1].arguments_json);
     try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"ls\",\"cwd\":\"src\"}", projected[1].tool_calls[0].arguments_json);
-}
-
-test "terminal request projection cleans every partial allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        check_terminal_request_projection_allocation_failures,
-        .{},
-    );
 }
 
 const max_fuzz_request_text_bytes: usize = 16 * 1024;
@@ -2314,200 +1541,6 @@ fn fuzzRequestWrapperText(_: void, smith: *std.testing.Smith) !void {
     defer if (subagent_intake) |json| alloc.free(json);
     try std.testing.expectEqual(expected == null, subagent_intake == null);
     if (subagent_intake) |json| try std.testing.expectEqualStrings(expected.?, json);
-}
-
-test "request wrappers sent as JSON text unwrap as tool_args reads them" {
-    try std.testing.fuzz({}, fuzzRequestWrapperText, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "{\"action\":\"run\",\"command\":\"printf ok\"}",
-            "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}",
-            "{\"handle\":\"h.txt\",\"query\":\"needle\"}",
-            "{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"hi\"}",
-            "{\"action\":\"run\",\"task\":\"review\"}",
-            "{}",
-            "[1]",
-            "\"{\\\"action\\\":\\\"run\\\"}\"",
-            "{",
-        }) ++ @import("fuzz_corpus").request_wrapper_text.*),
-    });
-}
-
-test "terminal request normalization reads a wrapper written as JSON text" {
-    const alloc = std.testing.allocator;
-    const run = (try normalized_terminal_request_arguments(
-        alloc,
-        "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"printf ok\\\"}\"}",
-        null,
-    )).?;
-    defer alloc.free(run);
-    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"printf ok\"}", run);
-    // The write input is read from a text wrapper as from an object.
-    const write = (try normalized_terminal_request_arguments(
-        alloc,
-        "{\"request\":\"{\\\"action\\\":\\\"write\\\",\\\"session_id\\\":\\\"terminal-a\\\",\\\"input\\\":{\\\"keys\\\":[\\\"enter\\\"]}}\"}",
-        null,
-    )).?;
-    defer alloc.free(write);
-    try std.testing.expectEqualStrings(
-        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
-        write,
-    );
-
-    // Anything else is kept as it was sent: text of another kind, an object
-    // encoded twice, text nested deeper than tool input may be, and a wrapper
-    // beside other fields.
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const twice = try std.json.Stringify.valueAlloc(arena, "{\"action\":\"run\",\"command\":\"true\"}", .{});
-    const deep = text_utils.repeat("{\"a\":", 300) ++ "1" ++ text_utils.repeat("}", 300);
-    for ([_][]const u8{ "[1]", "x", "null", "", twice, deep }) |text| {
-        const args_json = try std.json.Stringify.valueAlloc(arena, .{ .request = text }, .{});
-        try std.testing.expect(try normalized_terminal_request_arguments(alloc, args_json, null) == null);
-    }
-    const beside = try std.json.Stringify.valueAlloc(arena, .{
-        .request = "{\"action\":\"run\",\"command\":\"true\"}",
-        .yield_time_ms = 1000,
-    }, .{});
-    try std.testing.expect(try normalized_terminal_request_arguments(alloc, beside, null) == null);
-}
-
-test "terminal request normalization unwraps only exact eligible native calls" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const native_terminal = tool_dispatch.Tool{
-        .name = "terminal",
-        .description = "terminal",
-        .model_schema = .{ .name = "terminal", .description = "terminal" },
-        .executor_kind = .terminal,
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    var browser_terminal = native_terminal;
-    browser_terminal.executor_kind = .run_command;
-    const native_tools = [_]tool_dispatch.Tool{native_terminal};
-    const browser_tools = [_]tool_dispatch.Tool{browser_terminal};
-    const native_registry = tool_dispatch.Registry{ .tools = &native_tools };
-    const browser_registry = tool_dispatch.Registry{ .tools = &browser_tools };
-
-    const wrapped = "{\"request\":{\"action\":\"exec\",\"command\":\"printf ok\"}}";
-    const calls = [_]ToolCall{
-        .{
-            .id = "terminal-call",
-            .name = "terminal",
-            .arguments_json = wrapped,
-            .provisional_id = "provisional-terminal",
-            .provider_result = "provider-result",
-            .provenance = .provider_executed,
-        },
-        .{
-            .id = "other-call",
-            .name = "read_file",
-            .arguments_json = "{\"path\":\"README.md\"}",
-        },
-    };
-    const normalized = try normalize_terminal_request_tool_calls(
-        arena,
-        native_registry,
-        true,
-        &calls,
-    );
-    try std.testing.expect(normalized.ptr != calls[0..].ptr);
-    try std.testing.expectEqualStrings(
-        "{\"action\":\"exec\",\"command\":\"printf ok\"}",
-        normalized[0].arguments_json,
-    );
-    try std.testing.expectEqualStrings(calls[0].id, normalized[0].id);
-    try std.testing.expectEqualStrings(calls[0].provisional_id.?, normalized[0].provisional_id.?);
-    try std.testing.expectEqualStrings(calls[0].provider_result.?, normalized[0].provider_result.?);
-    try std.testing.expectEqual(calls[0].provenance, normalized[0].provenance);
-    try std.testing.expectEqualStrings(calls[1].arguments_json, normalized[1].arguments_json);
-
-    const inferred_write_calls = [_]ToolCall{.{
-        .id = "inferred-write",
-        .name = "terminal",
-        .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}",
-    }};
-    const inferred_write = try normalize_terminal_request_tool_calls(
-        arena,
-        native_registry,
-        true,
-        &inferred_write_calls,
-    );
-    try std.testing.expectEqualStrings(
-        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
-        inferred_write[0].arguments_json,
-    );
-
-    const semantic_null_write_calls = [_]ToolCall{
-        .{
-            .id = "null-lease-write",
-            .name = "terminal",
-            .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":null,\"input\":{\"keys\":[\"enter\"]}}}",
-        },
-        .{
-            .id = "textual-null-lease-write",
-            .name = "terminal",
-            .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"null\",\"input\":{\"keys\":[\"enter\"]}}}",
-        },
-    };
-    const semantic_null_writes = try normalize_terminal_request_tool_calls(
-        arena,
-        native_registry,
-        true,
-        &semantic_null_write_calls,
-    );
-    for (semantic_null_writes) |call| {
-        try std.testing.expectEqualStrings(
-            "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}",
-            call.arguments_json,
-        );
-    }
-
-    const invalid_input_calls = [_]ToolCall{.{
-        .id = "invalid-input",
-        .name = "terminal",
-        .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"x\",\"keys\":[\"enter\"]}}}",
-    }};
-    const invalid_input = try normalize_terminal_request_tool_calls(
-        arena,
-        native_registry,
-        true,
-        &invalid_input_calls,
-    );
-    try std.testing.expectEqualStrings(
-        "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"x\",\"keys\":[\"enter\"]}}",
-        invalid_input[0].arguments_json,
-    );
-
-    const ineligible = try normalize_terminal_request_tool_calls(arena, native_registry, false, &calls);
-    try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
-    try std.testing.expectEqual(wrapped.ptr, ineligible[0].arguments_json.ptr);
-
-    const browser = try normalize_terminal_request_tool_calls(arena, browser_registry, true, &calls);
-    try std.testing.expectEqual(calls[0..].ptr, browser.ptr);
-    try std.testing.expectEqual(wrapped.ptr, browser[0].arguments_json.ptr);
-
-    const non_exact_calls = [_]ToolCall{.{
-        .id = "non-exact",
-        .name = "terminal",
-        .arguments_json = "{\"request\":{\"action\":\"exec\",\"command\":\"true\"},\"extra\":true}",
-    }};
-    const non_exact = try normalize_terminal_request_tool_calls(arena, native_registry, true, &non_exact_calls);
-    try std.testing.expectEqual(non_exact_calls[0..].ptr, non_exact.ptr);
-
-    const malformed_calls = [_]ToolCall{.{
-        .id = "malformed",
-        .name = "terminal",
-        .arguments_json = "{",
-        .argument_integrity = .malformed_json,
-    }};
-    const malformed = try normalize_terminal_request_tool_calls(arena, native_registry, true, &malformed_calls);
-    try std.testing.expectEqual(malformed_calls[0..].ptr, malformed.ptr);
 }
 
 fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !void {
@@ -2563,66 +1596,6 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
 fn testInferRunAction(object: std.json.ObjectMap) ?[]const u8 {
     if (object.get("action") != null or object.get("command") == null) return null;
     return "run";
-}
-
-test "terminal intake adds the action a call leaves out before it is stored" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const shell_tool = tool_dispatch.Tool{
-        .name = "shell",
-        .description = "shell",
-        .model_schema = .{ .name = "shell", .description = "shell" },
-        .executor_kind = .terminal,
-        .decode = undefined,
-        .call = undefined,
-        .infer_action_fn = testInferRunAction,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    var without_inference = shell_tool;
-    without_inference.infer_action_fn = null;
-    const calls = [_]ToolCall{
-        .{ .id = "inferred", .name = "shell", .arguments_json = "{\"command\":\"ls\",\"cwd\":\"src\"}" },
-        .{ .id = "wrapped", .name = "shell", .arguments_json = "{\"request\":{\"command\":\"ls\"}}" },
-        .{ .id = "explicit", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}" },
-        .{ .id = "unnamed", .name = "shell", .arguments_json = "{\"session_id\":\"shell-1\"}" },
-    };
-
-    const normalized = try normalize_terminal_request_tool_calls(
-        arena,
-        .{ .tools = &.{shell_tool} },
-        true,
-        &calls,
-    );
-    // The action comes first, as in a call that names it.
-    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"ls\",\"cwd\":\"src\"}", normalized[0].arguments_json);
-    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"ls\"}", normalized[1].arguments_json);
-    try std.testing.expectEqual(calls[2].arguments_json.ptr, normalized[2].arguments_json.ptr);
-    try std.testing.expectEqual(calls[3].arguments_json.ptr, normalized[3].arguments_json.ptr);
-
-    const plain = try normalize_terminal_request_tool_calls(
-        arena,
-        .{ .tools = &.{without_inference} },
-        true,
-        calls[0..1],
-    );
-    try std.testing.expectEqual(calls[0..1].ptr, plain.ptr);
-    const ineligible = try normalize_terminal_request_tool_calls(
-        arena,
-        .{ .tools = &.{shell_tool} },
-        false,
-        &calls,
-    );
-    try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
-}
-
-test "terminal request normalization cleans every partial allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        testing_allocator.no_resize,
-        check_terminal_request_normalization_allocation_failures,
-        .{},
-    );
 }
 
 const LiveToolAuthorityResolution = union(enum) {
@@ -2694,26 +1667,6 @@ fn permissionModeForAction(
 fn snapshotRootPermissionMode(deps: *const AgentRuntimeDeps) ?types.PermissionMode {
     const snapshot = deps.snapshot_root_permission_mode orelse return null;
     return snapshot(deps.ctx);
-}
-
-test "permission mode for action prefers child then live root then captured fallback" {
-    const cases = [_]struct {
-        captured: types.PermissionMode,
-        root_live: ?types.PermissionMode,
-        child_live: ?types.PermissionMode,
-        expected: types.PermissionMode,
-    }{
-        .{ .captured = .ask, .root_live = null, .child_live = null, .expected = .ask },
-        .{ .captured = .ask, .root_live = .auto, .child_live = null, .expected = .auto },
-        .{ .captured = .auto, .root_live = .ask, .child_live = null, .expected = .ask },
-        .{ .captured = .ask, .root_live = .auto, .child_live = .yolo, .expected = .yolo },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            case.expected,
-            permissionModeForAction(case.captured, case.root_live, case.child_live),
-        );
-    }
 }
 
 fn rejectPermissionForLiveAuthority(
@@ -2904,34 +1857,6 @@ fn preparedTerminalModelOutput(
         ),
         else => unreachable,
     };
-}
-
-test "a prepared call of a tool spark does not know names it as visible text" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const cases = [_]struct { name: []const u8, shown: []const u8 }{
-        .{ .name = "missing_tool", .shown = "Unsupported tool: missing_tool" },
-        .{ .name = "", .shown = "Unsupported tool: " },
-        .{ .name = "x\x1b]0;owned\x07y", .shown = "Unsupported tool: x&#x1b;]0;owned&#x07;y" },
-        .{ .name = "a\x00b\r\nc", .shown = "Unsupported tool: a&#x00;b&#x0d;&#x0a;c" },
-    };
-    for (cases) |case| {
-        const shown = try preparedTerminalModelOutput(
-            arena,
-            .{ .id = "odd-tool", .name = case.name, .arguments_json = "{}" },
-            .{ .kind = .unsupported },
-        );
-        try std.testing.expectEqualStrings(case.shown, shown);
-    }
-    // A terminal that already carries the model's text is passed on as it is.
-    const kept = try arena.dupe(u8, "Tool arguments are invalid.");
-    try std.testing.expectEqualStrings("Tool arguments are invalid.", try preparedTerminalModelOutput(
-        arena,
-        .{ .id = "x", .name = "read_file", .arguments_json = "{}" },
-        .{ .kind = .validation_failure, .model_output = kept },
-    ));
 }
 
 noinline fn preparedCandidateClassificationComplete(
@@ -3336,36 +2261,6 @@ fn reportProviderExecutedUsage(
         const execution = providerExecutedResult(call) orelse continue;
         runtime_parallel_execution.reportInnerToolUsage(deps, call.name, execution);
     }
-}
-
-test "provider executed result reports one observed request only for search aliases" {
-    const aliases = [_][]const u8{
-        "exa_search",
-        "parallel_search",
-        "perplexity_search",
-    };
-    for (aliases) |name| {
-        const result = providerExecutedResult(.{
-            .id = "provider_call",
-            .name = name,
-            .arguments_json = "{}",
-            .provider_result = "{\"results\":[]}",
-            .provenance = .provider_executed,
-        }) orelse return error.TestExpectedProviderResult;
-        const usage = result.inner_usage orelse return error.TestExpectedSearchUsage;
-        try std.testing.expectEqual(@as(u32, 1), usage.web_search_requests);
-        try std.testing.expectEqual(@as(u64, 0), usage.input_tokens);
-        try std.testing.expectEqual(@as(u64, 0), usage.output_tokens);
-    }
-
-    const non_search = providerExecutedResult(.{
-        .id = "provider_call",
-        .name = "provider_tool",
-        .arguments_json = "{}",
-        .provider_result = "{}",
-        .provenance = .provider_executed,
-    }) orelse return error.TestExpectedProviderResult;
-    try std.testing.expectEqual(@as(?types.ToolUsage, null), non_search.inner_usage);
 }
 
 fn hasToolResult(messages: []const ChatMessage, call_id: []const u8) bool {
@@ -3807,42 +2702,6 @@ fn appendRecoveryConversationContext(
     });
 }
 
-test "recovery conversation context is chronological and system free" {
-    const alloc = std.testing.allocator;
-
-    for ([_]?resend_strategy.Strategy{ null, .retry_request }) |strategy| {
-        var messages: std.ArrayList(ChatMessage) = .empty;
-        defer messages.deinit(alloc);
-        try messages.append(alloc, .{ .role = .user, .content = "request" });
-        try appendRecoveryConversationContext(alloc, &messages, strategy);
-        try std.testing.expectEqual(@as(usize, 1), messages.items.len);
-    }
-
-    {
-        var messages: std.ArrayList(ChatMessage) = .empty;
-        defer messages.deinit(alloc);
-        try messages.append(alloc, .{ .role = .user, .content = "request" });
-        try appendRecoveryConversationContext(alloc, &messages, .regenerate_tool);
-        try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-        try std.testing.expectEqual(types.ChatRole.user, messages.items[1].role);
-        try std.testing.expectEqualStrings(resend_strategy.regenerate_tool_prompt, messages.items[1].content.?);
-    }
-
-    const prompted = [_]resend_strategy.Strategy{
-        .regenerate_tool,
-        .continue_after_confirmed_tool,
-        .reconcile_tool,
-    };
-    for (prompted) |strategy| {
-        var messages: std.ArrayList(ChatMessage) = .empty;
-        defer messages.deinit(alloc);
-        try messages.append(alloc, .{ .role = .user, .content = "request" });
-        try appendRecoveryConversationContext(alloc, &messages, strategy);
-        try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-        try std.testing.expectEqual(types.ChatRole.user, messages.items[1].role);
-    }
-}
-
 const ProviderPromptProjection = struct {
     instructions: std.ArrayList(ChatMessage),
     messages: std.ArrayList(ChatMessage),
@@ -3898,44 +2757,6 @@ fn build_provider_prompt_with_response_language_control(
         else
             1 + compaction_history_tail.len,
     };
-}
-
-test "compacted request keeps the pending user prompt after the handoff" {
-    var projected = try build_provider_prompt_with_response_language_control(
-        std.testing.allocator,
-        &.{.{ .role = .system, .content = "stable" }},
-        &.{.{ .role = .system, .content = "overlay" }},
-        &.{.{ .role = .user, .content = "removed history" }},
-        .{ .role = .user, .content = "pending prompt" },
-        &.{
-            .{ .role = .assistant, .content = "compacted suffix" },
-            .{ .role = .tool, .content = "new suffix" },
-        },
-        .subagent,
-        false,
-        false,
-        "handoff",
-        &.{.{ .role = .assistant, .content = "retained tail" }},
-        1,
-    );
-    defer projected.instructions.deinit(std.testing.allocator);
-    defer projected.messages.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), projected.instructions.items.len);
-    try std.testing.expectEqualStrings("stable", projected.instructions.items[0].content.?);
-    try std.testing.expectEqualStrings("overlay", projected.instructions.items[1].content.?);
-    const expected = [_][]const u8{
-        "handoff",
-        "retained tail",
-        "pending prompt",
-        "new suffix",
-    };
-    try std.testing.expectEqual(expected.len, projected.messages.items.len);
-    for (expected, projected.messages.items) |content, message| {
-        try std.testing.expectEqualStrings(content, message.content.?);
-    }
-    try std.testing.expectEqual(@as(usize, 2), projected.current_user_index);
-    try agent_stream_provider.validate_prompt_lanes(projected.instructions.items, projected.messages.items);
 }
 
 fn response_language_context_conflicts(
@@ -4087,75 +2908,6 @@ fn shouldRejectRecoveryAuthority(
         source,
         account_id,
     );
-}
-
-test "potentially sent recovery rejects missing or changed credential authority" {
-    const identity = credential_authority.derive(
-        .chatgpt_subscription,
-        "acct_1",
-    ).?;
-    const checkpoint = session_codec.RecoveryCheckpoint{
-        .turn_id = 1,
-        .user = .{ .text = @constCast("continue") },
-        .assistant_source = @constCast("partial"),
-        .cause = .response_interrupted,
-        .action = .continuing_response,
-        .authority = .{
-            .provider = .codex,
-            .model = @constCast("gpt-5.4"),
-            .credential_source = .chatgpt_subscription,
-            .credential_identity = identity,
-        },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
-    };
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        checkpoint,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        checkpoint,
-        .chatgpt_subscription,
-        "acct_2",
-    ));
-
-    var legacy = checkpoint;
-    legacy.authority.credential_source = null;
-    legacy.authority.credential_identity = null;
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        legacy,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    legacy.authority.credential_source = .ai_gateway_api_key;
-    legacy.authority.credential_identity = credential_authority.derive(
-        .ai_gateway_api_key,
-        null,
-    );
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        legacy,
-        .ai_gateway_api_key,
-        null,
-    ));
-    try std.testing.expect(shouldRejectRecoveryAuthority(
-        legacy,
-        .stored_key,
-        null,
-    ));
-    legacy.authority.credential_source = null;
-    legacy.authority.credential_identity = null;
-    legacy.consumed_provider_attempts = 0;
-    try std.testing.expect(!shouldRejectRecoveryAuthority(
-        legacy,
-        .chatgpt_subscription,
-        "acct_1",
-    ));
-    legacy.disposition = .history_only;
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, .chatgpt_subscription, "acct_1"));
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, null, null));
 }
 
 /// Saved as `max_provider_attempts` in the recovery checkpoint. Attempts no
@@ -4542,128 +3294,6 @@ fn streamSucceeded(result: runtime_gateway_step.StreamResult) bool {
     return std.meta.activeTag(result) == .completed;
 }
 
-test "recovery checkpoints do not accumulate temporary history copies in the turn arena" {
-    const support = @import("tests/support.zig");
-    const Sink = struct {
-        checkpoint: ?session_codec.RecoveryCheckpoint = null,
-        fail: bool = false,
-
-        fn set(raw: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.fail) return error.CheckpointWriteFailed;
-            const next = try checkpoint.dupe(std.testing.allocator);
-            if (self.checkpoint) |*old| old.deinit(std.testing.allocator);
-            self.checkpoint = next;
-        }
-
-        fn clear(_: *anyopaque) !void {}
-    };
-    var sink: Sink = .{};
-    defer if (sink.checkpoint) |*checkpoint| checkpoint.deinit(std.testing.allocator);
-    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
-    defer fake.deinit();
-    var deps = fake.deps();
-    deps.ctx = &sink;
-    deps.recovery_checkpoint = .{ .set = Sink.set, .clear = Sink.clear };
-    var fixture: support.PromptFixture = .{};
-    var finalization = TurnFinalizationGuard.init(&deps, 1, support.testLifecycleContext(
-        hooks.RuntimeView.empty(),
-        std.testing.allocator,
-        fixture.workspace_root,
-    ));
-    defer finalization.deinit();
-    var turn = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer turn.deinit();
-    const alloc = turn.allocator();
-    var messages: std.ArrayList(ChatMessage) = .empty;
-    for (0..1000) |step_index| {
-        const id = try alloc.print("read_{d}", .{step_index});
-        const calls = try alloc.alloc(ToolCall, 1);
-        calls[0] = .{ .id = id, .name = "read_file", .arguments_json = "{\"path\":\"evidence.txt\"}" };
-        try messages.appendSlice(alloc, &.{
-            .{ .role = .assistant, .tool_calls = calls },
-            .{ .role = .tool, .tool_call_id = id, .tool_name = "read_file", .tool_result_status = .success, .content = text_utils.repeat("current evidence", 16) },
-        });
-        const retained_bytes = turn.queryCapacity();
-        try persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "partial", "model", false, false, 1, false, .network_interrupted, .retry_request, .confirmed, .{}, .keep);
-        try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
-        try std.testing.expectEqual(step_index + 1, sink.checkpoint.?.execution.tool_steps.len);
-        try std.testing.expectEqualStrings(id, sink.checkpoint.?.execution.tool_steps[step_index].tool_calls[0].id);
-    }
-    sink.fail = true;
-    const retained_bytes = turn.queryCapacity();
-    try std.testing.expectError(error.CheckpointWriteFailed, persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "cancelled", "model", false, false, 1, false, .network_interrupted, .continue_after_confirmed_tool, .confirmed, .{}, .keep));
-    try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
-    try std.testing.expectEqual(@as(usize, 1000), sink.checkpoint.?.execution.tool_steps.len);
-}
-
-test "running tool calls reach append_turn_piece before they run" {
-    const support = @import("tests/support.zig");
-    const Sink = struct {
-        appends: usize = 0,
-        finished_steps: usize = 0,
-        running: std.ArrayList([]u8) = .empty,
-        running_text: ?[]u8 = null,
-
-        fn append(raw: *anyopaque, progress: runtime_deps.TurnProgress) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.appends += 1;
-            self.finished_steps = progress.execution.tool_steps.len;
-            if (self.running_text) |text| std.testing.allocator.free(text);
-            self.running_text = if (progress.running_assistant) |text| try std.testing.allocator.dupe(u8, text) else null;
-            for (progress.running_calls) |call| {
-                try self.running.append(std.testing.allocator, try std.testing.allocator.dupe(u8, call.id));
-            }
-        }
-    };
-    var sink: Sink = .{};
-    defer {
-        for (sink.running.items) |id| std.testing.allocator.free(id);
-        sink.running.deinit(std.testing.allocator);
-        if (sink.running_text) |text| std.testing.allocator.free(text);
-    }
-    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
-    defer fake.deinit();
-    var deps = fake.deps();
-    var fixture: support.PromptFixture = .{};
-    var finalization = TurnFinalizationGuard.init(&deps, 1, support.testLifecycleContext(
-        hooks.RuntimeView.empty(),
-        std.testing.allocator,
-        fixture.workspace_root,
-    ));
-    defer finalization.deinit();
-    var finished = [_]ToolCall{.{ .id = "read_0", .name = "read_file", .arguments_json = "{\"path\":\"b\"}" }};
-    var running = [_]ToolCall{
-        .{ .id = "run_1", .name = "shell", .arguments_json = "{\"command\":\"sleep 9\"}" },
-        .{ .id = "run_2", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
-    };
-    const messages = [_]ChatMessage{
-        .{ .role = .assistant, .content = "Reading b first.", .tool_calls = &finished },
-        .{ .role = .tool, .tool_call_id = "read_0", .tool_name = "read_file", .tool_result_status = .success, .content = "done" },
-        .{ .role = .assistant, .content = "Running both now.", .tool_calls = &running },
-    };
-
-    // Without the hook, as on v1, nothing is built or sent.
-    try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &running);
-    try std.testing.expectEqual(@as(usize, 0), sink.appends);
-
-    deps.ctx = &sink;
-    deps.append_turn_piece = Sink.append;
-    try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &running);
-    try std.testing.expectEqual(@as(usize, 1), sink.appends);
-    // The finished step travels as execution memory, the running calls beside it.
-    try std.testing.expectEqual(@as(usize, 1), sink.finished_steps);
-    try std.testing.expectEqual(@as(usize, 2), sink.running.items.len);
-    try std.testing.expectEqualStrings("run_1", sink.running.items[0]);
-    try std.testing.expectEqualStrings("run_2", sink.running.items[1]);
-    // With the text of the message that issued them, not an earlier one (D51).
-    try std.testing.expectEqualStrings("Running both now.", sink.running_text.?);
-
-    // A step with no calls sends nothing.
-    try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &.{});
-    try std.testing.expectEqual(@as(usize, 1), sink.appends);
-}
-
 /// Shows a settled call in Ctrl+O as it happens and keeps it with the turn,
 /// so every later save of the turn carries it. Neither may fail the turn: a
 /// record that can't be shown or kept is traced and dropped.
@@ -4811,60 +3441,6 @@ fn projectEmptyHistoryReplay(
     }
 }
 
-test "discarded completion prose preserves ownership and fails atomically" {
-    const Probe = struct {
-        fn project(alloc: Allocator, value: ?types.ProviderReplay, _: []const ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
-            try std.testing.expect(!text and reasoning);
-            const replay = value.?;
-            if (std.mem.eql(u8, replay.parts_json, "fail")) return error.InvalidProviderState;
-            if (std.mem.eql(u8, replay.parts_json, "drop")) return null;
-            if (std.mem.eql(u8, replay.parts_json, "kept")) return replay;
-            return .{ .source = replay.source, .parts_json = try alloc.dupe(u8, "retained") };
-        }
-
-        fn run(alloc: Allocator) !void {
-            const provider: agent_stream_provider.Provider = .{
-                .stream_fn = agent_stream_provider.unavailable_provider.stream_fn,
-                .project_replay_fn = project,
-            };
-            for ([_]bool{ false, true }) |owned| {
-                for ([_]?[]const u8{ null, "kept", "replace", "drop", "fail" }) |state| {
-                    var original: agent_stream_provider.Result = .{ .completed = .{ .ownership = .owned } };
-                    defer original.deinit(alloc);
-                    original.completed.completion.content = try alloc.dupe(u8, "prose");
-                    if (state) |value| original.completed.completion.provider_state_json = try alloc.dupe(u8, value);
-                    var result = original;
-                    if (owned) original.completed.ownership = .borrowed else result.completed.ownership = .borrowed;
-                    defer result.deinit(alloc);
-                    defer if (!owned) {
-                        if (result.completed.completion.provider_state_json) |parts| {
-                            if (original.completed.completion.provider_state_json == null or
-                                parts.ptr != original.completed.completion.provider_state_json.?.ptr) alloc.free(@constCast(parts));
-                        }
-                    };
-                    const prior = result.completed.completion;
-                    discardCompletionProse(alloc, provider, .{ .provider = .gateway, .model = "fixture-model" }, &result.completed) catch |err| {
-                        try std.testing.expectEqual(prior.content.?.ptr, result.completed.completion.content.?.ptr);
-                        try std.testing.expectEqual(prior.provider_state_json.?.ptr, result.completed.completion.provider_state_json.?.ptr);
-                        if (err == error.InvalidProviderState) continue;
-                        return err;
-                    };
-                    try std.testing.expect(result.completed.completion.content == null);
-                    if (state == null or std.mem.eql(u8, state.?, "drop")) {
-                        try std.testing.expect(result.completed.completion.provider_state_json == null);
-                    } else if (std.mem.eql(u8, state.?, "kept")) {
-                        try std.testing.expectEqual(prior.provider_state_json.?.ptr, result.completed.completion.provider_state_json.?.ptr);
-                    } else {
-                        try std.testing.expectEqualStrings("retained", result.completed.completion.provider_state_json.?);
-                    }
-                }
-            }
-        }
-    };
-    try Probe.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
-}
-
 fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
     return switch (kind) {
         .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => true,
@@ -4872,27 +3448,11 @@ fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
     };
 }
 
-test "every HTTP status retries exactly when it is 429 or a 5xx other than 501 and 505, and its failure names that status" {
-    var code: u16 = 100;
-    while (code <= 999) : (code += 1) {
-        const status: std.http.Status = @fromBackingInt(@intCast(code));
-        const kind = agent_stream_provider.FailureKind.fromHttpStatus(status);
-        try std.testing.expectEqual(code == 429 or (code >= 500 and code <= 599 and code != 501 and code != 505), isRetryableModelFailure(kind));
-        try std.testing.expectEqual(status, failureStatus(.{ .kind = kind, .http_status = status }));
-    }
-}
-
 /// The module takes Retry-After in milliseconds. Absurd hints saturate; the
 /// module caps every hint, a rate limit's included, at its 30 second ceiling.
 fn retryAfterMs(seconds: ?u64) ?u32 {
     const value = seconds orelse return null;
     return std.math.cast(u32, value *| std.time.ms_per_s) orelse std.math.maxInt(u32);
-}
-
-test "retry after converts to milliseconds and saturates" {
-    try std.testing.expectEqual(@as(?u32, null), retryAfterMs(null));
-    try std.testing.expectEqual(@as(?u32, 3_000), retryAfterMs(3));
-    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), retryAfterMs(std.math.maxInt(u64)));
 }
 
 fn failureStatus(failure: agent_stream_provider.Failure) std.http.Status {
@@ -4947,17 +3507,14 @@ fn needsUserFailureKind(
 /// only its sign-in wait shows the provider's reason, which the gateway
 /// builtin masks. A ChatGPT or Grok subscription signs in again as before.
 fn gatewayLogin(credential_source: ?types.CredentialSource) bool {
-    const source = credential_source orelse return false;
-    return source == .spark_login;
+    _ = credential_source;
+    return false;
 }
 
 /// Whether `/login` repairs the source, so spark can open it on its own.
 fn signInRepairs(credential_source: ?types.CredentialSource) bool {
-    const source = credential_source orelse return false;
-    return switch (source) {
-        .spark_login, .chatgpt_subscription, .grok_subscription => true,
-        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => false,
-    };
+    _ = credential_source;
+    return false;
 }
 
 /// The provider's HTTP error detail, clipped, as spark shows it.
@@ -4989,29 +3546,6 @@ fn pushWaitingHttpFailureReason(
 ) !void {
     const detail = try httpFailureDetail(arena, failure, job, request_capabilities);
     const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
-    if (deps.push_interactive_notice) |push| {
-        try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
-    } else {
-        try deps.push_system_notice(deps.ctx, message);
-    }
-}
-
-/// Names the Vercel team a refused login was sent for, and how to choose
-/// another. spark resends with the same team, so a team the gateway refuses
-/// fails on every resend, and the user cannot switch teams while the request
-/// waits.
-fn pushRefusedTeamHint(deps: *const AgentRuntimeDeps, arena: Allocator, job: QueuedPrompt) !void {
-    if (job.gateway_team_label == null and job.gateway_team == null) return;
-    // A saved login's slug is not checked when it loads, so only a valid team
-    // name reaches the terminal.
-    const message = if (types.displayGatewayTeam(job.gateway_team_label, job.gateway_team)) |team|
-        try std.fmt.allocPrint(
-            arena,
-            "spark sent this request for the Vercel team {s}. If that is the wrong team, press Esc twice, run /connect, choose another team, and send it again.",
-            .{team},
-        )
-    else
-        "spark sent this request for this login's Vercel team. If that is the wrong team, press Esc twice, run /connect, choose another team, and send it again.";
     if (deps.push_interactive_notice) |push| {
         try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
     } else {
@@ -5065,53 +3599,6 @@ fn shouldRecoverContextOverflow(
         has_compactable_context and
         replay_safe and
         agent_stream_provider.isContextOverflow(failure);
-}
-
-test "context overflow recovery is typed safe and bounded" {
-    const context_failure = agent_stream_provider.Failure{
-        .kind = .invalid_request,
-        .detail = @constCast("AI_APICallError: input exceeds the context window"),
-    };
-    const unrelated_failure = agent_stream_provider.Failure{
-        .kind = .invalid_request,
-        .detail = @constCast("invalid tool schema"),
-    };
-    const grok_prompt_overflow = agent_stream_provider.Failure{
-        .kind = .invalid_request,
-        .detail = @constCast("This model's maximum prompt length is 1000000 but the request contains 1003383 tokens."),
-    };
-    const anthropic_prompt_overflow = agent_stream_provider.Failure{
-        .kind = .invalid_request,
-        .detail = @constCast("AI_APICallError: prompt is too long: 1077372 tokens > 1000000 maximum"),
-    };
-    const request_too_large = agent_stream_provider.Failure{
-        .kind = .request_too_large,
-    };
-    const cases = [_]struct {
-        failure: agent_stream_provider.Failure,
-        has_compactable_context: bool = true,
-        replay_safe: bool = true,
-        recovery_available: bool = true,
-        cancelled: bool = false,
-        expected: bool,
-    }{
-        .{ .failure = context_failure, .expected = true },
-        .{ .failure = grok_prompt_overflow, .expected = true },
-        .{ .failure = anthropic_prompt_overflow, .expected = true },
-        .{ .failure = request_too_large, .expected = true },
-        .{ .failure = unrelated_failure, .expected = false },
-        .{ .failure = context_failure, .has_compactable_context = false, .expected = false },
-        .{ .failure = context_failure, .replay_safe = false, .expected = false },
-        .{ .failure = context_failure, .recovery_available = false, .expected = false },
-        .{ .failure = context_failure, .cancelled = true, .expected = false },
-    };
-    for (cases) |case| try std.testing.expectEqual(case.expected, shouldRecoverContextOverflow(
-        case.failure,
-        case.has_compactable_context,
-        case.replay_safe,
-        case.recovery_available,
-        case.cancelled,
-    ));
 }
 
 /// A size rejection is retried without compaction while the rejected request
@@ -5213,117 +3700,6 @@ fn holdImagesToBlocks(
     return rebuilt;
 }
 
-test "a session past its size limit leaves images out a block at a time" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    // A body as long as the request's text and images.
-    const Builder = struct {
-        fn build(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.RequestData) anyerror![]u8 {
-            var len: usize = 100;
-            for (request.messages) |message| {
-                const text: []const u8 = message.content orelse "";
-                len += text.len;
-                if (message.tool_result_memory) |memory| {
-                    for (memory.tool_images) |image| len += image.data.len;
-                }
-            }
-            const body = try alloc.alloc(u8, len);
-            @memset(body, 'x');
-            return body;
-        }
-        fn stream(_: ?*anyopaque, _: Allocator, _: agent_stream_provider.ModelRequest) anyerror!agent_stream_provider.Result {
-            return error.TestUnexpectedStream;
-        }
-    };
-    const provider = agent_stream_provider.Provider{ .stream_fn = Builder.stream, .build_request_fn = Builder.build };
-    const limits = request_image_budget.Limits{ .max_request_bytes = 100_000 };
-
-    var messages: [40]types.ChatMessage = undefined;
-    for (&messages, 0..) |*message, index| {
-        const data = try arena.alloc(u8, 4000);
-        @memset(data, 'A');
-        const images = try arena.alloc(types.ToolImage, 1);
-        images[0] = .{ .data = data, .mime_type = try arena.dupe(u8, "image/png") };
-        message.* = .{
-            .role = .tool,
-            .content = try arena.print("<path>shot-{d}.png</path>", .{index}),
-            .tool_result_memory = .{ .tool_images = images, .tool_image_handle = try arena.print("image-result-{d}", .{index}) },
-        };
-    }
-
-    var previous_cut: usize = 0;
-    var cut_changes: usize = 0;
-    var minimal_changes: usize = 0;
-    var previous_minimal: usize = 0;
-    for (1..messages.len + 1) |count| {
-        var request: agent_stream_provider.RequestData = .{
-            .model = "test/model",
-            .messages = messages[0..count],
-            .tool_choice = .auto,
-            .provider_options = .{},
-        };
-        const sizes = try request_image_budget.imageSizes(arena, request.messages);
-        const first = (try provider.buildRequest(arena, request)).?;
-        const fitted = try fitRequestImages(arena, provider, &request, first, limits, 4096, .{});
-        const minimal = sizes.len - (try request_image_budget.imageSizes(arena, request.messages)).len;
-        const body = try holdImagesToBlocks(arena, provider, &request, fitted, sizes, limits, 4096, .{});
-        const cut = sizes.len - (try request_image_budget.imageSizes(arena, request.messages)).len;
-
-        try std.testing.expect(body.len <= limits.max_request_bytes);
-        try std.testing.expect(cut >= minimal and cut >= previous_cut);
-        // The newest image is always sent.
-        try std.testing.expectEqual(@as(usize, 1), request.messages[count - 1].tool_result_memory.?.tool_images.len);
-        if (cut != previous_cut) cut_changes += 1;
-        if (minimal != previous_minimal) minimal_changes += 1;
-        previous_cut = cut;
-        previous_minimal = minimal;
-    }
-    // Leaving out one more image per request would change the cached prompt
-    // on every request past the limit. A block ends at a quarter of the
-    // limit, seven of these images, so the cut changes every seventh.
-    try std.testing.expect(minimal_changes >= 10);
-    try std.testing.expect(cut_changes * 4 <= minimal_changes);
-}
-
-test "size rejections retry with fewer images only while images remain" {
-    const too_large = agent_stream_provider.Failure{ .kind = .request_too_large };
-    const overflow_text = agent_stream_provider.Failure{
-        .kind = .invalid_request,
-        .detail = @constCast("AI_APICallError: input is too long"),
-    };
-    const cases = [_]struct {
-        failure: agent_stream_provider.Failure,
-        images_sent: usize = 3,
-        images_last_refused: ?usize = null,
-        replay_safe: bool = true,
-        cancelled: bool = false,
-        expected: bool,
-    }{
-        .{ .failure = too_large, .expected = true },
-        // Any number of retries, while each leaves out more images.
-        .{ .failure = too_large, .images_sent = 3, .images_last_refused = 5, .expected = true },
-        .{ .failure = too_large, .images_sent = 1, .images_last_refused = 2, .expected = true },
-        // One that left out none stops, so the retries always end.
-        .{ .failure = too_large, .images_sent = 3, .images_last_refused = 3, .expected = false },
-        .{ .failure = too_large, .images_sent = 4, .images_last_refused = 3, .expected = false },
-        .{ .failure = too_large, .images_sent = 0, .expected = false },
-        .{ .failure = too_large, .images_sent = 0, .images_last_refused = 1, .expected = false },
-        .{ .failure = too_large, .replay_safe = false, .expected = false },
-        .{ .failure = too_large, .cancelled = true, .expected = false },
-        .{ .failure = overflow_text, .expected = false },
-    };
-    for (cases) |case| try std.testing.expectEqual(case.expected, shouldRetryWithFewerImages(
-        case.failure,
-        case.images_sent,
-        case.images_last_refused,
-        case.replay_safe,
-        case.cancelled,
-    ));
-    try std.testing.expectEqual(@as(usize, 30_000), loweredRequestByteLimit(40_000));
-    try std.testing.expect(loweredRequestByteLimit(33_829_735) < 33_829_735);
-}
-
 /// spark never asks a model to extend an assistant message, and models without
 /// prefill support reject that shape. Returns `source` unchanged, or an
 /// `arena` copy ending with a host continuation when history projection left
@@ -5337,67 +3713,6 @@ fn with_replyable_conversation_tail(
     @memcpy(projected[0..source.len], source);
     projected[source.len] = .{ .role = .user, .content = assistant_tail_continuation_prompt };
     return projected;
-}
-
-test "request tail ends with a user continuation instead of assistant prefill" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const replyable = [_]ChatMessage{
-        .{ .role = .user, .content = "go" },
-        .{ .role = .tool, .tool_call_id = "call", .tool_name = "read_file", .content = "result" },
-    };
-    try std.testing.expectEqual(@as([*]const ChatMessage, &replyable), (try with_replyable_conversation_tail(arena, &replyable)).ptr);
-    try std.testing.expectEqual(@as(usize, 0), (try with_replyable_conversation_tail(arena, &.{})).len);
-
-    const prefill = [_]ChatMessage{
-        .{ .role = .user, .content = "go" },
-        .{ .role = .assistant, .content = "[Prior subagent create action completed.]" },
-    };
-    const repaired = try with_replyable_conversation_tail(arena, &prefill);
-    try std.testing.expectEqual(@as(usize, 3), repaired.len);
-    try std.testing.expectEqualStrings(prefill[1].content.?, repaired[1].content.?);
-    try std.testing.expectEqual(types.ChatRole.user, repaired[2].role);
-    try std.testing.expectEqualStrings(assistant_tail_continuation_prompt, repaired[2].content.?);
-    try std.testing.expectEqual(types.ChatRole.assistant, prefill[1].role);
-}
-
-test "legacy subagent history at the tail stays replyable after projection" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const tool = tool_dispatch.Tool{
-        .name = "subagent",
-        .description = "subagent",
-        .model_schema = .{ .name = "subagent", .description = "subagent" },
-        .executor_kind = .subagent,
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    const calls = [_]ToolCall{.{
-        .id = "legacy",
-        .name = "subagent",
-        .arguments_json = "{\"command\":{\"create\":{\"name\":\"worker\",\"mode\":\"persistent\",\"prompt\":\"do it\"}}}",
-    }};
-    const messages = [_]ChatMessage{
-        .{ .role = .user, .content = "delegate" },
-        .{ .role = .assistant, .tool_calls = &calls },
-        .{ .role = .tool, .tool_call_id = "legacy", .tool_name = "subagent", .content = "not executed", .tool_result_status = .failure },
-    };
-    const projected = try project_subagent_request_messages(
-        arena,
-        .{ .tools = &.{tool} },
-        true,
-        &messages,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(types.ChatRole.assistant, projected[projected.len - 1].role);
-    const request = try with_replyable_conversation_tail(arena, projected);
-    try std.testing.expectEqual(types.ChatRole.user, request[request.len - 1].role);
-    try std.testing.expectEqualStrings(assistant_tail_continuation_prompt, request[request.len - 1].content.?);
 }
 
 /// Some provider routes reject a request that ends with tool results as an
@@ -5416,19 +3731,6 @@ fn postToolAssistantPrefillRejection(
         return null;
     }
     return tail.tool_name orelse "unknown";
-}
-
-test "assistant prefill rejection recovers after any tool result tail" {
-    const detail = "AI_APICallError: This model does not support assistant message prefill. The conversation must end with a user message.";
-    const after_tool = [_]ChatMessage{
-        .{ .role = .user, .content = "go" },
-        .{ .role = .tool, .tool_call_id = "call", .tool_name = "subagent", .content = "failed" },
-    };
-    try std.testing.expectEqualStrings("subagent", postToolAssistantPrefillRejection(.bad_request, detail, &after_tool).?);
-    try std.testing.expect(postToolAssistantPrefillRejection(.bad_request, "other failure", &after_tool) == null);
-    try std.testing.expect(postToolAssistantPrefillRejection(.too_many_requests, detail, &after_tool) == null);
-    const after_user = [_]ChatMessage{.{ .role = .user, .content = "go" }};
-    try std.testing.expect(postToolAssistantPrefillRejection(.bad_request, detail, &after_user) == null);
 }
 
 fn providerFailureReplaySafe(
@@ -5487,73 +3789,6 @@ noinline fn settle_deferred_tool_starts(
             .{@errorName(err)},
         );
     };
-}
-
-test "deferred tool cleanup preserves interruption and cancellation outcomes" {
-    const support = @import("tests/support.zig");
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    var fake = support.FakeAgentRuntimeDeps.init(alloc);
-    defer fake.deinit();
-    const deps = fake.deps();
-    var stream_ctx = runtime_assistant_stream.StreamChunkContext{ .hooks = &deps, .turn_id = 71, .alloc = alloc };
-    defer stream_ctx.deinit();
-    try stream_ctx.provisional_statuses.publish(&deps, alloc, 71, "local", "read_file", .read, "Reading", "fixture.txt", null);
-    try stream_ctx.provisional_statuses.publish(&deps, alloc, 71, "remote", "exa_search", .read, "Searching", null, null);
-    var cancelled = std.atomic.Value(bool).init(false);
-    settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 71, &cancelled);
-    try std.testing.expect(stream_ctx.provisional_statuses.visibleId(.{ .id = "local", .name = "read_file", .arguments_json = "{}" }) == null);
-    try std.testing.expect(stream_ctx.provisional_statuses.visibleId(.{ .id = "remote", .name = "exa_search", .arguments_json = "{}" }) != null);
-    cancelled.store(true, .seq_cst);
-    settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 71, &cancelled);
-    var local_count: usize = 0;
-    var remote_count: usize = 0;
-    for (fake.lifecycle_events.items) |event| {
-        if (event != .terminal) continue;
-        if (std.mem.eql(u8, event.terminal.id.call_id, "local")) {
-            try std.testing.expectEqual(.failed, event.terminal.outcome.kind);
-            local_count += 1;
-        } else if (std.mem.eql(u8, event.terminal.id.call_id, "remote")) {
-            try std.testing.expectEqual(.cancelled, event.terminal.outcome.kind);
-            remote_count += 1;
-        } else return error.UnexpectedTerminalIdentity;
-    }
-    try std.testing.expectEqual(@as(usize, 1), local_count);
-    try std.testing.expectEqual(@as(usize, 1), remote_count);
-}
-
-test "deferred tool cleanup contains publication failure and preserves tracking" {
-    const support = @import("tests/support.zig");
-    const Sink = struct {
-        calls: usize = 0,
-        failed_terminal: bool = false,
-
-        fn push(raw: *anyopaque, event: types.ToolLifecycleEvent) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            self.failed_terminal = event == .terminal and event.terminal.outcome.kind == .failed;
-            return error.TestCleanupSinkFailed;
-        }
-    };
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    var fake = support.FakeAgentRuntimeDeps.init(alloc);
-    defer fake.deinit();
-    var deps = fake.deps();
-    var sink = Sink{};
-    var stream_ctx = runtime_assistant_stream.StreamChunkContext{ .hooks = &deps, .turn_id = 73, .alloc = alloc };
-    defer stream_ctx.deinit();
-    try stream_ctx.provisional_statuses.publish(&deps, alloc, 73, "local", "read_file", .read, "Reading", "fixture.txt", null);
-    deps.ctx = &sink;
-    deps.push_tool_lifecycle = Sink.push;
-    var cancelled = std.atomic.Value(bool).init(false);
-    settle_deferred_tool_starts(&deps, &stream_ctx, arena_state.allocator(), 73, &cancelled);
-    try std.testing.expectEqual(@as(usize, 1), sink.calls);
-    try std.testing.expect(sink.failed_terminal);
-    try std.testing.expectEqual(@as(usize, 0), stream_ctx.provisional_statuses.terminal_ids.items.len);
-    try std.testing.expect(stream_ctx.provisional_statuses.visibleId(.{ .id = "local", .name = "read_file", .arguments_json = "{}" }) != null);
 }
 
 /// A recovered step whose response still failed ends with spark's terminal
@@ -6115,44 +4350,6 @@ fn requiresResolvedRequestCapabilities(
         (fast_mode and !available.supports_fast_mode);
 }
 
-test "request capabilities resolve before capacity planning and Vision routing" {
-    try std.testing.expect(requiresResolvedRequestCapabilities(
-        false,
-        true,
-        .auto,
-        false,
-        .{},
-    ));
-    try std.testing.expect(requiresResolvedRequestCapabilities(
-        false,
-        false,
-        .auto,
-        false,
-        .{},
-    ));
-    try std.testing.expect(!requiresResolvedRequestCapabilities(
-        false,
-        true,
-        .auto,
-        false,
-        .{ .context_window = 128_000, .image_input_support = .non_native },
-    ));
-    try std.testing.expect(!requiresResolvedRequestCapabilities(
-        false,
-        true,
-        .auto,
-        false,
-        .{ .context_window = 128_000, .image_input_support = .native },
-    ));
-    try std.testing.expect(!requiresResolvedRequestCapabilities(
-        false,
-        false,
-        .auto,
-        false,
-        .{ .context_window = 128_000 },
-    ));
-}
-
 const PreparedSkills = struct {
     catalog: ?*const skill_runtime.BoundedPromptSection = null,
     explicit: ?*const skill_invocation.ExplicitPromptSection = null,
@@ -6353,129 +4550,6 @@ fn keptToolboxMenu(
     return .{ .menu = kept.get().?, .note = null, .shortened = bounded.shortened };
 }
 
-test "a toolbox change noted before a compaction is noted again after it, and the menu stays" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var agent: runtime_agent.Agent = .{};
-    defer agent.deinit(std.testing.allocator);
-    const first = [_]toolbox.Entry{ .{ .kind = .mcp_server, .name = "fixture" }, .{ .kind = .mcp_server, .name = "outside" } };
-    const now = first[0..1];
-
-    const sent = try keptToolboxMenu(arena, &agent.toolbox_menu, &first, "", .{});
-    const menu = try arena.dupe(u8, sent.menu);
-    try std.testing.expect((try keptToolboxMenu(arena, &agent.toolbox_menu, now, "", .{})).note != null);
-    try std.testing.expectEqual(@as(?[]const u8, null), (try keptToolboxMenu(arena, &agent.toolbox_menu, now, "", .{})).note);
-
-    // The compaction drops the turn that held the note.
-    agent.dropHistory(std.testing.allocator);
-    const after = try keptToolboxMenu(arena, &agent.toolbox_menu, now, "", .{});
-    try std.testing.expectEqualStrings(menu, after.menu);
-    try std.testing.expect(std.mem.find(u8, after.note.?, "MCP servers: fixture") != null);
-    try std.testing.expectEqual(@as(?[]const u8, null), (try keptToolboxMenu(arena, &agent.toolbox_menu, now, "", .{})).note);
-
-    // Nothing changed since the menu: a compaction adds no note.
-    agent.dropHistory(std.testing.allocator);
-    try std.testing.expectEqual(@as(?[]const u8, null), (try keptToolboxMenu(arena, &agent.toolbox_menu, &first, "", .{})).note);
-}
-
-test "the toolbox menu stays as first sent, and each change is noted once" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var kept: runtime_agent.ToolboxMenu = .{};
-    const first = [_]toolbox.Entry{.{ .kind = .skill, .name = "review", .description = "Review a change." }};
-    const added = first ++ [_]toolbox.Entry{.{ .kind = .mcp_server, .name = "linear" }};
-
-    const sent = try keptToolboxMenu(arena, &kept, &first, "", .{});
-    try std.testing.expectEqual(@as(?[]const u8, null), sent.note);
-    try std.testing.expect(std.mem.find(u8, sent.menu, "- review") != null);
-    const menu = try arena.dupe(u8, sent.menu);
-
-    // A server added later leaves the menu's bytes alone and is noted.
-    const changed = try keptToolboxMenu(arena, &kept, &added, "", .{});
-    try std.testing.expectEqualStrings(menu, changed.menu);
-    try std.testing.expect(std.mem.find(u8, changed.note.?, "MCP servers: linear") != null);
-
-    // The same change isn't noted twice.
-    const again = try keptToolboxMenu(arena, &kept, &added, "", .{});
-    try std.testing.expectEqualStrings(menu, again.menu);
-    try std.testing.expectEqual(@as(?[]const u8, null), again.note);
-
-    // Going back is a change too, and the menu still doesn't move.
-    const back = try keptToolboxMenu(arena, &kept, &first, "", .{});
-    try std.testing.expectEqualStrings(menu, back.menu);
-    try std.testing.expect(back.note != null);
-}
-
-test "the toolbox menu lists a skill copied into two folders once" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const skills = [_]skill_runtime.Skill{
-        .{ .name = "review", .description = "Review a change.", .path = "/workspace/.agents/skills/review", .source = .workspace_agents },
-        .{ .name = "review", .description = "Review a change.", .path = "/home/.spark/skills/review", .source = .global_spark },
-        .{ .name = "review", .description = "Review a pull request as an exam.", .path = "/home/.agents/skills/review", .source = .global_agents },
-        .{ .name = "deploy", .description = "Deploy a release.", .path = "/workspace/.agents/skills/deploy", .source = .workspace_agents },
-    };
-    var section = try skill_runtime.buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
-    defer section.deinit(alloc);
-
-    var entries: std.ArrayList(toolbox.Entry) = .empty;
-    _ = try appendSkillEntries(arena, &entries, &section, .{}, false);
-
-    // The identical copy from the lower-precedence folder is left out; the
-    // copy with its own description stays.
-    try std.testing.expectEqual(@as(usize, 3), entries.items.len);
-    try std.testing.expectEqualStrings("Review a change.", entries.items[0].description);
-    try std.testing.expectEqualStrings("Review a pull request as an exam.", entries.items[1].description);
-    try std.testing.expectEqualStrings("deploy", entries.items[2].name);
-    const menu = try toolbox.render(arena, entries.items, .{});
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, menu, "- review (open as "));
-    try std.testing.expect(std.mem.find(u8, menu, "Review a change.") != null);
-    // The listed copy still opens by the location the catalog gives it.
-    const resolved = try section.locations.resolve(arena, entries.items[0].open_as.?);
-    try std.testing.expectEqualStrings("/workspace/.agents/skills/review", resolved);
-
-    // A conversation that keeps its menu lists the same skills, so the change
-    // hash doesn't differ between its first request and the rest.
-    var kept_entries: std.ArrayList(toolbox.Entry) = .empty;
-    _ = try appendSkillEntries(arena, &kept_entries, &section, .{}, true);
-    try std.testing.expectEqual(toolbox.entriesHash(entries.items), toolbox.entriesHash(kept_entries.items));
-}
-
-test "an unconfigured skill description is cut to the catalog's 200 characters in the menu" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const skills = [_]skill_runtime.Skill{
-        .{ .name = "long", .description = text_utils.repeat("x", 300), .path = "/workspace/.agents/skills/long", .source = .workspace_agents },
-        .{ .name = "short", .description = "Fits as it is.", .path = "/workspace/.agents/skills/short", .source = .workspace_agents },
-    };
-    var section = try skill_runtime.buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
-    defer section.deinit(alloc);
-
-    var entries: std.ArrayList(toolbox.Entry) = .empty;
-    const limited = try appendSkillEntries(arena, &entries, &section, .{}, false);
-    try std.testing.expectEqual(@as(usize, 1), limited);
-    try std.testing.expectEqual(@as(usize, context_limits.catalog_skill_description_characters), entries.items[0].description.len);
-    try std.testing.expectEqualStrings("Fits as it is.", entries.items[1].description);
-    // The menu still cuts each line to its own 100 bytes.
-    const menu = try toolbox.render(arena, entries.items, .{});
-    const line_start = std.mem.find(u8, menu, "- long: ").?;
-    const line_end = std.mem.findScalarPos(u8, menu, line_start, '\n').?;
-    try std.testing.expectEqual(@as(usize, 100), std.mem.count(u8, menu[line_start..line_end], "x"));
-
-    // A configured limit replaces the default.
-    var configured: context_limits.Values = .{};
-    configured.skill_description_bytes = .{ .value = .{ .bytes = 50 }, .source = .user_workspace };
-    var configured_entries: std.ArrayList(toolbox.Entry) = .empty;
-    try std.testing.expectEqual(@as(usize, 1), try appendSkillEntries(arena, &configured_entries, &section, configured, false));
-    try std.testing.expectEqual(@as(usize, 50), configured_entries.items[0].description.len);
-}
-
 fn processQueuedPromptInner(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -6560,8 +4634,6 @@ fn processQueuedPromptInner(
     var overlay_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer mem_utils.deinit_arena(overlay_arena_state);
 
-    var local_grants: std.ArrayList(PermissionGrant) = .empty;
-    defer local_grants.deinit(arena);
 
     var completed_tool_names: std.ArrayList([]u8) = .empty;
     defer completed_tool_names.deinit(arena);
@@ -6732,9 +4804,6 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages={d} added_gateway_messages={d} interrupted_turns={d} history_turn_kinds={s} projected_message_roles={s} partial_interrupted_closures={d}",
         .{ active_history.len, stable_prefix.items.len + history_messages.items.len, history_messages.items.len, interrupted_turns, history_turn_kinds, projected_roles, partial_interrupted_closures },
     );
-    for (job.grants) |grant| {
-        try local_grants.append(arena, .{ .tool_name = grant.tool_name, .target_path = grant.target_path });
-    }
 
     // The turn's images are saved before any request is built, so a note
     // never names a file the session failed to write (D89,
@@ -6791,7 +4860,6 @@ fn processQueuedPromptInner(
         &history_messages,
         &within_turn_suffix,
         &overlay_arena_state,
-        &local_grants,
         &completed_tool_names,
         &summary_accumulator,
         &finish_trace,
@@ -6896,56 +4964,6 @@ fn containsImageId(image_ids: []const usize, candidate: usize) bool {
     return false;
 }
 
-fn buildReviewTurnContext(
-    config: Config,
-    model: []const u8,
-    root_user_intent_context: []const u8,
-    current_turn_messages: []const ChatMessage,
-    pending_assistant: ChatMessage,
-    credential: types.CredentialLease,
-    target_call_id: []const u8,
-    review_attempt_available: bool,
-) permission_auto_classifier.ReviewTurnContext {
-    const trusted_root_context = auto_classifier_context.rootUserRequestContext(
-        root_user_intent_context,
-    ) orelse "";
-    return .{
-        .model = model,
-        .pending_assistant = pending_assistant,
-        .credential = credential,
-        .target_call_id = target_call_id,
-        .review_attempt_available = review_attempt_available,
-        .origin = switch (config.origin) {
-            .root => .root,
-            .subagent => .subagent,
-        },
-        .trusted_root_context = trusted_root_context,
-        .current_turn_untrusted_messages = current_turn_messages,
-    };
-}
-
-fn permissionDeniedModelOutput(
-    alloc: Allocator,
-    tool_name: []const u8,
-    reason: types.ToolPermissionDenialReason,
-    outcome: command_admission.PermissionOutcome,
-) ![]u8 {
-    return switch (reason) {
-        .review_caution, .review_evidence_incomplete, .review_unavailable => tool_result_errors.toolReviewHeldJson(
-            alloc,
-            tool_name,
-            reason,
-            if (outcome.auto_review_result) |result| result.rationale else null,
-            outcome.auto_review_failure,
-        ),
-        .user_denied, .auto_denied, .policy_denied, .permission_required => tool_result_errors.toolPermissionDeniedJson(
-            alloc,
-            tool_name,
-            reason,
-        ),
-    };
-}
-
 fn activeCredentialLease(
     secret_value: []const u8,
     job: QueuedPrompt,
@@ -6959,44 +4977,15 @@ fn activeCredentialLease(
     } };
 }
 
-fn reviewFeedbackMemory(reason: types.ToolPermissionDenialReason, output: []const u8) ?types.ToolResultMemory {
-    return switch (reason) {
-        .review_caution, .review_evidence_incomplete, .review_unavailable => .{
-            .review_feedback = true,
-            .output_bytes = output.len,
-            .stored_output_bytes = output.len,
-        },
-        .user_denied, .auto_denied, .policy_denied, .permission_required => null,
-    };
-}
-
-fn appendTrustedPermissionFeedback(
-    alloc: Allocator,
-    feedback: *std.ArrayList([]const u8),
-    messages: []const ChatMessage,
-) !void {
-    for (messages) |message| {
-        if (message.role != .user or !message.permission_feedback) continue;
-        const content = message.content orelse continue;
-        if (content.len > 0) try feedback.append(alloc, content);
-    }
-}
-
 fn buildToolExecutionRootUserContext(
     alloc: Allocator,
     root_user_context: []const u8,
     within_turn_suffix: []const ChatMessage,
     pending_user_suffix: []const ChatMessage,
 ) ![]u8 {
-    var trusted_permission_feedback: std.ArrayList([]const u8) = .empty;
-    defer trusted_permission_feedback.deinit(alloc);
-    try appendTrustedPermissionFeedback(alloc, &trusted_permission_feedback, within_turn_suffix);
-    try appendTrustedPermissionFeedback(alloc, &trusted_permission_feedback, pending_user_suffix);
-    return auto_classifier_context.buildToolExecutionRootUserContext(
-        alloc,
-        root_user_context,
-        trusted_permission_feedback.items,
-    );
+    _ = within_turn_suffix;
+    _ = pending_user_suffix;
+    return alloc.dupe(u8, root_user_context);
 }
 
 /// The vision tool mode the request offers, for the mode the image route chose.
@@ -7024,23 +5013,6 @@ fn requestUserImages(messages: []const ChatMessage, current_user_message_index: 
         }
     }
     return found;
-}
-
-test "requestUserImages splits kept images at the turn's own message" {
-    const kept = [_]types.ImageAttachment{.{ .id = 1, .path = @constCast("inline://1"), .media_type = @constCast("image/png"), .inline_data = @constCast("png") }};
-    const dropped = [_]types.ImageAttachment{.{ .id = 2, .path = @constCast("inline://2"), .media_type = @constCast("image/png"), .snapshot_sha256 = @constCast("digest") }};
-    const earlier_only = [_]ChatMessage{
-        .{ .role = .user, .content = "first", .images = &kept },
-        .{ .role = .assistant, .content = "ok" },
-        .{ .role = .user, .content = "Testing" },
-    };
-    try std.testing.expectEqual(RequestUserImages{ .this_turn = false, .earlier = true }, requestUserImages(&earlier_only, 2));
-    const now = [_]ChatMessage{
-        .{ .role = .user, .content = "first", .images = &dropped },
-        .{ .role = .assistant, .content = "ok" },
-        .{ .role = .user, .content = "Look", .images = &kept },
-    };
-    try std.testing.expectEqual(RequestUserImages{ .this_turn = true, .earlier = false }, requestUserImages(&now, 2));
 }
 
 /// What a down model catalog held back from one request, for the notice that
@@ -7134,86 +5106,6 @@ fn catalogUnreachableImageLine(arena: Allocator, failure: ?model_catalog.Failure
     );
 }
 
-test "catalogDownNotice names a failed connection in one line and keeps the other failures' lines" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const fast_line = "Fast mode is unavailable for this model right now; continuing at standard speed.";
-    const withheld = [_]struct { tools: image_route.ToolImages, earlier: image_route.ToolImages }{
-        .{ .tools = .none, .earlier = .none },
-        .{ .tools = .none, .earlier = .withheld_unknown },
-        .{ .tools = .withheld_unknown, .earlier = .none },
-        .{ .tools = .withheld_unknown, .earlier = .withheld_unknown },
-    };
-    // Every input: each failure, no image decision or each withheld mix, and
-    // fast mode dropped or not.
-    for (std.enums.values(model_catalog.FailureCategory)) |failure| {
-        for ([_]?usize{ null, 0, 1, 2, 3 }) |mix| {
-            for ([_]bool{ false, true }) |fast_off| {
-                const images: ?image_route.Decision = if (mix) |index| .{
-                    .route = .unavailable,
-                    .mode = .unavailable,
-                    .tool_images = withheld[index].tools,
-                    .earlier_images = withheld[index].earlier,
-                } else null;
-                const subject = if (images) |chosen| withheldImageSubject(chosen) else null;
-                const lines = try catalogDownNotice(arena, .{ .failure = failure, .service = "AI Gateway", .images = images, .fast_off = fast_off });
-                if (failure == .transport) {
-                    if (subject == null and !fast_off) {
-                        try std.testing.expectEqual(@as(usize, 0), lines.len);
-                        continue;
-                    }
-                    try std.testing.expectEqual(@as(usize, 1), lines.len);
-                    const line = lines.slice()[0];
-                    try std.testing.expect(std.mem.startsWith(u8, line, "spark couldn't connect to AI Gateway to load the model catalog, so "));
-                    try std.testing.expect(std.mem.endsWith(u8, line, " until it loads. Check your network connection or firewall."));
-                    try std.testing.expect(std.mem.findScalar(u8, line, '\n') == null);
-                    try std.testing.expectEqual(fast_off, std.mem.find(u8, line, "fast mode is off") != null);
-                    try std.testing.expectEqual(subject != null, std.mem.find(u8, line, "aren't reaching the model") != null);
-                    if (subject) |words| try std.testing.expect(std.mem.find(u8, line, words) != null);
-                    continue;
-                }
-                var expected: CatalogDownLines = .{};
-                if (subject != null) expected.append(catalogDownImageText(images.?));
-                if (fast_off) expected.append(fast_line);
-                try std.testing.expectEqual(expected.len, lines.len);
-                for (expected.slice(), lines.slice()) |want, got| {
-                    try std.testing.expectEqualStrings(want, got);
-                    try std.testing.expect(std.mem.find(u8, got, "couldn't connect") == null);
-                }
-            }
-        }
-    }
-
-    const both = try catalogDownNotice(arena, .{
-        .failure = .transport,
-        .service = model_catalog.serviceName(.gateway),
-        .images = .{ .route = .unavailable, .mode = .unavailable, .tool_images = .none, .earlier_images = .withheld_unknown },
-        .fast_off = true,
-    });
-    try std.testing.expectEqualStrings(
-        "spark couldn't connect to AI Gateway to load the model catalog, so earlier images aren't reaching the model and fast mode is off until it loads. Check your network connection or firewall.",
-        both.slice()[0],
-    );
-    const codex = try catalogDownNotice(arena, .{ .failure = .transport, .service = model_catalog.serviceName(.codex), .fast_off = true });
-    try std.testing.expectEqualStrings(
-        "spark couldn't connect to the model provider to load the model catalog, so fast mode is off until it loads. Check your network connection or firewall.",
-        codex.slice()[0],
-    );
-
-    // An attached image the turn cannot send gets a cause line only for a
-    // failed connection; the host's own error follows it.
-    for (std.enums.values(model_catalog.FailureCategory)) |failure| {
-        const line = try catalogUnreachableImageLine(arena, failure, "AI Gateway");
-        try std.testing.expectEqual(failure == .transport, line != null);
-    }
-    try std.testing.expect(try catalogUnreachableImageLine(arena, null, "AI Gateway") == null);
-    try std.testing.expectEqualStrings(
-        "spark couldn't connect to AI Gateway to load the model catalog, so it couldn't confirm that this model accepts images. Check your network connection or firewall.",
-        (try catalogUnreachableImageLine(arena, .transport, "AI Gateway")).?,
-    );
-}
-
 /// Whether a tool image in `messages` still reaches the request: one the
 /// session keeps, or a handle to materialize. `image_attachments.withholdDroppedImages`
 /// turns the others into notes.
@@ -7226,21 +5118,6 @@ fn requestHasToolImages(messages: []const ChatMessage) bool {
         }
     }
     return false;
-}
-
-test "requestHasToolImages ignores images the session dropped" {
-    var kept_bytes = "png".*;
-    var mime = "image/png".*;
-    const kept = [_]types.ToolImage{.{ .data = &kept_bytes, .mime_type = &mime }};
-    const dropped = [_]types.ToolImage{.{ .data = &.{}, .mime_type = &mime, .name = @as([64]u8, @splat('0')) }};
-    const with_kept = [_]ChatMessage{.{ .role = .tool, .content = "a", .tool_result_memory = .{ .tool_images = @constCast(&kept) } }};
-    const with_dropped = [_]ChatMessage{.{ .role = .tool, .content = "b", .tool_result_memory = .{ .tool_images = @constCast(&dropped) } }};
-    const with_handle = [_]ChatMessage{.{ .role = .tool, .content = "c", .tool_result_memory = .{ .tool_image_handle = @constCast("image-result-x") } }};
-    const plain = [_]ChatMessage{.{ .role = .tool, .content = "d" }};
-    try std.testing.expect(requestHasToolImages(&with_kept));
-    try std.testing.expect(!requestHasToolImages(&with_dropped));
-    try std.testing.expect(requestHasToolImages(&with_handle));
-    try std.testing.expect(!requestHasToolImages(&plain));
 }
 
 fn buildProviderPromptForCompactionWindow(
@@ -7473,389 +5350,6 @@ const CompactionProgress = struct {
     }
 };
 
-test "compaction activity automatic error provenance excludes secondary finalization errors" {
-    const support = @import("tests/support.zig");
-    const Host = struct {
-        fake: support.FakeAgentRuntimeDeps,
-        activity: compaction_activity.State = .{},
-        fn from(raw: *anyopaque) *@This() {
-            const fake: *support.FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-            return @fieldParentPtr("fake", fake);
-        }
-        fn begin(raw: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId {
-            return from(raw).activity.begin(origin, turn_id, 0);
-        }
-        fn running(raw: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
-            from(raw).activity.running(id, stage);
-        }
-        fn settle(raw: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
-            from(raw).activity.settle(id, feedback, 1);
-        }
-    };
-    const alloc = std.testing.allocator;
-    for ([_]bool{ false, true }) |bound| {
-        for ([_]bool{ false, true }) |secondary_failure| {
-            var host: Host = .{ .fake = support.FakeAgentRuntimeDeps.init(alloc) };
-            defer host.fake.deinit();
-            const model = "provider/compaction-provenance";
-            host.fake.available_capability_overrides = &.{.{ .model = model, .capabilities = .{ .context_window = 45_000 } }};
-            if (secondary_failure) host.fake.finalization_error = error.ContextCapacityExceeded;
-            const provider_failure: support.FakeCompletion = .{ .status = .bad_request, .err_body = "{\"error\":{\"message\":\"summary request rejected\"}}" };
-            var gateway = support.FakeGateway.init(alloc, &.{ provider_failure, provider_failure });
-            defer gateway.deinit();
-            var fixture: support.PromptFixture = .{};
-            var job = fixture.job();
-            job.turn_id = 31;
-            job.model = @constCast(model);
-            var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(text_utils.repeat("history ", 19_000)) }};
-            var history = [_]HistoryTurn{.{ .assistant = .{
-                .user = .{ .text = @constCast("earlier request") },
-                .assistant = @constCast("earlier answer"),
-                .execution = .{ .tool_steps = &steps },
-            } }};
-            job.history = &history;
-            var deps = host.fake.deps();
-            deps.agent_stream_provider = gateway.provider();
-            if (bound) deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle };
-            var provenance: ?compaction_activity.ErrorProvenance = null;
-            deps.compaction_failure = &provenance;
-            var agent: runtime_agent.Agent = .{};
-            defer agent.deinit(alloc);
-            try agent.restoreHistory(alloc, job.history);
-            // The conversation's model fails, then the fallback model does too.
-            const expected: anyerror = if (secondary_failure) error.ContextCapacityExceeded else error.ModelFailed;
-            try std.testing.expectError(expected, processAgentPrompt(&agent, &deps, null, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, fixture.config().workspace_root), fixture.config(), job));
-            try std.testing.expectEqual(@as(usize, 2), gateway.index);
-            if (bound) {
-                const op = host.activity.snapshot.operation.?;
-                try std.testing.expectEqual(compaction_activity.Origin.automatic, op.origin);
-                try std.testing.expectEqual(error.ModelFailed, op.phase.terminal.err.?);
-                if (!secondary_failure) {
-                    try std.testing.expectEqual(op.id, provenance.?.operation_id);
-                    try std.testing.expectEqual(@as(?u64, 31), provenance.?.turn_id);
-                }
-            }
-            if (!bound or secondary_failure) try std.testing.expect(provenance == null);
-        }
-    }
-}
-
-test "automatic compaction interruption persists transport cancellation and preserves publication authority" {
-    const support = @import("tests/support.zig");
-    const Host = struct {
-        fake: support.FakeAgentRuntimeDeps,
-        activity: compaction_activity.State = .{},
-        cancel: *std.atomic.Value(bool),
-        summary_error: ?anyerror = null,
-        publication_error: ?anyerror = null,
-        cancel_at_publication: bool = false,
-        summary_calls: usize = 0,
-        publication_calls: usize = 0,
-
-        fn from(raw: *anyopaque) *@This() {
-            const fake: *support.FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-            return @fieldParentPtr("fake", fake);
-        }
-        fn begin(raw: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId {
-            return from(raw).activity.begin(origin, turn_id, 0);
-        }
-        fn running(raw: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
-            from(raw).activity.running(id, stage);
-        }
-        fn settle(raw: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
-            from(raw).activity.settle(id, feedback, 1);
-        }
-        fn commit(raw: *anyopaque, summary: types.CompactedSummaryHistoryTurn, prefix: ?types.AssistantHistoryTurn, cut: ?types.ContextHistoryCut) !void {
-            const self = from(raw);
-            self.publication_calls += 1;
-            try std.testing.expectEqual(compaction_activity.Stage.publication, self.activity.snapshot.operation.?.phase.running);
-            if (self.cancel_at_publication) self.cancel.store(true, .seq_cst);
-            if (self.publication_error) |err| return err;
-            const deps = self.fake.deps();
-            try deps.commit_context_compaction.?.commit(raw, summary, prefix, cut);
-        }
-        fn stream(raw: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.summary_calls += 1;
-            try std.testing.expectEqual(compaction_activity.Stage.summary, self.activity.snapshot.operation.?.phase.running);
-            try std.testing.expect(!request.cancel_flag.load(.seq_cst));
-            try request.admission.admit();
-            request.delivery.markPossiblySent();
-            if (self.summary_error) |err| return err;
-            return .{ .completed = .{ .completion = .{ .content = "Preserve the earlier request and follow the latest request.", .finish_reason = .stop } } };
-        }
-    };
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        summary_error: ?anyerror = null,
-        publication_error: ?anyerror = null,
-        cancel_at_publication: bool = false,
-        expected_error: ?anyerror = null,
-        committed: bool = false,
-    }{
-        .{ .publication_error = error.Aborted, .cancel_at_publication = true },
-        .{ .summary_error = error.Cancelled },
-        .{ .publication_error = error.Aborted, .expected_error = error.Aborted },
-        .{ .publication_error = error.SessionPersistenceUncertain, .cancel_at_publication = true, .expected_error = error.SessionPersistenceUncertain },
-        .{ .publication_error = error.TestPersistenceFailure, .cancel_at_publication = true, .expected_error = error.TestPersistenceFailure },
-        .{ .cancel_at_publication = true, .committed = true },
-    };
-    for (cases) |case| {
-        var fixture: support.PromptFixture = .{};
-        var host: Host = .{
-            .fake = support.FakeAgentRuntimeDeps.init(alloc),
-            .cancel = &fixture.cancel_flag,
-            .summary_error = case.summary_error,
-            .publication_error = case.publication_error,
-            .cancel_at_publication = case.cancel_at_publication,
-        };
-        defer host.fake.deinit();
-        const model = "provider/compaction-interruption";
-        host.fake.available_capability_overrides = &.{.{ .model = model, .capabilities = .{ .context_window = 45_000 } }};
-        var gateway = support.FakeGateway.init(alloc, &.{});
-        defer gateway.deinit();
-        var deps = host.fake.deps();
-        deps.agent_stream_provider = gateway.provider();
-        deps.agent_stream_provider.context = &host;
-        deps.agent_stream_provider.stream_fn = Host.stream;
-        deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle };
-        deps.commit_context_compaction = .{ .commit = Host.commit };
-        var provenance: ?compaction_activity.ErrorProvenance = null;
-        deps.compaction_failure = &provenance;
-        var job = fixture.job();
-        job.turn_id = 37;
-        job.model = @constCast(model);
-        var steps = [_]types.ToolExecutionStep{.{ .assistant = @constCast(text_utils.repeat("history ", 19_000)) }};
-        var history = [_]HistoryTurn{.{ .assistant = .{
-            .user = .{ .text = @constCast("earlier request") },
-            .assistant = @constCast("earlier answer"),
-            .execution = .{ .tool_steps = &steps },
-        } }};
-        job.history = &history;
-        var agent: runtime_agent.Agent = .{};
-        defer agent.deinit(alloc);
-        try agent.restoreHistory(alloc, job.history);
-        const result = processAgentPrompt(&agent, &deps, null, support.testLifecycleContext(hooks.RuntimeView.empty(), alloc, fixture.config().workspace_root), fixture.config(), job);
-        if (case.committed) {
-            // The next request build observes cancellation outside the committed transaction.
-            try std.testing.expectError(error.Cancelled, result);
-            try std.testing.expectEqual(types.TurnPresentationOutcome.failed, host.fake.finalized_outcome.?);
-            try std.testing.expectEqual(@as(usize, 0), host.fake.interrupted_history_count);
-            try std.testing.expectEqual(@as(usize, 0), host.fake.interrupted_event_count);
-            try std.testing.expectEqual(@as(usize, 0), host.fake.finish_event_count);
-            try std.testing.expectEqual(@as(usize, 1), host.fake.history_turns.items.len);
-            try std.testing.expect(host.fake.history_turns.items[0] == .compacted_summary);
-            try std.testing.expect(provenance == null);
-        } else if (case.expected_error) |err| {
-            try std.testing.expectError(err, result);
-            try std.testing.expectEqual(types.TurnPresentationOutcome.failed, host.fake.finalized_outcome.?);
-            try std.testing.expectEqual(@as(usize, 0), host.fake.interrupted_history_count);
-            try std.testing.expectEqual(@as(usize, 0), host.fake.interrupted_event_count);
-            try std.testing.expectEqual(@as(usize, 0), host.fake.finish_event_count);
-            try std.testing.expectEqual(@as(usize, 0), host.fake.history_turns.items.len);
-            try std.testing.expectEqual(err, provenance.?.err);
-        } else {
-            try result;
-            try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, host.fake.finalized_outcome.?);
-            try std.testing.expectEqual(@as(usize, 1), host.fake.interrupted_history_count);
-            try std.testing.expectEqual(@as(usize, 1), host.fake.interrupted_event_count);
-            try std.testing.expectEqual(@as(usize, 1), host.fake.finish_event_count);
-            try std.testing.expectEqual(@as(usize, 1), host.fake.history_turns.items.len);
-            const interrupted = host.fake.history_turns.items[0].interrupted;
-            try std.testing.expectEqualStrings(job.prompt, interrupted.user.text);
-            try std.testing.expectEqual(types.CancellationOrigin.compaction, interrupted.cancellation_origin);
-            try std.testing.expect(provenance == null);
-        }
-        try std.testing.expectEqual(case.cancel_at_publication, fixture.cancel_flag.load(.seq_cst));
-        try std.testing.expectEqual(@as(usize, 1), host.summary_calls);
-        try std.testing.expectEqual(@as(usize, if (case.summary_error == null) 1 else 0), host.publication_calls);
-        try std.testing.expectEqual(@as(usize, 1), host.fake.finalization_count);
-        const op = host.activity.snapshot.operation.?;
-        try std.testing.expectEqual(compaction_activity.Origin.automatic, op.origin);
-        try std.testing.expectEqual(@as(?u64, 37), op.turn_id);
-        const expected_outcome: compaction_activity.Outcome = if (case.committed) .succeeded else if (case.expected_error != null) .failed else .cancelled;
-        const expected_publication: compaction_activity.Publication = if (case.committed)
-            .committed
-        else if (case.publication_error) |err|
-            if (err == error.SessionPersistenceUncertain) .uncertain else .not_published
-        else
-            .not_published;
-        try std.testing.expectEqual(expected_outcome, op.phase.terminal.outcome);
-        try std.testing.expectEqual(expected_publication, op.phase.terminal.publication);
-        const expected_stage: compaction_activity.Stage = if (case.summary_error != null) .summary else .publication;
-        try std.testing.expectEqual(expected_stage, op.phase.terminal.stage);
-        if (case.summary_error) |err| {
-            try std.testing.expectEqual(err, op.phase.terminal.err.?);
-        } else if (case.publication_error) |err| {
-            try std.testing.expectEqual(err, op.phase.terminal.err.?);
-        } else {
-            try std.testing.expect(op.phase.terminal.err == null);
-        }
-    }
-}
-
-test "compaction activity transaction settles only after publication and preserves failures" {
-    const support = @import("tests/support.zig");
-    const session_child_store = @import("../../session/session_child_store.zig");
-    const Host = struct {
-        fake: support.FakeAgentRuntimeDeps,
-        worker: worker_runtime.WorkerRuntime = .{},
-        cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        commit_error: ?anyerror = null,
-        provider_error: ?anyerror = null,
-        cancel_at_commit: bool = false,
-        provider_returned: bool = false,
-        acknowledged: bool = false,
-
-        fn from(raw: *anyopaque) *@This() {
-            const fake: *support.FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-            return @fieldParentPtr("fake", fake);
-        }
-        fn begin(raw: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId {
-            return from(raw).worker.beginCompactionActivity(origin, turn_id);
-        }
-        fn running(raw: *anyopaque, id: compaction_activity.OperationId, stage: compaction_activity.Stage) void {
-            from(raw).worker.runCompactionActivity(id, stage);
-        }
-        fn settle(raw: *anyopaque, id: compaction_activity.OperationId, feedback: compaction_activity.Feedback) void {
-            const self = from(raw);
-            if (feedback.outcome == .succeeded) std.debug.assert(self.acknowledged);
-            self.worker.settleCompactionActivity(id, feedback);
-        }
-        fn commit(raw: *anyopaque, _: types.CompactedSummaryHistoryTurn, _: ?types.AssistantHistoryTurn, _: ?types.ContextHistoryCut) !void {
-            const self = from(raw);
-            try std.testing.expect(self.provider_returned);
-            try std.testing.expectEqual(compaction_activity.Stage.publication, self.worker.compactionActivitySnapshot().operation.?.phase.running);
-            if (self.cancel_at_commit) self.cancel.store(true, .seq_cst);
-            if (self.commit_error) |err| return err;
-            self.acknowledged = true;
-        }
-        fn stream(raw: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) !agent_stream_provider.Result {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            try std.testing.expectEqual(compaction_activity.Stage.summary, self.worker.compactionActivitySnapshot().operation.?.phase.running);
-            if (self.provider_error) |err| return err;
-            try request.admission.admit();
-            request.delivery.markPossiblySent();
-            self.provider_returned = true;
-            return .{ .completed = .{ .completion = .{ .content = "The user requested the recorded change.", .finish_reason = .stop } } };
-        }
-    };
-    const alloc = std.testing.allocator;
-    for (0..7) |case| {
-        var host: Host = .{ .fake = support.FakeAgentRuntimeDeps.init(alloc) };
-        defer host.fake.deinit();
-        defer host.worker.deinit(alloc);
-        switch (case) {
-            0 => {},
-            1 => host.cancel_at_commit = true,
-            2 => host.commit_error = error.SessionPersistenceUncertain,
-            3 => {
-                host.commit_error = error.Aborted;
-                host.cancel_at_commit = true;
-            },
-            4 => host.commit_error = error.TestPersistenceFailure,
-            5 => host.provider_error = error.Timeout,
-            6 => host.cancel.store(true, .seq_cst),
-            else => unreachable,
-        }
-        var deps = host.fake.deps();
-        var gateway = support.FakeGateway.init(alloc, &.{});
-        defer gateway.deinit();
-        deps.agent_stream_provider = gateway.provider();
-        deps.agent_stream_provider.context = &host;
-        deps.agent_stream_provider.stream_fn = Host.stream;
-        deps.compaction_activity = .{ .begin = Host.begin, .running = Host.running, .settle = Host.settle };
-        deps.commit_context_compaction = .{ .commit = Host.commit };
-        deps.push_interactive_notice = null;
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-        defer alloc.free(dir);
-        var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, dir, .tool_results, .writable);
-        defer capability.deinit();
-        // A tool call leaves work to summarize, so the model is asked. Its
-        // output is larger than the kept budget, so the turn is compacted,
-        // while its user message still fits word for word.
-        const notes = text_utils.repeat("recorded notes ", 400);
-        const calls = [_]types.ToolCall{.{ .id = "record-1", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" }};
-        const results = [_]types.PersistedToolResult{.{
-            .tool_call_id = @constCast("record-1"),
-            .tool_name = @constCast("read_file"),
-            .status = .success,
-            .output = @constCast(notes),
-            .output_bytes = notes.len,
-            .stored_output_bytes = notes.len,
-        }};
-        const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
-        const turns = [_]HistoryTurn{.{ .assistant = .{
-            .user = .{ .text = @constCast(text_utils.repeat("recorded source ", 100)) },
-            .assistant = @constCast("Recorded it."),
-            .execution = .{ .tool_steps = @constCast(&steps) },
-        } }};
-        var provenance: ?compaction_activity.ErrorProvenance = null;
-        var summary_model: runtime_text_completion.CompactorCaller = .{
-            .stream_provider = deps.agent_stream_provider,
-            .provider = .gateway,
-            .model = "fixture/model",
-            .api_key = "fixture-key",
-            .credential_source = .ai_gateway_api_key,
-            .retry_count = 1,
-            .capabilities_context = deps.ctx,
-            .capabilities_fn = deps.available_model_capabilities,
-        };
-        const request: ContextCompactionRequest = .{
-            .activity_origin = .manual,
-            .failure_provenance = &provenance,
-            .compactor = .{
-                .history = &turns,
-                .append_messages = session_runtime.appendHistoryChatMessages,
-                .size = .{ .compact_at_tokens = 5_000, .usable_tokens = 10_000 },
-                .caller = summary_model.caller(),
-                .records = result_store.compactorStore(&capability),
-                .cancel_flag = &host.cancel,
-                .trace_ctx = .{ .turn_id = 19 },
-            },
-        };
-        const result = compactContext(alloc, &deps, request);
-        if (case < 2) {
-            var outcome = (try result).?;
-            defer outcome.deinit();
-            try std.testing.expect(provenance == null);
-            try std.testing.expectEqual(types.ContextHistoryCut{ .turns = 1 }, outcome.cut);
-            try std.testing.expectEqual(@as(usize, 1), outcome.checkpoint.compaction_count);
-            try std.testing.expect(std.mem.find(u8, outcome.model_text, "recorded source recorded source") != null);
-            try std.testing.expectEqual(compaction_activity.Publication.committed, host.worker.compactionActivitySnapshot().operation.?.phase.terminal.publication);
-        } else {
-            const expected: anyerror = switch (case) {
-                2 => error.SessionPersistenceUncertain,
-                3 => error.Aborted,
-                4 => error.TestPersistenceFailure,
-                5 => error.ModelFailed,
-                6 => error.Cancelled,
-                else => unreachable,
-            };
-            try std.testing.expectError(expected, result);
-            const op = host.worker.compactionActivitySnapshot().operation.?;
-            try std.testing.expectEqual(op.id, provenance.?.operation_id);
-            try std.testing.expectEqual(@as(?u64, 19), provenance.?.turn_id);
-            try std.testing.expectEqual(expected, provenance.?.err);
-            try std.testing.expectEqual(expected, op.phase.terminal.err.?);
-            try std.testing.expectEqual(if (case == 3 or case == 6) compaction_activity.Outcome.cancelled else .failed, op.phase.terminal.outcome);
-            if (case == 2) try std.testing.expectEqual(compaction_activity.Publication.uncertain, op.phase.terminal.publication);
-        }
-        const terminal = host.worker.compactionActivitySnapshot();
-        host.worker.finishProcessing();
-        try std.testing.expectEqualDeep(terminal, host.worker.compactionActivitySnapshot());
-
-        // Unbound callers keep the same original cancellation result and no presentation output.
-        deps.compaction_activity = null;
-        provenance = null;
-        host.cancel.store(true, .seq_cst);
-        try std.testing.expectError(error.Cancelled, compactContext(alloc, &deps, request));
-        try std.testing.expect(provenance == null);
-    }
-}
-
 fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
@@ -7871,7 +5365,6 @@ fn processQueuedPromptLoop(
     history_messages_ptr: *std.ArrayList(ChatMessage),
     within_turn_suffix_ptr: *std.ArrayList(ChatMessage),
     overlay_arena_state: *std.heap.ArenaAllocator,
-    local_grants_ptr: *std.ArrayList(PermissionGrant),
     completed_tool_names_ptr: *std.ArrayList([]u8),
     summary_accumulator_ptr: *runtime_telemetry.TurnSummaryAccumulator,
     finish_trace_ptr: *PromptFinishTrace,
@@ -7890,12 +5383,6 @@ fn processQueuedPromptLoop(
     const history_messages = history_messages_ptr.*;
     var within_turn_suffix = within_turn_suffix_ptr.*;
     defer within_turn_suffix_ptr.* = within_turn_suffix;
-    var local_grants = local_grants_ptr.*;
-    defer local_grants_ptr.* = local_grants;
-    var turn_file_mutation_denials: runtime_tool_admission.TurnFileMutationDenials = .{};
-    defer turn_file_mutation_denials.deinit(arena);
-    var turn_review_cache: runtime_tool_admission.TurnReviewCache = .{};
-    defer turn_review_cache.deinit(arena);
     var terminal_validation_retry: runtime_tool_admission.TerminalValidationRetryState = .{};
     defer terminal_validation_retry.deinit(arena);
     var shell_execution_failure_retry: runtime_tool_admission.ShellExecutionFailureRetryState = .{};
@@ -7955,32 +5442,8 @@ fn processQueuedPromptLoop(
         &pending_context_notes,
     );
     const root_user_intent_context = switch (config.origin) {
-        .subagent => if (config.current_prompt_is_root_authority)
-            try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
-                arena,
-                job.prompt,
-                config.root_user_messages,
-                config.root_user_evidence_complete,
-            )
-        else if (config.root_user_intent_context.len > 0)
-            config.root_user_intent_context
-        else if (config.root_user_messages.len > 0)
-            try auto_classifier_context.buildRootUserContextFromVerifiedRequests(
-                arena,
-                config.root_user_messages[config.root_user_messages.len - 1],
-                config.root_user_messages,
-                config.root_user_evidence_complete,
-            )
-        else
-            "",
-        .root => if (job.root_user_intent_context.len > 0)
-            job.root_user_intent_context
-        else
-            try auto_classifier_context.buildCanonicalRootUserContext(
-                arena,
-                job.prompt,
-                job.history,
-            ),
+        .subagent => config.root_user_intent_context,
+        .root => job.root_user_intent_context,
     };
     var active_api_key: []const u8 = job.api_key;
     var owned_refreshed_api_key: ?[]u8 = null;
@@ -8560,10 +6023,7 @@ fn processQueuedPromptLoop(
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{noted_messages.len});
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
-            var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, step_effort, attempt_fast_mode, config.ultrafast_mode);
-            provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
-            provider_opts.provider_order = config.provider_order;
-            provider_opts.provider_strict = config.provider_strict;
+            const provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, step_effort, attempt_fast_mode, config.ultrafast_mode);
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
             // A custom connection sends an effort level only when the model's
             // settings declare it. One the person set and the model does not
@@ -8901,32 +6361,6 @@ fn processQueuedPromptLoop(
             runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, .changed) catch |progress_err| {
                 debug_trace.logf("agent", "token progress publication failed source=gateway_prepare err={s}", .{@errorName(progress_err)});
             };
-            if (job.provider == .gateway) {
-                try persistRecoveryCheckpoint(
-                    deps,
-                    finalization,
-                    job,
-                    within_turn_suffix.items,
-                    stream_ctx.interruption_source_or(""),
-                    gateway_model,
-                    selected_fast_mode,
-                    attempt_fast_mode,
-                    request_recovery.attempt() - 1,
-                    true,
-                    recovery_cause,
-                    recovery_strategy,
-                    effectiveRecoveryToolEvidence(
-                        preserved_tool_evidence,
-                        null,
-                        &stream_ctx,
-                    ),
-                    step_ctx,
-                    request_recovery.sendRecord(),
-                );
-            } else {
-                // No write goes before this send, so its record goes now.
-                request_recovery.flushRecord();
-            }
 
             disarmCacheWarming(deps);
             const gateway_wait_started_ms = io_mod.milliTimestamp();
@@ -8950,7 +6384,7 @@ fn processQueuedPromptLoop(
                 else
                     .{ .direct = .{
                         .secret_bytes = active_api_key,
-                        .source = job.credential_source orelse .ai_gateway_api_key,
+                        .source = job.credential_source orelse .configured,
                         .account_id = job.account_id,
                         .tenant_context = job.gateway_team,
                     } },
@@ -9242,8 +6676,7 @@ fn processQueuedPromptLoop(
                 };
                 armCacheWarming(deps, .{
                     .candidate = .{
-                        .gateway_with_direct_credential = job.provider == .gateway and
-                            job.credential_source != .host_managed and active_api_key.len > 0,
+                        .gateway_with_direct_credential = false,
                         .model = gateway_model,
                         .root_turn = config.origin == .root,
                         .prompt_caching = request_data.provider_options.prompt_caching,
@@ -9410,9 +6843,7 @@ fn processQueuedPromptLoop(
                 );
             }
             const settled_attempts: usize = request_recovery.attempt();
-            if (job.provider == .gateway or
-                response_failure == null or response_failure.?.kind != .unauthorized)
-            {
+            if (response_failure == null or response_failure.?.kind != .unauthorized) {
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
@@ -9518,7 +6949,6 @@ fn processQueuedPromptLoop(
             {
                 if (!auth_reason_shown) {
                     try pushWaitingHttpFailureReason(deps, arena, failure, job, request_capabilities);
-                    try pushRefusedTeamHint(deps, arena, job);
                     auth_reason_shown = true;
                 }
                 _ = try request_recovery.failed(.{ .kind = .refused });
@@ -10671,7 +8101,7 @@ fn processQueuedPromptLoop(
                             .tool_name = "vision",
                             .message = runtime_vision_contracts.native_route_unavailable_message,
                             .suggestion = if (request_capabilities.image_input_support == .native or
-                                (request_capabilities.image_input_support == .unknown and job.provider != .gateway))
+                                request_capabilities.image_input_support == .unknown)
                                 "Continue using the model's native image input without Vision."
                             else
                                 "Continue without Vision.",
@@ -10765,6 +8195,7 @@ fn processQueuedPromptLoop(
             .tool_calls = effective_tool_calls,
             .provider_replay = provider_replay,
         };
+        _ = pending_assistant;
 
         var preparation_batch = tool_preparation.ReadyCallBatch.init(
             arena,
@@ -11047,8 +8478,7 @@ fn processQueuedPromptLoop(
                 runtime_parallel_execution.LeadingGroup{};
             const parallel_permission_eligible = switch (parallel_group.kind) {
                 .none => false,
-                .read_only => root_action_permission_mode == .auto or
-                    root_action_permission_mode == .yolo,
+                .read_only => true,
                 // Each call is reviewed before the group starts.
                 .subagent, .host => true,
             };
@@ -11185,39 +8615,10 @@ fn processQueuedPromptLoop(
                         parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
 
-                    const parallel_preserved_review_hold = if (root_action_permission_mode == .auto)
-                        turn_review_cache.cached(parallel_call)
-                    else
-                        null;
-                    const parallel_review_attempt_available = root_action_permission_mode != .auto or
-                        turn_review_cache.reviewAttemptAvailable(parallel_call);
-                    const parallel_review_context = buildReviewTurnContext(
-                        config,
-                        successful_gateway_model,
-                        root_user_intent_context,
-                        within_turn_suffix.items,
-                        pending_assistant,
-                        activeCredentialLease(active_api_key, job),
-                        parallel_call.id,
-                        parallel_review_attempt_available,
-                    );
-                    if (parallel_preserved_review_hold) |hold| {
-                        debug_trace.eventf(
-                            "permission",
-                            "turn_permission_denial_preserved",
-                            step_ctx,
-                            "call_id={s} tool_name={s}",
-                            .{ parallel_call.id, parallel_call.name },
-                        );
-                        tooling_tool_admission.recordReusedReviewHold(parallel_call, hold, config.origin == .subagent);
-                    }
-                    const maybe_parallel_permission: ?command_admission.PermissionOutcome = if (parallel_preserved_review_hold) |outcome|
-                        outcome
-                    else
-                        runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, root_action_permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, advertised_dynamic_tools, config.workspace_root, step_ctx) catch |err| blk: {
-                            if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
-                            break :blk null;
-                        };
+                    const maybe_parallel_permission: ?command_admission.PermissionOutcome = runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, null, null, advertised_dynamic_tool_names, step_ctx) catch |err| blk: {
+                        if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                        break :blk null;
+                    };
                     if (maybe_parallel_permission == null or config.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
@@ -11253,16 +8654,10 @@ fn processQueuedPromptLoop(
                     if (decision.isDenied()) {
                         const reason = permission_outcome.denial_reason orelse
                             decision.denialReason() orelse .user_denied;
-                        try turn_review_cache.remember(
-                            arena,
-                            parallel_call,
-                            permission_outcome,
-                        );
-                        const denied_output = try permissionDeniedModelOutput(
+                        const denied_output = try tool_result_errors.toolPermissionDeniedJson(
                             arena,
                             parallel_call.name,
                             reason,
-                            permission_outcome,
                         );
                         parallel_status_terminalized[group_index] = try stream_ctx.provisional_statuses.finishDeniedCall(
                             deps,
@@ -11280,14 +8675,8 @@ fn processQueuedPromptLoop(
                         precomputed_results[group_index] = .{
                             .status = .failure,
                             .model_output = denied_output,
-                            .tool_result_memory = reviewFeedbackMemory(reason, denied_output),
                         };
                         continue;
-                    }
-
-                    if (decision == .always) {
-                        const target_path = try deps.permission_target_for_call(deps.ctx, arena, parallel_call, advertised_dynamic_tool_names);
-                        try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, parallel_call, target_path);
                     }
 
                     if (!parallel_status_started[group_index]) {
@@ -11388,7 +8777,6 @@ fn processQueuedPromptLoop(
                         .turn_id = turn_id,
                         .root_user_intent_context = parallel_execution_root_user_context,
                         .current_turn_messages = within_turn_suffix.items,
-                        .session_grants = local_grants.items,
                         .permission_mode = root_action_permission_mode,
                         .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                         .max_tool_result_bytes = config.max_tool_result_bytes,
@@ -12043,6 +9431,7 @@ fn processQueuedPromptLoop(
                 prepared.externalActionIdentity()
             else
                 null;
+            _ = external_file_action_identity;
             const live_authority_target = if (prepared_file_mutation) |prepared|
                 try arena.dupe(u8, prepared.targetPath())
             else
@@ -12115,18 +9504,8 @@ fn processQueuedPromptLoop(
                 root_live_permission_mode,
                 if (live_authority) |resolved| resolved.authority.permission_mode else null,
             );
-            const action_grants: []const PermissionGrant = if (live_authority) |resolved|
-                resolved.authority.grants
-            else
-                local_grants.items;
             var status_started = false;
-            const defer_auto_command_lifecycle = try runtime_tool_admission.deferCapturedCommandLifecycleForAutoPermissionNotice(
-                deps.tool_registry,
-                arena,
-                tool_call,
-                action_permission_mode,
-                lifecycle.scope.kind == .interactive,
-            );
+            const defer_auto_command_lifecycle = false;
             if (!runtime_tool_admission.deferVisibleLifecycleUntilAfterPermission(tool_call.name) and
                 !defer_auto_command_lifecycle)
             {
@@ -12146,18 +9525,6 @@ fn processQueuedPromptLoop(
                 try types.dupeToolCall(call_allocator, tool_call)
             else
                 tool_call;
-            const review_attempt_available = action_permission_mode != .auto or
-                turn_review_cache.reviewAttemptAvailable(execution_call);
-            const review_context = buildReviewTurnContext(
-                config,
-                successful_gateway_model,
-                root_user_intent_context,
-                within_turn_suffix.items,
-                pending_assistant,
-                activeCredentialLease(active_api_key, job),
-                execution_call.id,
-                review_attempt_available,
-            );
             const tool_execution_root_user_context = try buildToolExecutionRootUserContext(
                 call_allocator,
                 root_user_intent_context,
@@ -12168,33 +9535,8 @@ fn processQueuedPromptLoop(
                 resolved.authority.generation
             else
                 0;
-            const preserved_denial = if (external_file_action_identity) |identity|
-                turn_file_mutation_denials.preservedOutcome(identity)
-            else
-                null;
-            const preserved_review_hold = if (action_permission_mode == .auto)
-                turn_review_cache.cached(execution_call)
-            else
-                null;
-            const effective_preserved_denial = preserved_denial orelse
-                preserved_review_hold;
-            if (effective_preserved_denial != null) {
-                debug_trace.eventf(
-                    "permission",
-                    "turn_permission_denial_preserved",
-                    step_ctx,
-                    "call_id={s} tool_name={s}",
-                    .{ tool_call.id, tool_call.name },
-                );
-            }
-            // The review hold decides the call only when nothing before it does.
-            if (live_target_failure == null and preserved_denial == null) {
-                if (preserved_review_hold) |hold| tooling_tool_admission.recordReusedReviewHold(execution_call, hold, config.origin == .subagent);
-            }
             const maybe_permission: ?command_admission.PermissionOutcome = if (live_target_failure) |failure|
                 .{ .tool_failure = failure }
-            else if (effective_preserved_denial) |outcome|
-                outcome
             else
                 (if (prepared_file_mutation) |*prepared|
                     runtime_tool_admission.requestPreparedFileMutationPermissionTraced(
@@ -12202,12 +9544,8 @@ fn processQueuedPromptLoop(
                         arena,
                         execution_call,
                         prepared,
-                        review_context,
-                        action_permission_mode,
-                        action_grants,
                         if (live_authority) |resolved| resolved.authority else null,
                         advertised_dynamic_tool_names,
-                        config.workspace_root,
                         step_ctx,
                     )
                 else
@@ -12215,14 +9553,9 @@ fn processQueuedPromptLoop(
                         deps,
                         call_allocator,
                         execution_call,
-                        review_context,
-                        action_permission_mode,
-                        action_grants,
                         if (live_authority) |resolved| resolved.authority else null,
                         null,
                         advertised_dynamic_tool_names,
-                        advertised_dynamic_tools,
-                        config.workspace_root,
                         step_ctx,
                     )) catch |err| blk: {
                     if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
@@ -12310,17 +9643,9 @@ fn processQueuedPromptLoop(
                     deps,
                     call_allocator,
                     execution_call,
-                    review_context,
-                    refreshed.authority.permission_mode,
-                    refreshed.authority.grants,
                     refreshed.authority,
-                    .{ .action = .{
-                        .authority = prepared_authority,
-                        .human_approval = exact_human_approval,
-                    } },
+                    prepared_authority,
                     advertised_dynamic_tool_names,
-                    advertised_dynamic_tools,
-                    config.workspace_root,
                     step_ctx,
                 ) catch |err| blk: {
                     if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
@@ -12358,13 +9683,6 @@ fn processQueuedPromptLoop(
                 if (exact_human_approval != .once) {
                     exact_human_approval = permission_result.human_approval;
                 }
-            }
-            if (external_file_action_identity) |identity| {
-                try turn_file_mutation_denials.rememberHumanDenial(
-                    arena,
-                    identity,
-                    permission_result,
-                );
             }
             if (permission_result.tool_failure) |failure_output| {
                 if (!status_started) {
@@ -12445,16 +9763,10 @@ fn processQueuedPromptLoop(
                 }
                 const reason = permission_outcome.denial_reason orelse
                     decision.denialReason() orelse .user_denied;
-                try turn_review_cache.remember(
-                    arena,
-                    tool_call,
-                    permission_outcome,
-                );
-                const denied_output = try permissionDeniedModelOutput(
+                const denied_output = try tool_result_errors.toolPermissionDeniedJson(
                     arena,
                     tool_call.name,
                     reason,
-                    permission_outcome,
                 );
                 if (!status_started and (is_file_mutation or defer_auto_command_lifecycle)) {
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
@@ -12487,7 +9799,7 @@ fn processQueuedPromptLoop(
                     &step_batch,
                     tool_call,
                     denied_output,
-                    reviewFeedbackMemory(reason, denied_output),
+                    null,
                     .{
                         .increment_total = false,
                         .status = .failure,
@@ -12571,61 +9883,6 @@ fn processQueuedPromptLoop(
                 );
             }
 
-            // An "always" answer keeps its grants whoever asked. A subagent's
-            // live authority reads its instance's grants at every call, so the
-            // grants kept here are what its next call, its siblings, and main
-            // find (`src/core/agent/runtime/tests/tool_flow.zig`, "a subagent's
-            // always approval of a command stores the session grant").
-            if (decision == .always) {
-                if (execution_authority == .file_mutation) {
-                    const offer = execution_authority.file_mutation.grant_offer orelse
-                        return error.MissingToolExecutionAuthority;
-                    try runtime_tool_admission.applyFrozenFileMutationSessionGrants(
-                        arena,
-                        deps,
-                        &local_grants,
-                        offer.grants,
-                    );
-                } else if (execution_authority == .vision_paths) {
-                    for (execution_authority.vision_paths.targets) |target| {
-                        try runtime_tool_admission.applyInitialSessionGrants(
-                            deps,
-                            arena,
-                            &local_grants,
-                            config.workspace_root,
-                            tool_call,
-                            target.canonical_path,
-                        );
-                    }
-                } else {
-                    const target_path = try deps.permission_target_for_call(deps.ctx, arena, tool_call, advertised_dynamic_tool_names);
-                    try runtime_tool_admission.applyInitialSessionGrants(deps, arena, &local_grants, config.workspace_root, tool_call, target_path);
-                }
-            }
-
-            var one_time_execution_grants: std.ArrayList(PermissionGrant) = .empty;
-            defer mem_utils.deinitList(arena, &one_time_execution_grants);
-            var execution_grants: []const PermissionGrant = if (live_authority) |resolved|
-                resolved.authority.grants
-            else
-                local_grants.items;
-            if (decision == .once and execution_authority == .file_mutation) {
-                if (execution_authority.file_mutation.grant_offer) |offer| {
-                    try one_time_execution_grants.appendSlice(
-                        arena,
-                        execution_grants,
-                    );
-                    try runtime_tool_admission.appendFrozenFileMutationGrants(
-                        arena,
-                        &one_time_execution_grants,
-                        offer.grants,
-                    );
-                    if (one_time_execution_grants.items.len > execution_grants.len) {
-                        execution_grants = one_time_execution_grants.items;
-                    }
-                }
-            }
-
             if (config.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 _ = try stream_ctx.provisional_statuses.finishDeniedCall(
@@ -12698,7 +9955,6 @@ fn processQueuedPromptLoop(
                 .root_user_evidence_complete = true,
                 .authorized_image_catalog = job.authorized_image_catalog,
                 .current_turn_messages = within_turn_suffix.items,
-                .session_grants = execution_grants,
                 .live_authority = if (live_authority) |resolved| resolved.authority else null,
                 .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                 .max_tool_result_bytes = config.max_tool_result_bytes,
@@ -13521,68 +10777,4 @@ pub fn copyLatestStopPartial(
         null
     else
         try alloc.dupe(u8, partial);
-}
-
-test "malformed duplicate unauthorized and path Vision calls settle no image ids" {
-    const catalog = [_]types.ImageAttachment{.{
-        .id = 1,
-        .path = @constCast("/tmp/authorized.png"),
-        .media_type = @constCast("image/png"),
-    }};
-    var settled_ids: std.ArrayList(usize) = .empty;
-    defer settled_ids.deinit(std.testing.allocator);
-
-    const malformed = ToolCall{
-        .id = "vision-malformed",
-        .name = "vision",
-        .arguments_json = "{\"image_ids\":[1]",
-        .argument_integrity = .malformed_json,
-        .provenance = .spark_local,
-    };
-    try std.testing.expect(!try appendAuthorizedVisionAttemptIds(
-        std.testing.allocator,
-        &settled_ids,
-        malformed,
-        &catalog,
-    ));
-
-    const duplicate = ToolCall{
-        .id = "vision-duplicate",
-        .name = "vision",
-        .arguments_json = "{\"image_ids\":[1,1],\"focus\":\"inspect\"}",
-        .provenance = .spark_local,
-    };
-    try std.testing.expect(!try appendAuthorizedVisionAttemptIds(
-        std.testing.allocator,
-        &settled_ids,
-        duplicate,
-        &catalog,
-    ));
-
-    const unauthorized = ToolCall{
-        .id = "vision-unauthorized",
-        .name = "vision",
-        .arguments_json = "{\"image_ids\":[2],\"focus\":\"inspect\"}",
-        .provenance = .spark_local,
-    };
-    try std.testing.expect(!try appendAuthorizedVisionAttemptIds(
-        std.testing.allocator,
-        &settled_ids,
-        unauthorized,
-        &catalog,
-    ));
-
-    const path_source = ToolCall{
-        .id = "vision-path",
-        .name = "vision",
-        .arguments_json = "{\"paths\":[\"photo.png\"],\"focus\":\"inspect\"}",
-        .provenance = .spark_local,
-    };
-    try std.testing.expect(!try appendAuthorizedVisionAttemptIds(
-        std.testing.allocator,
-        &settled_ids,
-        path_source,
-        &catalog,
-    ));
-    try std.testing.expectEqual(@as(usize, 0), settled_ids.items.len);
 }

@@ -25,7 +25,6 @@ const session_layout = @import("session_layout.zig");
 const session_child_store = @import("session_child_store.zig");
 const relationship_index_codec = @import("session_relationship_index_codec.zig");
 const result_store = @import("result_store.zig");
-const session_permission_state = @import("../permissions/session_permission_state.zig");
 const child_state = @import("../subagent/child_state.zig");
 const json_decode = @import("../shared/json_decode.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -715,9 +714,8 @@ pub const Member = struct {
     language: types.ConversationLanguage,
     preferences: session_codec.DurableSessionPreferences,
     title: ?[]const u8,
-    permissions: session_permission_state.State,
-    /// True when `permissions.json` could not be read and `permissions`
-    /// holds no rules in its place (`Rules.drop_unreadable`).
+    /// Kept for older callers. Saved permission rules are no longer read, so
+    /// this stays false.
     rules_dropped: bool,
     steps: []const Step,
     turns: usize,
@@ -828,7 +826,7 @@ fn isConversationMetadata(a: Allocator, bytes: []const u8) bool {
 
 /// The current format: `session.json` and `events.jsonl` frames, read as
 /// v1's state load reads them.
-fn readConversation(a: Allocator, locked: *Locked, metadata_bytes: []const u8, member: *Member, problem: *Problem, rules: Rules) !void {
+fn readConversation(a: Allocator, locked: *Locked, metadata_bytes: []const u8, member: *Member, problem: *Problem, _: Rules) !void {
     const metadata = session_codec.decodeSessionMetadata(a, metadata_bytes) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return problem.set("session.json {s}", .{describe(a, metadata_bytes, err)}),
@@ -847,14 +845,8 @@ fn readConversation(a: Allocator, locked: *Locked, metadata_bytes: []const u8, m
         .ultrafast_mode = value.ultrafast_mode orelse false,
     };
     member.title = value.title;
-    member.permissions = readPermissions(a, &locked.dir, problem) catch |err| switch (rules) {
-        .required => return err,
-        .drop_unreadable => if (err == error.OutOfMemory) return err else dropped: {
-            problem.* = .{};
-            member.rules_dropped = true;
-            break :dropped .{};
-        },
-    };
+    // `permissions.json` held saved permission rules. spark always has full
+    // access now, so the file is not read.
 
     var frames: FrameReader = .{ .arena = a, .dir = &locked.dir, .id = locked.id, .problem = problem, .builder = .init(a) };
     defer frames.builder.deinit();
@@ -862,19 +854,6 @@ fn readConversation(a: Allocator, locked: *Locked, metadata_bytes: []const u8, m
     try frames.finish();
     member.steps = frames.steps.items;
     member.listed_ms = listedTime(&locked.dir, value.updated_at_ms, frames.steps.items.len > 0);
-}
-
-fn readPermissions(a: Allocator, dir: *io_mod.VerifiedDir, problem: *Problem) !session_permission_state.State {
-    const state = session_log.loadConversationPermissionState(a, dir) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return problem.set("permissions.json can't be read ({s})", .{@errorName(err)}),
-    };
-    // v1 migrates an older schema on its first writable open.
-    if (state.version == session_permission_state.schema_version) return state;
-    return session_permission_state.migrateV1ToV2(a, state) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return problem.set("permissions.json can't be migrated ({s})", .{@errorName(err)}),
-    };
 }
 
 /// v1's listing time: `session.json`'s, or the log's change time once the
@@ -1158,13 +1137,6 @@ fn fromState(a: Allocator, locked: *Locked, state: *session_codec.DurableSession
     member.created_ms = @intCast(@max(state.created_at_ms, 0));
     member.language = state.conversation_language;
     member.preferences = state.preferences;
-    member.permissions = state.permission_state;
-    if (state.permission_state.version != session_permission_state.schema_version) {
-        member.permissions = session_permission_state.migrateV1ToV2(a, state.permission_state) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return problem.set("permissions can't be migrated ({s})", .{@errorName(err)}),
-        };
-    }
     // As v1's migration of an older format left it: a history-only
     // checkpoint kept as an interrupted turn, the rest dropped; empty file
     // evidence dropped; each result kept inline stored under v1's handle.
@@ -1454,58 +1426,4 @@ fn readFileIfPresent(a: Allocator, dir: *io_mod.VerifiedDir, name: []const u8, m
 fn describe(a: Allocator, bytes: []const u8, err: anyerror) []const u8 {
     if (!(std.json.validate(a, bytes) catch false)) return "is not valid JSON";
     return @errorName(err);
-}
-
-test "a checkpoint inside a turn covers that turn's steps and steering as v1's writer counted them (D87)" {
-    const result = struct {
-        fn of(id: []const u8) Event {
-            return .{ .tool_result = .{ .call_id = id, .tool_name = "shell", .status = .success, .artifact_ref = "", .stored_bytes = 0, .completeness = .complete } };
-        }
-    };
-    const events = [_]Event{
-        .{ .user = .{ .text = "go" } },
-        .{ .assistant = .{ .text = "plan" } },
-        .{ .tool_call = .{ .call_id = "c1", .tool_name = "shell", .arguments_json = "{}" } },
-        result.of("c1"),
-        .{ .steering = .{ .text = "faster" } },
-        .{ .assistant = .{ .text = "a reply with no tool call" } },
-        .{ .assistant = .{ .text = "then one more" } },
-        .{ .tool_call = .{ .call_id = "c2", .tool_name = "shell", .arguments_json = "{}" } },
-        result.of("c2"),
-    };
-    const seqs = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-    // Each coverage v1's writer can choose: a step's last result, a
-    // steering message, and a reply with no tool call, at its own seq.
-    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1 }, try coveredSteps(&events, &seqs, 4));
-    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1, .steering = 1 }, try coveredSteps(&events, &seqs, 5));
-    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 2, .steering = 1 }, try coveredSteps(&events, &seqs, 6));
-    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 3, .steering = 1 }, try coveredSteps(&events, &seqs, 9));
-}
-
-test "a member folder another process removes after it is opened and before it is locked is gone, not an error (D61)" {
-    const alloc = std.testing.allocator;
-    const io = io_mod.getIo();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, ".spark/sessions/v1memberid01");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
-    defer store.deinit(alloc);
-    const opened = (try openMemberDir(&store, "v1memberid01")).?;
-    // The other process's conversion removes the folder.
-    try tmp.dir.deleteTree(io, ".spark/sessions/v1memberid01");
-    try std.testing.expectEqual(@as(?Locked, null), try lockOpened(alloc, &store, "v1memberid01", opened, io_mod.milliTimestamp(), 0));
-}
-
-test "an older turn the current event format cannot keep names its file, turn and cause" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var problem: Problem = .{};
-    // Schema 3 kept a prompt's bytes even when they were not UTF-8.
-    const turn: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("bad \xff byte") }, .assistant = @constCast("answer") } };
-    try std.testing.expectError(error.InvalidSessionFormat, requireKeepable(arena.allocator(), turn, "events.jsonl", 3, &problem));
-    try std.testing.expectEqualStrings("events.jsonl turn 3 has a prompt that is not valid UTF-8, which the current format can't keep", problem.text());
-    const fine: types.HistoryTurn = .{ .assistant = .{ .user = .{ .text = @constCast("fine") }, .assistant = @constCast("answer") } };
-    try requireKeepable(arena.allocator(), fine, "events.jsonl", 1, &problem);
 }

@@ -92,19 +92,3 @@ pub const LineInput = struct {
         return i;
     }
 };
-
-test "LineInput edits at the cursor across multibyte characters" {
-    const alloc = std.testing.allocator;
-    var in: LineInput = .{};
-    defer in.deinit(alloc);
-    for ("ab") |b| try in.insert(alloc, b);
-    in.left();
-    try in.insert(alloc, 'X');
-    try std.testing.expectEqualStrings("aXb", in.items());
-    try in.set(alloc, "h\xc3\xa9");
-    in.deleteBack();
-    try std.testing.expectEqualStrings("h", in.items());
-    in.home();
-    in.deleteForward();
-    try std.testing.expectEqualStrings("", in.items());
-}

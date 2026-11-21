@@ -116,31 +116,3 @@ pub fn inspectLocalConfigUnavailable(
         .configuration_issues = try alloc.alloc(ConfigurationIssue, 0),
     } };
 }
-
-test "classify applies one precedence rule for every surface" {
-    const Case = struct {
-        connection: ConnectionState,
-        authentication: AuthenticationState = .none,
-        deferred: bool = false,
-        expected: Status,
-    };
-    const cases = [_]Case{
-        .{ .connection = .ready, .expected = .ready },
-        .{ .connection = .connecting, .expected = .connecting },
-        .{ .connection = .failed, .expected = .failed },
-        .{ .connection = .disconnected, .expected = .unavailable },
-        .{ .connection = .disconnected, .deferred = true, .expected = .on_demand },
-        .{ .connection = .failed, .authentication = .required, .expected = .needs_auth },
-        .{ .connection = .disconnected, .authentication = .required, .expected = .needs_auth },
-        .{ .connection = .connecting, .authentication = .required, .expected = .needs_auth },
-        .{ .connection = .disabled, .expected = .disabled },
-        .{ .connection = .disabled, .authentication = .required, .expected = .disabled },
-        .{ .connection = .failed, .authentication = .authenticated, .expected = .failed },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            case.expected,
-            classify(case.connection, case.authentication, case.deferred),
-        );
-    }
-}

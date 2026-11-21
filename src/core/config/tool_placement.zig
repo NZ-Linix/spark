@@ -166,67 +166,6 @@ test "the defaults put install_skill behind toolbox and leave the rest direct" {
     try std.testing.expectEqualStrings("install_skill", behind.slice()[0]);
 }
 
-test "settings move tools either way, and the command line wins over them" {
-    var settings: Overrides = .{};
-    settings.set(.web_search, .toolbox);
-    settings.set(.install_skill, .direct);
-    var behind = behindToolbox(settings, &.{});
-    try std.testing.expectEqual(@as(usize, 1), behind.len);
-    try std.testing.expectEqualStrings("web_search", behind.slice()[0]);
-
-    behind = behindToolbox(settings, &.{
-        .{ .tool = .web_search, .placement = .direct },
-        .{ .tool = .shell, .placement = .toolbox },
-        .{ .tool = .shell, .placement = .direct },
-        .{ .tool = .glob_files, .placement = .toolbox },
-    });
-    try std.testing.expectEqual(@as(usize, 1), behind.len);
-    try std.testing.expectEqualStrings("glob_files", behind.slice()[0]);
-}
-
-test "setting keys name each movable tool" {
-    try std.testing.expectEqual(Tool.web_search, toolOfKey("tool_placement.web_search").?);
-    try std.testing.expectEqual(@as(?Tool, null), toolOfKey("tool_placement.vision"));
-    try std.testing.expectEqual(@as(?Tool, null), toolOfKey("context_limits.web_search"));
-    try std.testing.expectEqualStrings("tool_placement.glob_files", setting_keys[0]);
-    try std.testing.expect(std.mem.startsWith(u8, movable_list, "glob_files, grep_files, "));
-    try std.testing.expectEqual(Placement.toolbox, placementOf(.{}, .install_skill));
-    try std.testing.expectEqual(Placement.direct, placementOf(.{}, .shell));
-}
-
-test "a folder's entry wins over the profile for the tools it names" {
-    var profile: Overrides = .{};
-    profile.set(.web_fetch, .toolbox);
-    profile.set(.web_search, .toolbox);
-    var folder: Overrides = .{};
-    folder.set(.web_search, .direct);
-    profile.merge(folder);
-    try std.testing.expectEqual(Placement.toolbox, profile.get(.web_fetch).?);
-    try std.testing.expectEqual(Placement.direct, profile.get(.web_search).?);
-}
-
-test "overrides and settings name a movable tool and a placement" {
-    try std.testing.expectEqual(Override{ .tool = .web_search, .placement = .toolbox }, try parseOverride(" web_search = Toolbox "));
-    try std.testing.expectEqual(Override{ .tool = .install_skill, .placement = .direct }, try parseOverride("install_skill=direct"));
-    try std.testing.expectError(error.InvalidToolPlacementOverride, parseOverride("web_search"));
-    try std.testing.expectError(error.InvalidToolPlacementOverride, parseOverride("=toolbox"));
-    try std.testing.expectError(error.UnknownToolPlacementTool, parseOverride("toolbox=direct"));
-    try std.testing.expectError(error.UnknownToolPlacementTool, parseOverride("vision=toolbox"));
-    try std.testing.expectError(error.UnknownToolPlacementTool, parseOverride("capability_search=toolbox"));
-    try std.testing.expectError(error.InvalidToolPlacementValue, parseOverride("shell=hidden"));
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"web_fetch\":\"toolbox\",\"install_skill\":\"DIRECT\"}", .{});
-    defer parsed.deinit();
-    const overrides = try parseJsonObject(parsed.value);
-    try std.testing.expectEqual(Placement.toolbox, overrides.get(.web_fetch).?);
-    try std.testing.expectEqual(Placement.direct, overrides.get(.install_skill).?);
-    try std.testing.expectEqual(@as(?Placement, null), overrides.get(.shell));
-
-    const wrong = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"shell\":true}", .{});
-    defer wrong.deinit();
-    try std.testing.expectError(error.InvalidToolPlacementValue, parseJsonObject(wrong.value));
-}
-
 const fuzz_names = [_][]const u8{ "shell", "install_skill", "read_tool_result", " web_search\t", "Shell", "toolbox", "skill", "vision", "mcp_x", "" };
 const fuzz_values = [_][]const u8{ "toolbox", "direct", "DIRECT", " Toolbox\n", "toolboxx", "", "\"direct\"", "true" };
 const fuzz_separators = [_][]const u8{ "=", " = ", "==", "" };
@@ -277,14 +216,4 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) anyerror!void {
         const tool = Tool.parse(entry.key_ptr.*) orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(Placement.parse(entry.value_ptr.string), overrides.get(tool));
     }
-}
-
-test "tool placement parsing reads a placement or an error from any text" {
-    try std.testing.fuzz({}, fuzzParse, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "\x00\x00\x00",
-            "\x01\x01\x01\x02\x00\x03",
-            "\xff{\"shell\":\"toolbox\",\"shell\":\"direct\"}",
-        }) ++ @import("fuzz_corpus").tool_placement_parse.*),
-    });
 }

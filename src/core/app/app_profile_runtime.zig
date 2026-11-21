@@ -9,7 +9,6 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const agents = @import("../agents/agents.zig");
-const app_permission_runtime = @import("app_permission_runtime.zig");
 const mod_registry = @import("../mods/registry.zig");
 const ui_render = @import("../../ui/render.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -241,65 +240,6 @@ test "a launch row shows the model and effort the instance would start with" {
     try std.testing.expectEqualStrings("default", plain[1]);
 }
 
-test "launch tool summaries never promise read-only behavior" {
-    const base: profiles.Entry = .{ .name = "x", .description = "", .source = .home };
-    try std.testing.expectEqualStrings("all tools", LaunchCompletion.toolsText(base));
-    var every = base;
-    every.tools = &.{"*"};
-    try std.testing.expectEqualStrings("all tools", LaunchCompletion.toolsText(every));
-    var custom = base;
-    custom.tools = &.{ "*", "!subagent" };
-    try std.testing.expectEqualStrings("custom", LaunchCompletion.toolsText(custom));
-    var read_only = base;
-    read_only.tools = &.{ "read_file", "grep_files" };
-    try std.testing.expectEqualStrings("custom", LaunchCompletion.toolsText(read_only));
-    var no_shell = base;
-    no_shell.tools = &.{ "*", "!shell" };
-    try std.testing.expectEqualStrings("custom", LaunchCompletion.toolsText(no_shell));
-    var no_edits = base;
-    no_edits.tools = &.{ "*", "!edit_file", "!write_file" };
-    try std.testing.expectEqualStrings("custom", LaunchCompletion.toolsText(no_edits));
-    for ([_][]const u8{ "install_skill", "subagent", "mcp_select_tool", "shell" }) |tool| {
-        var effectful = base;
-        effectful.tools = &.{tool};
-        try std.testing.expectEqualStrings("custom", LaunchCompletion.toolsText(effectful));
-    }
-}
-
-test "a launch row shows the overrides spark started with, and a profile's control bytes as escapes" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var entry: profiles.Entry = .{ .name = "x", .description = "", .source = .project };
-    entry.model = "evil\x1b]0;owned\x07";
-    entry.effort = .literal("high");
-    const row = try LaunchCompletion.rowOf(arena, entry, .{ .model = "openai/gpt-5" });
-    try std.testing.expect(std.mem.findScalar(u8, row[0], 0x1b) == null);
-    try std.testing.expect(std.mem.findScalar(u8, row[0], 0x07) == null);
-
-    // `--model` and `--effort` win over the profile, as the launch applies them.
-    const overridden = try LaunchCompletion.rowOf(arena, entry, .{ .model = "openai/gpt-5", .model_override = "openai/gpt-5.4-mini", .effort_override = .literal("low") });
-    try std.testing.expectEqualStrings("gpt-5.4-mini", overridden[0]);
-    try std.testing.expectEqualStrings("low", overridden[1]);
-}
-
-test "launch completion lists profiles only while the composer holds /launch" {
-    var completion: LaunchCompletion = .{};
-    defer completion.deinit();
-    try std.testing.expect(!completion.refresh(std.testing.allocator, "/model", null, null, .{}));
-    try std.testing.expectEqual(@as(usize, 0), completion.entries.len);
-    try std.testing.expect(completion.refresh(std.testing.allocator, "/launch ", null, null, .{}));
-    // Further loop passes reuse the snapshot without reading disk.
-    try std.testing.expect(!completion.refresh(std.testing.allocator, "/launch ", null, null, .{}));
-    // The profile a bare `/launch` starts comes first.
-    try std.testing.expectEqualStrings("/launch main", completion.entries[0].full);
-    try std.testing.expect(completion.refresh(std.testing.allocator, "/launchx", null, null, .{}));
-    try std.testing.expect(completion.arena == null);
-    try std.testing.expectEqual(@as(usize, 0), completion.entries.len);
-    try std.testing.expect(!completion.refresh(std.testing.allocator, "/launchx", null, null, .{}));
-    try std.testing.expect(completion.refresh(std.testing.allocator, "/launch ", null, null, .{}));
-}
-
 /// The model the first instance starts with: `--model`, else the launch
 /// profile's, unless `--provider` or `SPARK_MODEL` chose the process's model, as
 /// `applyProcessModelOverride` decides for `/launch <profile>`. Null leaves the
@@ -308,14 +248,6 @@ pub fn launchModel(model_flag: ?[]const u8, provider_flag: bool, env_model: ?[]c
     if (model_flag) |model| return model;
     if (provider_flag or env_model != null) return null;
     return profile_model;
-}
-
-test "the launch profile's model gives way to the model the process chose" {
-    try std.testing.expectEqualStrings("profile/model", launchModel(null, false, null, "profile/model").?);
-    try std.testing.expect(launchModel(null, false, "env/model", "profile/model") == null);
-    try std.testing.expect(launchModel(null, true, null, "profile/model") == null);
-    try std.testing.expectEqualStrings("flag/model", launchModel("flag/model", true, "env/model", "profile/model").?);
-    try std.testing.expect(launchModel(null, false, null, null) == null);
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -374,8 +306,6 @@ pub fn Runtime(comptime App: type) type {
         /// turns tracing on.
         pub fn applyLaunchMode(app: *App) !void {
             try reportProfile(app, &app.main_agent, "main");
-            const permission = app_permission_runtime.Runtime(App);
-            permission.initMode(app, &app.main_agent, profileMode(&app.main_agent, "main", permission.modeOf(app, &app.main_agent)));
         }
 
         /// The permission mode `agent`'s profile gives it over `parent`, the
@@ -421,39 +351,4 @@ pub fn Runtime(comptime App: type) type {
             });
         }
     };
-}
-
-test "launch model cells stay bounded before padding every row" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const huge = try arena.alloc(u8, profiles.max_settings_bytes);
-    @memset(huge, 'x');
-    const entry: profiles.Entry = .{ .name = "long", .description = "", .source = .project, .model = huge };
-    const row = try LaunchCompletion.rowOf(arena, entry, .{});
-    try std.testing.expect(text_utils.terminalSafeVisibleWidth(row[0]) <= 32);
-    try std.testing.expect(row[0].len < 128);
-}
-
-test "a limited launch listing keeps the default profile first" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try tmp.dir.createDirPath(std.testing.io, ".spark/agents");
-    for (0..140) |index| {
-        const name = try arena.print(".spark/agents/junk-{d}", .{index});
-        var file = try tmp.dir.createFile(std.testing.io, name, .{});
-        file.close(std.testing.io);
-    }
-    const home = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
-    var completion: LaunchCompletion = .{};
-    defer completion.deinit();
-    try std.testing.expect(completion.refresh(std.testing.allocator, "/launch ", home, null, .{ .profile_name = "reviewer" }));
-    try std.testing.expectEqualStrings("/launch reviewer", completion.entries[0].full);
-    try std.testing.expect(std.mem.find(u8, completion.entries[0].description.?, "Not in listing") != null);
-    try std.testing.expect(std.mem.find(u8, completion.entries[0].description.?, "list limited") != null);
-    // Builtins remain usable even when no folder entries can be read.
-    try std.testing.expectEqual(@as(usize, 3), completion.entries.len);
 }

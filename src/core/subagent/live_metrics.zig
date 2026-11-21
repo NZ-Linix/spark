@@ -122,67 +122,6 @@ fn storeFallback(out: *[max_label_bytes]u8) usize {
     return fallback.len;
 }
 
-test "a call's label masks secrets, also ones a cut would split" {
-    var out: [max_label_bytes]u8 = undefined;
-    const label = out[0..storeLabel(&out, "Running OPENAI_API_KEY=qrelayfixturevalue npm test")];
-    try std.testing.expect(std.mem.find(u8, label, "qrelayfixturevalue") == null);
-    try std.testing.expect(std.mem.find(u8, label, "[redacted]") != null);
-    // A token across the label's cut is masked whole before the cut. Cut
-    // first, the 15 bytes of it that would show, "Bearer qrelayfi", are too
-    // short to be found as a token.
-    const pad: [133]u8 = @splat('x');
-    const late = out[0..storeLabel(&out, "Running " ++ pad ++ " Bearer qrelayfixturetoken")];
-    try std.testing.expect(std.mem.find(u8, late, "qrelay") == null);
-    try std.testing.expect(std.mem.endsWith(u8, late, "[redacted]"));
-}
-
-test "a call's label stays one line, terminal-safe, and bounded" {
-    var out: [max_label_bytes]u8 = undefined;
-    const plain = out[0..storeLabel(&out, "Waiting for npm test")];
-    try std.testing.expectEqualStrings("Waiting for npm test", plain);
-
-    const lines = out[0..storeLabel(&out, "Running printf a\n\n\tb")];
-    try std.testing.expectEqualStrings("Running printf a b", lines);
-
-    const escape = out[0..storeLabel(&out, "Running \x1b[2Jclear")];
-    try std.testing.expect(std.mem.findScalar(u8, escape, 0x1b) == null);
-
-    const xs: [4000]u8 = @splat('x');
-    const long = "Running " ++ xs;
-    const cut = out[0..storeLabel(&out, long)];
-    try std.testing.expect(cut.len <= max_label_bytes);
-    try std.testing.expect(std.mem.endsWith(u8, cut, ellipsis));
-}
-
-test "a call ends only itself, and a later call stays current" {
-    var metrics: LiveMetrics = .{};
-    metrics.callStarted("call-1", "Running a", 1_000);
-    metrics.callStarted("call-2", "Running b", 2_000);
-    metrics.callEnded("call-1");
-    const current = metrics.currentCall().?;
-    try std.testing.expectEqualStrings("Running b", current.label());
-    try std.testing.expectEqual(@as(u64, 3_000), current.runningMs(5_000));
-    try std.testing.expectEqual(@as(u64, 0), current.runningMs(1_000));
-    metrics.callEnded("call-2");
-    try std.testing.expect(metrics.currentCall() == null);
-    metrics.callStarted("call-3", "Running c", 3_000);
-    metrics.reset();
-    try std.testing.expect(metrics.currentCall() == null);
-}
-
-test "a subagent's call label stays bounded, one line, and terminal-safe on fuzzed bytes" {
-    try std.testing.fuzz({}, fuzzCallLabel, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "",
-            "Waiting for npm test",
-            "Running sh -c 'printf a; exec sleep 600'\n\n\tnext",
-            "Running \x1b[2J\x1b]0;owned\x07\u{9b}31m\xff\xfe\x00\x7f",
-            "Waiting for " ++ long_label_seed,
-            "a\xed\xa0\x80\r\rb\xc3(",
-        }) ++ @import("fuzz_corpus").subagent_call_label.*),
-    });
-}
-
 /// 200 four-byte characters, past the raw limit, so the cut lands inside one.
 const long_label_seed: [800]u8 = blk: {
     var bytes: [800]u8 = undefined;

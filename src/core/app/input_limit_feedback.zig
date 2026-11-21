@@ -16,7 +16,7 @@ pub fn report(
             attempted_bytes,
             switch (owner) {
                 .composer => "prompt_resource",
-                .question_freeform, .approval_amendment => "decision_input",
+                .question_freeform => "decision_input",
             },
         },
     );
@@ -30,14 +30,14 @@ pub fn report(
 
     app.shell.render_requests.request(switch (owner) {
         .composer => .footer,
-        .question_freeform, .approval_amendment => .modal,
+        .question_freeform => .modal,
     });
     try app.writeDomainNotice(.{
         .topic = "input",
         .tone = .@"error",
         .body = switch (owner) {
             .composer => "That edit exceeds the local prompt safety limit and was not applied.",
-            .question_freeform, .approval_amendment => "That edit exceeds the input limit and was not applied.",
+            .question_freeform => "That edit exceeds the input limit and was not applied.",
         },
     }, true);
 }

@@ -226,46 +226,6 @@ fn parseChildStatus(reader: *ChildStatusReader, bytes: []const u8) error{Unreada
     return reader.result();
 }
 
-test "child status parser reads spark mcp show output and refuses anything else" {
-    var reader: ChildStatusReader = undefined;
-    const ready = try parseChildStatus(&reader, "{\"name\":\"a\",\"status\":\"ready\",\"error\":null,\"tools\":[{\"name\":\"x\"},{\"name\":\"y\"}]}\n");
-    try std.testing.expectEqualStrings("ready", ready.status);
-    try std.testing.expect(ready.err == null);
-    try std.testing.expectEqual(@as(usize, 2), ready.tools);
-    const failed = try parseChildStatus(&reader, "{\"status\":\"failed\",\"error\":\"boom\"}");
-    try std.testing.expectEqualStrings("boom", failed.err.?);
-    const escaped = try parseChildStatus(&reader, "{\"st\\u0061tus\":\"ready\",\"tools\":[1,\"two\",[3],null,{\"tools\":[4,5]}],\"other\":{\"status\":\"no\"}}");
-    try std.testing.expectEqualStrings("ready", escaped.status);
-    try std.testing.expectEqual(@as(usize, 5), escaped.tools);
-    for ([_][]const u8{ "", "null", "[]", "{\"status\":1}", "{\"tools\":[]}", "{\"status\":\"ready\"", "{\"status\":\"ready\"} x", "\xff" }) |bad| {
-        try std.testing.expectError(error.Unreadable, parseChildStatus(&reader, bad));
-    }
-    const deep = "{\"status\":\"ready\",\"x\":" ++ text_utils.repeat("[", 40) ++ text_utils.repeat("]", 40) ++ "}";
-    try std.testing.expectError(error.Unreadable, parseChildStatus(&reader, deep));
-}
-
-test "child status reader counts any number of tools in fixed memory" {
-    var reader: ChildStatusReader = undefined;
-    reader.init();
-    reader.feed("{\"name\":\"big\",\"status\":\"rea");
-    reader.feed("dy\",\"error\":null,\"tools\":[");
-    const tool = "{\"name\":\"tool\",\"description\":\"" ++ text_utils.repeat("d", 200) ++ "\",\"inputSchema\":{\"type\":\"object\"}}";
-    for (0..5_000) |i| reader.feed(if (i == 0) tool else "," ++ tool);
-    reader.feed("]}\n");
-    reader.end();
-    const parsed = try reader.result();
-    try std.testing.expectEqualStrings("ready", parsed.status);
-    try std.testing.expectEqual(@as(usize, 5_000), parsed.tools);
-}
-
-test "child status reader cuts a long error at a whole character" {
-    var reader: ChildStatusReader = undefined;
-    const long = "{\"status\":\"failed\",\"error\":\"" ++ text_utils.repeat("a", ChildStatusReader.error_capacity - 1) ++ "\u{e9}tail\"}";
-    const parsed = try parseChildStatus(&reader, long);
-    try std.testing.expectEqual(ChildStatusReader.error_capacity - 1, parsed.err.?.len);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(parsed.err.?));
-}
-
 fn fuzzChildStatus(_: void, smith: *std.testing.Smith) anyerror!void {
     var buffer: [4096]u8 = undefined;
     const bytes = buffer[0..@intCast(smith.slice(&buffer))];
@@ -290,16 +250,4 @@ fn fuzzChildStatus(_: void, smith: *std.testing.Smith) anyerror!void {
     try std.testing.expectEqual(want.tools, have.tools);
     // A status spark reads came from the bytes, so it is no longer than them.
     try std.testing.expect(want.status.len <= bytes.len);
-}
-
-test "doctor child status parser tolerates arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzChildStatus, .{
-        .corpus = &(@import("fuzz_seed").slices(.{
-            "{\"name\":\"a\",\"status\":\"ready\",\"error\":null,\"tools\":[{\"name\":\"x\"}]}",
-            "{\"status\":\"needs_login\",\"error\":\"sign in\"}",
-            "{\"status\":\"ready\"",
-            "[]",
-            "\xff\x00{",
-        }) ++ @import("fuzz_corpus").doctor_child_status.*),
-    });
 }

@@ -23,16 +23,6 @@ const json_option = command_specs.OptionDoc{ .flag = "--json", .description = "E
 /// Options for local commands that only take `--json`.
 pub const json_only_options = [_]command_specs.OptionDoc{json_option};
 
-const login_providers = [_]command_specs.SubcommandDoc{
-    .{ .usage = "vercel", .description = "the model connection (the default)", .options = &login_options },
-    .{ .usage = "codex", .description = "ChatGPT subscription" },
-    .{ .usage = "grok", .description = "Grok subscription" },
-};
-
-pub const login_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--api-key", .description = "Paste a the model connection API key instead of signing in through the browser" },
-};
-
 pub const sessions_options = [_]command_specs.OptionDoc{
     .{ .flag = "--live", .description = "List only the sessions an spark process has open now, with their subagents" },
     .{ .flag = "--all", .description = "List saved sessions across every workspace in this profile" },
@@ -50,11 +40,6 @@ const sessions_subcommands = [_]command_specs.SubcommandDoc{
 
 const models_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "ls", .description = "List available models (default)", .options = &.{json_option} },
-};
-
-pub const usage_options = [_]command_specs.OptionDoc{
-    .{ .flag = "--period <today|7d|month>", .description = "Select the period, in UTC days (default: month)" },
-    json_option,
 };
 
 /// Options for `spark doctor`. Its parser in `src/core/cli/cli_surface.zig`
@@ -113,17 +98,17 @@ pub const session_options = [_]command_specs.OptionDoc{
     json_option,
 };
 
-pub const acp_options = agentRunOptions("sessions this server starts", .without_provider_order) ++ [_]command_specs.OptionDoc{
+pub const acp_options = agentRunOptions("sessions this server starts") ++ [_]command_specs.OptionDoc{
     .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
 };
 
-pub const acp_usage = "acp " ++ agent_run_usage_base ++ " [--log-file <path>]";
+pub const acp_usage = "acp " ++ agent_run_usage ++ " [--log-file <path>]";
 
-pub const pr_options = agentRunOptions("this request", .with_provider_order) ++ [_]command_specs.OptionDoc{
+pub const pr_options = agentRunOptions("this request") ++ [_]command_specs.OptionDoc{
     .{ .flag = "--create", .description = "Publish the drafted pull request via the GitHub CLI" },
 };
 
-const issue_options = agentRunOptions("this request", .with_provider_order) ++ [_]command_specs.OptionDoc{
+const issue_options = agentRunOptions("this request") ++ [_]command_specs.OptionDoc{
     .{ .flag = "--create", .description = "Publish the drafted issue via the GitHub CLI" },
 };
 
@@ -188,49 +173,34 @@ pub const mcp_approve_options = [_]command_specs.OptionDoc{
     .{ .flag = "--all", .description = "Approve every project server" },
 };
 
-const permission_modes = [_][]const u8{ "ask", "auto", "full-access" };
-/// The built-in providers. A configured connection's name is also accepted.
-const builtin_providers = [_][]const u8{ "gateway", "codex", "grok" };
-
-/// Whether a command takes the gateway provider-order flags.
-const ProviderOrder = enum { with_provider_order, without_provider_order };
+const permission_modes = [_][]const u8{"full-access"};
 
 /// The flags that shape an agent run, the same on every command that runs the
 /// agent: `spark ask`, `spark pr`, `spark issue`, and `spark acp`. `scope` names what they
-/// shape, such as "this request". `src/core/cli/agent_run_flags.zig` parses
-/// them. `spark acp` leaves out the provider-order flags, because ACP sessions
-/// don't apply gateway provider routing.
-fn agentRunOptions(comptime scope: []const u8, comptime provider_order: ProviderOrder) [if (provider_order == .with_provider_order) 15 else 12]command_specs.OptionDoc {
-    const all = [_]command_specs.OptionDoc{
-        .{ .flag = "--permission-mode <mode>", .description = "Set the permission mode for " ++ scope ++ ": ask, auto, or full-access", .values = &permission_modes },
-        .{ .flag = "--ask", .description = "Ask before each action that needs permission" },
-        .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
+/// shape, such as "this request". `src/core/cli/agent_run_flags.zig` parses them.
+fn agentRunOptions(comptime scope: []const u8) [10]command_specs.OptionDoc {
+    return .{
+        .{ .flag = "--permission-mode <mode>", .description = "Set the permission mode for " ++ scope ++ "; full-access is the only mode", .values = &permission_modes },
         .{ .flag = "--full-access", .description = "Disable spark permission checks" },
         .{ .flag = "--yolo", .description = "Alias for --full-access" },
-        .{ .flag = "--provider <name>", .description = "Override the model provider for " ++ scope ++ " (gateway, codex, grok, or a configured name)", .values = &builtin_providers },
+        .{ .flag = "--provider <name>", .description = "Override the model provider for " ++ scope ++ " with a configured provider name" },
         .{ .flag = "--model <id>", .description = "Override the model for " ++ scope },
         .{ .flag = "--effort <level>", .description = "Override the reasoning effort for " ++ scope },
         .{ .flag = "--fast", .description = "Enable Fast mode for " ++ scope ++ " when the model supports it" },
         .{ .flag = "--no-fast", .description = "Disable Fast mode for " ++ scope },
         .{ .flag = "--ultrafast", .description = "Request Ultrafast mode for " ++ scope ++ " when the model supports it" },
         .{ .flag = "--no-ultrafast", .description = "Disable Ultrafast mode for " ++ scope },
-        .{ .flag = "--provider-order <a,b,...>", .description = "Prefer these gateway providers in order for " ++ scope },
-        .{ .flag = "--provider-strict", .description = "Restrict " ++ scope ++ " to only the providers in --provider-order" },
-        .{ .flag = "--no-provider-strict", .description = "Clear the provider restriction for " ++ scope },
     };
-    return if (provider_order == .with_provider_order) all else all[0..12].*;
 }
 
 /// The usage-line form of `agentRunOptions`.
-const agent_run_usage_base = "[--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast]";
-const agent_run_usage = agent_run_usage_base ++ " [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict]";
+const agent_run_usage = "[--permission-mode <mode>|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast]";
 
-pub const ask_options = agentRunOptions("this request", .with_provider_order) ++ [_]command_specs.OptionDoc{
+pub const ask_options = agentRunOptions("this request") ++ [_]command_specs.OptionDoc{
     .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
     .{ .flag = "--system TEXT", .description = "Replace the built-in system prompt for this request" },
     json_option,
     .{ .flag = "--quiet", .description = "Suppress assistant output" },
-    .{ .flag = "--prompt-permissions", .description = "Prompt for Y/N permission approval when stdin is a TTY" },
     .{ .flag = "--timeout <seconds>", .description = "Time limit for each shell command the agent runs" },
     .{ .flag = "--config <key=value>", .description = "Override a setting for this request, with the keys spark config set takes; repeatable" },
     .{ .flag = "--no-save", .description = "Do not save the session; incompatible with --resume" },
@@ -251,7 +221,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask " ++ agent_run_usage ++ " [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>",
+        .usage = "ask " ++ agent_run_usage ++ " [--image PATH] [--system TEXT] [--json] [--quiet] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &ask_options,
         .details = &.{
@@ -261,7 +231,6 @@ pub const top_level_specs = [_]TopLevelSpec{
             "JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. cache_read_tokens and cache_write_tokens appear only when the provider reports them. Subagent usage and dollar spend are excluded.",
             "JSON subagents appears only when a subagent did work in this request. It lists each one in the order it first ran, with its name, id, and usage in the same shape, counted for this request alone. spark session <session_id>/<name> reads one and prints the same id.",
             "--system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.",
-            "With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.",
         },
     },
     .{
@@ -288,33 +257,12 @@ pub const top_level_specs = [_]TopLevelSpec{
         .summary = "Draft or publish a GitHub issue",
         .options = &issue_options,
     },
-    // Removed: spark connects only to endpoints added with /connect. Kept
-    // hidden so old scripts get a clear message instead of an unknown command.
-    .{ .kind = .login, .token = "login", .hidden_from_top_level_help = true, .usage = "login", .summary = "Removed; run /connect in spark" },
-    .{ .kind = .logout, .token = "logout", .hidden_from_top_level_help = true, .usage = "logout", .summary = "Removed; run /connect in spark" },
-    .{ .kind = .setup, .token = "setup", .hidden_from_top_level_help = true, .usage = "setup", .summary = "Removed; run /connect in spark" },
     .{
         .kind = .status,
         .token = "status",
         .usage = "status [--json]",
         .summary = "Show configuration and runtime information",
         .options = &.{json_option},
-    },
-    .{
-        .kind = .permissions,
-        .token = "permissions",
-        .usage = "permissions [--json]",
-        .summary = "Show the permission mode and rules",
-        .options = &.{json_option},
-        .details = &.{
-            "Modes:",
-            "  ask          Prompt before sensitive tool calls",
-            "  auto         Apply rules, then review unresolved sensitive tool calls (default)",
-            "  full-access  Disable spark permission checks",
-            "",
-            "Change the mode from the interactive shell with `/permissions [ask|auto|full-access|reset]`,",
-            "and manage persistent allow rules with `/allowlist`.",
-        },
     },
     .{
         .kind = .mcp,
@@ -336,7 +284,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .provider,
         .token = "provider",
         .usage = "provider <name>",
-        .summary = "Choose the model provider used by spark",
+        .summary = "Choose a configured provider for spark",
     },
     .{
         .kind = .doctor,
@@ -344,13 +292,6 @@ pub const top_level_specs = [_]TopLevelSpec{
         .usage = "doctor [--json] [--fix] [--deep]",
         .summary = "Check that spark can work here, with a fix for each problem",
         .options = &doctor_options,
-    },
-    .{
-        .kind = .teams,
-        .token = "teams",
-        .hidden_from_top_level_help = true,
-        .usage = "teams",
-        .summary = "Removed",
     },
     .{
         .kind = .session,
@@ -390,33 +331,22 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
-        .kind = .credits,
-        .token = "credits",
-        .aliases = &.{"balance"},
-        .hidden_from_top_level_help = true,
-        .usage = "credits [--json]",
-        .summary = "Removed",
-        .options = &.{json_option},
-    },
-    .{
-        .kind = .usage,
-        .token = "usage",
-        .usage = "usage [--period <today|7d|month>] [--json]",
-        .summary = "Show your provider's usage and spend",
-        .options = &usage_options,
-        .details = &.{
-            "With AI Gateway, reads its usage reports: with spark login, your spend on the team and your budget; with an API key, that key's spend.",
-            "With Codex, reads your ChatGPT plan's limits and activity; with Grok, your plan's allowance and credits.",
-            "Finished days are cached under ~/.spark and fetched at most once a day.",
-        },
-    },
-    .{
         .kind = .upgrade,
         .token = "upgrade",
         .aliases = &.{"update"},
         .usage = "upgrade [--channel <stable|dev>] [--json]",
         .summary = "Upgrade spark on the selected release channel",
         .options = &upgrade_options,
+    },
+    .{
+        .kind = .pair,
+        .token = "pair",
+        .usage = "pair",
+        .summary = "Pair an iPhone so it can see and start spark sessions here",
+        .details = &.{
+            "Shows a six-digit code to type into the spark iPhone app, then keeps this computer reachable from the phone.",
+            "Runs spark-bridge, which installs beside spark.",
+        },
     },
     .{
         .kind = .replay,
@@ -490,21 +420,18 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
     } },
     .{ .entries = &.{
-        .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active connection" },
+        .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose a configured provider" },
         .{ .kind = .models, .usage = "models" },
-    } },
-    .{ .entries = &.{
-        .{ .kind = .usage, .usage = "usage [--period <today|7d|month>]", .summary = "Show your provider's usage and spend" },
     } },
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
         .{ .kind = .mcp, .usage = "mcp <command> ..." },
         .{ .kind = .slack, .usage = "slack <install|status|refresh>" },
-        .{ .kind = .permissions, .usage = "permissions" },
         .{ .kind = .workspace, .usage = "workspace" },
         .{ .kind = .config, .usage = "config" },
         .{ .kind = .upgrade, .usage = "upgrade|update", .summary = "Upgrade spark on the selected release channel" },
+        .{ .kind = .pair, .usage = "pair", .summary = "Pair an iPhone" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .completion, .usage = "completion <shell>" },
         .{ .kind = .help, .usage = "help" },
@@ -525,10 +452,7 @@ pub const launch_wide_options = [_]command_specs.OptionDoc{
 /// `spark --help`, and a test checks that the two lists match. The usage line
 /// after a launch-flag mistake is built from this list.
 pub const launch_options = launch_wide_options ++ [_]command_specs.OptionDoc{
-    .{ .flag = "--provider <name>", .description = "", .values = &builtin_providers },
-    .{ .flag = "--provider-order <a,b,...>", .description = "" },
-    .{ .flag = "--provider-strict", .description = "" },
-    .{ .flag = "--no-provider-strict", .description = "" },
+    .{ .flag = "--provider <name>", .description = "" },
     .{ .flag = "--model <id>", .description = "" },
     .{ .flag = "--effort <level>", .description = "" },
     .{ .flag = "--fast", .description = "" },
@@ -536,8 +460,6 @@ pub const launch_options = launch_wide_options ++ [_]command_specs.OptionDoc{
     .{ .flag = "--ultrafast", .description = "" },
     .{ .flag = "--no-ultrafast", .description = "" },
     .{ .flag = "--permission-mode <mode>", .description = "", .values = &permission_modes },
-    .{ .flag = "--ask", .description = "" },
-    .{ .flag = "--auto", .description = "" },
     .{ .flag = "--full-access", .description = "" },
     .{ .flag = "--yolo", .description = "" },
     .{ .flag = "--profile <name>", .description = "" },
@@ -583,15 +505,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--provider <name>",
-        .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
-    },
-    .{
-        .usage = "--provider-order <a,b,...>",
-        .description = "Prefer these gateway providers in order for an interactive session",
-    },
-    .{
-        .usage = "--provider-strict, --no-provider-strict",
-        .description = "Restrict an interactive session to the providers in --provider-order, or clear the restriction",
+        .description = "Override the model provider for an interactive session with a configured provider name",
     },
     .{
         .usage = "--model <id>",
@@ -700,9 +614,7 @@ pub const slash_specs = [_]SlashSpec{
 
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .requires_args = true, .accepts_payload = true },
     .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork", .completion_description = "fork the session before a prompt", .presentation_category = .session },
-    .{ .kind = .connect, .command = "/connect", .help_entry = "/connect", .completion_description = "add an OpenAI-compatible endpoint, its API key, and models", .presentation_category = .account },
-    .{ .kind = .provider, .command = "/provider", .aliases = &.{"/setup"}, .show_aliases_in_completion = false, .help_entry = "/provider", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
-    .{ .kind = .usage, .command = "/usage", .aliases = &.{}, .help_entry = "/usage", .completion_description = "show your provider's usage and spend", .presentation_category = .account },
+    .{ .kind = .provider, .command = "/provider", .help_entry = "/provider", .completion_description = "add an OpenAI-compatible endpoint, its API key, and models", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration and the session ID", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .requires_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
@@ -717,7 +629,6 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast [on|off]", .completion_description = "toggle Fast mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .ultrafast, .command = "/ultrafast", .help_entry = "/ultrafast [on|off|status]", .completion_description = "request Ultrafast mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .prompt, .command = "/prompt", .help_entry = "/prompt [<name>|default|dir add PATH|dir remove PATH]", .completion_description = "replace the whole system prompt with one from your prompt folders", .presentation_category = .model, .has_args = true, .accepts_payload = true },
-    .{ .kind = .search, .command = "/search", .help_entry = "/search [vercel|firecrawl|auto]", .completion_description = "choose the web search provider: Vercel, Firecrawl, or Firecrawl with Vercel as fallback", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the spark version", .presentation_category = .general },
     .{ .kind = .update, .command = "/update", .aliases = &.{"/upgrade"}, .help_entry = "/update", .completion_description = "update spark from GitHub and restart into this session", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
@@ -791,147 +702,4 @@ test "spark config help names settings by their current keys" {
         }
     }
     try std.testing.expect(checked > 0);
-}
-
-test "built-in slash commands register exact active order" {
-    const expected_commands = [_][]const u8{
-        "/help",
-        "/clear",
-        "/new",
-        "/reset",
-        "/resume",
-        "/launch",
-        "/close",
-        "/agents",
-        "/rename",
-        "/fork",
-        "/connect",
-        "/provider",
-        "/stats",
-        "/usage",
-        "/status",
-        "/image",
-        "/images",
-        "/model",
-        "/effort",
-        "/permissions",
-        "/allowlist",
-        "/undo",
-        "/mcp",
-        "/skills",
-        "/copy",
-        "/feedback",
-        "/trace",
-        "/compact",
-        "/settings",
-        "/paste",
-        "/fast",
-        "/ultrafast",
-        "/statusline",
-        "/sound",
-        "/workspace",
-        "/shell",
-        "/prompt",
-        "/search",
-        "/version",
-        "/update",
-        "/quit",
-    };
-
-    try std.testing.expectEqual(expected_commands.len, slash_specs.len);
-    for (expected_commands, slash_specs) |expected, spec| {
-        try std.testing.expectEqualStrings(expected, spec.command);
-    }
-}
-
-test "built-in slash registry resolves primary commands and aliases" {
-    const image = slash_registry.lookup("/img") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(SlashKind.image, image.kind);
-
-    const usage = slash_registry.lookup("/usage") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(SlashKind.usage, usage.kind);
-
-    const quit = slash_registry.matchExact("/exit\t") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(SlashKind.quit, quit.command.kind);
-    try std.testing.expectEqualStrings("/exit", quit.token);
-
-    const model = command_specs.matchedSlashPrefix(slash_registry, "/model\tmodel-id", .model) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("/model", model);
-
-    const credits = slash_registry.lookup("/credits") orelse return error.TestExpectedEqual;
-    try std.testing.expect(credits.requires_prompt_credential);
-
-    const model_command = slash_registry.lookup("/model") orelse return error.TestExpectedEqual;
-    try std.testing.expect(!model_command.requires_prompt_credential);
-    try std.testing.expect(slash_registry.lookup("/models") == null);
-
-    try std.testing.expect(command_specs.matchedSlashPrefix(slash_registry, "/model\nmodel-id", .model) == null);
-}
-
-test "retired appearance slash commands are not registered" {
-    try std.testing.expect(!isExactSlashCommand("/appearance"));
-    try std.testing.expect(!isExactSlashCommand("/input"));
-    try std.testing.expect(!isExactSlashCommand("/maxxing\t"));
-    try std.testing.expect(!isExactSlashCommand("/input lines"));
-    try std.testing.expect(!isExactSlashCommand("/unknown"));
-}
-
-test "built-in paste completion describes clipboard image attachment" {
-    const completion = nthSlashCompletion("/pas", 0) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("/paste", completion);
-
-    const description = nthSlashCompletionDescription("/pas", 0) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("attach an image from the clipboard when supported", description);
-}
-
-test "built-in statusline help and completion include workspace" {
-    const help = try renderSlashHelp(std.testing.allocator);
-    defer std.testing.allocator.free(help);
-    try std.testing.expect(
-        std.mem.find(u8, help, "/statusline [context|session|workspace]") != null,
-    );
-
-    try std.testing.expectEqualStrings(
-        "/statusline workspace",
-        nthSlashCompletion("/statusline w", 0).?,
-    );
-}
-
-test "every launch flag appears in spark --help" {
-    const cli_flags = @import("../core/cli/cli_flags.zig");
-    outer: for (launch_options) |doc| {
-        const name = cli_flags.flagName(doc);
-        if (std.mem.eql(u8, name, "--yolo")) continue;
-        for (top_level_flags) |flag| {
-            var parts = std.mem.splitSequence(u8, flag.usage, ", ");
-            while (parts.next()) |part| {
-                const end = std.mem.findScalar(u8, part, ' ') orelse part.len;
-                if (std.mem.eql(u8, part[0..end], name)) continue :outer;
-            }
-        }
-        std.debug.print("{s} is parsed but missing from top_level_flags\n", .{name});
-        return error.TestExpectedEqual;
-    }
-    // And the other way: help shows no launch flag the parser doesn't read,
-    // apart from the resume words, help, and version, which spark reads first.
-    for (top_level_flags) |flag| {
-        var parts = std.mem.splitSequence(u8, flag.usage, ", ");
-        part: while (parts.next()) |part| {
-            const name = part[0 .. std.mem.findScalar(u8, part, ' ') orelse part.len];
-            for ([_][]const u8{ "-c", "--continue", "-r", "--resume", "-h", "--help", "-v", "--version" }) |early| {
-                if (std.mem.eql(u8, name, early)) continue :part;
-            }
-            for (launch_options) |doc| {
-                if (std.mem.eql(u8, cli_flags.flagName(doc), name)) continue :part;
-            }
-            std.debug.print("{s} is in top_level_flags but the launch parser doesn't read it\n", .{name});
-            return error.TestExpectedEqual;
-        }
-    }
-}
-
-test "the launch usage line pairs each --no- spelling with its flag" {
-    try std.testing.expect(std.mem.startsWith(u8, launch_usage, "usage: spark [--context-limit <spec>] [--add-dir <path>] [--no-additional-dirs] "));
-    try std.testing.expect(std.mem.find(u8, launch_usage, " [--fast|--no-fast] ") != null);
-    try std.testing.expect(std.mem.endsWith(u8, launch_usage, " <command>\n"));
 }

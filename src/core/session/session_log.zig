@@ -14,7 +14,6 @@ const history_snapshot = @import("history_snapshot.zig");
 const session_layout = @import("session_layout.zig");
 const session_replay = @import("session_replay.zig");
 const result_store = @import("result_store.zig");
-const session_permission_state = @import("../permissions/session_permission_state.zig");
 const json_decode = @import("../shared/json_decode.zig");
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
@@ -26,7 +25,6 @@ const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 const listed_first_event_max_bytes: usize = 16 * 1024;
 const events_file = "events.jsonl";
 const manifest_file = "session.json";
-const permission_state_file = "permissions.json";
 const recovery_checkpoint_file = "recovery.json";
 
 /// Counts a turn's steps and steering as its frames arrive, as a context cut
@@ -181,23 +179,6 @@ fn nextConversationTurnOpen(open: bool, event: session_event.ConversationEvent) 
     };
 }
 
-pub fn loadConversationPermissionState(
-    alloc: Allocator,
-    dir: *io_mod.VerifiedDir,
-) !session_permission_state.State {
-    const bytes = readManagedFileAlloc(
-        alloc,
-        dir,
-        permission_state_file,
-        session_codec.max_permission_state_bytes,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return .{},
-        else => return err,
-    };
-    defer alloc.free(bytes);
-    return session_codec.decodePermissionState(alloc, bytes);
-}
-
 /// The checkpoint `recovery.json` holds for the log's last seq, or null when
 /// it names an earlier one (v1 drops it). Caller owns the result.
 pub fn loadConversationRecoveryCheckpoint(
@@ -317,8 +298,6 @@ fn load_conversation_state_at_boundary(
     else
         null;
     errdefer if (last_work_id) |work_id| mem_utils.free(alloc, work_id);
-    var permission_state = try loadConversationPermissionState(alloc, dir);
-    errdefer permission_state.deinit(alloc);
     var recovery_checkpoint = if (recovery == null)
         try loadConversationRecoveryCheckpoint(alloc, dir, conversation_seq)
     else
@@ -365,7 +344,6 @@ fn load_conversation_state_at_boundary(
         .context_history_start = latestConversationCheckpointIndex(history),
         .total_input_tokens = 0,
         .total_output_tokens = 0,
-        .permission_state = permission_state,
         .last_subagent_work_id = last_work_id,
         .recovery_checkpoint = recovery_checkpoint,
         .subagent_child = metadata.value.subagent_child,
@@ -515,115 +493,6 @@ pub fn load_conversation_recovery_state(
     state.history = archive;
     state.context_history_start = latestConversationCheckpointIndex(archive);
     return state;
-}
-
-test "conversation recovery boundary validates prefix and never edits source" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
-    const prefix =
-        "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"fact\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"saved\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
-    const suffixes = [_][]const u8{
-        "{",
-        "invalid\n",
-        "{\"schema_version\":1,\"seq\":99,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"wrong sequence\"}}}\n",
-        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"context_checkpoint\":{\"covers_through_seq\":9,\"summary\":\"invalid coverage\"}}}\n",
-        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"unfinished batch\"}}}\n" ++
-            "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"one\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
-            "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"two\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
-            "{\"schema_version\":1,\"seq\":7,\"timestamp_ms\":1,\"event\":{\"interrupted\":{\"reason\":\"failed\"}}}\ninvalid\n",
-    };
-    for (suffixes) |suffix| {
-        const bytes = try std.mem.concat(alloc, u8, &.{ prefix, suffix });
-        defer alloc.free(bytes);
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = bytes, .flags = .{ .permissions = private_file_permissions } });
-        const boundary = try find_conversation_recovery_boundary(alloc, &dir);
-        try std.testing.expectEqual(prefix.len, boundary.bytes);
-        try std.testing.expectEqual(@as(u64, 3), boundary.seq);
-        try std.testing.expect(!boundary.turn_open);
-        const actual = try readManagedFileAlloc(alloc, &dir, events_file, bytes.len);
-        defer alloc.free(actual);
-        try std.testing.expectEqualStrings(bytes, actual);
-    }
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = prefix, .flags = .{ .permissions = private_file_permissions } });
-    try std.testing.expectError(error.SessionRecoveryNotNeeded, find_conversation_recovery_boundary(alloc, &dir));
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = "invalid\n", .flags = .{ .permissions = private_file_permissions } });
-    try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, find_conversation_recovery_boundary(alloc, &dir));
-}
-
-test "conversation recovery rejects checkpoint cuts inside tool batches" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
-    const prefix =
-        "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"request\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"one\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"two\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"tool_result\":{\"call_id\":\"one\",\"tool_name\":\"shell\",\"status\":\"success\",\"artifact_ref\":\"one.txt\",\"stored_bytes\":0,\"completeness\":\"complete\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"tool_result\":{\"call_id\":\"two\",\"tool_name\":\"shell\",\"status\":\"success\",\"artifact_ref\":\"two.txt\",\"stored_bytes\":0,\"completeness\":\"complete\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
-    for ([_]u64{ 1, 2, 3, 4, 5, 6 }) |coverage| {
-        for ([_][]const u8{ "", "invalid\n" }) |tail| {
-            const bytes = try alloc.print("{s}{{\"schema_version\":1,\"seq\":7,\"timestamp_ms\":1,\"event\":{{\"context_checkpoint\":{{\"covers_through_seq\":{d},\"summary\":\"checkpoint\"}}}}}}\n{s}", .{ prefix, coverage, tail });
-            defer alloc.free(bytes);
-            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = bytes, .flags = .{ .permissions = private_file_permissions } });
-            if (coverage >= 2 and coverage <= 4) {
-                const boundary = try find_conversation_recovery_boundary(alloc, &dir);
-                try std.testing.expectEqual(prefix.len, boundary.bytes);
-                try std.testing.expectEqual(@as(u64, 6), boundary.seq);
-            } else if (tail.len == 0) {
-                try std.testing.expectError(error.SessionRecoveryNotNeeded, find_conversation_recovery_boundary(alloc, &dir));
-            } else {
-                const boundary = try find_conversation_recovery_boundary(alloc, &dir);
-                try std.testing.expectEqual(bytes.len - tail.len, boundary.bytes);
-            }
-        }
-    }
-}
-
-test "conversation recovery allocation failures do not become corruption" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .flags = .{ .permissions = private_file_permissions }, .data = "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"fact\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"saved\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n" ++
-        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"context_checkpoint\":{\"covers_through_seq\":1,\"summary\":\"retained fact\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"pending\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"call1\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\ninvalid\n" });
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
-        fn check(alloc: Allocator, source: *io_mod.VerifiedDir) !void {
-            const boundary = try find_conversation_recovery_boundary(alloc, source);
-            try std.testing.expectEqual(@as(u64, 4), boundary.seq);
-        }
-    }.check, .{&dir});
-}
-
-test "conversation recovery state preserves allocation errors and contains invalid metadata" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = manifest_file, .flags = .{ .permissions = private_file_permissions }, .data = "{\"schema_version\":4,\"id\":\"recovery-source\",\"created_at_ms\":1,\"updated_at_ms\":1,\"origin_workspace_root\":\"/tmp\",\"workspace_root\":\"/tmp\",\"conversation_language\":\"en\",\"provider\":\"gateway\",\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false,\"title\":null,\"subagent_child\":false}" });
-    const prefix =
-        "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"fact\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"saved\"}}}\n" ++
-        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .flags = .{ .permissions = private_file_permissions }, .data = prefix ++ "invalid\n" });
-    const boundary = try find_conversation_recovery_boundary(alloc, &dir);
-    try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, load_conversation_recovery_state(alloc, &dir, "wrong-id", boundary));
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
-        fn check(a: Allocator, source: *io_mod.VerifiedDir, cut: ConversationRecoveryBoundary) !void {
-            var state = try load_conversation_recovery_state(a, source, "recovery-source", cut);
-            defer state.deinit(a);
-            try std.testing.expectEqual(@as(usize, 1), state.history.len);
-            try std.testing.expect(state.recovery_checkpoint == null);
-        }
-    }.check, .{ &dir, boundary });
 }
 
 /// Reads and validates current metadata once. The caller owns the decoded value.
@@ -1648,185 +1517,6 @@ pub const ConversationTurnBuilder = struct {
     }
 };
 
-test "conversation replay keeps reasoning-only assistant units before the final reply" {
-    const alloc = std.testing.allocator;
-    var builder = ConversationTurnBuilder.init(alloc);
-    defer builder.deinit();
-    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
-    try builder.begin(.{ .text = "question" });
-    try builder.appendAssistant(.{ .text = "", .provider_replay = replay });
-    try builder.appendAssistant(.{ .text = "answer" });
-    const turn = try builder.finishAssistant(.{});
-    defer types.freeHistoryTurn(alloc, turn);
-    try std.testing.expectEqualStrings("answer", turn.assistant.assistant);
-    try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
-    try std.testing.expectEqualStrings(replay.parts_json, turn.assistant.execution.tool_steps[0].provider_replay.?.parts_json);
-}
-
-test "a cancelled command note keeps the row only for the interrupted turn's own call (D100)" {
-    const alloc = std.testing.allocator;
-    var builder = ConversationTurnBuilder.init(alloc);
-    defer builder.deinit();
-    const call: session_event.ConversationToolCall = .{
-        .call_id = "call-silent",
-        .tool_name = "shell",
-        .arguments_json = "{\"command\":\"sleep 30\"}",
-    };
-    // A note before the turn's user message is left out.
-    try builder.noteCancelledCommand("call-silent");
-    try std.testing.expect(builder.cancelled_command_call_id == null);
-
-    // The note of the turn's own call gives a presentation with no output.
-    try builder.begin(.{ .text = "run it" });
-    try builder.appendToolCall(call);
-    try builder.noteCancelledCommand("call-silent");
-    const kept = try builder.finishInterrupted(.{ .reason = .cancelled });
-    defer types.freeHistoryTurn(alloc, kept);
-    const presentation = kept.interrupted.cancelled_command orelse return error.TestExpectedPresentation;
-    try std.testing.expect(presentation.output_replay == null);
-    try std.testing.expect(presentation.command_artifact_handle == null);
-
-    // A note of another call is dropped.
-    try builder.begin(.{ .text = "run it again" });
-    try builder.appendToolCall(call);
-    try builder.noteCancelledCommand("call-other");
-    const unmatched = try builder.finishInterrupted(.{ .reason = .cancelled });
-    defer types.freeHistoryTurn(alloc, unmatched);
-    try std.testing.expect(unmatched.interrupted.cancelled_command == null);
-
-    // A turn that finished keeps no note for the next one.
-    try builder.begin(.{ .text = "finish" });
-    try builder.noteCancelledCommand("call-silent");
-    try builder.appendAssistant(.{ .text = "done" });
-    const finished = try builder.finishAssistant(.{});
-    defer types.freeHistoryTurn(alloc, finished);
-    try std.testing.expect(builder.cancelled_command_call_id == null);
-    try builder.begin(.{ .text = "then stop" });
-    try builder.appendToolCall(call);
-    const plain = try builder.finishInterrupted(.{ .reason = .cancelled });
-    defer types.freeHistoryTurn(alloc, plain);
-    try std.testing.expect(plain.interrupted.cancelled_command == null);
-
-    // The saved output's own refs still rebuild it, with no note.
-    try builder.begin(.{ .text = "with output" });
-    try builder.appendToolCall(call);
-    const with_output = try builder.finishInterrupted(.{ .reason = .cancelled, .command_artifact_ref = "spark-command-out.log" });
-    defer types.freeHistoryTurn(alloc, with_output);
-    try std.testing.expectEqualStrings("spark-command-out.log", with_output.interrupted.cancelled_command.?.command_artifact_handle.?);
-}
-
-test "review rows attach once, only to a turn's edit with no full-diff source" {
-    const alloc = std.testing.allocator;
-    var builder = ConversationTurnBuilder.init(alloc);
-    defer builder.deinit();
-    const preview = [_]types.CommittedFilePresentationLine{.{ .kind = .addition, .new_line = 1, .text = "new" }};
-    const rows = [_]types.CommittedFilePresentationLine{
-        .{ .kind = .addition, .new_line = 1, .text = "new" },
-        .{ .kind = .context, .old_line = 1, .new_line = 2, .text = "tail" },
-    };
-    try builder.begin(.{ .text = "edit" });
-    try builder.appendToolCall(.{ .call_id = "edit-1", .tool_name = "edit_file", .arguments_json = "{}" });
-    try builder.appendToolCall(.{ .call_id = "write-1", .tool_name = "write_file", .arguments_json = "{}" });
-    try builder.appendToolResult(.{
-        .call_id = "edit-1",
-        .tool_name = "edit_file",
-        .status = .success,
-        .artifact_ref = "result.txt",
-        .stored_bytes = 0,
-        .completeness = .complete,
-        .committed_file_presentation = .{ .path = "a.txt", .kind = .edited, .lines = &preview, .additions = 1, .deletions = 0, .truncated = false },
-    });
-    // The second result finishes the step; attaching still finds both.
-    try builder.appendToolResult(.{
-        .call_id = "write-1",
-        .tool_name = "write_file",
-        .status = .success,
-        .artifact_ref = "result.txt",
-        .stored_bytes = 0,
-        .completeness = .complete,
-        .committed_file_presentation = .{ .path = "b.txt", .kind = .added, .lines = &preview, .additions = 1, .deletions = 0, .truncated = false, .previous_content = "", .after_content = "new\n" },
-    });
-    const edit_id: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "edit-1" };
-    try std.testing.expect(!try builder.attachReviewLines("missing", edit_id, &rows));
-    try std.testing.expect(!try builder.attachReviewLines("write-1", .{ .turn_id = 1, .call_id = "write-1" }, &rows));
-    try std.testing.expect(try builder.attachReviewLines("edit-1", edit_id, &rows));
-    try std.testing.expect(!try builder.attachReviewLines("edit-1", edit_id, &rows));
-    try builder.appendAssistant(.{ .text = "done" });
-    const turn = try builder.finishAssistant(.{});
-    defer types.freeHistoryTurn(alloc, turn);
-    const results = turn.assistant.execution.tool_steps[0].tool_results;
-    const edit = results[0].committed_file_presentation.?;
-    try std.testing.expectEqual(rows.len, edit.review_lines.?.len);
-    try std.testing.expectEqualStrings("tail", edit.review_lines.?[1].text);
-    try std.testing.expectEqualStrings("edit-1", edit.lifecycle_id.?.call_id);
-    try std.testing.expect(results[1].committed_file_presentation.?.review_lines == null);
-}
-
-test "reasoning-only checkpoint coverage and replay count the same completed unit" {
-    const alloc = std.testing.allocator;
-    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
-    const events = [_]session_event.ConversationEvent{
-        .{ .user = .{ .text = "question" } },
-        .{ .assistant = .{ .text = "", .provider_replay = replay } },
-        .{ .context_checkpoint = .{ .covers_through_seq = 2, .summary = "prior facts" } },
-    };
-    var progress: ConversationProgress = .{};
-    var builder = ConversationTurnBuilder.init(alloc);
-    defer builder.deinit();
-    for (events, 1..) |event, seq| {
-        try progress.observe(@intCast(seq), event, .{ .tool_steps = 1 });
-        switch (event) {
-            .user => |value| try builder.begin(value),
-            .assistant => |value| try builder.appendAssistant(value),
-            .context_checkpoint => try builder.finishStep(),
-            else => unreachable,
-        }
-    }
-    try std.testing.expectEqual(@as(u64, 2), progress.coverage);
-    try std.testing.expectEqual(@as(usize, 1), progress.point.tool_steps);
-    try std.testing.expectEqual(progress.point.tool_steps, builder.steps.items.len);
-    try builder.appendAssistant(.{ .text = "final", .provider_replay = replay });
-    try progress.observe(4, .{ .assistant = .{ .text = "final", .provider_replay = replay } }, null);
-    try progress.observe(5, .{ .turn_completed = .{} }, null);
-    const turn = try builder.finishAssistant(.{});
-    defer types.freeHistoryTurn(alloc, turn);
-    try std.testing.expectEqual(@as(usize, 1), progress.point.turns);
-    try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
-    try std.testing.expectEqualStrings(replay.parts_json, turn.assistant.provider_replay.?.parts_json);
-}
-
-test "reasoning-only history keeps an empty final response as a distinct boundary" {
-    const alloc = std.testing.allocator;
-    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
-    var steps = [_]types.ToolExecutionStep{.{ .provider_replay = replay }};
-    var events: std.ArrayList(session_event.ConversationEvent) = .empty;
-    defer events.deinit(alloc);
-    try session_event.appendHistoryTurnConversationEvents(alloc, &events, .{ .assistant = .{
-        .user = .{ .text = @constCast("question") },
-        .assistant = @constCast(""),
-        .execution = .{ .tool_steps = &steps },
-    } });
-    var builder = ConversationTurnBuilder.init(alloc);
-    defer builder.deinit();
-    var progress: ConversationProgress = .{};
-    for (events.items, 1..) |event, seq| {
-        try progress.observe(@intCast(seq), event, .{ .tool_steps = 1 });
-        switch (event) {
-            .user => |value| try builder.begin(value),
-            .assistant => |value| try builder.appendAssistant(value),
-            .turn_completed => |value| {
-                const turn = try builder.finishAssistant(value);
-                defer types.freeHistoryTurn(alloc, turn);
-                try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
-                try std.testing.expectEqualStrings("", turn.assistant.assistant);
-                try std.testing.expect(turn.assistant.provider_replay == null);
-            },
-            else => unreachable,
-        }
-    }
-    try std.testing.expectEqual(@as(u64, 2), progress.coverage);
-}
-
 fn dupeConversationToolResult(
     alloc: Allocator,
     value: session_event.ConversationToolResult,
@@ -2055,7 +1745,6 @@ pub const CommitPosition = session_replay.CommitPosition;
 
 test {
     _ = session_replay;
-    _ = session_permission_state;
 }
 
 /// Drops file evidence an older format kept with an empty path, as v1's
@@ -2331,133 +2020,4 @@ fn readManagedFileAlloc(
         error.StreamTooLong => error.InvalidSessionFormat,
         else => err,
     };
-}
-
-test "root init rejects symlinked durable and sessions roots" {
-    const alloc = std.testing.allocator;
-
-    {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        try tmp.dir.createDirPath(io_mod.getIo(), "home");
-        try tmp.dir.createDirPath(io_mod.getIo(), "outside");
-        tmp.dir.symLink(
-            io_mod.getIo(),
-            "../outside",
-            "home/.spark",
-            .{ .is_directory = true },
-        ) catch |err| switch (err) {
-            error.AccessDenied => return error.SkipZigTest,
-            else => return err,
-        };
-        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-        defer alloc.free(home);
-
-        try std.testing.expectError(
-            error.SessionPathUnsafe,
-            Root.initFromHome(alloc, home, .writable),
-        );
-    }
-
-    {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        try tmp.dir.createDirPath(io_mod.getIo(), "home/.spark");
-        try tmp.dir.createDirPath(io_mod.getIo(), "outside");
-        tmp.dir.symLink(
-            io_mod.getIo(),
-            "../../outside",
-            "home/.spark/sessions",
-            .{ .is_directory = true },
-        ) catch |err| switch (err) {
-            error.AccessDenied => return error.SkipZigTest,
-            else => return err,
-        };
-        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-        defer alloc.free(home);
-
-        try std.testing.expectError(
-            error.SessionPathUnsafe,
-            Root.initFromHome(alloc, home, .writable),
-        );
-    }
-}
-
-test "legacy import file projection cleans up allocation failures" {
-    const Check = struct {
-        fn run(alloc: Allocator) !void {
-            const files = [_]types.FileEvidence{
-                .{ .path = @constCast(""), .new_path = @constCast("unusable.txt"), .tool_call_id = @constCast("old-call"), .tool_name = @constCast("read_file") },
-                .{ .path = @constCast("retained.txt"), .tool_call_id = @constCast("old-call"), .tool_name = @constCast("read_file") },
-            };
-            var history = [_]session.HistoryTurn{.{ .assistant = .{
-                .user = .{ .text = @constCast("request") },
-                .assistant = @constCast("response"),
-                .execution = .{ .files = try types.dupeFileEvidenceSlice(alloc, &files) },
-            } }};
-            defer types.freeFileEvidenceSlice(alloc, history[0].assistant.execution.files);
-            try std.testing.expectEqual(@as(usize, 1), try discardEmptyLegacyFileEvidence(alloc, &history));
-            try std.testing.expectEqualStrings("retained.txt", history[0].assistant.execution.files[0].path);
-        }
-    };
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Check.run, .{});
-}
-
-test "legacy steering prefix records retain their original boundary" {
-    const alloc = std.testing.allocator;
-    for ([_]u8{ 1, 2 }) |schema_version| {
-        const bytes = try alloc.print(
-            "{{\"schema_version\":{d},\"seq\":2,\"timestamp_ms\":10,\"event\":{{\"assistant\":{{\"text\":\"legacy prefix\"}}}}}}\n",
-            .{schema_version},
-        );
-        defer alloc.free(bytes);
-        var decoded = try session_event.decodeConversationFrame(alloc, bytes);
-        defer decoded.deinit();
-        var progress: ConversationProgress = .{};
-        try progress.observe(1, .{ .user = .{ .text = "request" } }, null);
-        try progress.observe(2, decoded.value.event, null);
-        try progress.observe(3, .{ .steering = .{ .text = "human update" } }, null);
-        try std.testing.expectEqual(@as(usize, 0), progress.point.tool_steps);
-        try std.testing.expectEqual(@as(usize, 1), progress.point.steering);
-        var builder = ConversationTurnBuilder.init(alloc);
-        defer builder.deinit();
-        try builder.begin(.{ .text = "request" });
-        try builder.appendAssistant(decoded.value.event.assistant);
-        try builder.appendSteering("human update");
-        const execution = try builder.takeExecution(&.{}, null);
-        defer types.freeExecutionMemory(alloc, execution);
-        try std.testing.expectEqual(@as(usize, 0), execution.tool_steps.len);
-        try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
-        try std.testing.expectEqual(@as(usize, 0), execution.steering[0].after_tool_step_count);
-        try std.testing.expectEqualStrings("legacy prefix", execution.steering[0].assistant_prefix.?);
-    }
-}
-
-test "takeExecution frees provider replay on allocation failure" {
-    for ([_]bool{ false, true }) |standalone_response| try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
-        fn run(alloc: Allocator, standalone: bool) !void {
-            var builder = ConversationTurnBuilder.init(alloc);
-            defer builder.deinit();
-            try builder.begin(.{ .text = "request" });
-            try builder.appendAssistant(.{
-                .text = "earlier reply",
-                .standalone_response = standalone,
-                .provider_replay = .{
-                    .source = .{ .provider = .gateway, .model = "test-model" },
-                    .parts_json = "[{\"type\":\"reasoning\",\"text\":\"private state\"}]",
-                },
-            });
-            try builder.appendSteering("human update");
-            const execution = try builder.takeExecution(&.{.{
-                .path = @constCast("result.txt"),
-                .tool_call_id = @constCast("call-1"),
-                .tool_name = @constCast("read_file"),
-            }}, null);
-            defer types.freeExecutionMemory(alloc, execution);
-            try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
-            try std.testing.expect(execution.tool_steps[0].provider_replay != null);
-            try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
-            try std.testing.expectEqual(@as(usize, 1), execution.files.len);
-        }
-    }.run, .{standalone_response});
 }

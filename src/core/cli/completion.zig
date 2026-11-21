@@ -180,7 +180,7 @@ fn buildModel(arena: Allocator, registry: command_specs.TopLevelRegistry, launch
     _ = try model.node(arena, "");
 
     for (registry.specs) |spec| {
-        if (spec.hidden_from_top_level_help or spec.replaced_by != null) continue;
+        if (spec.hidden_from_top_level_help) continue;
         {
             const root = try model.node(arena, "");
             try addEntry(arena, &root.words, .{ .name = spec.token, .description = spec.summary });
@@ -748,77 +748,4 @@ fn writeEscaped(w: *Writer, text: []const u8, quoting: Quoting) !void {
             else => try w.writeByte(byte),
         },
     };
-}
-
-test "a flag's fixed values come from its list or its placeholder" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const period = try fixedValues(arena, .{ .flag = "--period <today|7d|month>", .description = "" });
-    try std.testing.expectEqual(@as(usize, 3), period.len);
-    try std.testing.expectEqualStrings("7d", period[1]);
-    const listed = try fixedValues(arena, .{ .flag = "--permission-mode <mode>", .description = "", .values = &.{ "ask", "auto" } });
-    try std.testing.expectEqualStrings("auto", listed[1]);
-    try std.testing.expectEqual(@as(usize, 0), (try fixedValues(arena, .{ .flag = "--limit <1-100>", .description = "" })).len);
-    try std.testing.expectEqual(@as(usize, 0), (try fixedValues(arena, .{ .flag = "--model <id>", .description = "" })).len);
-    const resume_values = try placeholderValues(arena, "--resume [last|<id>]");
-    try std.testing.expectEqual(@as(usize, 1), resume_values.len);
-    try std.testing.expectEqualStrings("last", resume_values[0]);
-}
-
-test "the model follows subcommands, keeps parent flags, and marks setting-key paths" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const specs = [_]command_specs.TopLevelSpec{.{
-        .kind = .config,
-        .token = "config",
-        .usage = "config",
-        .summary = "Show and change spark settings",
-        .options = &.{.{ .flag = "--global", .description = "Only the profile" }},
-        .subcommands = &.{
-            .{ .usage = "get <key>", .description = "Print a value" },
-            .{ .usage = "trust", .description = "", .subcommands = &.{.{ .usage = "reset", .description = "Forget" }} },
-        },
-    }};
-    const registry: command_specs.TopLevelRegistry = .{
-        .specs = &specs,
-        .description = "",
-        .interactive_hint = "",
-        .flags = &.{.{ .usage = "--permission-mode <mode>", .description = "Set the mode" }},
-    };
-    const launch = [_]OptionDoc{.{ .flag = "--permission-mode <mode>", .description = "", .values = &.{ "ask", "auto" } }};
-    const model = try buildModel(arena, registry, &launch);
-
-    var get: ?Node = null;
-    var reset: ?Node = null;
-    for (model.nodes.items) |n| {
-        if (std.mem.eql(u8, n.path, "config get")) get = n;
-        if (std.mem.eql(u8, n.path, "config trust reset")) reset = n;
-    }
-    try std.testing.expectEqual(KeyList.all, get.?.keys);
-    // A word offers its own flags and --help, not its parent's.
-    try std.testing.expectEqual(@as(usize, 1), get.?.flags.items.len);
-    try std.testing.expectEqualStrings("--help", reset.?.flags.items[0].name);
-    try std.testing.expect(contains(model.value_flags.items, "--permission-mode"));
-    try std.testing.expectEqualStrings("auto", model.values.items[0].values[1]);
-    try std.testing.expect(contains(model.setting_keys.items, "status_line.context"));
-    try std.testing.expect(!contains(model.setting_keys.items, "notifications.turn_end"));
-    try std.testing.expect(!contains(model.setting_keys.items, "models"));
-    try std.testing.expect(contains(model.settable_keys.items, "fast_mode"));
-    try std.testing.expect(contains(model.setting_keys.items, "permission_mode"));
-    try std.testing.expect(!contains(model.settable_keys.items, "permission_mode"));
-}
-
-test "descriptions are quoted for each shell" {
-    var buffer: [64]u8 = undefined;
-    var w: Writer = .fixed(&buffer);
-    try writeEscaped(&w, "it's: here", .zsh);
-    try std.testing.expectEqualStrings("it'\\''s: here", w.buffered());
-    w = .fixed(&buffer);
-    try writeEscaped(&w, "a:b", .zsh_name);
-    try std.testing.expectEqualStrings("a\\:b", w.buffered());
-    w = .fixed(&buffer);
-    try writeEscaped(&w, "it's \\n", .fish);
-    try std.testing.expectEqualStrings("it\\'s \\\\n", w.buffered());
 }

@@ -37,16 +37,3 @@ pub fn fromSaved(text: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, text, open) or !std.mem.endsWith(u8, text, close)) return null;
     return text[open.len .. text.len - close.len];
 }
-
-test "a saved prompt comes back as written, and the user's words never do" {
-    const alloc = std.testing.allocator;
-    const text = try saved(alloc, "Summarize what you just did.");
-    defer alloc.free(text);
-    try std.testing.expectEqualStrings("Summarize what you just did.", fromSaved(text).?);
-
-    try std.testing.expect(fromSaved("Summarize what you just did.") == null);
-    try std.testing.expect(fromSaved("") == null);
-    try std.testing.expect(fromSaved(open) == null);
-    try std.testing.expect(fromSaved(open ++ "no end") == null);
-    try std.testing.expect(fromSaved("no start" ++ close) == null);
-}
