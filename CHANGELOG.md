@@ -1,8 +1,32 @@
 # spark
 
-## 26.11.21
+## 26.11.21.1
 
 <!-- release:start -->
+
+**Providers and prompts now live in one shared library that the iPhone, the cloud, and every paired Mac use.**
+
+### New Features
+
+- Providers are kept on the relay and shared by the cloud and every paired Mac. Edit them in the iPhone app or with spark on any Mac, and the change reaches every other Mac within a few seconds.
+- Write system prompts in the iPhone app and pick one when you start a new chat. It replaces spark's own system prompt for that chat.
+- `spark provider show`, `set`, `unset`, `remove-model`, and `rename` change one provider field from the shell, for example `spark provider set oc-go display_name "OpenCode Go"`.
+- Rename or delete a chat in the iPhone app by pressing and holding it in the sidebar. Rename or delete a folder the same way in the folder picker.
+
+### Improvements
+
+- `/provider` and `/mcp` list a provider's fields and open only the one you pick, instead of walking through every field.
+- The iPhone chat opens as soon as you send the first message, groups tool calls into one line, and uses a slightly smaller font. Tapping outside the keyboard closes it.
+- The iPhone folder picker opens folders it has already shown at once and makes it easier to go up a level.
+
+### Bug Fixes
+
+- spark no longer shows the interrupted turn hint on every launch. It appears once after a turn is interrupted.
+- `/quit` clears the screen when spark exits.
+
+<!-- release:end -->
+
+## 26.11.21
 
 **Pair your iPhone with spark, and spark now always runs with full access.**
 
@@ -15,8 +39,6 @@
 
 - Run `spark pair` to link the spark iPhone app to this computer with a six-digit code. The app lists the chats you start from the phone and the spark sessions running on the computer, and can start new ones in any folder.
 - The iPhone app can also run chats in the cloud, which keep working while the computer is asleep. Copy a provider from the computer to the cloud, or add one in the app.
-
-<!-- release:end -->
 
 ## 26.11.20
 
