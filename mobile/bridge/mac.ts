@@ -18,11 +18,16 @@ import { runningSessions } from "./mac_sessions";
 import { PhoneSessions } from "./phone_sessions";
 import { loginShellVariable, Profile } from "./providers";
 import type { Request } from "./protocol";
+import { type LibraryOp, Mirror } from "./sync";
 
 const HOME = homedir();
 const CONFIG = process.env.SPARK_MOBILE_CONFIG ?? join(HOME, ".spark", "mobile.json");
 /** the Mac sessions the phone started, beside the pairing */
 const PHONE_SESSIONS = join(dirname(CONFIG), "mobile-sessions.json");
+/** which library prompt each phone session runs with */
+const SESSION_PROMPTS = join(dirname(CONFIG), "mobile-prompts.json");
+/** what the copy of the relay's library last wrote here */
+const LIBRARY_STATE = join(dirname(CONFIG), "mobile-library.json");
 /** the spark profile whose providers the phone can copy to the cloud */
 const SPARK_HOME = process.env.SPARK_HOME ?? join(HOME, ".spark");
 const ROOT = process.env.SPARK_MOBILE_ROOT ?? HOME;
@@ -115,6 +120,26 @@ function serve(c: Config, onPaired?: (device: string) => void, quiet = false) {
   const info = { name: "Mac", kind: "mac" as const, home: ROOT, platform: process.platform };
   name.then((n) => (info.name = n));
   const bin = spark();
+  const profile = new Profile({ home: SPARK_HOME, spark: bin, role: "mac", lookup: loginShellVariable });
+  let rid = 0;
+  const waiting = new Map<number, { resolve: () => void; reject: (e: Error) => void }>();
+  const mirror = new Mirror({
+    home: SPARK_HOME,
+    stateFile: LIBRARY_STATE,
+    profile,
+    log: (line) => console.log(dim(line)),
+    send: (op: LibraryOp) =>
+      new Promise<void>((resolve, reject) => {
+        if (socket?.readyState !== WebSocket.OPEN) return reject(new Error("The relay isn't connected."));
+        const id = ++rid;
+        waiting.set(id, { resolve, reject });
+        socket.send(JSON.stringify({ rid: id, library: op }));
+        setTimeout(() => {
+          if (waiting.delete(id)) reject(new Error("The relay didn't answer."));
+        }, 30_000);
+      }),
+  });
+  mirror.start();
   const host = new Host({
     info,
     spark: bin,
@@ -122,7 +147,8 @@ function serve(c: Config, onPaired?: (device: string) => void, quiet = false) {
     root: ROOT,
     confine: ROOT !== HOME,
     filter: { phone: new PhoneSessions(PHONE_SESSIONS), running: () => runningSessions(bin) },
-    profile: new Profile({ home: SPARK_HOME, spark: bin, role: "mac", lookup: loginShellVariable }),
+    profile,
+    prompts: { home: SPARK_HOME, sessions: SESSION_PROMPTS },
     send: (msg, to) => {
       if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ to, msg }));
     },
@@ -147,6 +173,17 @@ function serve(c: Config, onPaired?: (device: string) => void, quiet = false) {
       if (m.relay === "paired") {
         console.log(`  ${bold("Paired")} with ${m.device}.`);
         onPaired?.(m.device);
+        return;
+      }
+      if (m.relay === "library" && m.library) {
+        void mirror.receive(m.library).then(() => host.invalidate());
+        return;
+      }
+      if (m.relay === "library-reply") {
+        const w = waiting.get(m.rid);
+        waiting.delete(m.rid);
+        if (m.ok) w?.resolve();
+        else w?.reject(new Error(m.error ?? "The relay refused it."));
         return;
       }
       if (m.msg) host.handle(m.msg as Request, m.from);
@@ -261,6 +298,8 @@ switch (command) {
     rmSync(PLIST, { force: true });
     rmSync(CONFIG, { force: true });
     rmSync(PHONE_SESSIONS, { force: true });
+    rmSync(SESSION_PROMPTS, { force: true });
+    rmSync(LIBRARY_STATE, { force: true });
     console.log("This Mac is unpaired. Run spark pair to pair again.");
     break;
   default:

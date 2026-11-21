@@ -62,7 +62,8 @@ struct Shell: View {
   @ViewBuilder private var main: some View {
     NavigationStack {
       if let chat = link.chat {
-        ChatView(chat: chat).id(chat.key)
+        // the chat's own identity: a new chat keeps its screen when the host gives it an id
+        ChatView(chat: chat).id(ObjectIdentifier(chat))
       } else {
         NewChatView(ask: newChat)
       }
@@ -127,6 +128,10 @@ private struct Sidebar: View {
   let pair: () -> Void
   @State private var query = ""
   @State private var picked = 0
+  @State private var renaming: Listed?
+  @State private var newTitle = ""
+  @State private var deleting: Listed?
+  @State private var problem: String?
 
   var body: some View {
     VStack(alignment: .leading, spacing: 14) {
@@ -181,8 +186,7 @@ private struct Sidebar: View {
             Text(link.host.map { $0.kind == .cloud ? "Cloud" : $0.name } ?? "spark")
               .font(.geist(15, .medium))
               .lineLimit(1)
-            HStack(spacing: 5) {
-              LiveDot(on: (link.host?.online ?? false) && link.phase == .online)
+            if let status {
               Text(status).font(.geist(12)).foregroundStyle(Color.dim)
             }
           }
@@ -205,6 +209,37 @@ private struct Sidebar: View {
     .padding(.bottom, 4)
     .frame(maxHeight: .infinity, alignment: .top)
     .sensoryFeedback(.selection, trigger: picked)
+    .alert("Rename chat", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+      TextField("Title", text: $newTitle)
+      Button("Cancel", role: .cancel) {}
+      Button("Rename") {
+        guard let l = renaming else { return }
+        let title = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, title != l.session.title else { return }
+        Task {
+          do { try await link.rename(l.session, on: l.host.id, to: title) } catch { problem = error.localizedDescription }
+        }
+      }
+    }
+    .confirmationDialog(
+      "Delete \(deleting?.session.title ?? "this chat")?",
+      isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+      titleVisibility: .visible
+    ) {
+      Button("Delete chat", role: .destructive) {
+        guard let l = deleting else { return }
+        Task {
+          do { try await link.delete(l.session, on: l.host.id) } catch { problem = error.localizedDescription }
+        }
+      }
+    } message: {
+      Text("spark removes it from \(deleting.map { $0.host.kind == .cloud ? "the cloud" : $0.host.name } ?? "the host") for good.")
+    }
+    .alert("Couldn't change that chat", isPresented: Binding(get: { problem != nil }, set: { if !$0 { problem = nil } })) {
+      Button("OK", role: .cancel) {}
+    } message: {
+      Text(problem ?? "")
+    }
     .task(id: "\(visible)-\(link.phase == .online)") {
       guard link.phase == .online else { return }
       if !visible {
@@ -218,9 +253,10 @@ private struct Sidebar: View {
     }
   }
 
-  private var status: String {
+  /** said only when something is wrong */
+  private var status: String? {
     guard link.phase == .online else { return "Connecting" }
-    return link.host?.online == true ? "Online" : "Offline"
+    return link.host?.online == true ? nil : "Offline"
   }
 
   private func matches(_ s: SessionInfo) -> Bool {
@@ -306,7 +342,7 @@ private struct Sidebar: View {
     HStack(spacing: 6) {
       Image(systemName: h.symbol).font(.system(size: 11, weight: .semibold))
       Text(h.kind == .cloud ? "Cloud" : h.name).lineLimit(1)
-      LiveDot(on: h.online && link.phase == .online)
+      if h.kind == .mac { LiveDot(on: h.online && link.phase == .online) }
     }
     .font(.geist(12, .medium))
     .foregroundStyle(Color.dim)
@@ -322,6 +358,14 @@ private struct Sidebar: View {
       picked += 1
       Task { await link.open(l.session, on: l.host.id) }
       close()
+    }
+    .contextMenu {
+      Button("Rename", systemImage: "pencil") {
+        newTitle = l.session.title
+        renaming = l
+      }
+      Button("Delete", systemImage: "trash", role: .destructive) { deleting = l }
+        .disabled(l.session.running)
     }
   }
 
@@ -374,7 +418,6 @@ private struct Sidebar: View {
             .foregroundStyle(.white)
             .lineLimit(1)
           HStack(spacing: 5) {
-            if session.running { LiveDot() }
             if let badge {
               Image(systemName: badge).font(.system(size: 10, weight: .semibold))
             }

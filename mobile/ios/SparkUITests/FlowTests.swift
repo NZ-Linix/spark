@@ -15,18 +15,19 @@ final class FlowTests: XCTestCase {
   @MainActor
   func testPairStartAndChat() throws {
     let relay = try XCTUnwrap(env["SPARK_RELAY"], "set TEST_RUNNER_SPARK_RELAY")
-    let code = try XCTUnwrap(env["SPARK_PAIR_CODE"], "set TEST_RUNNER_SPARK_PAIR_CODE")
     let app = XCUIApplication()
     app.launchEnvironment["SPARK_RELAY"] = relay
     app.launch()
 
-    XCTAssertTrue(app.buttons["5"].waitForExistence(timeout: 5))
-    sleep(1)
-    shot(app, "01-welcome")
-    for digit in code { app.buttons[String(digit)].tap() }
-
     let menu = app.buttons["Chats"]
-    XCTAssertTrue(menu.waitForExistence(timeout: 15))
+    if !menu.waitForExistence(timeout: 8) {
+      let code = try XCTUnwrap(env["SPARK_PAIR_CODE"], "set TEST_RUNNER_SPARK_PAIR_CODE")
+      XCTAssertTrue(app.buttons["5"].waitForExistence(timeout: 5))
+      sleep(1)
+      shot(app, "01-welcome")
+      for digit in code { app.buttons[String(digit)].tap() }
+      XCTAssertTrue(menu.waitForExistence(timeout: 15))
+    }
     sleep(1)
     shot(app, "02-new-chat")
 
@@ -61,7 +62,8 @@ final class FlowTests: XCTestCase {
     XCTAssertTrue(composer.waitForExistence(timeout: 10))
     sleep(1)
     shot(app, "07b-composer-open")
-    app.staticTexts["What should we build?"].tap()
+    // a tap anywhere off the keyboard puts it away
+    app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35)).tap()
     sleep(1)
     shot(app, "07c-composer-rest")
 
@@ -85,7 +87,10 @@ final class FlowTests: XCTestCase {
     composer.tap()
     composer.typeText("Read README.md and tell me in one short paragraph what this project is, with one **bold** word.")
     app.buttons["Send"].tap()
-    sleep(4)
+    shot(app, "08a-sent")
+    sleep(1)
+    shot(app, "08b-started")
+    sleep(3)
     shot(app, "08-working")
     XCTAssertTrue(waitUntilIdle(app, timeout: 120))
     app.swipeDown()
@@ -96,6 +101,23 @@ final class FlowTests: XCTestCase {
     sleep(1)
     shot(app, "10-sidebar-with-chat")
 
+    // long press a chat to rename it
+    let row = app.buttons.matching(NSPredicate(format: "label CONTAINS 'README'")).firstMatch
+    if row.waitForExistence(timeout: 5) {
+      row.press(forDuration: 0.8)
+      XCTAssertTrue(app.buttons["Rename"].waitForExistence(timeout: 5))
+      sleep(1)
+      shot(app, "10b-chat-menu")
+      app.buttons["Rename"].tap()
+      let title = app.alerts.textFields.firstMatch
+      XCTAssertTrue(title.waitForExistence(timeout: 5))
+      title.clearAndType("Renamed from the phone")
+      app.alerts.buttons["Rename"].tap()
+      XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS 'Renamed from the phone'")).firstMatch.waitForExistence(timeout: 10))
+      sleep(1)
+      shot(app, "10c-renamed")
+    }
+
     app.buttons["Settings"].tap()
     sleep(1)
     shot(app, "11-settings")
@@ -104,15 +126,28 @@ final class FlowTests: XCTestCase {
     app.buttons["New chat"].firstMatch.tap()
     sleep(2)
     shot(app, "12-picker-recent")
+
+    // into a folder and back up with the row at the top
+    let demo = app.buttons.matching(NSPredicate(format: "label CONTAINS 'demo-app'")).element(boundBy: 1)
+    if demo.waitForExistence(timeout: 5) {
+      demo.tap()
+      let up = app.buttons["folderUp"]
+      XCTAssertTrue(up.waitForExistence(timeout: 10))
+      sleep(1)
+      shot(app, "13-picker-inside")
+      up.tap()
+      XCTAssertFalse(up.waitForExistence(timeout: 3))
+    }
   }
 
   /**
-   * The sidebar's three layouts, then copying a provider from the Mac to the cloud. Needs a relay
-   * with cloud sessions and a paired Mac whose spark profile has a provider named local. Pairs with
-   * TEST_RUNNER_SPARK_PAIR_CODE when the app isn't paired yet.
+   * The sidebar's three layouts, the shared providers, and a prompt written, renamed, and deleted.
+   * Needs a relay with cloud sessions and a paired Mac whose spark profile has a provider named
+   * local, which reaches the library on the Mac's first sync. Pairs with TEST_RUNNER_SPARK_PAIR_CODE
+   * when the app isn't paired yet.
    */
   @MainActor
-  func testSidebarLayoutsAndCopyProvider() throws {
+  func testSidebarLayoutsAndLibrary() throws {
     let relay = try XCTUnwrap(env["SPARK_RELAY"], "set TEST_RUNNER_SPARK_RELAY")
     let app = XCUIApplication()
     app.launchEnvironment["SPARK_RELAY"] = relay
@@ -143,29 +178,66 @@ final class FlowTests: XCTestCase {
 
     app.buttons["Settings"].tap()
     app.segmentedControls["sidebarStyle"].buttons["Sections"].tap()
-    let providers = app.buttons["Cloud providers"]
+    let providers = app.buttons["cloudProviders"]
     XCTAssertTrue(providers.waitForExistence(timeout: 5))
     providers.tap()
-    let copy = app.buttons["copyFromMac"]
-    XCTAssertTrue(copy.waitForExistence(timeout: 15))
-    sleep(1)
-    shot(app, "23-cloud-providers")
-    copy.tap()
-    let local = app.buttons["macProvider-local"]
-    XCTAssertTrue(local.waitForExistence(timeout: 15))
-    sleep(1)
-    shot(app, "24-copy-from-mac")
-    local.tap()
-    let replace = app.buttons["Replace it"]
-    if replace.waitForExistence(timeout: 3) { replace.tap() }
     XCTAssertTrue(app.buttons["provider-local"].waitForExistence(timeout: 30))
     sleep(1)
-    shot(app, "25-copied")
+    shot(app, "23-providers")
 
     app.buttons["provider-local"].tap()
     XCTAssertTrue(app.buttons["saveProvider"].waitForExistence(timeout: 5))
     sleep(1)
-    shot(app, "26-edit-provider")
+    shot(app, "24-edit-provider")
+    let model = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'model-'")).firstMatch
+    XCTAssertTrue(model.waitForExistence(timeout: 5))
+    model.tap()
+    XCTAssertTrue(app.textFields["modelContext"].waitForExistence(timeout: 5))
+    sleep(1)
+    shot(app, "25-edit-model")
+    // back from the model, close the provider, back to Settings
+    app.buttons.matching(NSPredicate(format: "identifier == 'BackButton' AND label == 'Local Test'")).firstMatch.tap()
+    let close = app.buttons["Cancel"]
+    XCTAssertTrue(close.waitForExistence(timeout: 5))
+    close.tap()
+    sleep(1)
+    app.buttons.matching(NSPredicate(format: "identifier == 'BackButton' AND label == 'Settings'")).firstMatch.tap()
+
+    // a prompt: write it, rename it, delete it
+    let prompts = app.buttons["prompts"]
+    XCTAssertTrue(prompts.waitForExistence(timeout: 5))
+    prompts.tap()
+    let add = app.buttons["addPrompt"]
+    XCTAssertTrue(add.waitForExistence(timeout: 10))
+    add.tap()
+    let name = app.textFields["promptName"]
+    XCTAssertTrue(name.waitForExistence(timeout: 5))
+    name.typeText("Reviewer")
+    app.textViews["promptText"].tap()
+    app.textViews["promptText"].typeText("You review code carefully and answer in short sentences.")
+    sleep(1)
+    shot(app, "26-prompt-editor")
+    app.buttons["savePrompt"].tap()
+    let saved = app.buttons["prompt-Reviewer"]
+    XCTAssertTrue(saved.waitForExistence(timeout: 15))
+    sleep(1)
+    shot(app, "27-prompts")
+
+    saved.press(forDuration: 0.8)
+    app.buttons["Rename"].tap()
+    let field = app.alerts.textFields.firstMatch
+    XCTAssertTrue(field.waitForExistence(timeout: 5))
+    field.clearAndType("Careful reviewer")
+    app.alerts.buttons["Rename"].tap()
+    let renamed = app.buttons["prompt-Careful reviewer"]
+    XCTAssertTrue(renamed.waitForExistence(timeout: 15))
+
+    renamed.press(forDuration: 0.8)
+    app.buttons["Delete"].tap()
+    app.buttons["Delete"].firstMatch.tap()
+    XCTAssertFalse(renamed.waitForExistence(timeout: 5))
+    sleep(1)
+    shot(app, "28-prompt-deleted")
   }
 
   /** the stop button goes away once spark is done */
@@ -190,5 +262,16 @@ final class FlowTests: XCTestCase {
     a.name = name
     a.lifetime = .keepAlways
     add(a)
+  }
+}
+
+extension XCUIElement {
+  /** replaces whatever the field holds */
+  func clearAndType(_ text: String) {
+    tap()
+    if let current = value as? String, !current.isEmpty {
+      typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count))
+    }
+    typeText(text)
   }
 }

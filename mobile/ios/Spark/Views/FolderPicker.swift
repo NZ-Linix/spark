@@ -2,7 +2,8 @@ import SwiftUI
 
 /**
  * Choosing where a chat runs: starts at the host's home every time, walks down a folder at a tap,
- * jumps back through the path above, and searches everything below where you are.
+ * goes up a level from the row at the top or any part of the path, and searches everything below
+ * where you are. Folders already seen open at once while the host is asked again.
  */
 struct FolderPicker: View {
   @Environment(Link.self) private var link
@@ -12,7 +13,6 @@ struct FolderPicker: View {
 
   @State private var root: String?
   @State private var listing: Listing?
-  @State private var forward = true
   @State private var query = ""
   @State private var results: [Folder]?
   @State private var searching = false
@@ -20,6 +20,12 @@ struct FolderPicker: View {
   @State private var naming = false
   @State private var newName = ""
   @State private var moved = 0
+  /** every listing seen in this sheet, by path */
+  @State private var cache: [String: Listing] = [:]
+  @State private var loading: String?
+  @State private var target: UUID?
+  @State private var renaming: Folder?
+  @State private var deleting: Folder?
   @FocusState private var searchFocused: Bool
 
   var body: some View {
@@ -28,7 +34,7 @@ struct FolderPicker: View {
         VStack(spacing: 12) {
           HostSwitch()
           searchField
-          if query.isEmpty, let listing, listing.path != root { crumbs(listing) }
+          if query.isEmpty, let listing, listing.path != root { crumbs(listing).transition(.opacity) }
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
@@ -37,11 +43,8 @@ struct FolderPicker: View {
           if !query.isEmpty {
             searchList.transition(.opacity)
           } else if let listing {
+            // one list for every folder: moving swaps its rows instead of building a new list
             folderList(listing)
-              .id(listing.path)
-              .transition(.asymmetric(
-                insertion: .offset(x: forward ? 60 : -60).combined(with: .opacity),
-                removal: .offset(x: forward ? -60 : 60).combined(with: .opacity)))
           } else if let problem {
             Text(problem).font(.geist(15)).foregroundStyle(Color.dim).multilineTextAlignment(.center).padding(32)
               .frame(maxHeight: .infinity)
@@ -82,6 +85,27 @@ struct FolderPicker: View {
           .transition(Settle(distance: 20))
         }
       }
+      .alert("Rename folder", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+        TextField("Name", text: $newName)
+          .textInputAutocapitalization(.never)
+          .autocorrectionDisabled()
+        Button("Rename") { rename() }
+        Button("Cancel", role: .cancel) { newName = "" }
+      }
+      .confirmationDialog(
+        "Delete \(deleting?.name ?? "this folder")?",
+        isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+        titleVisibility: .visible
+      ) {
+        Button("Delete folder", role: .destructive) { delete() }
+      } message: {
+        Text("Everything inside it is deleted from \(link.host.map { $0.kind == .cloud ? "the cloud" : $0.name } ?? "the computer") for good.")
+      }
+      .alert("Couldn't change that folder", isPresented: Binding(get: { problem != nil && listing != nil }, set: { if !$0 { problem = nil } })) {
+        Button("OK", role: .cancel) {}
+      } message: {
+        Text(problem ?? "")
+      }
       .alert("New folder", isPresented: $naming) {
         TextField("Name", text: $newName)
           .textInputAutocapitalization(.never)
@@ -95,11 +119,12 @@ struct FolderPicker: View {
     .presentationDetents([.large])
     .presentationBackground(Color.page)
     .sensoryFeedback(.selection, trigger: moved)
-    .animation(.spring(duration: 0.32, bounce: 0.05), value: listing?.path)
     .animation(.ease, value: query.isEmpty)
+    .animation(.snappy(duration: 0.2), value: listing?.path == root)
     .task(id: link.host?.id) {
       root = nil
       listing = nil
+      cache = [:]
       await go(nil)
     }
     .task(id: query) { await search() }
@@ -142,7 +167,7 @@ struct FolderPicker: View {
             let last = i == parts.count - 1
             Button {
               guard !last else { return }
-              Task { await go(part.path, forward: false) }
+              Task { await go(part.path) }
             } label: {
               Text(part.name)
                 .font(.geistMono(13, last ? .medium : .regular))
@@ -176,6 +201,28 @@ struct FolderPicker: View {
 
   private func folderList(_ listing: Listing) -> some View {
     List {
+      if listing.path != root, let parent = listing.parent ?? segments(listing.path).dropLast().last?.path {
+        Button { Task { await go(parent) } } label: {
+          HStack(spacing: 12) {
+            Image(systemName: "arrow.turn.left.up")
+              .font(.system(size: 14, weight: .semibold))
+              .foregroundStyle(Color.dim)
+              .frame(width: 22)
+            Text(parent == root ? "~" : (parent.split(separator: "/").last.map(String.init) ?? parent))
+              .font(.geist(16))
+              .foregroundStyle(Color.dim)
+              .lineLimit(1)
+            Spacer(minLength: 0)
+          }
+          .padding(.vertical, 12)
+          .contentShape(.rect)
+        }
+        .accessibilityLabel("Up to \(display(parent))")
+        .accessibilityIdentifier("folderUp")
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 20))
+        .listRowSeparatorTint(Color.hairline)
+      }
       if listing.path == root, !recent.isEmpty {
         Section {
           ForEach(recent, id: \.self) { path in
@@ -227,15 +274,32 @@ struct FolderPicker: View {
     .listStyle(.plain)
     .scrollContentBackground(.hidden)
     .overlay {
-      if listing.folders.isEmpty {
+      if listing.folders.isEmpty, loading == nil {
         Text("No folders in here").font(.geist(15)).foregroundStyle(Color.faint)
       }
     }
+    // swipe right from anywhere to go up a level, like the back gesture
+    .simultaneousGesture(
+      DragGesture(minimumDistance: 30)
+        .onEnded { g in
+          guard g.translation.width > 90, abs(g.translation.height) < 50, listing.path != root,
+                let parent = listing.parent ?? segments(listing.path).dropLast().last?.path else { return }
+          Task { await go(parent) }
+        }
+    )
   }
 
   @ViewBuilder private func rows(_ listing: Listing) -> some View {
     ForEach(listing.folders) { f in
-      Button { Task { await go(f.path) } } label: { FolderRow(name: f.name, detail: nil, git: f.git) }
+      Button { Task { await go(f.path) } } label: { FolderRow(name: f.name, detail: nil, git: f.git, loading: loading == f.path) }
+        .contextMenu {
+          Button("Use this folder", systemImage: "checkmark") { chosen(f.path, display(f.path)) }
+          Button("Rename", systemImage: "pencil") {
+            newName = f.name
+            renaming = f
+          }
+          Button("Delete", systemImage: "trash", role: .destructive) { deleting = f }
+        }
         .listRowBackground(Color.clear)
         .listRowInsets(EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 20))
         .listRowSeparatorTint(Color.hairline)
@@ -254,7 +318,7 @@ struct FolderPicker: View {
             searchFocused = false
           }
         } label: {
-          FolderRow(name: f.name, detail: display(f.path), git: f.git)
+          FolderRow(name: f.name, detail: display(f.path), git: f.git, loading: false)
         }
         .listRowBackground(Color.clear)
         .listRowInsets(EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 20))
@@ -292,17 +356,30 @@ struct FolderPicker: View {
 
   // MARK: Loading
 
-  private func go(_ path: String?, forward: Bool = true) async {
+  /** shows a folder seen before at once and asks the host again; a new one opens when it answers */
+  private func go(_ path: String?) async {
     guard let host = link.host?.id else { return }
+    // only the newest tap wins: an answer to an older one just fills the cache
+    let ticket = UUID()
+    target = ticket
+    if let path, let seen = cache[path] {
+      listing = seen
+      moved += 1
+    } else {
+      loading = path
+    }
+    defer { if target == ticket { loading = nil } }
     do {
       let next = try await link.folders(host, path)
+      guard link.host?.id == host else { return }
       if root == nil { root = next.path }
-      self.forward = forward || (listing.map { next.path.count > $0.path.count } ?? true)
+      cache[next.path] = next
+      guard target == ticket else { return }
+      if listing?.path != next.path { moved += 1 }
       listing = next
       problem = nil
-      moved += 1
     } catch {
-      problem = error.localizedDescription
+      if target == ticket { problem = error.localizedDescription }
     }
   }
 
@@ -319,6 +396,40 @@ struct FolderPicker: View {
     results = try? await link.search(host, q, in: listing?.path)
   }
 
+  private func rename() {
+    guard let f = renaming, let host = link.host?.id else { return }
+    let name = newName.trimmingCharacters(in: .whitespaces)
+    newName = ""
+    guard !name.isEmpty, name != f.name, let here = listing?.path else { return }
+    Task {
+      do {
+        _ = try await link.renameFolder(host, f.path, to: name)
+        drop(f.path)
+        await go(here)
+      } catch {
+        problem = error.localizedDescription
+      }
+    }
+  }
+
+  private func delete() {
+    guard let f = deleting, let host = link.host?.id, let here = listing?.path else { return }
+    Task {
+      do {
+        try await link.deleteFolder(host, f.path)
+        drop(f.path)
+        await go(here)
+      } catch {
+        problem = error.localizedDescription
+      }
+    }
+  }
+
+  /** forgets a folder and everything seen below it */
+  private func drop(_ path: String) {
+    for key in cache.keys where key == path || key.hasPrefix(path + "/") { cache[key] = nil }
+  }
+
   private func create() {
     guard let listing else { return }
     let name = newName.trimmingCharacters(in: .whitespaces)
@@ -327,6 +438,7 @@ struct FolderPicker: View {
     Task {
       do {
         let path = try await link.mkdir(host, in: listing.path, named: name)
+        cache[listing.path] = nil
         await go(path)
       } catch {
         problem = error.localizedDescription
@@ -351,6 +463,7 @@ private struct FolderRow: View {
   let name: String
   let detail: String?
   let git: Bool
+  let loading: Bool
 
   var body: some View {
     HStack(spacing: 12) {
@@ -370,9 +483,13 @@ private struct FolderRow: View {
           .font(.system(size: 11, weight: .medium))
           .foregroundStyle(Color.faint)
       }
-      Image(systemName: "chevron.right")
-        .font(.system(size: 11, weight: .semibold))
-        .foregroundStyle(Color.faint)
+      if loading {
+        ProgressView().controlSize(.mini).tint(Color.dim)
+      } else {
+        Image(systemName: "chevron.right")
+          .font(.system(size: 11, weight: .semibold))
+          .foregroundStyle(Color.faint)
+      }
     }
     .padding(.vertical, 12)
     .contentShape(.rect)

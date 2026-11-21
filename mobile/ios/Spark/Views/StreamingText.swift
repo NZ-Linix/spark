@@ -40,9 +40,10 @@ struct StreamingText: View {
       let end = streaming ? count : count + Self.tail
       guard shown < end else { return }
       let behind = count - shown
-      let step = behind > 0 ? max(1, Int((Double(behind) / 10).rounded(.up))) : 2
+      // about 30 steps a second: each one parses the answer again, so fewer, larger steps stay smooth
+      let step = behind > 0 ? max(2, Int((Double(behind) / 6).rounded(.up))) : 4
       shown = min(end, shown + step)
-      try? await Task.sleep(for: .milliseconds(16))
+      try? await Task.sleep(for: .milliseconds(33))
     }
   }
 }

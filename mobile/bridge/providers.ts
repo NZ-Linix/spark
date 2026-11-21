@@ -14,19 +14,19 @@ const MAX_MODEL_BYTES = 256;
 const CHECK_MS = 15_000;
 const SHELL_MS = 5_000;
 
-type Json = Record<string, any>;
+export type Json = Record<string, any>;
 
 export type ProfileOptions = {
   /** the SPARK_HOME whose settings.json holds the providers */
   home: string;
   spark: string;
-  /** "mac" lists and exports; "cloud" lists, adds, changes and deletes */
+  /** both list, add, change and delete; only "mac" exports, and only "cloud" keeps header values in cloud-env.json */
   role: "mac" | "cloud";
   /** how the Mac finds a variable the bridge wasn't started with (a LaunchAgent gets almost none) */
   lookup?: (name: string) => Promise<string | undefined>;
 };
 
-const isObject = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
+export const isObject = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /** the last 4 characters, and only when the key is long enough that they give little away */
 function mask(key: unknown): string | undefined {
@@ -126,12 +126,14 @@ export class Profile {
   }
 
   /**
-   * Adds or replaces a provider on the cloud. spark checks the whole new settings file first, so a
-   * provider spark would refuse never replaces a working one. A key left out keeps the saved key.
+   * Adds or replaces a provider. spark checks the whole new settings file first, so a provider spark
+   * would refuse never replaces a working one. A key left out keeps the saved key. `previous` renames
+   * a provider: the old name goes, and the saved model and chosen provider follow it.
    */
-  put(input: { name: string; provider: unknown; model?: unknown; env?: unknown }): Promise<ProviderSummary[]> {
-    if (this.o.role !== "cloud") return Promise.reject(new Error("Providers are only changed on the cloud."));
-    const { name, provider, model, env } = input;
+  put(input: { name: string; provider: unknown; model?: unknown; env?: unknown; previous?: unknown }): Promise<ProviderSummary[]> {
+    const { name, provider, model, env, previous } = input;
+    if (this.o.role !== "cloud" && env !== undefined && env !== null && isObject(env) && Object.keys(env).length) return Promise.reject(new Error("The Mac reads header values from its own environment."));
+    if (previous !== undefined && previous !== null && (typeof previous !== "string" || !NAME.test(previous))) return Promise.reject(new Error("That old name isn't valid."));
     if (typeof name !== "string" || !NAME.test(name)) return Promise.reject(new Error("A provider's name starts with a letter and uses letters, digits, _ and -."));
     if (!isObject(provider)) return Promise.reject(new Error("That provider isn't an object."));
     if (model !== undefined && model !== null && (typeof model !== "string" || model.length > MAX_MODEL_BYTES)) return Promise.reject(new Error("That model name isn't valid."));
@@ -145,9 +147,20 @@ export class Profile {
       const s = this.read();
       s.providers = isObject(s.providers) ? s.providers : {};
       const next: Json = structuredClone(provider);
-      const old = s.providers[name];
+      const renamed = typeof previous === "string" && previous !== name ? previous : undefined;
+      if (renamed && isObject(s.providers[name])) throw new Error(`There's already a provider named ${name}.`);
+      const old = s.providers[renamed ?? name];
+      if (renamed) {
+        delete s.providers[renamed];
+        if (isObject(s.models) && typeof s.models[renamed] === "string") {
+          s.models[name] = s.models[renamed];
+          delete s.models[renamed];
+        }
+        if (s.provider === renamed) s.provider = name;
+      }
       if (isObject(next.auth) && next.auth.type === "key" && !next.auth.key && isObject(old) && old.auth?.type === "key") next.auth.key = old.auth.key;
       s.providers[name] = next;
+      if (isObject(s.models) && typeof s.models[name] === "string" && !(isObject(next.model_metadata) && s.models[name] in next.model_metadata)) delete s.models[name];
       if (typeof model === "string" && model) {
         s.models = isObject(s.models) ? s.models : {};
         s.models[name] = model;
@@ -161,7 +174,6 @@ export class Profile {
   }
 
   delete(name: unknown): Promise<ProviderSummary[]> {
-    if (this.o.role !== "cloud") return Promise.reject(new Error("Providers are only changed on the cloud."));
     return this.serial(async () => {
       const s = this.read();
       if (typeof name !== "string" || !isObject(s.providers) || !isObject(s.providers[name])) throw new Error("That provider is already gone.");
@@ -200,9 +212,12 @@ export class Profile {
   private async save(settings: Json, values: Record<string, string>) {
     const used = new Set(Object.values(isObject(settings.providers) ? settings.providers : {}).flatMap((p) => (isObject(p) ? variables(p) : [])));
     const secrets = Object.fromEntries(Object.entries(values).filter(([k]) => used.has(k)));
-    await this.check(settings, secrets);
+    // The Mac's spark reads these from the person's shell, which the check can't see, so it stands
+    // in a value: the check is of the settings, not of whether a variable is set right now.
+    const checked = this.o.role === "mac" ? Object.fromEntries([...used].filter((k) => ENV_NAME.test(k) && !RESERVED_ENV.test(k)).map((k) => [k, "set-on-the-mac"])) : secrets;
+    await this.check(settings, checked);
     writeAtomic(this.settingsFile, settings);
-    writeAtomic(this.secretsFile, secrets);
+    if (this.o.role === "cloud") writeAtomic(this.secretsFile, secrets);
   }
 
   /** spark loads the settings at `initialize` and refuses ones it can't use; its reason goes to the phone */
@@ -231,6 +246,7 @@ function summarize(name: string, p: Json, s: Json): ProviderSummary {
   if (isObject(shown.auth) && shown.auth.type === "key") shown.auth = { type: "key" };
   return {
     name,
+    displayName: typeof p.display_name === "string" && p.display_name ? p.display_name : undefined,
     protocol: typeof p.protocol === "string" ? p.protocol : "",
     baseUrl: typeof p.base_url === "string" ? p.base_url : "",
     auth,
@@ -245,7 +261,7 @@ function summarize(name: string, p: Json, s: Json): ProviderSummary {
 }
 
 /** spark won't start on a chosen provider with no saved model, so it gets its first listed one */
-function chooseModel(s: Json) {
+export function chooseModel(s: Json) {
   const p = typeof s.provider === "string" && isObject(s.providers) ? s.providers[s.provider] : undefined;
   if (!isObject(p) || (isObject(s.models) && typeof s.models[s.provider] === "string")) return;
   const first = isObject(p.model_metadata) ? Object.keys(p.model_metadata)[0] : undefined;
@@ -267,7 +283,7 @@ function checkEnv(env: unknown): Record<string, string> {
 }
 
 /** replaces `file` with an atomic rename, readable only by its owner */
-function writeAtomic(file: string, value: unknown) {
+export function writeAtomic(file: string, value: unknown) {
   const tmp = `${file}.${process.pid}.tmp`;
   rmSync(tmp, { force: true });
   writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });

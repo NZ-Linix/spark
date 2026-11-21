@@ -1,18 +1,38 @@
 import Foundation
 import Observation
 
+/**
+ * One message or tool call in a chat. Each is its own observable, so text streaming into one row
+ * redraws that row alone and the thread around it stays put.
+ */
+@Observable
+final class Entry: Identifiable {
+  let id: String
+  /** fixed for the row's life: the thread lays rows out by role without watching their text */
+  let role: Item.Role
+  var item: Item
+
+  init(_ item: Item) {
+    id = item.id
+    role = item.role
+    self.item = item
+  }
+}
+
 /** One open session: its messages as they stream in, whether spark is working, and what it's asking. */
 @Observable
 final class Chat {
   let host: String
   var info: SessionInfo
-  var items: [Item] = []
+  private(set) var entries: [Entry] = []
   var running = false
   var config: [ConfigOption] = []
   var permission: Permission?
   var usage: Usage?
   var loaded = false
   var problem: String?
+  /** a chat the phone shows before its session exists: its first message waits for the host */
+  var starting = false
   /** bumped when a reply finishes, for the haptic */
   var finished = 0
 
@@ -25,31 +45,59 @@ final class Chat {
   }
 
   var key: String { "\(host)/\(info.id)" }
+  var isEmpty: Bool { entries.isEmpty }
 
   func load(_ s: Snapshot) {
     info = s.info
-    items = s.items
     running = s.running
     config = s.config
     permission = s.permission
     usage = s.usage
+    // rows the phone already shows keep their objects, so reopening doesn't redraw the thread
+    var next: [Entry] = []
+    next.reserveCapacity(s.items.count)
+    for item in s.items {
+      if let i = index[item.id], entries[i].role == item.role {
+        if entries[i].item != item { entries[i].item = item }
+        next.append(entries[i])
+      } else {
+        next.append(Entry(item))
+      }
+    }
+    entries = next
     reindex()
     loaded = true
+  }
+
+  /** the session now exists on the host: take its id and options, keep what's shown */
+  func adopt(_ s: Snapshot) {
+    // the host names a session only once its first turn ends; until then the phone's title stays
+    let title = info.title
+    info = s.info
+    if !title.isEmpty { info.title = title }
+    config = s.config
+    usage = s.usage
+    starting = false
+  }
+
+  /** a message the phone shows at once; the host's copy has the same id and replaces it */
+  func add(_ item: Item) {
+    index[item.id] = entries.count
+    entries.append(Entry(item))
   }
 
   func apply(_ e: Event) {
     switch e.t {
     case "item":
       guard let item = e.item else { return }
-      if let i = index[item.id] {
-        items[i] = item
+      if let i = index[item.id], entries[i].role == item.role {
+        if entries[i].item != item { entries[i].item = item }
       } else {
-        index[item.id] = items.count
-        items.append(item)
+        add(item)
       }
     case "append":
       guard let id = e.id.flatMap(Self.string), let text = e.text, let i = index[id] else { return }
-      items[i].text += text
+      entries[i].item.text += text
     case "state":
       let was = running
       running = e.running ?? false
@@ -72,7 +120,7 @@ final class Chat {
 
   private func reindex() {
     index = [:]
-    for (i, item) in items.enumerated() { index[item.id] = i }
+    for (i, e) in entries.enumerated() { index[e.id] = i }
   }
 
   private static func string(_ j: JSON) -> String? {

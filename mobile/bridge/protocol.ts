@@ -50,6 +50,8 @@ export type SessionInfo = {
 /** one provider in a profile's settings.json */
 export type ProviderSummary = {
   name: string;
+  /** the name menus show, such as "OpenCode Go" for oc-go */
+  displayName?: string;
   protocol: string;
   baseUrl: string;
   auth: "none" | "key" | "bearer";
@@ -87,28 +89,41 @@ export type Snapshot = SessionInfo & {
 
 export type Folder = { name: string; path: string; git: boolean };
 
+/** one prompt in the library: a whole system prompt a new chat can start with */
+export type PromptSummary = { name: string; text: string; updatedAt: string };
+
 /** phone → host */
 export type Request =
   | { id: number; op: "hello" }
   | { id: number; op: "sessions" }
   | { id: number; op: "open"; s: string }
-  | { id: number; op: "new"; cwd: string }
-  | { id: number; op: "prompt"; s: string; text: string }
+  /** `prompt` names a library prompt the session runs with instead of spark's own */
+  | { id: number; op: "new"; cwd: string; prompt?: string }
+  /** `item` is the id the phone shows the message under until the host's copy arrives */
+  | { id: number; op: "prompt"; s: string; text: string; item?: string }
   | { id: number; op: "cancel"; s: string }
   | { id: number; op: "config"; s: string; option: string; value: string }
   | { id: number; op: "options" }
   | { id: number; op: "answer"; s: string; request: string; option: string | null }
   | { id: number; op: "close"; s: string }
+  | { id: number; op: "sessionRename"; s: string; title: string }
+  | { id: number; op: "sessionDelete"; s: string }
   | { id: number; op: "folders"; path?: string }
   | { id: number; op: "mkdir"; path: string; name: string }
+  | { id: number; op: "folderRename"; path: string; name: string }
+  | { id: number; op: "folderDelete"; path: string }
   | { id: number; op: "search"; query: string; path?: string }
   | { id: number; op: "providers" }
   /** Mac only */
   | { id: number; op: "providerExport"; name: string }
-  /** cloud only; a key left out keeps the saved one */
-  | { id: number; op: "providerPut"; name: string; provider: Record<string, unknown>; model?: string; env?: Record<string, string> }
-  /** cloud only */
-  | { id: number; op: "providerDelete"; name: string };
+  /** a key left out keeps the saved one; `env` is cloud only; `previous` renames */
+  | { id: number; op: "providerPut"; name: string; provider: Record<string, unknown>; model?: string; env?: Record<string, string>; previous?: string }
+  | { id: number; op: "providerDelete"; name: string }
+  /** the library's prompts; the cloud keeps them */
+  | { id: number; op: "prompts" }
+  /** `previous` renames */
+  | { id: number; op: "promptPut"; name: string; text: string; previous?: string }
+  | { id: number; op: "promptDelete"; name: string };
 
 /** host → phone */
 export type Event =

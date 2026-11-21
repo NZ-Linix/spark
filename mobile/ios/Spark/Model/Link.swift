@@ -336,16 +336,50 @@ final class Link {
     await reopen(chat)
   }
 
-  func start(in folder: String, on host: String) async throws -> Chat {
-    let snap = try await request(host, "new", ["cwd": .string(folder)], as: Snapshot.self)
-    let chat = Chat(host: host, info: snap.info)
-    chat.load(snap)
-    remember(chat)
+  /**
+   * A new chat whose first message shows at once. The session starts on the host behind it, takes
+   * the options chosen before it existed, and then gets the message, with the same id as the one
+   * already on screen so the host's copy replaces it in place.
+   */
+  @discardableResult
+  func begin(_ text: String, in folder: String, on host: String, options: [String: String], prompt: String?) -> Chat {
+    let now = ISO8601DateFormatter().string(from: .now)
+    let chat = Chat(host: host, info: SessionInfo(id: "", title: Self.title(text), cwd: folder, updatedAt: now, live: true, running: true, origin: "phone"))
+    chat.loaded = true
+    chat.starting = true
+    chat.running = true
+    let first = Item(id: UUID().uuidString, role: .user, text: text)
+    chat.add(first)
+    if let known = configs[host] { chat.config = known.map { o in var o = o; if let v = options[o.id] { o.currentValue = v }; return o } }
     self.chat = chat
-    var list = sessions[host] ?? []
-    list.insert(snap.info, at: 0)
-    sessions[host] = list
+    Task {
+      do {
+        var fields: [String: JSON] = ["cwd": .string(folder)]
+        if let prompt { fields["prompt"] = .string(prompt) }
+        let snap = try await request(host, "new", fields, as: Snapshot.self)
+        chat.adopt(snap)
+        remember(chat)
+        var list = sessions[host] ?? []
+        list.insert(chat.info, at: 0)
+        sessions[host] = list
+        for (id, value) in options where chat.config.first(where: { $0.id == id })?.currentValue != value {
+          await set(chat, id, to: value)
+        }
+        _ = try await request(host, "prompt", ["s": .string(chat.info.id), "text": .string(text), "item": .string(first.id)])
+        chat.problem = nil
+      } catch {
+        chat.starting = false
+        chat.running = false
+        chat.problem = error.localizedDescription
+      }
+    }
     return chat
+  }
+
+  /** what the sidebar calls a chat until spark names it */
+  private static func title(_ text: String) -> String {
+    let line = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? text
+    return line.count > 60 ? String(line.prefix(60)) + "…" : line
   }
 
   private func reopen(_ chat: Chat) async {
@@ -360,17 +394,38 @@ final class Link {
     }
   }
 
+  /** shows the message at once; the host's copy, with the same id, replaces it */
   func send(_ text: String, in chat: Chat) async {
+    let item = Item(id: UUID().uuidString, role: .user, text: text)
+    chat.add(item)
+    chat.running = true
     do {
-      _ = try await request(chat.host, "prompt", ["s": .string(chat.info.id), "text": .string(text)])
+      _ = try await request(chat.host, "prompt", ["s": .string(chat.info.id), "text": .string(text), "item": .string(item.id)])
       chat.problem = nil
     } catch {
+      chat.running = false
       chat.problem = error.localizedDescription
     }
   }
 
   func cancel(_ chat: Chat) async {
+    guard !chat.info.id.isEmpty else { return }
     _ = try? await request(chat.host, "cancel", ["s": .string(chat.info.id)])
+  }
+
+  func rename(_ session: SessionInfo, on host: String, to title: String) async throws {
+    _ = try await request(host, "sessionRename", ["s": .string(session.id), "title": .string(title)])
+    if var list = sessions[host], let i = list.firstIndex(where: { $0.id == session.id }) {
+      list[i].title = title
+      sessions[host] = list
+    }
+    if let chat, chat.host == host, chat.info.id == session.id { chat.info.title = title }
+  }
+
+  func delete(_ session: SessionInfo, on host: String) async throws {
+    _ = try await request(host, "sessionDelete", ["s": .string(session.id)])
+    sessions[host]?.removeAll { $0.id == session.id }
+    if let chat, chat.host == host, chat.info.id == session.id { self.chat = nil }
   }
 
   func answer(_ chat: Chat, _ p: Permission, option: String?) async {
@@ -400,34 +455,56 @@ final class Link {
     }
   }
 
-  // MARK: Providers
+  // MARK: Providers and prompts
 
-  func providers(_ host: String) async throws -> [ProviderSummary] {
+  /** every host's options change when the shared providers do */
+  private func providersChanged() {
+    configs = [:]
+  }
+
+  func providers(_ host: String = "cloud") async throws -> [ProviderSummary] {
     try await request(host, "providers", as: [ProviderSummary].self)
   }
 
-  /** writes a provider into the cloud's profile; spark checks it first */
-  func putProvider(_ name: String, _ provider: [String: JSON], model: String?, env: [String: JSON] = [:]) async throws -> [ProviderSummary] {
+  /** the shared prompts; the cloud keeps them */
+  private(set) var prompts: [PromptSummary] = []
+
+  @discardableResult
+  func loadPrompts() async throws -> [PromptSummary] {
+    prompts = try await request("cloud", "prompts", as: [PromptSummary].self)
+    return prompts
+  }
+
+  @discardableResult
+  func putPrompt(_ name: String, text: String, previous: String? = nil) async throws -> [PromptSummary] {
+    var fields: [String: JSON] = ["name": .string(name), "text": .string(text)]
+    if let previous, previous != name { fields["previous"] = .string(previous) }
+    prompts = try await request("cloud", "promptPut", fields, as: [PromptSummary].self)
+    return prompts
+  }
+
+  @discardableResult
+  func deletePrompt(_ name: String) async throws -> [PromptSummary] {
+    prompts = try await request("cloud", "promptDelete", ["name": .string(name)], as: [PromptSummary].self)
+    return prompts
+  }
+
+  /** writes a provider into a host's profile; spark checks it first. `previous` renames one. */
+  func putProvider(_ name: String, _ provider: [String: JSON], model: String?, env: [String: JSON] = [:], previous: String? = nil, on host: String = "cloud") async throws -> [ProviderSummary] {
     var fields: [String: JSON] = ["name": .string(name), "provider": .object(provider)]
     if let model, !model.isEmpty { fields["model"] = .string(model) }
     if !env.isEmpty { fields["env"] = .object(env) }
-    let list = try await request("cloud", "providerPut", fields, as: [ProviderSummary].self)
-    // a new chat asks the cloud again, so it sees the new models
-    configs["cloud"] = nil
+    if let previous, previous != name { fields["previous"] = .string(previous) }
+    let list = try await request(host, "providerPut", fields, as: [ProviderSummary].self)
+    // a new chat asks the host again, so it sees the new models
+    providersChanged()
     return list
   }
 
-  func deleteProvider(_ name: String) async throws -> [ProviderSummary] {
-    let list = try await request("cloud", "providerDelete", ["name": .string(name)], as: [ProviderSummary].self)
-    configs["cloud"] = nil
+  func deleteProvider(_ name: String, on host: String = "cloud") async throws -> [ProviderSummary] {
+    let list = try await request(host, "providerDelete", ["name": .string(name)], as: [ProviderSummary].self)
+    providersChanged()
     return list
-  }
-
-  /** a one-time copy: later changes on either side stay on that side */
-  func copyProvider(_ name: String, from mac: String, as newName: String) async throws -> [ProviderSummary] {
-    struct Export: Decodable { var provider: [String: JSON]; var model: String?; var env: [String: JSON] }
-    let e = try await request(mac, "providerExport", ["name": .string(name)], as: Export.self)
-    return try await putProvider(newName, e.provider, model: e.model, env: e.env)
   }
 
   func folders(_ host: String, _ path: String?) async throws -> Listing {
@@ -442,6 +519,15 @@ final class Link {
 
   func mkdir(_ host: String, in path: String, named name: String) async throws -> String {
     try await request(host, "mkdir", ["path": .string(path), "name": .string(name)], as: String.self)
+  }
+
+  /** returns the folder's new path */
+  func renameFolder(_ host: String, _ path: String, to name: String) async throws -> String {
+    try await request(host, "folderRename", ["path": .string(path), "name": .string(name)], as: String.self)
+  }
+
+  func deleteFolder(_ host: String, _ path: String) async throws {
+    _ = try await request(host, "folderDelete", ["path": .string(path)])
   }
 
   // MARK: HTTP

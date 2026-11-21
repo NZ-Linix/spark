@@ -107,4 +107,10 @@ export class Acp {
   kill() {
     if (!this.closed) this.proc.kill();
   }
+
+  /** stops spark and waits until it has exited, so its session lock is free */
+  async stop() {
+    this.kill();
+    await this.proc.exited;
+  }
 }

@@ -128,6 +128,8 @@ nonisolated struct Listed: Identifiable, Hashable, Sendable {
 /** One provider in a host's spark settings, as `providers` lists it. */
 nonisolated struct ProviderSummary: Codable, Identifiable, Hashable, Sendable {
   var name: String
+  /** the name menus show, such as "OpenCode Go" for oc-go */
+  var displayName: String?
   var `protocol`: String
   var baseUrl: String
   /** none, key, or bearer */
@@ -140,6 +142,15 @@ nonisolated struct ProviderSummary: Codable, Identifiable, Hashable, Sendable {
   var active: Bool
   /** the whole provider as settings.json holds it, with its key left out */
   var provider: [String: JSON]
+  var id: String { name }
+  var title: String { displayName ?? name }
+}
+
+/** One prompt in the shared library: a whole system prompt a new chat can start with. */
+nonisolated struct PromptSummary: Codable, Identifiable, Hashable, Sendable {
+  var name: String
+  var text: String
+  var updatedAt: String
   var id: String { name }
 }
 

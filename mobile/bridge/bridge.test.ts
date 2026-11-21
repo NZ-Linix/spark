@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { macSessions, parseRunning } from "./mac_sessions";
 import { PhoneSessions } from "./phone_sessions";
 import type { SessionInfo } from "./protocol";
+import { Host } from "./host";
+import { applySnapshot, fingerprint, Library, type LibrarySnapshot, PROMPT_DIR } from "./library";
 import { Profile } from "./providers";
+import { type LibraryOp, Mirror } from "./sync";
 
 /** the spark this checkout builds; the provider checks run it against a scratch profile */
 const SPARK = process.env.SPARK_BIN ?? resolve(import.meta.dir, "../../zig-out/bin/spark");
@@ -120,9 +123,30 @@ describe("provider export (Mac)", () => {
     expect(JSON.stringify(p)).not.toContain("abcdefgh");
   });
 
-  test("the Mac never writes", async () => {
+  test("the Mac takes no header values from the phone", async () => {
     const mac = new Profile({ home: dir, spark: SPARK, role: "mac" });
-    await expect(mac.put({ name: "x", provider: {} })).rejects.toThrow("only changed on the cloud");
+    await expect(mac.put({ name: "x", provider: {}, env: { X: "1" } })).rejects.toThrow("own environment");
+  });
+});
+
+describe.skipIf(!existsSync(SPARK))("provider edit (Mac)", () => {
+  test("renames a provider, keeps its env key, and shows the display name", async () => {
+    writeFileSync(join(dir, "settings.json"), JSON.stringify({ theme: "dark", provider: "router", models: { router: "m-large" }, providers: { router } }));
+    const mac = new Profile({ home: dir, spark: SPARK, role: "mac" });
+    const list = await mac.put({ name: "oc-go", previous: "router", provider: { ...router, display_name: "OpenCode Go" } });
+    expect(list).toMatchObject([{ name: "oc-go", displayName: "OpenCode Go", auth: "bearer", keyEnv: "TEST_ROUTER_KEY", active: true, model: "m-large" }]);
+    const s = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
+    expect(s.theme).toBe("dark");
+    expect(s.providers.router).toBeUndefined();
+    expect(s.provider).toBe("oc-go");
+    expect(existsSync(join(dir, "cloud-env.json"))).toBe(false);
+  });
+
+  test("a removed model is no longer the saved one", async () => {
+    writeFileSync(join(dir, "settings.json"), JSON.stringify({ provider: "router", models: { router: "m-large" }, providers: { router } }));
+    const mac = new Profile({ home: dir, spark: SPARK, role: "mac" });
+    const [p] = await mac.put({ name: "router", provider: { ...router, model_metadata: { "m-small": { display_name: "Small" } } } });
+    expect(p.model).toBe("m-small");
   });
 });
 
@@ -245,4 +269,154 @@ test("ten wrong codes cancel every open code", async () => {
   } finally {
     relay.kill();
   }
+});
+
+describe("library", () => {
+  const key = { ...router, auth: { type: "key", key: "sk-abcdefghijkl9876" }, headers: {} };
+
+  test("adds, renames and deletes prompts, and refuses a name that is a path", () => {
+    const lib = new Library({ dir, spark: SPARK });
+    let changes = 0;
+    lib.onChange(() => changes++);
+    lib.putPrompt({ name: "Reviewer", text: "Review." });
+    expect(lib.putPrompt({ name: "Strict reviewer", previous: "Reviewer", text: "Be strict." }).map((p) => p.name)).toEqual(["Strict reviewer"]);
+    expect(() => lib.putPrompt({ name: "../x", text: "" })).toThrow("prompt's name");
+    expect(() => lib.putPrompt({ name: ".hidden", text: "" })).toThrow("prompt's name");
+    expect(lib.deletePrompt("Strict reviewer")).toEqual([]);
+    expect(() => lib.deletePrompt("Strict reviewer")).toThrow("already gone");
+    expect(changes).toBe(3);
+  });
+
+  test("a copy replaces the providers, keeps the profile's choices, and lists the prompts", () => {
+    const home = join(dir, "home");
+    mkdirSync(home);
+    writeFileSync(join(home, "settings.json"), JSON.stringify({ theme: "dark", provider: "b", models: { b: "m-large", gone: "x" }, providers: { gone: key } }));
+    writeFileSync(join(home, "prompts.json"), JSON.stringify({ dirs: ["/Users/example/prompts"], starred: ["a"] }));
+    const snap: LibrarySnapshot = { providers: { a: key, b: key }, models: { a: "m-large" }, provider: "a", env: {}, prompts: { Reviewer: "Review." } };
+    const marks = applySnapshot(home, snap);
+    const s = JSON.parse(readFileSync(join(home, "settings.json"), "utf8"));
+    expect(Object.keys(s.providers).sort()).toEqual(["a", "b"]);
+    expect(s).toMatchObject({ theme: "dark", provider: "b", models: { a: "m-large", b: "m-large" } });
+    expect(s.models.gone).toBeUndefined();
+    expect(readFileSync(join(home, PROMPT_DIR, "Reviewer.md"), "utf8")).toBe("Review.");
+    const list = JSON.parse(readFileSync(join(home, "prompts.json"), "utf8"));
+    expect(list).toEqual({ dirs: ["/Users/example/prompts", join(home, PROMPT_DIR)], starred: ["a"] });
+    expect(marks.a).toBe(fingerprint(key));
+    expect(statSync(join(home, "settings.json")).mode & 0o777).toBe(0o600);
+    // a deleted prompt leaves the profile too
+    applySnapshot(home, { ...snap, prompts: {} });
+    expect(readdirSync(join(home, PROMPT_DIR))).toEqual([]);
+  });
+
+  test("starts from the providers the cloud profiles already had", () => {
+    for (const [d, p] of [["one", "a"], ["two", "b"]]) {
+      mkdirSync(join(dir, d));
+      writeFileSync(join(dir, d, "settings.json"), JSON.stringify({ provider: p, providers: { [p]: key } }));
+    }
+    writeFileSync(join(dir, "two", "cloud-env.json"), JSON.stringify({ TEST_ORG: "o" }));
+    utimesSync(join(dir, "one", "settings.json"), new Date(2026, 0, 1), new Date(2026, 0, 1));
+    const lib = new Library({ dir: join(dir, "lib"), spark: SPARK });
+    lib.adopt([join(dir, "one"), join(dir, "two")]);
+    const snap = lib.snapshot();
+    expect(Object.keys(snap.providers).sort()).toEqual(["a", "b"]);
+    expect(snap.env).toEqual({ TEST_ORG: "o" });
+    // the newest profile's choice wins, and spark gets a model for it
+    expect(snap.provider).toBe("b");
+    expect(snap.models).toEqual({ b: "m-large" });
+  });
+});
+
+describe("Mac mirror", () => {
+  const key = (k: string) => ({ ...router, auth: { type: "key", key: k }, headers: {} });
+  const setup = (local: Record<string, unknown>) => {
+    writeFileSync(join(dir, "settings.json"), JSON.stringify({ provider: Object.keys(local)[0], providers: local }));
+    const sent: LibraryOp[] = [];
+    let refuse = false;
+    const mirror = new Mirror({
+      home: dir,
+      stateFile: join(dir, "mobile-library.json"),
+      profile: new Profile({ home: dir, spark: SPARK, role: "mac", lookup: async () => "sk-from-the-shell-1234" }),
+      send: async (op) => {
+        if (refuse) throw new Error("no");
+        sent.push(op);
+      },
+    });
+    return { mirror, sent, refuse: () => (refuse = true) };
+  };
+  const snap = (providers: Record<string, any>): LibrarySnapshot => ({ providers, models: {}, env: {}, prompts: {} });
+
+  test("the first sync sends only the providers the library lacks, then copies the library", async () => {
+    const { mirror, sent } = setup({ mine: router, both: key("sk-local-0000000000") });
+    await mirror.receive(snap({ both: key("sk-cloud-1111111111") }));
+    expect(sent.map((o) => o.op + " " + o.name)).toEqual(["providerPut mine"]);
+    expect((sent[0] as any).provider.auth).toEqual({ type: "key", key: "sk-from-the-shell-1234" });
+    const s = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
+    expect(s.providers.both.auth.key).toBe("sk-cloud-1111111111");
+  });
+
+  test("a local edit goes to the library and a refused one is undone", async () => {
+    const { mirror, sent, refuse } = setup({ a: key("sk-cloud-1111111111") });
+    await mirror.receive(snap({ a: key("sk-cloud-1111111111") }));
+    expect(sent).toEqual([]);
+    await Bun.sleep(20);
+    const edited = { ...key("sk-cloud-1111111111"), display_name: "Router" };
+    writeFileSync(join(dir, "settings.json"), JSON.stringify({ provider: "a", providers: { a: edited, b: key("sk-new-22222222222") } }));
+    await mirror.poll();
+    expect(sent.map((o) => o.op + " " + o.name)).toEqual(["providerPut a", "providerPut b"]);
+    expect((sent[0] as any).provider.display_name).toBe("Router");
+    // a deletion the relay refuses comes back
+    await Bun.sleep(20);
+    refuse();
+    writeFileSync(join(dir, "settings.json"), JSON.stringify({ provider: "a", providers: {} }));
+    await mirror.poll();
+    const s = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
+    expect(Object.keys(s.providers)).toEqual(["a"]);
+  });
+});
+
+describe("folders from the phone", () => {
+  /** a host on a scratch root; each request resolves with its reply */
+  function host(confine = true) {
+    const root = join(dir, "root");
+    mkdirSync(join(root, "work", "app"), { recursive: true });
+    const replies: any[] = [];
+    const h = new Host({ info: { name: "Cloud", kind: "cloud", home: root, platform: process.platform }, spark: SPARK, root, confine, send: (e) => replies.push(e) });
+    let n = 0;
+    const ask = async (req: Record<string, unknown>) => {
+      const id = `r${++n}`;
+      await h.handle({ id, ...req } as any);
+      return replies.find((r) => r.id === id);
+    };
+    return { root, ask };
+  }
+
+  test("renames and deletes a folder inside the root", async () => {
+    const { root, ask } = host();
+    const renamed = await ask({ op: "folderRename", path: join(root, "work", "app"), name: "site" });
+    expect(renamed.ok).toBe(true);
+    expect(existsSync(join(root, "work", "site"))).toBe(true);
+    expect(existsSync(join(root, "work", "app"))).toBe(false);
+
+    mkdirSync(join(root, "work", "taken"));
+    const clash = await ask({ op: "folderRename", path: join(root, "work", "site"), name: "taken" });
+    expect(clash.ok).toBe(false);
+    expect(clash.error).toContain("already a folder named taken");
+
+    writeFileSync(join(root, "work", "site", "file.txt"), "x");
+    const deleted = await ask({ op: "folderDelete", path: join(root, "work", "site") });
+    expect(deleted.ok).toBe(true);
+    expect(existsSync(join(root, "work", "site"))).toBe(false);
+  });
+
+  test("refuses the root, what holds it, and paths outside it", async () => {
+    const { root, ask } = host();
+    for (const path of [root, dir, "/", join(dir, "elsewhere")]) {
+      const r = await ask({ op: "folderDelete", path });
+      expect(r.ok).toBe(false);
+    }
+    expect(existsSync(root)).toBe(true);
+    const bad = await ask({ op: "folderRename", path: join(root, "work"), name: "../escape" });
+    expect(bad.ok).toBe(false);
+    expect(existsSync(join(root, "work"))).toBe(true);
+  });
 });

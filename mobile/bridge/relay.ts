@@ -6,16 +6,19 @@
  *   SPARK_RELAY_DATA     where pairings are kept (./data)
  *   SPARK_RELAY_NAME     what the phone calls this relay (spark)
  *   SPARK_CLOUD_ROOT     turns on cloud sessions; each phone gets a folder under it
- *   SPARK_CLOUD_SETTINGS a spark settings.json copied into each phone's cloud profile when it is
- *                        first used; after that the phone manages that profile's providers
+ *   SPARK_CLOUD_SETTINGS a spark settings.json whose providers start the library when it is new
+ *
+ * The library ($SPARK_RELAY_DATA/library) holds the one set of providers and prompts every phone,
+ * cloud profile and Mac shares. Each cloud profile and each connected Mac gets a copy after every
+ * change, and a Mac sends its own edits here.
  *   SPARK_BIN            the spark binary for cloud sessions (spark)
  */
 import type { ServerWebSocket } from "bun";
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { Host } from "./host";
-import { Profile } from "./providers";
+import { applySnapshot, Library } from "./library";
 import type { Event, Request } from "./protocol";
 
 const PORT = Number(process.env.PORT ?? 8787);
@@ -74,7 +77,42 @@ const codes = new Map<string, { host: string; expires: number }>();
 type Socket = ServerWebSocket<{ kind: "device" | "host"; id: string }>;
 const deviceSockets = new Map<string, Set<Socket>>();
 const hostSockets = new Map<string, Socket>();
-const clouds = new Map<string, Host>();
+const clouds = new Map<string, { host: Host; home: string }>();
+
+const library = new Library({ dir: join(DATA, "library"), spark: SPARK });
+{
+  const homes = CLOUD && existsSync(CLOUD) ? readdirSync(CLOUD).map((d) => join(CLOUD, d, "spark")) : [];
+  if (CLOUD_SETTINGS && existsSync(CLOUD_SETTINGS)) homes.push(dirname(CLOUD_SETTINGS));
+  library.adopt(homes);
+}
+
+/** every Mac and cloud profile gets the library as it is now */
+function spreadLibrary() {
+  const snap = library.snapshot();
+  for (const { host, home } of clouds.values()) {
+    try {
+      applySnapshot(home, snap);
+    } catch (e) {
+      console.error(`couldn't copy the library to ${home}:`, e);
+    }
+    host.invalidate();
+  }
+  const text = JSON.stringify({ relay: "library", library: snap });
+  for (const ws of hostSockets.values()) ws.send(text);
+}
+library.onChange(spreadLibrary);
+
+/** a Mac's own provider edit, from spark on that Mac */
+async function macLibraryOp(op: any): Promise<unknown> {
+  switch (op?.op) {
+    case "providerPut":
+      return library.putProvider(op);
+    case "providerDelete":
+      return library.deleteProvider(op.name);
+    default:
+      throw new Error("The relay doesn't know that library change.");
+  }
+}
 
 function json(body: unknown, status = 200) {
   return Response.json(body, { status, headers: { "cache-control": "no-store" } });
@@ -98,30 +136,25 @@ function announce(hostId: string) {
 }
 
 function cloudFor(device: string): Host {
-  let h = clouds.get(device);
-  if (h) return h;
+  const known = clouds.get(device);
+  if (known) return known.host;
   const base = join(CLOUD!, device);
   const work = join(base, "work");
   const home = join(base, "spark");
   mkdirSync(work, { recursive: true });
   mkdirSync(home, { recursive: true, mode: 0o700 });
-  if (CLOUD_SETTINGS && existsSync(CLOUD_SETTINGS) && !existsSync(join(home, "settings.json"))) {
-    copyFileSync(CLOUD_SETTINGS, join(home, "settings.json"));
-    // it holds provider keys
-    chmodSync(join(home, "settings.json"), 0o600);
-  }
-  // only this phone's profile: every file it touches is under this phone's own folder
-  const profile = new Profile({ home, spark: SPARK, role: "cloud" });
-  h = new Host({
+  applySnapshot(home, library.snapshot());
+  const h = new Host({
     info: { name: "Cloud", kind: "cloud", home: work, platform: process.platform },
     spark: SPARK,
     root: work,
     confine: true,
-    env: () => ({ ...profile.env(), SPARK_HOME: home }),
-    profile,
+    env: () => ({ ...library.profile.env(), SPARK_HOME: home }),
+    library,
+    prompts: { home, sessions: join(base, "session-prompts.json") },
     send: (event: Event) => toDevice(device, { host: "cloud", msg: event }),
   });
-  clouds.set(device, h);
+  clouds.set(device, { host: h, home });
   return h;
 }
 
@@ -255,6 +288,7 @@ Bun.serve<{ kind: "device" | "host"; id: string }, {}>({
         hostSockets.get(id)?.close(4000, "Replaced by a newer connection.");
         hostSockets.set(id, ws);
         announce(id);
+        ws.send(JSON.stringify({ relay: "library", library: library.snapshot() }));
       }
     },
     message(ws, raw) {
@@ -282,6 +316,13 @@ Bun.serve<{ kind: "device" | "host"; id: string }, {}>({
           h.name = name(m.name, h.name);
           save();
           announce(id);
+        }
+        if (m.library && typeof m.rid === "number") {
+          macLibraryOp(m.library).then(
+            () => ws.send(JSON.stringify({ relay: "library-reply", rid: m.rid, ok: true })),
+            (e) => ws.send(JSON.stringify({ relay: "library-reply", rid: m.rid, ok: false, error: e instanceof Error ? e.message : String(e) })),
+          );
+          return;
         }
         if (!m.msg) return;
         const to: string[] = m.to ? [m.to].filter((d: string) => h.devices.includes(d)) : h.devices;

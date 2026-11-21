@@ -127,7 +127,7 @@ enum Inline {
         options: .init(allowsExtendedAttributes: false, interpretedSyntax: .inlineOnlyPreservingWhitespace, failurePolicy: .returnPartiallyParsedIfPossible)))
       ?? AttributedString(s)
     for run in out.runs where run.inlinePresentationIntent?.contains(.code) == true {
-      out[run.range].font = .geistMono(15, relativeTo: .body)
+      out[run.range].font = .geistMono(14, relativeTo: .body)
       out[run.range].backgroundColor = Color.white.opacity(0.08)
     }
     return out
@@ -145,7 +145,7 @@ struct MarkdownView: View {
 
   var body: some View {
     let blocks = Block.parse(text)
-    VStack(alignment: .leading, spacing: 14) {
+    VStack(alignment: .leading, spacing: 12) {
       ForEach(Array(blocks.enumerated()), id: \.offset) { i, block in
         BlockView(block: block, ink: i == blocks.count - 1 ? ink : nil)
           .equatable()
@@ -168,30 +168,30 @@ private struct BlockView: View, Equatable {
     switch block {
     case .heading(let level, let s):
       Text(Inline.render(s))
-        .font(.geist(level <= 2 ? 21 : 18, .semibold, relativeTo: level <= 2 ? .title3 : .headline))
+        .font(.geist(level <= 2 ? 19 : 16.5, .semibold, relativeTo: level <= 2 ? .title3 : .headline))
         .kerning(-0.2)
         .textRenderer(renderer)
         .padding(.top, 6)
     case .paragraph(let s):
       Text(Inline.render(s))
-        .font(.geist(17))
-        .lineSpacing(5)
+        .font(.geist(15.5))
+        .lineSpacing(4)
         .textRenderer(renderer)
     case .item(let level, let marker, let s):
       HStack(alignment: .firstTextBaseline, spacing: 10) {
         Text(marker.first?.isNumber == true ? marker.replacingOccurrences(of: ")", with: ".") : "•")
-          .font(.geist(17, marker.first?.isNumber == true ? .medium : .regular).monospacedDigit())
+          .font(.geist(15.5, marker.first?.isNumber == true ? .medium : .regular).monospacedDigit())
           .foregroundStyle(.secondary)
           .frame(minWidth: 14, alignment: .leading)
         Text(Inline.render(s))
-          .font(.geist(17))
+          .font(.geist(15.5))
           .lineSpacing(5)
           .textRenderer(renderer)
       }
       .padding(.leading, CGFloat(level) * 20)
     case .quote(let s):
       Text(Inline.render(s))
-        .font(.geist(17))
+        .font(.geist(15.5))
         .foregroundStyle(.secondary)
         .textRenderer(renderer)
         .padding(.leading, 14)
@@ -270,7 +270,7 @@ private struct CodeBlock: View {
       .padding(.top, 10)
       ScrollView(.horizontal, showsIndicators: false) {
         Text(code)
-          .font(.geistMono(14, relativeTo: .footnote))
+          .font(.geistMono(13, relativeTo: .footnote))
           .lineSpacing(3)
           .textSelection(.enabled)
           .padding(14)
@@ -289,14 +289,14 @@ private struct TableBlock: View {
       Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 10) {
         GridRow {
           ForEach(Array(head.enumerated()), id: \.offset) { _, cell in
-            cellText(cell).font(.geist(15, .semibold))
+            cellText(cell).font(.geist(14, .semibold))
           }
         }
         ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
           Divider().gridCellUnsizedAxes(.horizontal)
           GridRow {
             ForEach(0..<head.count, id: \.self) { c in
-              cellText(c < row.count ? row[c] : "").font(.geist(15))
+              cellText(c < row.count ? row[c] : "").font(.geist(14))
             }
           }
         }

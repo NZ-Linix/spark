@@ -42,7 +42,7 @@ struct SettingsView: View {
           connection
           hosts
           sidebar
-          if link.hosts.contains(where: { $0.kind == .cloud }) { cloud }
+          if link.hosts.contains(where: { $0.kind == .cloud }) { library }
           about
           Button("Forget all pairings", role: .destructive) { confirmLeave = true }
             .font(.geist(15, .medium))
@@ -85,7 +85,9 @@ struct SettingsView: View {
     HStack(spacing: 14) {
       ZStack {
         Circle().fill(Color.white.opacity(0.06))
-        LiveDot(on: link.phase == .online)
+        Image(systemName: link.phase == .online ? "antenna.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
+          .font(.system(size: 16, weight: .medium))
+          .foregroundStyle(link.phase == .online ? Color.white : Color.dim)
       }
       .frame(width: 44, height: 44)
       VStack(alignment: .leading, spacing: 3) {
@@ -110,7 +112,7 @@ struct SettingsView: View {
               .background(Color.white.opacity(0.07), in: .rect(cornerRadius: 10, style: .continuous))
             VStack(alignment: .leading, spacing: 2) {
               Text(h.kind == .cloud ? "Cloud" : h.name).font(.geist(16))
-              Text(h.online ? "Online" : "Offline").font(.geist(12)).foregroundStyle(h.online ? Color.dim : Color.faint)
+              if !h.online { Text("Offline").font(.geist(12)).foregroundStyle(Color.faint) }
             }
             Spacer(minLength: 0)
             if h.kind == .mac {
@@ -171,31 +173,38 @@ struct SettingsView: View {
     }
   }
 
-  private var cloud: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      Caption("Cloud")
-      NavigationLink {
-        CloudProvidersView()
-      } label: {
-        HStack(spacing: 12) {
-          Image(systemName: "key")
-            .font(.system(size: 14, weight: .medium))
-            .frame(width: 34, height: 34)
-            .background(Color.white.opacity(0.07), in: .rect(cornerRadius: 10, style: .continuous))
-          Text("Cloud providers").font(.geist(16))
-          Spacer(minLength: 0)
-          Image(systemName: "chevron.right")
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(Color.faint)
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .contentShape(.rect)
+  private func providersLink<Destination: View>(_ title: String, symbol: String, id: String, @ViewBuilder _ destination: @escaping () -> Destination) -> some View {
+    NavigationLink(destination: destination) {
+      HStack(spacing: 12) {
+        Image(systemName: symbol)
+          .font(.system(size: 14, weight: .medium))
+          .frame(width: 34, height: 34)
+          .background(Color.white.opacity(0.07), in: .rect(cornerRadius: 10, style: .continuous))
+        Text(title).font(.geist(16))
+        Spacer(minLength: 0)
+        Image(systemName: "chevron.right")
+          .font(.system(size: 13, weight: .semibold))
+          .foregroundStyle(Color.faint)
       }
-      .buttonStyle(.plain)
+      .foregroundStyle(.white)
+      .padding(.horizontal, 12)
+      .padding(.vertical, 10)
+      .contentShape(.rect)
+    }
+    .buttonStyle(.plain)
+    .accessibilityIdentifier(id)
+  }
+
+  private var library: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Caption("Library")
+      VStack(spacing: 0) {
+        providersLink("Providers", symbol: "server.rack", id: "cloudProviders") { CloudProvidersView() }
+        Divider().overlay(Color.hairline).padding(.leading, 58)
+        providersLink("Prompts", symbol: "text.quote", id: "prompts") { PromptsView() }
+      }
       .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 22, style: .continuous))
-      Text("The models cloud chats can use. Add your own, or copy one from your Mac.")
+      Text("One set of providers and prompts for the cloud and every paired Mac. A new chat can start with any prompt instead of spark's own.")
         .font(.geist(13))
         .foregroundStyle(Color.faint)
         .padding(.horizontal, 6)

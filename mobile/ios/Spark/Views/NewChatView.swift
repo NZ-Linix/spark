@@ -12,9 +12,10 @@ struct NewChatView: View {
   @State private var label = ""
   /** model and other options chosen before the chat exists; applied once it starts */
   @State private var pending: [String: String] = [:]
+  /** a library prompt the chat runs with in place of spark's own */
+  @AppStorage("prompt") private var prompt = ""
   @State private var picking = false
   @State private var draft = ""
-  @State private var starting = false
   @State private var problem: String?
   @State private var shown = false
   @State private var sent = 0
@@ -53,7 +54,7 @@ struct NewChatView: View {
         if let problem {
           Text(problem).font(.geist(13)).foregroundStyle(Color.dim).padding(.horizontal, 24).transition(.opacity)
         }
-        Composer(text: $draft, focused: $focused, running: starting, enabled: link.phase == .online && link.host?.online == true) {
+        Composer(text: $draft, focused: $focused, running: false, enabled: link.phase == .online && link.host?.online == true) {
           send()
         } stop: {
         } accessories: {
@@ -62,6 +63,9 @@ struct NewChatView: View {
           .fixedSize()
           .layoutPriority(1)
           .accessibilityLabel(folder == nil ? "Choose a folder" : "Folder \(label)")
+          if !link.prompts.isEmpty {
+            PromptChip(prompts: link.prompts, selection: $prompt)
+          }
           ConfigChips(options: options) { id, value in pending[id] = value }
         }
       }
@@ -97,7 +101,9 @@ struct NewChatView: View {
       pending = [:]
     }
     .task(id: "\(link.host?.id ?? "")-\(link.phase == .online)") {
-      if let host = link.host?.id, link.phase == .online { await link.loadOptions(host) }
+      guard link.phase == .online else { return }
+      if let host = link.host?.id { await link.loadOptions(host) }
+      if link.hosts.contains(where: { $0.kind == .cloud }) { _ = try? await link.loadPrompts() }
     }
   }
 
@@ -113,25 +119,46 @@ struct NewChatView: View {
 
   private func send() {
     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !text.isEmpty, !starting, let host = link.host?.id else { return }
+    guard !text.isEmpty, let host = link.host?.id else { return }
     guard let folder else {
       picking = true
       return
     }
-    starting = true
     sent += 1
-    Task {
-      defer { starting = false }
-      do {
-        let chat = try await link.start(in: folder, on: host)
-        draft = ""
-        for (id, value) in pending where chat.config.first(where: { $0.id == id })?.currentValue != value {
-          await link.set(chat, id, to: value)
-        }
-        await link.send(text, in: chat)
-      } catch {
-        problem = error.localizedDescription
+    let chosen = link.prompts.contains(where: { $0.name == prompt }) ? prompt : nil
+    // the chat shows at once with this message in it; the session starts behind it
+    link.begin(text, in: folder, on: host, options: pending, prompt: chosen)
+    draft = ""
+  }
+}
+
+/** Which library prompt a new chat runs with; spark's own when none is chosen. */
+private struct PromptChip: View {
+  let prompts: [PromptSummary]
+  @Binding var selection: String
+
+  var body: some View {
+    let current = prompts.first { $0.name == selection }
+    Menu {
+      Picker("Prompt", selection: $selection) {
+        Text("spark's own").tag("")
+        ForEach(prompts) { p in Text(p.name).tag(p.name) }
       }
+    } label: {
+      HStack(spacing: 4) {
+        Image(systemName: "text.quote").font(.system(size: 11, weight: .semibold))
+        Text(current?.name ?? "Prompt")
+          .font(.geist(13.5, .medium))
+          .lineLimit(1)
+        Image(systemName: "chevron.down")
+          .font(.system(size: 8, weight: .bold))
+          .foregroundStyle(Color.faint)
+      }
+      .foregroundStyle(current == nil ? Color.faint : Color.dim)
+      .padding(.horizontal, ComposerOption.slop)
+      .frame(height: 30)
+      .contentShape(.rect)
     }
+    .accessibilityLabel(current.map { "Prompt \($0.name)" } ?? "Choose a prompt")
   }
 }

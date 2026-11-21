@@ -30,6 +30,10 @@ export class PhoneSessions {
     this.save();
   }
 
+  remove(id: string) {
+    if (this.all().delete(id)) this.save();
+  }
+
   /** forgets sessions spark no longer lists; `known` must be every saved session, not one page */
   prune(known: Set<string>) {
     const ids = this.all();

@@ -1,7 +1,10 @@
-import { existsSync } from "node:fs";
-import { mkdir, readdir, realpath, stat } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdir, readdir, realpath, rename, rm, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { Acp } from "./acp";
+import { type Library, promptFile } from "./library";
+import { writeAtomic } from "./providers";
 import { macSessions, type Running } from "./mac_sessions";
 import type { PhoneSessions } from "./phone_sessions";
 import type { Profile } from "./providers";
@@ -23,6 +26,10 @@ export type HostOptions = {
   filter?: { phone: PhoneSessions; running: () => Promise<Running[]> };
   /** the providers in this host's spark profile */
   profile?: Profile;
+  /** the cloud only: the shared providers and prompts, which the phone edits through it */
+  library?: Library;
+  /** the spark profile the library's prompts are copied into, and the file that remembers which prompt each session runs with */
+  prompts?: { home: string; sessions: string };
   /** `to` is one device; without it, every device that can see this host */
   send: (event: Event, to?: string) => void;
 };
@@ -103,9 +110,9 @@ export class Host {
       case "open":
         return (await this.open(req.s)).snapshot();
       case "new":
-        return (await this.create(req.cwd)).snapshot();
+        return (await this.create(req.cwd, req.prompt)).snapshot();
       case "prompt":
-        return this.prompt(req.s, req.text);
+        return this.prompt(req.s, req.text, req.item);
       case "cancel": {
         const l = this.live.get(req.s);
         if (l) {
@@ -140,28 +147,60 @@ export class Host {
         return this.folders(req.path);
       case "search":
         return this.search(req.query, req.path);
+      case "sessionRename":
+        return this.renameSession(req.s, req.title);
+      case "sessionDelete":
+        return this.deleteSession(req.s);
       case "providers":
-        return this.profile().list();
+        return this.o.library ? this.o.library.providers() : this.profile().list();
       case "providerExport":
         return this.profile().export(req.name);
       case "providerPut": {
-        const list = await this.profile().put(req);
-        this.defaults = undefined;
+        const list = this.o.library ? await this.o.library.putProvider(req) : await this.profile().put(req);
+        this.invalidate();
         return list;
       }
       case "providerDelete": {
-        const list = await this.profile().delete(req.name);
-        this.defaults = undefined;
+        const list = this.o.library ? await this.o.library.deleteProvider(req.name) : await this.profile().delete(req.name);
+        this.invalidate();
         return list;
       }
+      case "prompts":
+        return this.library().prompts();
+      case "promptPut":
+        return this.library().putPrompt(req);
+      case "promptDelete":
+        return this.library().deletePrompt(req.name);
       case "mkdir": {
-        if (!req.name || /[/\\]/.test(req.name) || req.name.startsWith(".")) throw new Error("That isn't a folder name.");
         const parent = await this.allowed(req.path);
-        const path = join(parent, req.name);
+        const path = join(parent, folderName(req.name));
         await mkdir(path);
         return path;
       }
+      case "folderRename": {
+        const from = await this.removable(req.path);
+        const to = join(dirname(from), folderName(req.name));
+        if (to === from) return to;
+        if (existsSync(to)) throw new Error(`There's already a folder named ${basename(to)} there.`);
+        await rename(from, to);
+        return to;
+      }
+      case "folderDelete": {
+        const path = await this.removable(req.path);
+        await rm(path, { recursive: true, force: true });
+        return dirname(path);
+      }
     }
+  }
+
+  /** forgets what a new chat would start with, after its providers changed */
+  invalidate() {
+    this.defaults = undefined;
+  }
+
+  private library(): Library {
+    if (!this.o.library) throw new Error("Prompts live in the cloud. Open them there.");
+    return this.o.library;
   }
 
   // MARK: Sessions
@@ -252,7 +291,7 @@ export class Host {
     const known = (await this.saved()).sessions.find((s) => s.id === id);
     if (!known) throw new Error("That session is gone.");
     const cwd = existsSync(known.cwd) ? known.cwd : this.o.root;
-    const acp = new Acp(this.o.spark, cwd, this.env());
+    const acp = new Acp(this.o.spark, cwd, { ...this.env(), ...this.promptEnv(this.sessionPrompts()[id]) });
     const origin = !this.o.filter || this.o.filter.phone.all().has(id) ? "phone" : "mac";
     const l = new Live(id, cwd, known.title, known.updatedAt, acp, origin);
     this.wire(l);
@@ -269,9 +308,37 @@ export class Host {
     return l;
   }
 
-  private async create(path: string): Promise<Live> {
+  /** what spark runs with for a session that uses library prompt `name` */
+  private promptEnv(name?: string): Record<string, string> {
+    if (!name) return {};
+    const file = this.o.prompts ? promptFile(this.o.prompts.home, name) : null;
+    return file ? { SPARK_SYSTEM_PROMPT_FILE: file } : {};
+  }
+
+  private sessionPrompts(): Record<string, string> {
+    if (!this.o.prompts) return {};
+    try {
+      const parsed = JSON.parse(readFileSync(this.o.prompts.sessions, "utf8"));
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private rememberPrompt(id: string, name?: string) {
+    if (!this.o.prompts) return;
+    const all = this.sessionPrompts();
+    if (name) all[id] = name;
+    else if (!(id in all)) return;
+    else delete all[id];
+    writeAtomic(this.o.prompts.sessions, all);
+  }
+
+  private async create(path: string, prompt?: string): Promise<Live> {
     const cwd = await this.allowed(path);
-    const acp = new Acp(this.o.spark, cwd, this.env());
+    const env = this.promptEnv(prompt);
+    if (prompt && !env.SPARK_SYSTEM_PROMPT_FILE) throw new Error(`The prompt ${prompt} hasn't reached this host yet.`);
+    const acp = new Acp(this.o.spark, cwd, { ...this.env(), ...env });
     const l = new Live("", cwd, "New session", new Date().toISOString(), acp, "phone");
     this.wire(l);
     try {
@@ -280,6 +347,7 @@ export class Host {
       l.id = r.sessionId;
       if (Array.isArray(r?.configOptions)) l.config = r.configOptions;
       this.o.filter?.phone.add(l.id);
+      this.rememberPrompt(l.id, prompt);
     } catch (e) {
       acp.kill();
       throw e;
@@ -289,13 +357,54 @@ export class Host {
     return l;
   }
 
-  private async prompt(id: string, text: string) {
+  private async renameSession(id: string, raw: string) {
+    const title = String(raw ?? "").trim();
+    if (!title || title.length > 200 || /[\r\n]/.test(title)) throw new Error("A title is one line of 1 to 200 characters.");
+    const l = await this.open(id);
+    await l.acp.call("_spark/session/rename", { sessionId: l.id, title });
+    l.title = title;
+    l.updatedAt = new Date().toISOString();
+    this.o.send({ t: "info", s: l.id, title: l.title, updatedAt: l.updatedAt });
+    return null;
+  }
+
+  private async deleteSession(id: string) {
+    const l = this.live.get(id);
+    if (l?.running) throw new Error("spark is still working in that session. Stop it first.");
+    if (l) {
+      this.live.delete(id);
+      await l.acp.stop();
+    }
+    const acp = new Acp(this.o.spark, this.o.root, this.env());
+    try {
+      await acp.initialize();
+      // the bridge's own spark for it has only just exited; its lock can take a moment to go
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await acp.call("session/remove", { sessionId: id });
+          break;
+        } catch (e) {
+          if (attempt >= 4 || !String(e instanceof Error ? e.message : e).includes("another spark")) throw e;
+          await Bun.sleep(250);
+        }
+      }
+    } finally {
+      acp.kill();
+    }
+    this.o.filter?.phone.remove(id);
+    this.rememberPrompt(id);
+    return null;
+  }
+
+  /** `item` is the id the phone already shows the message under */
+  private async prompt(id: string, text: string, item?: string) {
     const l = await this.open(id);
     if (l.running) throw new Error("spark is still working on the last message.");
     const body = text.trim();
     if (!body) return null;
     l.touched = Date.now();
-    this.upsert(l, { id: crypto.randomUUID(), role: "user", text: body });
+    const shown = typeof item === "string" && /^[A-Za-z0-9-]{8,64}$/.test(item) && !l.index.has(item) ? item : crypto.randomUUID();
+    this.upsert(l, { id: shown, role: "user", text: body });
     this.setRunning(l, true);
     l.acp
       .call("session/prompt", { sessionId: l.id, prompt: [{ type: "text", text: body }] })
@@ -484,6 +593,20 @@ export class Host {
     return real;
   }
 
+  /** a folder the phone may rename or delete: never the host's root, the home folder, or what holds them */
+  private async removable(path: string): Promise<string> {
+    if (!path) throw new Error("Choose a folder.");
+    const real = await this.allowed(path);
+    const root = await realpath(this.o.root);
+    const home = await realpath(homedir()).catch(() => homedir());
+    for (const keep of [root, home]) {
+      if (real === keep || keep.startsWith(real + sep)) throw new Error("spark won't change that folder.");
+    }
+    if (dirname(real) === home && PROTECTED.has(basename(real))) throw new Error("spark won't change that folder.");
+    if (real.split(sep).filter(Boolean).length < 2) throw new Error("spark won't change that folder.");
+    return real;
+  }
+
   /** folders under `path` whose name contains `query`, nearest first, within a time budget */
   private async search(query: string, path?: string): Promise<Folder[]> {
     const q = query.trim().toLowerCase();
@@ -529,6 +652,15 @@ export class Host {
     const top = this.o.confine ? dir === root : dir === sep;
     return { path: dir, name: dir === root ? "Home" : basename(dir), parent: top ? null : dirname(dir), folders };
   }
+}
+
+/** the home folders macOS makes; the phone can't rename or delete them */
+const PROTECTED = new Set(["Desktop", "Documents", "Downloads", "Library", "Movies", "Music", "Pictures", "Public", "Applications"]);
+
+function folderName(raw: unknown): string {
+  const name = typeof raw === "string" ? raw.trim() : "";
+  if (!name || name.length > 255 || /[/\\\0]/.test(name) || name.startsWith(".")) throw new Error("That isn't a folder name.");
+  return name;
 }
 
 /** folders a search never walks into: big, generated, or not the user's projects */

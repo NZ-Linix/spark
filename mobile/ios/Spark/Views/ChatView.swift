@@ -8,23 +8,24 @@ struct ChatView: View {
   @State private var draft = ""
   @FocusState private var focused: Bool
   @State private var sent = 0
+  @State private var position = ScrollPosition(edge: .bottom)
 
   var body: some View {
     ZStack {
       if chat.loaded {
-        if chat.items.isEmpty, !chat.running {
+        // the thread stays mounted from the start, so the first message lands in it instead of swapping screens
+        thread
+        if chat.isEmpty, !chat.running {
           Fresh(folder: chat.info.folder, host: link.hosts.first { $0.id == chat.host })
-            .contentShape(.rect)
-            .onTapGesture { focused = true }
+            .allowsHitTesting(false)
             .transition(.opacity)
-        } else {
-          thread.transition(.opacity)
         }
       } else {
         ProgressView().tint(Color.dim).transition(.opacity)
       }
     }
-    .animation(.ease, value: chat.loaded)
+    .animation(.smooth(duration: 0.3), value: chat.loaded)
+    .animation(.smooth(duration: 0.3), value: chat.isEmpty)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .page()
     .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -60,53 +61,43 @@ struct ChatView: View {
     .sensoryFeedback(.impact(weight: .light), trigger: sent)
     .sensoryFeedback(.impact(flexibility: .soft, intensity: 0.6), trigger: chat.finished)
     .sensoryFeedback(trigger: chat.permission?.id) { _, new in new == nil ? nil : .warning }
-    .onAppear { if chat.loaded, chat.items.isEmpty { focused = true } }
-    .onChange(of: chat.loaded) { _, loaded in if loaded, chat.items.isEmpty { focused = true } }
+    .onAppear { if chat.loaded, chat.isEmpty, !chat.running { focused = true } }
+    .onChange(of: chat.loaded) { _, loaded in if loaded, chat.isEmpty { focused = true } }
   }
 
   private var thread: some View {
-    ScrollView {
+    let units = Unit.build(chat.entries)
+    let liveID = chat.running ? chat.entries.last?.id : nil
+    let first = chat.starting ? chat.entries.first?.id : nil
+    return ScrollView {
       LazyVStack(alignment: .leading, spacing: 0) {
-        ForEach(Array(chat.items.enumerated()), id: \.element.id) { i, item in
-          let prev = i > 0 ? chat.items[i - 1] : nil
-          Row(item: item, live: chat.running && i == chat.items.count - 1)
-            .padding(.top, gap(prev, item))
-            .transition(item.role == .user ? AnyTransition(Rise()) : AnyTransition(Settle(distance: 8)))
+        ForEach(units) { unit in
+          Group {
+            switch unit.kind {
+            case .one(let entry):
+              Row(entry: entry, live: entry.id == liveID, arriving: entry.id == first)
+            case .tools(let entries):
+              ToolGroup(entries: entries, live: entries.last?.id == liveID)
+            }
+          }
+          .padding(.top, unit.gap)
+          .transition(unit.role == .user ? AnyTransition(Rise()) : AnyTransition(Settle(distance: 8)))
         }
-        if chat.running, waiting {
-          Working()
-            .padding(.top, 18)
-            .transition(.opacity)
+        if chat.running {
+          WorkingLine(chat: chat)
         }
       }
-      .padding(.horizontal, 20)
+      .padding(.horizontal, 18)
       .padding(.top, 8)
       .padding(.bottom, 24)
-      .animation(.spring(duration: 0.5, bounce: 0.12), value: chat.items.count)
-      .animation(.ease, value: waiting && chat.running)
+      .animation(.smooth(duration: 0.35), value: units.count)
     }
+    .scrollPosition($position)
     .defaultScrollAnchor(.bottom)
     .defaultScrollAnchor(.bottom, for: .sizeChanges)
     .scrollDismissesKeyboard(.interactively)
-  }
-
-  /** spark is busy but nothing is streaming: its last word was yours, or a tool just finished */
-  private var waiting: Bool {
-    guard let last = chat.items.last else { return true }
-    switch last.role {
-    case .user, .notice: return true
-    case .tool: return last.status == .completed || last.status == .failed
-    default: return false
-    }
-  }
-
-  /** room above a row: more between turns, little between a run of tools */
-  private func gap(_ prev: Item?, _ item: Item) -> CGFloat {
-    guard let prev else { return 0 }
-    if item.role == .user { return 34 }
-    if prev.role == .user { return 22 }
-    if prev.role == .tool, item.role == .tool { return 2 }
-    return 14
+    // a tap anywhere in the thread puts the keyboard away; buttons and links still get theirs
+    .simultaneousGesture(TapGesture().onEnded { focused = false })
   }
 
   @ToolbarContentBuilder private var toolbar: some ToolbarContent {
@@ -114,39 +105,91 @@ struct ChatView: View {
       Button("Chats", systemImage: "line.3.horizontal") { shell.menu() }
     }
     ToolbarItem(placement: .principal) {
-      VStack(spacing: 1) {
-        Text(chat.info.title)
-          .font(.geist(15, .semibold))
-          .lineLimit(1)
-          .contentTransition(.opacity)
-        HStack(spacing: 5) {
-          if chat.running { LiveDot() }
-          Text(subtitle)
-            .font(.geist(12))
-            .foregroundStyle(Color.dim)
-            .lineLimit(1)
-        }
-      }
-      .frame(maxWidth: 240)
-      .animation(.ease, value: chat.info.title)
-      .animation(.ease, value: chat.running)
+      Text(chat.info.title)
+        .font(.geist(15, .semibold))
+        .lineLimit(1)
+        .contentTransition(.opacity)
+        .frame(maxWidth: 240)
+        .animation(.ease, value: chat.info.title)
     }
     ToolbarItem(placement: .topBarTrailing) {
       Button("New chat", systemImage: "square.and.pencil") { shell.newChat() }
     }
   }
 
-  private var subtitle: String {
-    let host = link.hosts.first { $0.id == chat.host }
-    return [chat.info.folder, host?.kind == .cloud ? "Cloud" : nil].compactMap { $0 }.joined(separator: " · ")
-  }
-
   private func send() {
     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty, !chat.running else { return }
     sent += 1
-    withAnimation(.spring(duration: 0.5, bounce: 0.15)) { draft = "" }
+    draft = ""
+    withAnimation(.smooth(duration: 0.3)) { position.scrollTo(edge: .bottom) }
     Task { await link.send(text, in: chat) }
+  }
+}
+
+/** What the thread lays out: one row, or a run of tool calls folded together. */
+private struct Unit: Identifiable {
+  enum Kind {
+    case one(Entry)
+    case tools([Entry])
+  }
+
+  let id: String
+  let kind: Kind
+  let role: Item.Role
+  let gap: CGFloat
+
+  /** groups by role only, which never changes for a row, so streaming text doesn't rebuild the list */
+  static func build(_ entries: [Entry]) -> [Unit] {
+    var out: [Unit] = []
+    var i = 0
+    var prev: Item.Role?
+    while i < entries.count {
+      let e = entries[i]
+      if e.role == .tool {
+        var j = i
+        while j < entries.count, entries[j].role == .tool { j += 1 }
+        let run = Array(entries[i..<j])
+        out.append(Unit(id: e.id, kind: run.count == 1 ? .one(e) : .tools(run), role: .tool, gap: gap(prev, .tool)))
+        prev = .tool
+        i = j
+      } else {
+        out.append(Unit(id: e.id, kind: .one(e), role: e.role, gap: gap(prev, e.role)))
+        prev = e.role
+        i += 1
+      }
+    }
+    return out
+  }
+
+  /** room above a row: more between turns, less inside one */
+  private static func gap(_ prev: Item.Role?, _ role: Item.Role) -> CGFloat {
+    guard let prev else { return 0 }
+    if role == .user { return 28 }
+    if prev == .user { return 18 }
+    return 12
+  }
+}
+
+/** spark is busy but nothing is streaming: its last word was yours, or a tool just finished. */
+private struct WorkingLine: View {
+  let chat: Chat
+
+  var body: some View {
+    if waiting {
+      Working()
+        .padding(.top, 16)
+        .transition(.opacity)
+    }
+  }
+
+  private var waiting: Bool {
+    guard let last = chat.entries.last else { return true }
+    switch last.role {
+    case .user, .notice: return true
+    case .tool: return last.item.status == .completed || last.item.status == .failed
+    default: return false
+    }
   }
 }
 
@@ -159,7 +202,7 @@ private struct Fresh: View {
   var body: some View {
     VStack(spacing: 12) {
       Text("What should we build?")
-        .font(.geist(30, .medium, relativeTo: .largeTitle))
+        .font(.geist(28, .medium, relativeTo: .largeTitle))
         .kerning(-0.8)
         .multilineTextAlignment(.center)
         .textRenderer(DitherIn(progress: shown ? 1 : 0))
@@ -179,15 +222,18 @@ private struct Fresh: View {
 }
 
 private struct Row: View {
-  let item: Item
+  let entry: Entry
   let live: Bool
+  /** the first message of a chat just started: it rises from the composer */
+  var arriving = false
 
   var body: some View {
-    switch item.role {
-    case .user: UserBubble(text: item.text)
+    let item = entry.item
+    switch entry.role {
+    case .user: UserBubble(text: item.text, arriving: arriving)
     case .assistant: StreamingText(text: item.text, streaming: live).textSelection(.enabled)
     case .thought: ThoughtRow(text: item.text, live: live)
-    case .tool: ToolRow(item: item)
+    case .tool: ToolRow(entry: entry)
     case .notice:
       Text(item.text)
         .font(.geist(13))
@@ -200,12 +246,14 @@ private struct Row: View {
 
 private struct UserBubble: View {
   let text: String
+  var arriving = false
+  @State private var landed = true
 
   var body: some View {
     HStack {
       Spacer(minLength: 48)
       Text(text)
-        .font(.geist(17))
+        .font(.geist(15.5))
         .lineSpacing(3)
         .padding(.horizontal, 16)
         .padding(.vertical, 11)
@@ -214,6 +262,14 @@ private struct UserBubble: View {
         .contextMenu {
           Button("Copy", systemImage: "doc.on.doc") { UIPasteboard.general.string = text }
         }
+    }
+    .offset(y: landed ? 0 : 120)
+    .scaleEffect(landed ? 1 : 0.94, anchor: .bottomTrailing)
+    .opacity(landed ? 1 : 0)
+    .onAppear {
+      guard arriving else { return }
+      landed = false
+      withAnimation(.spring(duration: 0.5, bounce: 0.16)) { landed = true }
     }
   }
 }
@@ -227,11 +283,11 @@ private struct ThoughtRow: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       Button {
-        withAnimation(.spring(duration: 0.38, bounce: 0)) { open.toggle() }
+        withAnimation(.snappy(duration: 0.3)) { open.toggle() }
       } label: {
         HStack(spacing: 6) {
           Text(live ? "Thinking" : "Thought")
-            .font(.geist(15, .medium))
+            .font(.geist(14, .medium))
             .modifier(MaybeShimmer(on: live))
           Image(systemName: "chevron.right")
             .font(.system(size: 10, weight: .bold))
@@ -242,33 +298,20 @@ private struct ThoughtRow: View {
         .contentShape(.rect)
       }
       .buttonStyle(.plain)
-      Text(text.trimmingCharacters(in: .whitespacesAndNewlines))
-        .font(.geist(15))
-        .lineSpacing(4)
-        .foregroundStyle(Color.dim)
-        .padding(.leading, 12)
-        .overlay(alignment: .leading) { Capsule().fill(Color.hairline).frame(width: 2) }
-        .padding(.top, 8)
-        .modifier(Reveal(open: open))
+      // laid out only while open: a long chain of thought costs nothing folded away
+      if open {
+        Text(text.trimmingCharacters(in: .whitespacesAndNewlines))
+          .font(.geist(14))
+          .lineSpacing(4)
+          .foregroundStyle(Color.dim)
+          .padding(.leading, 12)
+          .overlay(alignment: .leading) { Capsule().fill(Color.hairline).frame(width: 2) }
+          .padding(.top, 8)
+          .transition(.opacity.combined(with: .move(edge: .top)))
+      }
     }
+    .clipped()
     .sensoryFeedback(.selection, trigger: open)
-  }
-}
-
-/**
- * Folds content away by its height, top edge pinned, so opening and closing slide the rows below
- * smoothly instead of popping. The content stays laid out, just clipped to nothing when shut.
- */
-private struct Reveal: ViewModifier {
-  let open: Bool
-  func body(content: Content) -> some View {
-    content
-      .fixedSize(horizontal: false, vertical: true)
-      .frame(height: open ? nil : 0, alignment: .top)
-      .clipped()
-      .opacity(open ? 1 : 0)
-      .allowsHitTesting(open)
-      .accessibilityHidden(!open)
   }
 }
 
@@ -291,78 +334,163 @@ private struct Working: View {
         .opacity(on ? 1 : 0.15)
         .onAppear { withAnimation(.easeInOut(duration: 0.5).repeatForever()) { on = false } }
       Text("Working")
-        .font(.geist(15, .medium))
+        .font(.geist(14, .medium))
         .modifier(Shimmer())
     }
     .foregroundStyle(Color.dim)
   }
 }
 
-/** One thing spark did: what it ran or touched on one line, the output a tap away. */
-private struct ToolRow: View {
-  let item: Item
+/** A run of tool calls folded into one line that says what they did; the newest shows while it runs. */
+private struct ToolGroup: View {
+  let entries: [Entry]
+  let live: Bool
   @State private var open = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       Button {
-        guard hasOutput else { return }
-        withAnimation(.spring(duration: 0.38, bounce: 0)) { open.toggle() }
+        withAnimation(.snappy(duration: 0.3)) { open.toggle() }
       } label: {
-        HStack(alignment: .center, spacing: 9) {
-          Image(systemName: symbol)
+        HStack(spacing: 9) {
+          Image(systemName: "square.stack.3d.up")
             .font(.system(size: 12, weight: .medium))
             .frame(width: 16)
-            .foregroundStyle(Color.dim)
-          Text(verb)
+          Text(summary)
             .font(.geist(14, .medium))
-            .foregroundStyle(Color.dim)
-          if let detail = shown {
-            Text(detail)
-              .font(.geistMono(13))
-              .foregroundStyle(Color(white: 0.78))
-              .lineLimit(1)
-              .truncationMode(.middle)
+            .lineLimit(1)
+            .modifier(MaybeShimmer(on: live))
+          if failed > 0 {
+            Text("\(failed) failed").font(.geist(12)).foregroundStyle(.red.opacity(0.8))
           }
           Spacer(minLength: 4)
-          status
+          Image(systemName: "chevron.right")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(Color.faint)
+            .rotationEffect(.degrees(open ? 90 : 0))
         }
+        .foregroundStyle(Color.dim)
         .padding(.vertical, 6)
         .contentShape(.rect)
       }
       .buttonStyle(.plain)
-      if hasOutput, let output = item.output {
-        OutputBlock(text: output)
-          .padding(.top, 6)
-          .padding(.bottom, 4)
-          .modifier(Reveal(open: open))
+      .accessibilityLabel(summary)
+      .accessibilityHint(open ? "Hides the steps" : "Shows each step")
+
+      if open {
+        VStack(alignment: .leading, spacing: 0) {
+          ForEach(entries) { ToolRow(entry: $0) }
+        }
+        .padding(.leading, 8)
+        .overlay(alignment: .leading) { Capsule().fill(Color.hairline).frame(width: 1.5).padding(.vertical, 6) }
+        .transition(.opacity.combined(with: .move(edge: .top)))
+      } else if live, let last = entries.last {
+        ToolRow(entry: last)
+          .id(last.id)
+          .transition(.opacity)
       }
     }
+    .clipped()
     .sensoryFeedback(.selection, trigger: open)
   }
 
-  private var hasOutput: Bool { !(item.output ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+  private var failed: Int { entries.filter { $0.item.status == .failed }.count }
 
-  @ViewBuilder private var status: some View {
+  /** "Read 3 files, ran 2 commands" */
+  private var summary: String {
+    var counts: [(String, Int)] = []
+    func add(_ key: String) {
+      if let i = counts.firstIndex(where: { $0.0 == key }) { counts[i].1 += 1 } else { counts.append((key, 1)) }
+    }
+    for e in entries { add(e.item.kind ?? "other") }
+    let parts = counts.map { kind, n -> String in
+      switch kind {
+      case "read": "read \(n) \(n == 1 ? "file" : "files")"
+      case "edit": "edited \(n) \(n == 1 ? "file" : "files")"
+      case "delete": "deleted \(n) \(n == 1 ? "file" : "files")"
+      case "move": "moved \(n) \(n == 1 ? "file" : "files")"
+      case "execute": "ran \(n) \(n == 1 ? "command" : "commands")"
+      case "search": "searched \(n) \(n == 1 ? "time" : "times")"
+      case "fetch": "fetched \(n) \(n == 1 ? "page" : "pages")"
+      case "think": "planned"
+      default: "used \(n) \(n == 1 ? "tool" : "tools")"
+      }
+    }
+    let text = parts.prefix(3).joined(separator: ", ")
+    return text.prefix(1).uppercased() + text.dropFirst()
+  }
+}
+
+/** One thing spark did: what it ran or touched on one line, the output a tap away. */
+private struct ToolRow: View {
+  let entry: Entry
+  @State private var open = false
+
+  var body: some View {
+    let item = entry.item
+    VStack(alignment: .leading, spacing: 0) {
+      Button {
+        guard hasOutput(item) else { return }
+        withAnimation(.snappy(duration: 0.3)) { open.toggle() }
+      } label: {
+        HStack(alignment: .center, spacing: 9) {
+          Image(systemName: symbol(item))
+            .font(.system(size: 12, weight: .medium))
+            .frame(width: 16)
+            .foregroundStyle(Color.dim)
+          Text(verb(item))
+            .font(.geist(14, .medium))
+            .foregroundStyle(Color.dim)
+            .modifier(MaybeShimmer(on: !done(item)))
+            .layoutPriority(1)
+          if let detail = shown(item) {
+            Text(detail)
+              .font(.geistMono(12.5))
+              .foregroundStyle(Color(white: 0.74))
+              .lineLimit(1)
+              .truncationMode(.middle)
+          }
+          Spacer(minLength: 4)
+          status(item)
+        }
+        .padding(.vertical, 5)
+        .contentShape(.rect)
+      }
+      .buttonStyle(.plain)
+      // the output is only laid out once asked for: a closed row costs one line
+      if open, let output = item.output, hasOutput(item) {
+        OutputBlock(text: output)
+          .padding(.top, 4)
+          .padding(.bottom, 6)
+          .transition(.opacity.combined(with: .move(edge: .top)))
+      }
+    }
+    .clipped()
+    .sensoryFeedback(.selection, trigger: open)
+  }
+
+  private func hasOutput(_ item: Item) -> Bool { !(item.output ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+  @ViewBuilder private func status(_ item: Item) -> some View {
     switch item.status {
-    case .pending, .in_progress:
-      ProgressView().controlSize(.mini).tint(Color.dim)
     case .failed:
       Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.red.opacity(0.85))
-    default:
-      if hasOutput {
+    case .completed:
+      if hasOutput(item) {
         Image(systemName: "chevron.right")
           .font(.system(size: 9, weight: .bold))
           .foregroundStyle(Color.faint)
           .rotationEffect(.degrees(open ? 90 : 0))
       }
+    default:
+      EmptyView()
     }
   }
 
-  private var done: Bool { item.status == .completed || item.status == .failed }
+  private func done(_ item: Item) -> Bool { item.status == .completed || item.status == .failed }
 
-  private var verb: String {
-    let d = done
+  private func verb(_ item: Item) -> String {
+    let d = done(item)
     switch item.kind {
     case "execute": return d ? "Ran" : "Running"
     case "read": return d ? "Read" : "Reading"
@@ -378,7 +506,7 @@ private struct ToolRow: View {
     }
   }
 
-  private var symbol: String {
+  private func symbol(_ item: Item) -> String {
     switch item.kind {
     case "execute": "terminal"
     case "read": "doc.text"
@@ -393,7 +521,7 @@ private struct ToolRow: View {
   }
 
   /** paths read better as their last parts */
-  private var shown: String? {
+  private func shown(_ item: Item) -> String? {
     guard let d = item.detail?.trimmingCharacters(in: .whitespacesAndNewlines), !d.isEmpty else { return nil }
     let oneLine = d.replacingOccurrences(of: "\n", with: " ")
     if ["read", "edit", "delete", "move"].contains(item.kind ?? ""), oneLine.hasPrefix("/") {
@@ -409,7 +537,7 @@ private struct OutputBlock: View {
   var body: some View {
     ScrollView([.vertical, .horizontal], showsIndicators: false) {
       Text(text.trimmingCharacters(in: .newlines))
-        .font(.geistMono(12, relativeTo: .footnote))
+        .font(.geistMono(11.5, relativeTo: .footnote))
         .lineSpacing(2)
         .foregroundStyle(Color(white: 0.72))
         .textSelection(.enabled)

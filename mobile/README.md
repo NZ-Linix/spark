@@ -34,15 +34,23 @@ The sidebar shows the chats on the cloud and on the Mac. Settings, Sidebar picks
 
 With Sections or Merged, a chat opens on its own host, and the new-chat screen has a Cloud and Mac picker that starts on the host you used last. The sidebar checks for new chats every 15 seconds while it's open.
 
+Press and hold a chat in the sidebar to rename or delete it. A chat that is running can't be deleted until it stops.
+
+In the folder picker, the row at the top or any part of the path goes up a level, and swiping right does the same. Press and hold a folder to use it, rename it, or delete it with everything inside. The picker refuses to change the host's root folder, the home folder, the folders that hold either, and the standard folders in home such as Documents and Desktop.
+
 The cloud shows every chat. The Mac shows only the chats started from the phone, plus sessions running on the Mac right now, such as spark in a terminal. A running session counts when its spark process holds the session's lock. `spark-bridge` keeps the phone's chats in `mobile-sessions.json` beside its pairing file and forgets a chat once spark no longer lists it.
 
-## Cloud providers
+## Providers and prompts
 
-Settings, Cloud providers manages the models the cloud uses. Add, edit, or delete a provider, or copy one from the Mac. A copy carries every setting, the key, and the models, and is made once: later changes on the Mac stay there.
+The relay keeps one library of providers and prompts that the cloud and every paired Mac share. It lives in `$SPARK_RELAY_DATA/library`. The first time a relay starts with a library, it fills it from the providers its cloud profiles already have.
 
-When the Mac's provider reads its key from an environment variable, `spark-bridge` looks up the value in your login shell and the cloud stores it as a plain key. Header values read from variables are copied too, and the relay passes them only to that phone's cloud spark, kept in `cloud-env.json` in its profile. Variables that change how processes run, such as `PATH` or `DYLD_*`, are refused.
+Settings, Library, Providers adds, edits, renames, or deletes a provider in a form: display name, ID, protocol, address, key, timeouts, and each model's display name, context window, output limit, tool and image support, and reasoning levels. Fields the form doesn't show, such as headers and request fields, are kept as they were. Before it saves, the relay has spark check the new settings and shows spark's reason if it refuses them. The first provider you add becomes the default.
 
-Before it saves, the relay has spark check the new settings and shows spark's reason if it refuses them. The first provider you add becomes the cloud's default.
+Each Mac keeps a copy of the library in its own spark profile, so spark in a terminal uses the same providers. `spark-bridge` replaces the providers in `settings.json` with the library's whenever the library changes. A change spark makes on the Mac, such as `spark provider set` or the `/provider` form, goes to the relay within a second and from there to every other Mac and the cloud. When the relay refuses a change, `spark-bridge` logs the reason and puts the Mac's copy back. A key a Mac provider reads from an environment variable is looked up in your login shell and stored in the library as a plain key, and header values read from variables go to the cloud's spark as variables. Variables that change how processes run, such as `PATH` or `DYLD_*`, are refused. The first time a Mac syncs, it adds the providers only it has to the library; for a provider both have, the library's version wins.
+
+`spark provider set <name> [<model>] <field> <value>` changes one field without opening the `/provider` form, for example `spark provider set oc-go display_name "OpenCode Go"` or `spark provider set oc-go glm-5.3 context_window 200k`.
+
+Prompts are edited only in the app: Settings, Library, Prompts. Each prompt has a name and its text, and replaces spark's own system prompt for the chats that pick it. Pick one with the prompt button in the composer of a new chat. Press and hold a prompt to rename or delete it. Each Mac and cloud profile gets the prompts in `~/.spark/cloud-prompts`, which spark lists with your own prompts. A chat keeps its prompt when it is reopened. After that prompt is renamed or deleted, the chat runs with spark's own prompt the next time it opens.
 
 ## Build spark-bridge
 
@@ -77,7 +85,7 @@ open Spark.xcodeproj
 
 ### UI test
 
-`SparkUITests` walks pair, start, send and reply against a live relay and bridge. `testSidebarLayoutsAndCopyProvider` switches through the sidebar layouts and copies a Mac provider named `local` to the cloud:
+`SparkUITests` walks pair, start, send, reply, and renaming a chat against a live relay and bridge. `testSidebarLayoutsAndLibrary` switches through the sidebar layouts, opens a provider named `local` from the library, and writes, renames, and deletes a prompt:
 
 ```bash
 TEST_RUNNER_SPARK_RELAY=http://127.0.0.1:8799 TEST_RUNNER_SPARK_PAIR_CODE=<code> \
@@ -89,4 +97,4 @@ xcodebuild test -project Spark.xcodeproj -scheme Spark -destination 'platform=iO
 
 The relay authenticates every phone and Mac with a random token and keeps only its hash. Only a Mac whose `spark-bridge` carries the relay's enrollment secret can register, and a phone can register only with a pairing code from one of those Macs, so phones need no setup and strangers can't use the relay or its cloud. `SPARK_RELAY_OPEN=1` drops the pairing code requirement and lets any phone start on the cloud. A paired phone can run anything spark can run on that Mac, so host the relay behind TLS and unpair phones you no longer use. Messages are not end-to-end encrypted: whoever runs the relay can read them.
 
-That includes API keys. Copying or adding a cloud provider sends its key through the relay, and the server stores it in that phone's cloud profile (`settings.json`, mode 0600). Only use a relay you trust with those keys.
+That includes API keys. Entering a key in the app, or saving a provider with a key on a Mac, sends the key through the relay. The relay stores it in the library, every cloud profile, and every paired Mac's spark settings (`settings.json`, mode 0600). Every phone paired to the relay can see and change the library. Only use a relay you trust with those keys.
