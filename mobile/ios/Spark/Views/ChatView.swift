@@ -9,6 +9,21 @@ struct ChatView: View {
   @FocusState private var focused: Bool
   @State private var sent = 0
   @State private var position = ScrollPosition(edge: .bottom)
+  /** following the newest text: on at the bottom, off once you scroll up, on again back down */
+  @State private var pinned = true
+  /** a finger is on the thread, or it's still gliding from one */
+  @State private var scrolling = false
+  /** far enough up that a button back down helps */
+  @State private var away = false
+  /** the message being edited: sending goes back to just before it and sends the new text */
+  @State private var editing: Entry?
+  /** the reply to go back to, once confirmed */
+  @State private var rewindTo: Entry?
+  @State private var browsing = false
+  /** kept while the chat is open, so a command keeps running with the terminal closed */
+  @State private var terminal: Terminal?
+  /** the terminal on screen; set by item so the sheet never opens before it exists */
+  @State private var typing: Terminal?
 
   var body: some View {
     ZStack {
@@ -28,60 +43,119 @@ struct ChatView: View {
     .animation(.smooth(duration: 0.3), value: chat.isEmpty)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .page()
-    .safeAreaInset(edge: .bottom, spacing: 0) {
-      VStack(spacing: 10) {
-        if let p = chat.permission {
-          PermissionCard(permission: p) { option in
-            Task { await link.answer(chat, p, option: option) }
-          }
-          .padding(.horizontal, 10)
-          .transition(Settle(distance: 24))
-        }
-        if let problem = chat.problem {
-          Text(problem)
-            .font(.geist(13))
-            .foregroundStyle(Color.dim)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 24)
-            .transition(.opacity)
-        }
-        Composer(text: $draft, focused: $focused, running: chat.running, enabled: chat.loaded && link.phase == .online) {
-          send()
-        } stop: {
-          Task { await link.cancel(chat) }
-        } accessories: {
-          ConfigChips(options: chat.config) { id, value in Task { await link.set(chat, id, to: value) } }
-        }
-      }
-      .animation(.spring(duration: 0.45, bounce: 0.18), value: chat.permission)
-      .animation(.smooth, value: chat.problem)
-    }
+    .safeAreaInset(edge: .bottom, spacing: 0) { bottom }
     .navigationBarTitleDisplayMode(.inline)
     .toolbar { toolbar }
+    .sheet(isPresented: $browsing) { FilesView(host: chat.host, root: chat.info.cwd) }
+    .sheet(item: $typing) { TerminalView(terminal: $0) }
+    .confirmationDialog("Go back to this reply?", isPresented: Binding(get: { rewindTo != nil }, set: { if !$0 { rewindTo = nil } }), titleVisibility: .visible) {
+      Button("Go Back", role: .destructive) {
+        if let entry = rewindTo { rewind(to: entry) }
+      }
+    } message: {
+      Text("Everything after it leaves the chat.")
+    }
     .sensoryFeedback(.impact(weight: .light), trigger: sent)
     .sensoryFeedback(.impact(flexibility: .soft, intensity: 0.6), trigger: chat.finished)
+    .sensoryFeedback(.impact(weight: .medium), trigger: chat.epoch)
     .sensoryFeedback(trigger: chat.permission?.id) { _, new in new == nil ? nil : .warning }
     .onAppear { if chat.loaded, chat.isEmpty, !chat.running { focused = true } }
     .onChange(of: chat.loaded) { _, loaded in if loaded, chat.isEmpty { focused = true } }
+    .task(id: chat.elsewhere) { if chat.elsewhere { await link.follow(chat) } }
+    .task(id: link.phase == .online) {
+      // the chat's prompt can change from the model sheet once the library's prompts are known
+      guard link.phase == .online, link.prompts.isEmpty, link.hosts.contains(where: { $0.kind == .cloud }) else { return }
+      _ = try? await link.loadPrompts()
+    }
+  }
+
+  private var bottom: some View {
+    VStack(spacing: 10) {
+      if let p = chat.permission {
+        PermissionCard(permission: p) { option in
+          Task { await link.answer(chat, p, option: option) }
+        }
+        .padding(.horizontal, 10)
+        .transition(Settle(distance: 24))
+      }
+      if let problem = chat.problem ?? elsewhereNote {
+        Text(problem)
+          .font(.geist(13))
+          .foregroundStyle(Color.dim)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.horizontal, 24)
+          .transition(.opacity)
+      }
+      if editing != nil {
+        EditingBar {
+          editing = nil
+          draft = ""
+        }
+        .padding(.horizontal, 14)
+        .transition(Settle(distance: 12))
+      }
+      Composer(
+        text: $draft, focused: $focused, running: chat.running && !chat.elsewhere,
+        enabled: chat.loaded && !chat.elsewhere && !chat.rewinding && link.phase == .online,
+        placeholder: editing == nil ? "Message spark" : "Edit your message"
+      ) {
+        send()
+      } stop: {
+        Task { await link.cancel(chat) }
+      } trailing: {
+        ConfigChips(options: chat.config, set: { id, value in
+          if id == "effort" { UserDefaults.standard.set(value, forKey: "effort") }
+          Task { await link.set(chat, id, to: value) }
+        }, prompts: link.prompts, prompt: promptBinding, compact: true)
+      }
+    }
+    .animation(.spring(duration: 0.45, bounce: 0.18), value: chat.permission)
+    .animation(.smooth, value: chat.problem)
+    .animation(.smooth(duration: 0.28), value: editing?.id)
+  }
+
+  /** the chat's library prompt; a change starts its spark again with the new one */
+  private var promptBinding: Binding<String> {
+    Binding(get: { chat.prompt }, set: { name in
+      guard name != chat.prompt else { return }
+      Task { await link.setPrompt(chat, to: name) }
+    })
+  }
+
+  /** why the composer is off while another spark process has the chat open */
+  private var elsewhereNote: String? {
+    guard chat.elsewhere else { return nil }
+    let name = link.hosts.first { $0.id == chat.host }?.name ?? "the Mac"
+    return "Open in spark on \(name). Close it there to write here."
+  }
+
+  /** what a row's menu can do now: nothing changes the chat while spark works on it */
+  private var changeable: Bool {
+    !chat.running && !chat.elsewhere && !chat.starting && !chat.rewinding && !chat.info.id.isEmpty && link.phase == .online
   }
 
   private var thread: some View {
     let units = Unit.build(chat.entries)
     let liveID = chat.running ? chat.entries.last?.id : nil
     let first = chat.starting ? chat.entries.first?.id : nil
+    let ends = turnEnds
+    // while a message is being edited, it and everything after it fade: sending replaces them
+    let cut = editing.flatMap { e in chat.entries.firstIndex { $0.id == e.id } }
+    let order = cut == nil ? [:] : Dictionary(uniqueKeysWithValues: chat.entries.enumerated().map { ($1.id, $0) })
     return ScrollView {
       LazyVStack(alignment: .leading, spacing: 0) {
         ForEach(units) { unit in
           Group {
             switch unit.kind {
             case .one(let entry):
-              Row(entry: entry, live: entry.id == liveID, arriving: entry.id == first)
+              Row(entry: entry, live: entry.id == liveID, arriving: entry.id == first, ends: ends.contains(entry.id), changeable: changeable, act: act)
             case .tools(let entries):
               ToolGroup(entries: entries, live: entries.last?.id == liveID)
             }
           }
           .padding(.top, unit.gap)
-          .transition(unit.role == .user ? AnyTransition(Rise()) : AnyTransition(Settle(distance: 8)))
+          .opacity(cut.map { (order[unit.id] ?? 0) >= $0 ? 0.3 : 1 } ?? 1)
+          .transition(unit.role == .user ? AnyTransition(Sent()) : AnyTransition(Settle(distance: 8)))
         }
         if chat.running {
           WorkingLine(chat: chat)
@@ -90,14 +164,87 @@ struct ChatView: View {
       .padding(.horizontal, 18)
       .padding(.top, 8)
       .padding(.bottom, 24)
-      .animation(.smooth(duration: 0.35), value: units.count)
+      .animation(.spring(duration: 0.5, bounce: 0.14), value: units.count)
+      .animation(.smooth(duration: 0.25), value: cut)
     }
+    // going back to an earlier message lays the thread out afresh, from the bottom
+    .id(chat.epoch)
+    .transition(.opacity)
     .scrollPosition($position)
     .defaultScrollAnchor(.bottom)
-    .defaultScrollAnchor(.bottom, for: .sizeChanges)
+    // a short chat reads from the top, so a new one starts under the title and grows down
+    .defaultScrollAnchor(.top, for: .alignment)
     .scrollDismissesKeyboard(.interactively)
+    .onScrollPhaseChange { _, phase in
+      scrolling = phase == .tracking || phase == .interacting || phase == .decelerating
+      // a glide that came to rest at the bottom follows again from there
+      if phase == .idle, pinned { follow() }
+    }
+    .onScrollGeometryChange(for: Fill.self, of: Fill.init) { old, new in
+      if scrolling, new.end == old.end {
+        // only a finger decides: scrolled up stops following, back at the bottom starts again
+        pinned = new.distance < 56
+      }
+      let far = new.distance > 320
+      if far != away { withAnimation(.smooth(duration: 0.25)) { away = far } }
+      guard !scrolling else { return }
+      if pinned, new.end != old.end {
+        // the reply grew a line, or the composer or keyboard moved: glide down with it. A jump as
+        // big as a screen is the thread being laid out, which lands at once
+        follow(duration: abs(new.end - old.end) > 300 ? nil : 0.3)
+      } else if new.distance < -1 {
+        // past the end, after the content got shorter: never leave the page on empty space
+        follow()
+      }
+    }
+    .overlay(alignment: .bottom) {
+      if away {
+        Button {
+          pinned = true
+          follow(duration: 0.45)
+        } label: {
+          Image(systemName: "arrow.down")
+            .font(.system(size: 14, weight: .semibold))
+            .frame(width: 38, height: 38)
+            .glassEffect(.regular.interactive(), in: .circle)
+            .contentShape(.circle)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Scroll to the newest")
+        .padding(.bottom, 12)
+        .transition(.scale(0.8).combined(with: .opacity))
+      }
+    }
+    .overlay {
+      if chat.rewinding {
+        ProgressView().tint(Color.dim).transition(.opacity)
+      }
+    }
+    .animation(.smooth(duration: 0.2), value: chat.rewinding)
     // a tap anywhere in the thread puts the keyboard away; buttons and links still get theirs
     .simultaneousGesture(TapGesture().onEnded { focused = false })
+  }
+
+  /** the last answer in each turn, which gets the copy, retry and go-back buttons */
+  private var turnEnds: Set<String> {
+    var ends = Set<String>()
+    var last: String?
+    for e in chat.entries {
+      if e.role == .user {
+        if let last { ends.insert(last) }
+        last = nil
+      } else if e.role == .assistant {
+        last = e.id
+      }
+    }
+    if let last, !chat.running { ends.insert(last) }
+    return ends
+  }
+
+  /** the scroll view's bottom edge follows the newest text; short, smooth glides keep up with streaming */
+  private func follow(duration: Double? = 0.3) {
+    guard let duration else { return position.scrollTo(edge: .bottom) }
+    withAnimation(.smooth(duration: duration)) { position.scrollTo(edge: .bottom) }
   }
 
   @ToolbarContentBuilder private var toolbar: some ToolbarContent {
@@ -112,18 +259,129 @@ struct ChatView: View {
         .frame(maxWidth: 240)
         .animation(.ease, value: chat.info.title)
     }
-    ToolbarItem(placement: .topBarTrailing) {
-      Button("New chat", systemImage: "square.and.pencil") { shell.newChat() }
+    // a chat without a folder learns its own once the host has made it
+    if !chat.info.cwd.isEmpty {
+      ToolbarItemGroup(placement: .topBarTrailing) {
+        Button("Files", systemImage: "folder") {
+          focused = false
+          browsing = true
+        }
+        Button("Terminal", systemImage: "apple.terminal") {
+          focused = false
+          if terminal?.host != chat.host || terminal?.root != chat.info.cwd {
+            terminal = Terminal(host: chat.host, root: chat.info.cwd)
+          }
+          typing = terminal
+        }
+      }
+    }
+  }
+
+  private func act(_ action: RowAction, _ entry: Entry) {
+    switch action {
+    case .copy:
+      UIPasteboard.general.string = entry.item.text
+    case .edit:
+      guard changeable else { return }
+      editing = entry
+      draft = entry.item.text
+      focused = true
+    case .retry:
+      guard changeable, let prompt = entry.role == .user ? entry : chat.prompt(before: entry) else { return }
+      resend(prompt, text: prompt.item.text)
+    case .rewind:
+      guard changeable else { return }
+      rewindTo = entry
+    }
+  }
+
+  /** goes back to just after `entry`, a reply: the turns after it leave the chat */
+  private func rewind(to entry: Entry) {
+    rewindTo = nil
+    editing = nil
+    pinned = true
+    Task {
+      do {
+        try await link.rewind(chat, to: entry, keep: true)
+      } catch {
+        chat.problem = error.localizedDescription
+      }
+    }
+  }
+
+  /** goes back to just before `prompt` and sends `text` in its place */
+  private func resend(_ prompt: Entry, text: String) {
+    sent += 1
+    pinned = true
+    Task {
+      do {
+        try await link.rewind(chat, to: prompt, keep: false)
+        await link.send(text, in: chat)
+      } catch {
+        chat.problem = error.localizedDescription
+        if draft.isEmpty { draft = text }
+      }
     }
   }
 
   private func send() {
     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !text.isEmpty, !chat.running else { return }
-    sent += 1
+    guard !text.isEmpty, !chat.running, !chat.rewinding else { return }
     draft = ""
-    withAnimation(.smooth(duration: 0.3)) { position.scrollTo(edge: .bottom) }
+    pinned = true
+    if let target = editing {
+      editing = nil
+      resend(target, text: text)
+      return
+    }
+    sent += 1
+    // the keyboard stays up: the message rises from the composer without the page moving under it
     Task { await link.send(text, in: chat) }
+  }
+}
+
+/** Where the thread is scrolled: how far the bottom is, and where the end lies. */
+private struct Fill: Equatable {
+  var distance: CGFloat
+  var end: CGFloat
+
+  init(_ g: ScrollGeometry) {
+    let end = max(-g.contentInsets.top, g.contentSize.height + g.contentInsets.bottom - g.containerSize.height)
+    self.end = end.rounded()
+    distance = (end - g.contentOffset.y).rounded()
+  }
+}
+
+enum RowAction { case copy, edit, retry, rewind }
+
+/** Above the composer while a message is being edited: what sending will do, and a way out. */
+private struct EditingBar: View {
+  let cancel: () -> Void
+
+  var body: some View {
+    HStack(spacing: 8) {
+      Image(systemName: "pencil")
+        .font(.system(size: 12, weight: .semibold))
+      Text("Editing. Sending replaces it and what came after.")
+        .font(.geist(13, .medium))
+        .lineLimit(1)
+        .minimumScaleFactor(0.85)
+      Spacer(minLength: 4)
+      Button(action: cancel) {
+        Image(systemName: "xmark")
+          .font(.system(size: 11, weight: .bold))
+          .frame(width: 26, height: 26)
+          .background(Color.white.opacity(0.1), in: .circle)
+          .contentShape(.circle)
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("Stop editing")
+    }
+    .foregroundStyle(Color(white: 0.8))
+    .padding(.leading, 14)
+    .padding(.trailing, 6)
+    .frame(height: 38)
+    .glassEffect(.regular, in: .capsule)
   }
 }
 
@@ -224,14 +482,34 @@ private struct Fresh: View {
 private struct Row: View {
   let entry: Entry
   let live: Bool
-  /** the first message of a chat just started: it rises from the composer */
+  /** the first message of a chat just started: it settles in under the title */
   var arriving = false
+  /** the last answer of its turn: copy, retry and go back sit under it */
+  var ends = false
+  /** spark isn't working on the chat, so it can go back or try again */
+  var changeable = false
+  var act: (RowAction, Entry) -> Void = { _, _ in }
 
   var body: some View {
     let item = entry.item
     switch entry.role {
-    case .user: UserBubble(text: item.text, arriving: arriving)
-    case .assistant: StreamingText(text: item.text, streaming: live).textSelection(.enabled)
+    case .user:
+      UserBubble(text: item.text, arriving: arriving) {
+        Button("Copy", systemImage: "doc.on.doc") { act(.copy, entry) }
+        if changeable {
+          Button("Edit", systemImage: "pencil") { act(.edit, entry) }
+          Button("Send Again", systemImage: "arrow.clockwise") { act(.retry, entry) }
+        }
+      }
+    case .assistant:
+      VStack(alignment: .leading, spacing: 6) {
+        StreamingText(text: item.text, streaming: live).textSelection(.enabled)
+        if ends, !live {
+          ReplyActions(changeable: changeable) { act($0, entry) }
+            .transition(.opacity)
+        }
+      }
+      .animation(.smooth(duration: 0.3), value: live)
     case .thought: ThoughtRow(text: item.text, live: live)
     case .tool: ToolRow(entry: entry)
     case .notice:
@@ -244,9 +522,50 @@ private struct Row: View {
   }
 }
 
-private struct UserBubble: View {
+/** Under the last answer of a turn: copy it, ask again, or take the chat back to it. */
+private struct ReplyActions: View {
+  let changeable: Bool
+  let act: (RowAction) -> Void
+  @State private var copied = 0
+
+  var body: some View {
+    HStack(spacing: 2) {
+      button(copied > 0 ? "checkmark" : "doc.on.doc", "Copy") {
+        act(.copy)
+        copied += 1
+        Task {
+          try? await Task.sleep(for: .seconds(1.4))
+          copied = 0
+        }
+      }
+      .contentTransition(.symbolEffect(.replace))
+      if changeable {
+        button("arrow.clockwise", "Try again") { act(.retry) }
+        button("arrow.uturn.backward", "Go back to here") { act(.rewind) }
+      }
+    }
+    .padding(.leading, -8)
+    .foregroundStyle(Color.faint)
+    .sensoryFeedback(.success, trigger: copied) { _, new in new > 0 }
+    .animation(.smooth(duration: 0.2), value: changeable)
+  }
+
+  private func button(_ symbol: String, _ label: String, _ action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      Image(systemName: symbol)
+        .font(.system(size: 12.5, weight: .medium))
+        .frame(width: 32, height: 28)
+        .contentShape(.rect)
+    }
+    .buttonStyle(QuietPress())
+    .accessibilityLabel(label)
+  }
+}
+
+private struct UserBubble<Menu: View>: View {
   let text: String
   var arriving = false
+  @ViewBuilder var menu: Menu
   @State private var landed = true
 
   var body: some View {
@@ -258,18 +577,17 @@ private struct UserBubble: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 11)
         .background(Color.bubble, in: .rect(cornerRadius: 22, style: .continuous))
-        .textSelection(.enabled)
-        .contextMenu {
-          Button("Copy", systemImage: "doc.on.doc") { UIPasteboard.general.string = text }
-        }
+        .contentShape(.contextMenuPreview, .rect(cornerRadius: 22, style: .continuous))
+        .contextMenu { menu }
     }
-    .offset(y: landed ? 0 : 120)
-    .scaleEffect(landed ? 1 : 0.94, anchor: .bottomTrailing)
+    .offset(y: landed ? 0 : 18)
+    .scaleEffect(landed ? 1 : 0.94, anchor: .topTrailing)
+    .blur(radius: landed ? 0 : 10)
     .opacity(landed ? 1 : 0)
     .onAppear {
       guard arriving else { return }
       landed = false
-      withAnimation(.spring(duration: 0.5, bounce: 0.16)) { landed = true }
+      withAnimation(.spring(duration: 0.5, bounce: 0.12)) { landed = true }
     }
   }
 }
@@ -283,11 +601,12 @@ private struct ThoughtRow: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       Button {
-        withAnimation(.snappy(duration: 0.3)) { open.toggle() }
+        withAnimation(.fold) { open.toggle() }
       } label: {
         HStack(spacing: 6) {
           Text(live ? "Thinking" : "Thought")
             .font(.geist(14, .medium))
+            .contentTransition(.opacity)
             .modifier(MaybeShimmer(on: live))
           Image(systemName: "chevron.right")
             .font(.system(size: 10, weight: .bold))
@@ -307,11 +626,27 @@ private struct ThoughtRow: View {
           .padding(.leading, 12)
           .overlay(alignment: .leading) { Capsule().fill(Color.hairline).frame(width: 2) }
           .padding(.top, 8)
-          .transition(.opacity.combined(with: .move(edge: .top)))
+          .transition(.unfold)
       }
     }
     .clipped()
+    .animation(.smooth(duration: 0.3), value: live)
     .sensoryFeedback(.selection, trigger: open)
+  }
+}
+
+extension Animation {
+  /** a fold opening or closing: one smooth curve for the height and the chevron */
+  fileprivate static let fold = Animation.smooth(duration: 0.34)
+}
+
+extension AnyTransition {
+  /** folded content fades in just under its line, and fades out quicker than the fold closes */
+  fileprivate static var unfold: AnyTransition {
+    .asymmetric(
+      insertion: .opacity.combined(with: .offset(y: -6)).animation(.smooth(duration: 0.3).delay(0.05)),
+      removal: .opacity.animation(.easeOut(duration: 0.12))
+    )
   }
 }
 
@@ -350,7 +685,7 @@ private struct ToolGroup: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       Button {
-        withAnimation(.snappy(duration: 0.3)) { open.toggle() }
+        withAnimation(.fold) { open.toggle() }
       } label: {
         HStack(spacing: 9) {
           Image(systemName: "square.stack.3d.up")
@@ -383,7 +718,7 @@ private struct ToolGroup: View {
         }
         .padding(.leading, 8)
         .overlay(alignment: .leading) { Capsule().fill(Color.hairline).frame(width: 1.5).padding(.vertical, 6) }
-        .transition(.opacity.combined(with: .move(edge: .top)))
+        .transition(.unfold)
       } else if live, let last = entries.last {
         ToolRow(entry: last)
           .id(last.id)
@@ -431,7 +766,7 @@ private struct ToolRow: View {
     VStack(alignment: .leading, spacing: 0) {
       Button {
         guard hasOutput(item) else { return }
-        withAnimation(.snappy(duration: 0.3)) { open.toggle() }
+        withAnimation(.fold) { open.toggle() }
       } label: {
         HStack(alignment: .center, spacing: 9) {
           Image(systemName: symbol(item))
@@ -462,7 +797,7 @@ private struct ToolRow: View {
         OutputBlock(text: output)
           .padding(.top, 4)
           .padding(.bottom, 6)
-          .transition(.opacity.combined(with: .move(edge: .top)))
+          .transition(.unfold)
       }
     }
     .clipped()

@@ -18,7 +18,6 @@ struct Shell: View {
   @Environment(Link.self) private var link
   @State private var open = false
   @State private var drag: CGFloat = 0
-  @State private var tracking: Bool?
   @State private var showSettings = false
   @State private var showPair = false
   @State private var opened = 0
@@ -30,7 +29,7 @@ struct Shell: View {
       let width = min(geo.size.width * 0.84, 340)
       let progress = max(0, min(1, ((open ? width : 0) + drag) / width))
       ZStack(alignment: .leading) {
-        Sidebar(visible: open, close: { set(false) }, newChat: startNew, settings: { showSettings = true }, pair: { showPair = true })
+        Sidebar(visible: open, close: { set(false) }, newChat: startNew, cleared: clear, settings: { showSettings = true }, pair: { showPair = true })
           .frame(width: width)
           .offset(x: (progress - 1) * width * 0.35)
           .opacity(0.4 + progress * 0.6)
@@ -50,7 +49,11 @@ struct Shell: View {
           // full height always: the corner clip mustn't cut what reaches into the bottom inset
           .ignoresSafeArea(.container, edges: .vertical)
       }
-      .simultaneousGesture(swipe(width))
+      .background(SidebarSwipe(open: open, began: began, changed: { dx in
+        drag = open ? min(0, dx) : max(0, dx)
+      }, ended: { dx, vx in
+        set((open ? width : 0) + dx + vx * 0.2 > width / 2)
+      }))
     }
     .page()
     .environment(\.shell, ShellActions(menu: { set(true) }, newChat: startNew))
@@ -78,6 +81,12 @@ struct Shell: View {
     newChat += 1
   }
 
+  /** the open chat is gone: a blank new chat takes its place, the sidebar stays, no folder picker */
+  private func clear() {
+    newChat = 0
+    link.chat = nil
+  }
+
   private func set(_ value: Bool) {
     if value, !open {
       opened += 1
@@ -89,28 +98,124 @@ struct Shell: View {
     }
   }
 
-  private func swipe(_ width: CGFloat) -> some Gesture {
-    DragGesture(minimumDistance: 14, coordinateSpace: .global)
-      .onChanged { v in
-        if tracking == nil {
-          // only a mostly sideways swipe in the direction that makes sense; scrolling stays scrolling
-          let dx = v.translation.width
-          let dy = v.translation.height
-          tracking = abs(dx) > abs(dy) * 1.4 && (open ? dx < 0 : dx > 0)
-          if tracking == true, !open {
-            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-          }
+  private func began() {
+    guard !open else { return }
+    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+  }
+}
+
+/**
+ * The swipe that opens and closes the sidebar. It sits on the window, so it sees a swipe wherever it
+ * starts, buttons and lists included, and it looks at what's under the finger first: it stays out of
+ * the way of text being edited or selected (the caret, the handles, the loupe), of a press that was
+ * held before it moved, of a code block that can still scroll back, and of any sheet on top.
+ */
+private struct SidebarSwipe: UIViewRepresentable {
+  let open: Bool
+  let began: () -> Void
+  let changed: (CGFloat) -> Void
+  let ended: (_ dx: CGFloat, _ velocity: CGFloat) -> Void
+
+  func makeCoordinator() -> Coordinator { Coordinator() }
+
+  func makeUIView(context: Context) -> Anchor {
+    let anchor = Anchor()
+    anchor.isUserInteractionEnabled = false
+    anchor.pan = context.coordinator.pan
+    return anchor
+  }
+
+  func updateUIView(_ view: Anchor, context: Context) {
+    context.coordinator.swipe = self
+  }
+
+  static func dismantleUIView(_ view: Anchor, coordinator: Coordinator) {
+    coordinator.pan.view?.removeGestureRecognizer(coordinator.pan)
+  }
+
+  /** puts the recognizer on whatever window it ends up in */
+  final class Anchor: UIView {
+    var pan: UIPanGestureRecognizer?
+    override func didMoveToWindow() {
+      super.didMoveToWindow()
+      guard let pan, let window, pan.view !== window else { return }
+      pan.view?.removeGestureRecognizer(pan)
+      window.addGestureRecognizer(pan)
+    }
+  }
+
+  final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+    var swipe: SidebarSwipe?
+    let pan = UIPanGestureRecognizer()
+    private weak var touched: UIView?
+    private var down: TimeInterval = 0
+    private var start: CGPoint = .zero
+
+    override init() {
+      super.init()
+      pan.maximumNumberOfTouches = 1
+      pan.delegate = self
+      pan.addTarget(self, action: #selector(moved))
+    }
+
+    @objc private func moved(_ pan: UIPanGestureRecognizer) {
+      guard let swipe else { return }
+      let dx = pan.translation(in: nil).x
+      switch pan.state {
+      case .began: swipe.began(); swipe.changed(dx)
+      case .changed: swipe.changed(dx)
+      case .ended: swipe.ended(dx, pan.velocity(in: nil).x)
+      case .cancelled, .failed: swipe.ended(0, 0)
+      default: break
+      }
+    }
+
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+      // not through a sheet
+      if g.view?.window?.rootViewController?.presentedViewController != nil { return false }
+      touched = touch.view
+      down = touch.timestamp
+      start = touch.location(in: nil)
+      return true
+    }
+
+    /** the text being edited, with room around it for the selection handles that hang off its ends */
+    private func editing(in window: UIWindow?) -> CGRect? {
+      guard let window else { return nil }
+      func find(_ view: UIView) -> UIView? {
+        if view is UITextInput, view.isFirstResponder { return view }
+        for sub in view.subviews { if let hit = find(sub) { return hit } }
+        return nil
+      }
+      guard let field = find(window) else { return nil }
+      return field.convert(field.bounds, to: nil).insetBy(dx: -24, dy: -24)
+    }
+
+    func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
+      guard let open = swipe?.open else { return false }
+      let v = pan.translation(in: nil)
+      // a mostly sideways swipe in the direction that makes sense; scrolling stays scrolling
+      guard abs(v.x) > abs(v.y) * 1.4, open ? v.x < 0 : v.x > 0 else { return false }
+      // a swipe moves at once; a finger held first is selecting text or dragging something
+      if ProcessInfo.processInfo.systemUptime - down > 0.25 { return false }
+      // the text being edited or selected keeps the finger for its caret and handles
+      if editing(in: g.view as? UIWindow)?.contains(start) == true { return false }
+      if open { return true }
+      var view = touched
+      while let current = view {
+        if let scroll = current as? UIScrollView,
+           scroll.contentSize.width > scroll.bounds.width + 1,
+           scroll.contentOffset.x > -scroll.adjustedContentInset.left + 1 {
+          return false
         }
-        guard tracking == true else { return }
-        let dx = v.translation.width
-        drag = open ? min(0, dx) : max(0, dx)
+        view = current.superview
       }
-      .onEnded { v in
-        defer { tracking = nil }
-        guard tracking == true else { return }
-        let projected = (open ? width : 0) + v.predictedEndTranslation.width
-        set(projected > width / 2)
-      }
+      return true
+    }
+
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+      true
+    }
   }
 }
 
@@ -124,13 +229,14 @@ private struct Sidebar: View {
   let visible: Bool
   let close: () -> Void
   let newChat: () -> Void
+  /** the chat on screen was deleted */
+  let cleared: () -> Void
   let settings: () -> Void
   let pair: () -> Void
   @State private var query = ""
   @State private var picked = 0
   @State private var renaming: Listed?
   @State private var newTitle = ""
-  @State private var deleting: Listed?
   @State private var problem: String?
 
   var body: some View {
@@ -221,20 +327,6 @@ private struct Sidebar: View {
         }
       }
     }
-    .confirmationDialog(
-      "Delete \(deleting?.session.title ?? "this chat")?",
-      isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
-      titleVisibility: .visible
-    ) {
-      Button("Delete chat", role: .destructive) {
-        guard let l = deleting else { return }
-        Task {
-          do { try await link.delete(l.session, on: l.host.id) } catch { problem = error.localizedDescription }
-        }
-      }
-    } message: {
-      Text("spark removes it from \(deleting.map { $0.host.kind == .cloud ? "the cloud" : $0.host.name } ?? "the host") for good.")
-    }
     .alert("Couldn't change that chat", isPresented: Binding(get: { problem != nil }, set: { if !$0 { problem = nil } })) {
       Button("OK", role: .cancel) {}
     } message: {
@@ -270,7 +362,8 @@ private struct Sidebar: View {
 
   @ViewBuilder private var list: some View {
     ScrollView {
-      LazyVStack(alignment: .leading, spacing: 2, pinnedViews: []) {
+      // a plain stack: a lazy one jumps when a row in the middle leaves
+      VStack(alignment: .leading, spacing: 2) {
         switch style {
         case .switcher: switcherList
         case .sections: sectionsList
@@ -280,7 +373,7 @@ private struct Sidebar: View {
       // a fresh list for each layout: a lazy stack otherwise keeps rows drawn for the last one
       .id(style)
       .padding(.horizontal, 6)
-      .animation(.ease, value: link.listed.map(\.id))
+      .animation(.smooth(duration: 0.32), value: link.listed.map(\.id))
     }
     .scrollIndicators(.hidden)
     .refreshable { await link.refreshAll() }
@@ -305,7 +398,8 @@ private struct Sidebar: View {
         if headed { heading(h) }
         if !h.online { offline(h) }
         ForEach(shown) { row($0, badge: false) }
-        if h.online, shown.isEmpty, !link.loadingSessions {
+        // said only once the host has answered, so a refresh never flashes it
+        if h.online, shown.isEmpty, link.sessions[h.id] != nil {
           Text(query.isEmpty ? "No chats yet" : "No chats match")
             .font(.geist(13))
             .foregroundStyle(Color.faint)
@@ -364,8 +458,17 @@ private struct Sidebar: View {
         newTitle = l.session.title
         renaming = l
       }
-      Button("Delete", systemImage: "trash", role: .destructive) { deleting = l }
+      Button("Delete", systemImage: "trash", role: .destructive) { delete(l) }
         .disabled(l.session.running)
+    }
+  }
+
+  /** no question asked: the row leaves once the menu has closed, so the two don't fight */
+  private func delete(_ l: Listed) {
+    Task {
+      try? await Task.sleep(for: .milliseconds(320))
+      if link.chat?.host == l.host.id, link.chat?.info.id == l.session.id { cleared() }
+      do { try await link.delete(l.session, on: l.host.id) } catch { problem = error.localizedDescription }
     }
   }
 
@@ -378,7 +481,7 @@ private struct Sidebar: View {
   }
 
   @ViewBuilder private func empty(_ none: Bool) -> some View {
-    if none, !link.loadingSessions {
+    if none, !link.sessions.isEmpty {
       Text(query.isEmpty ? "No chats yet" : "No chats match")
         .font(.geist(14))
         .foregroundStyle(Color.faint)

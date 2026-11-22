@@ -113,6 +113,20 @@ struct Rise: Transition {
   }
 }
 
+/**
+ * A sent message leaving the composer: it starts low and a little small at the right, where the
+ * send button is, and springs up into its place while it sharpens.
+ */
+struct Sent: Transition {
+  func body(content: Content, phase: TransitionPhase) -> some View {
+    content
+      .opacity(phase.isIdentity ? 1 : 0)
+      .blur(radius: phase == .willAppear ? 4 : 0)
+      .scaleEffect(phase.isIdentity ? 1 : 0.88, anchor: .bottomTrailing)
+      .offset(y: phase == .willAppear ? 44 : 0)
+  }
+}
+
 /** Small things arriving: a soft fade up out of a blur. */
 struct Settle: Transition {
   var distance: CGFloat = 10

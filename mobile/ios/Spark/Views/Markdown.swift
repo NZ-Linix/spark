@@ -114,7 +114,31 @@ enum Block: Hashable {
     var s = line.trimmingCharacters(in: .whitespaces)
     if s.hasPrefix("|") { s.removeFirst() }
     if s.hasSuffix("|") { s.removeLast() }
-    return s.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    var out: [String] = []
+    var cell = ""
+    var code = false
+    var escaped = false
+    for ch in s {
+      if escaped {
+        // `\|` is a pipe in the cell; any other escape is left for the inline Markdown
+        if ch != "|" { cell.append("\\") }
+        cell.append(ch)
+        escaped = false
+      } else if ch == "\\", !code {
+        escaped = true
+      } else if ch == "`" {
+        code.toggle()
+        cell.append(ch)
+      } else if ch == "|", !code {
+        out.append(cell)
+        cell = ""
+      } else {
+        cell.append(ch)
+      }
+    }
+    if escaped { cell.append("\\") }
+    out.append(cell)
+    return out.map { $0.trimmingCharacters(in: .whitespaces) }
   }
 }
 
@@ -286,7 +310,7 @@ private struct TableBlock: View {
 
   var body: some View {
     ScrollView(.horizontal, showsIndicators: false) {
-      Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 10) {
+      Grid(alignment: .topLeading, horizontalSpacing: 20, verticalSpacing: 10) {
         GridRow {
           ForEach(Array(head.enumerated()), id: \.offset) { _, cell in
             cellText(cell).font(.geist(14, .semibold))
@@ -306,8 +330,32 @@ private struct TableBlock: View {
   }
 
   private func cellText(_ s: String) -> some View {
-    Text(Inline.render(s))
-      .frame(maxWidth: 240, alignment: .leading)
-      .fixedSize(horizontal: false, vertical: true)
+    CellWidth(max: 240) {
+      Text(Inline.render(s.replacing(/<br\s*\/?>/, with: "\n")))
+    }
+  }
+}
+
+/**
+ * A table cell: as wide as its text on one line, up to `max`, and as tall as the text wraps at that
+ * width. The table scrolls sideways, so its cells are offered no width; without this a long cell
+ * would measure one line tall and spill over the rows below it.
+ */
+private struct CellWidth: Layout {
+  let max: CGFloat
+
+  private func width(_ cell: LayoutSubview) -> CGFloat {
+    min(cell.sizeThatFits(.unspecified).width, max)
+  }
+
+  func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    guard let cell = subviews.first else { return .zero }
+    let w = width(cell)
+    return CGSize(width: w, height: cell.sizeThatFits(ProposedViewSize(width: w, height: nil)).height)
+  }
+
+  func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    guard let cell = subviews.first else { return }
+    cell.place(at: bounds.origin, proposal: ProposedViewSize(width: width(cell), height: nil))
   }
 }

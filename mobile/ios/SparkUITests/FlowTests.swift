@@ -60,6 +60,10 @@ final class FlowTests: XCTestCase {
 
     let composer = app.textFields["Message spark"]
     XCTAssertTrue(composer.waitForExistence(timeout: 10))
+    // the chosen folder's files and terminal are there before the chat starts
+    XCTAssertTrue(app.buttons["Files"].waitForExistence(timeout: 5))
+    XCTAssertTrue(app.buttons["Terminal"].exists)
+    shot(app, "07b-folder-tools")
     sleep(1)
     shot(app, "07b-composer-open")
     // a tap anywhere off the keyboard puts it away
@@ -72,15 +76,14 @@ final class FlowTests: XCTestCase {
       model.tap()
       sleep(1)
       shot(app, "07d-models")
+      // the effort slider sits at the top of the same sheet
+      let effort = app.otherElements["Reasoning effort"]
+      if effort.exists {
+        effort.swipeRight()
+        sleep(1)
+        shot(app, "07e-effort")
+      }
       app.buttons["Close"].firstMatch.tap()
-      sleep(1)
-    }
-    let effort = app.buttons["Reasoning effort"]
-    if effort.exists {
-      effort.tap()
-      sleep(1)
-      shot(app, "07e-effort")
-      app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.15)).tap()
       sleep(1)
     }
 
@@ -96,6 +99,53 @@ final class FlowTests: XCTestCase {
     app.swipeDown()
     sleep(1)
     shot(app, "09-reply")
+
+    // the chat's folder: read a file, make one, save it, delete it
+    app.buttons["Files"].tap()
+    let readme = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'README.md'")).firstMatch
+    XCTAssertTrue(readme.waitForExistence(timeout: 10))
+    sleep(1)
+    shot(app, "09b-files")
+    readme.tap()
+    XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 10))
+    shot(app, "09c-file")
+    app.navigationBars.firstMatch.buttons.firstMatch.tap()
+    app.buttons["New"].tap()
+    app.buttons["New File"].tap()
+    let fileName = app.alerts.textFields.firstMatch
+    XCTAssertTrue(fileName.waitForExistence(timeout: 5))
+    fileName.typeText("notes.txt")
+    app.alerts.buttons["Create"].tap()
+    XCTAssertTrue(app.buttons["Save"].waitForExistence(timeout: 10))
+    app.textViews.firstMatch.typeText("Written from the phone.\n")
+    shot(app, "09d-editing")
+    app.buttons["Save"].tap()
+    XCTAssertTrue(app.buttons["Edit"].waitForExistence(timeout: 10))
+    XCTAssertTrue(app.staticTexts["Written from the phone."].exists)
+    app.navigationBars.firstMatch.buttons.firstMatch.tap()
+    let notes = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'notes.txt'")).firstMatch
+    XCTAssertTrue(notes.waitForExistence(timeout: 10))
+    notes.swipeLeft()
+    app.buttons["Delete"].firstMatch.tap()
+    app.alerts.buttons["Delete"].tap()
+    XCTAssertTrue(notes.waitForNonExistence(timeout: 10))
+    app.buttons["Close"].firstMatch.tap()
+    sleep(1)
+
+    // a terminal in the same folder: a command's output, and a cd that carries over
+    app.buttons["Terminal"].tap()
+    sleep(1)
+    shot(app, "09e-terminal-open")
+    let command = app.textFields["Command"]
+    XCTAssertTrue(command.waitForExistence(timeout: 5))
+    command.typeText("ls\n")
+    XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'README.md'")).firstMatch.waitForExistence(timeout: 15))
+    command.typeText("cd .. && pwd\n")
+    XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label ENDSWITH '/root'")).firstMatch.waitForExistence(timeout: 15))
+    sleep(1)
+    shot(app, "09e-terminal")
+    app.buttons["Close"].firstMatch.tap()
+    sleep(1)
 
     app.buttons["Chats"].tap()
     sleep(1)
@@ -250,6 +300,99 @@ final class FlowTests: XCTestCase {
       sleep(1)
     }
     return false
+  }
+
+  /**
+   * A chat sent without choosing a folder runs in one of its own: its files can be made and shared,
+   * and deleting the chat from the sidebar takes the folder with it.
+   */
+  @MainActor
+  func testChatWithoutFolder() throws {
+    let relay = try XCTUnwrap(env["SPARK_RELAY"], "set TEST_RUNNER_SPARK_RELAY")
+    let app = XCUIApplication()
+    app.launchEnvironment["SPARK_RELAY"] = relay
+    app.launch()
+    XCTAssertTrue(app.buttons["Chats"].waitForExistence(timeout: 10))
+    XCTAssertTrue(app.buttons["Choose a folder"].waitForExistence(timeout: 10))
+
+    let composer = app.textFields["Message spark"]
+    composer.tap()
+    composer.typeText("Reply with the single word: ready")
+    app.buttons["Send"].tap()
+    XCTAssertTrue(app.buttons["Files"].waitForExistence(timeout: 30))
+    XCTAssertTrue(waitUntilIdle(app, timeout: 120))
+    shot(app, "20-folderless-chat")
+
+    app.buttons["Files"].tap()
+    XCTAssertTrue(app.navigationBars.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'chat-'")).firstMatch.waitForExistence(timeout: 10))
+    app.buttons["New"].tap()
+    app.buttons["New File"].tap()
+    let fileName = app.alerts.textFields.firstMatch
+    XCTAssertTrue(fileName.waitForExistence(timeout: 5))
+    fileName.typeText("hello.txt")
+    app.alerts.buttons["Create"].tap()
+    XCTAssertTrue(app.buttons["Save"].waitForExistence(timeout: 10))
+    app.textViews.firstMatch.typeText("hi from the phone\n")
+    app.buttons["Save"].tap()
+    XCTAssertTrue(app.buttons["Share"].waitForExistence(timeout: 10))
+    app.buttons["Share"].tap()
+    // the system share sheet, with the file in it
+    XCTAssertTrue(app.otherElements["ActivityListView"].waitForExistence(timeout: 15) || app.buttons["Copy"].waitForExistence(timeout: 5))
+    sleep(1)
+    shot(app, "21-share")
+    app.swipeDown(velocity: .fast)
+    sleep(1)
+    app.navigationBars.firstMatch.buttons.firstMatch.tap()
+    app.buttons["Close"].firstMatch.tap()
+    sleep(1)
+
+    app.buttons["Chats"].tap()
+    let row = app.buttons.matching(NSPredicate(format: "label CONTAINS 'no folder'")).firstMatch
+    XCTAssertTrue(row.waitForExistence(timeout: 10))
+    shot(app, "22-sidebar-no-folder")
+    row.press(forDuration: 1.0)
+    app.buttons["Delete"].tap()
+    XCTAssertTrue(row.waitForNonExistence(timeout: 10))
+  }
+
+  /**
+   * A session open in spark in a terminal on the Mac opens read-only from the sidebar, with its saved
+   * turns, and can be written once spark there closes. Needs spark running in a terminal on the Mac
+   * with a session whose title starts with TEST_RUNNER_SPARK_HELD_TITLE; close it after the shot
+   * named 30-terminal-session-read-only appears.
+   */
+  @MainActor
+  func testTerminalSessionOpensReadOnly() throws {
+    let relay = try XCTUnwrap(env["SPARK_RELAY"], "set TEST_RUNNER_SPARK_RELAY")
+    let title = try XCTUnwrap(env["SPARK_HELD_TITLE"], "set TEST_RUNNER_SPARK_HELD_TITLE")
+    let app = XCUIApplication()
+    app.launchEnvironment["SPARK_RELAY"] = relay
+    app.launch()
+    let menu = app.buttons["Chats"]
+    if !menu.waitForExistence(timeout: 8) {
+      let code = try XCTUnwrap(env["SPARK_PAIR_CODE"], "set TEST_RUNNER_SPARK_PAIR_CODE")
+      XCTAssertTrue(app.buttons["5"].waitForExistence(timeout: 5))
+      for digit in code { app.buttons[String(digit)].tap() }
+      XCTAssertTrue(menu.waitForExistence(timeout: 15))
+    }
+    menu.tap()
+    let row = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", title)).firstMatch
+    XCTAssertTrue(row.waitForExistence(timeout: 20))
+    row.tap()
+
+    let note = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Open in spark on'")).firstMatch
+    XCTAssertTrue(note.waitForExistence(timeout: 10))
+    XCTAssertFalse(app.textFields["Message spark"].isEnabled)
+    sleep(1)
+    shot(app, "30-terminal-session-read-only")
+
+    // once spark in the terminal closes, the chat opens here
+    XCTAssertTrue(note.waitForNonExistence(timeout: 120))
+    let composer = app.textFields["Message spark"]
+    XCTAssertTrue(composer.waitForExistence(timeout: 10))
+    XCTAssertTrue(composer.isEnabled)
+    sleep(1)
+    shot(app, "31-terminal-session-taken-over")
   }
 
   private func shot(_ app: XCUIApplication, _ name: String) {

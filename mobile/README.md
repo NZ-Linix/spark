@@ -34,11 +34,13 @@ The sidebar shows the chats on the cloud and on the Mac. Settings, Sidebar picks
 
 With Sections or Merged, a chat opens on its own host, and the new-chat screen has a Cloud and Mac picker that starts on the host you used last. The sidebar checks for new chats every 15 seconds while it's open.
 
-Press and hold a chat in the sidebar to rename or delete it. A chat that is running can't be deleted until it stops.
+Press and hold a chat in the sidebar to rename or delete it. Press and hold one of your messages to edit it or send it again; under each reply, the arrow takes the chat back to that reply. Either way spark forks the session at that point, the chat goes on in the fork, and the turns after it are gone. In a terminal, `/fork` (or `/rewind`) does the same and puts the prompt back in the composer, keeping the old session. A chat that is running can't be deleted until it stops.
 
 In the folder picker, the row at the top or any part of the path goes up a level, and swiping right does the same. Press and hold a folder to use it, rename it, or delete it with everything inside. The picker refuses to change the host's root folder, the home folder, the folders that hold either, and the standard folders in home such as Documents and Desktop.
 
 The cloud shows every chat. The Mac shows only the chats started from the phone, plus sessions running on the Mac right now, such as spark in a terminal. A running session counts when its spark process holds the session's lock. `spark-bridge` keeps the phone's chats in `mobile-sessions.json` beside its pairing file and forgets a chat once spark no longer lists it.
+
+spark lets one process write a session at a time. A chat that spark has open on the Mac, such as in a terminal, opens read-only on the phone: it shows the turns spark has finished, and the composer stays off. The phone reads it again every 3 seconds, and once spark on the Mac closes it, the chat opens on the phone and you can write in it. spark saves a turn when the turn ends, so the reply spark is working on shows up after it finishes.
 
 ## Providers and prompts
 
@@ -50,7 +52,7 @@ Each Mac keeps a copy of the library in its own spark profile, so spark in a ter
 
 `spark provider set <name> [<model>] <field> <value>` changes one field without opening the `/provider` form, for example `spark provider set oc-go display_name "OpenCode Go"` or `spark provider set oc-go glm-5.3 context_window 200k`.
 
-Prompts are edited only in the app: Settings, Library, Prompts. Each prompt has a name and its text, and replaces spark's own system prompt for the chats that pick it. Pick one with the prompt button in the composer of a new chat. Press and hold a prompt to rename or delete it. Each Mac and cloud profile gets the prompts in `~/.spark/cloud-prompts`, which spark lists with your own prompts. A chat keeps its prompt when it is reopened. After that prompt is renamed or deleted, the chat runs with spark's own prompt the next time it opens.
+Prompts are edited only in the app: Settings, Library, Prompts. Each prompt has a name and its text, and replaces spark's own system prompt for the chats that pick it. Pick one in the model sheet, from the chip beside the send button. A chat can change its prompt between messages: its spark starts again with the new one. Press and hold a prompt to rename or delete it. Each Mac and cloud profile gets the prompts in `~/.spark/cloud-prompts`, which spark lists with your own prompts. A chat keeps its prompt when it is reopened. After that prompt is renamed or deleted, the chat runs with spark's own prompt the next time it opens.
 
 ## Build spark-bridge
 
@@ -92,6 +94,8 @@ TEST_RUNNER_SPARK_RELAY=http://127.0.0.1:8799 TEST_RUNNER_SPARK_PAIR_CODE=<code>
 TEST_RUNNER_SPARK_SHOTS=/tmp/shots \
 xcodebuild test -project Spark.xcodeproj -scheme Spark -destination 'platform=iOS Simulator,name=iPhone 18 Pro'
 ```
+
+`testTerminalSessionOpensReadOnly` also needs spark open in a terminal on the Mac, on a session whose title starts with `TEST_RUNNER_SPARK_HELD_TITLE`. Quit that spark after the screenshot `30-terminal-session-read-only` appears, and the test checks that the chat opens on the phone.
 
 ## Security
 

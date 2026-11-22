@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { macSessions, parseRunning } from "./mac_sessions";
 import { PhoneSessions } from "./phone_sessions";
 import type { SessionInfo } from "./protocol";
 import { Host } from "./host";
+import { historyItems } from "./session_view";
 import { applySnapshot, fingerprint, Library, type LibrarySnapshot, PROMPT_DIR } from "./library";
 import { Profile } from "./providers";
 import { type LibraryOp, Mirror } from "./sync";
@@ -72,7 +73,8 @@ describe("Mac session filter", () => {
 
   test("reads spark sessions --live --json", () => {
     const text = JSON.stringify({ kind: "live_sessions", count: 1, sessions: [{ id: "a", title: "Fix it", workspace_root: "/Users/example/p", saved_model: null, state: "busy", created_at_ms: 0, updated_at_ms: 1_700_000_000_000, agents: [] }] });
-    expect(parseRunning(text)).toEqual([{ id: "a", title: "Fix it", cwd: "/Users/example/p", updatedAt: new Date(1_700_000_000_000).toISOString() }]);
+    expect(parseRunning(text)).toEqual([{ id: "a", title: "Fix it", cwd: "/Users/example/p", updatedAt: new Date(1_700_000_000_000).toISOString(), working: false }]);
+    expect(parseRunning(text.replace('"busy"', '"working"'))[0].working).toBe(true);
     expect(parseRunning(JSON.stringify({ kind: "other" }))).toEqual([]);
   });
 });
@@ -419,4 +421,271 @@ describe("folders from the phone", () => {
     expect(bad.ok).toBe(false);
     expect(existsSync(join(root, "work"))).toBe(true);
   });
+});
+
+describe("files and the terminal from the phone", () => {
+  /** a host confined to a scratch root, with every event it sends */
+  function host() {
+    mkdirSync(join(dir, "root", "app", "src"), { recursive: true });
+    // the host answers with real paths; a temp folder on macOS sits behind a link
+    const root = realpathSync(join(dir, "root"));
+    mkdirSync(join(root, "app", ".git"));
+    writeFileSync(join(root, "app", "README.md"), "# App\n");
+    writeFileSync(join(root, "app", ".env"), "KEY=1\n");
+    writeFileSync(join(root, "app", "blob.bin"), Buffer.from([1, 0, 2]));
+    const events: any[] = [];
+    const h = new Host({ info: { name: "Cloud", kind: "cloud", home: root, platform: process.platform }, spark: SPARK, root, confine: true, send: (e) => events.push(e) });
+    let n = 0;
+    const ask = async (req: Record<string, unknown>) => {
+      const id = `r${++n}`;
+      await h.handle({ id, ...req } as any);
+      return events.find((r) => r.t === "reply" && r.id === id);
+    };
+    /** resolves with a command's output and its done event */
+    const run = async (run: string, cwd: string, command: string) => {
+      const started = await ask({ op: "run", run, cwd, command });
+      expect(started.ok).toBe(true);
+      for (let i = 0; i < 200 && !events.some((e) => e.t === "term" && e.run === run && e.done); i++) await Bun.sleep(25);
+      const mine = events.filter((e) => e.t === "term" && e.run === run);
+      return { out: mine.map((e) => e.data ?? "").join(""), done: mine.find((e) => e.done) };
+    };
+    return { root, ask, run, h };
+  }
+
+  test("lists folders first, leaves out .git, and reads text and binary files", async () => {
+    const { root, ask } = host();
+    const list = await ask({ op: "files", path: join(root, "app") });
+    expect(list.result.entries.map((e: any) => e.name)).toEqual(["src", ".env", "blob.bin", "README.md"]);
+    const text = await ask({ op: "file", path: join(root, "app", "README.md") });
+    expect(text.result.kind).toBe("text");
+    expect(text.result.text).toBe("# App\n");
+    expect(typeof text.result.modified).toBe("number");
+    expect((await ask({ op: "file", path: join(root, "app", "blob.bin") })).result.kind).toBe("binary");
+    expect((await ask({ op: "files", path: dir })).ok).toBe(false);
+  });
+
+  test("creates, saves, renames, and deletes, and won't save over newer work", async () => {
+    const { root, ask } = host();
+    const app = join(root, "app");
+    const made = await ask({ op: "fileCreate", path: app, name: "notes.txt" });
+    expect(made.result).toBe(join(app, "notes.txt"));
+    expect((await ask({ op: "fileCreate", path: app, name: "notes.txt" })).ok).toBe(false);
+    expect((await ask({ op: "fileCreate", path: app, name: "lib", dir: true })).ok).toBe(true);
+    expect(statSync(join(app, "lib")).isDirectory()).toBe(true);
+
+    const read = await ask({ op: "file", path: join(app, "notes.txt") });
+    const saved = await ask({ op: "fileWrite", path: join(app, "notes.txt"), text: "hello", modified: read.result.modified });
+    expect(saved.ok).toBe(true);
+    expect(readFileSync(join(app, "notes.txt"), "utf8")).toBe("hello");
+    const stale = await ask({ op: "fileWrite", path: join(app, "notes.txt"), text: "older", modified: read.result.modified - 5000 });
+    expect(stale.ok).toBe(false);
+    expect(readFileSync(join(app, "notes.txt"), "utf8")).toBe("hello");
+
+    expect((await ask({ op: "entryRename", path: join(app, "notes.txt"), name: ".notes" })).result).toBe(join(app, ".notes"));
+    expect((await ask({ op: "entryRename", path: join(app, ".notes"), name: "../out" })).ok).toBe(false);
+    expect((await ask({ op: "entryDelete", path: join(app, ".notes") })).ok).toBe(true);
+    expect((await ask({ op: "entryDelete", path: join(app, "lib") })).ok).toBe(true);
+    expect(existsSync(join(app, ".notes")) || existsSync(join(app, "lib"))).toBe(false);
+    expect((await ask({ op: "entryDelete", path: root })).ok).toBe(false);
+    expect(existsSync(root)).toBe(true);
+  });
+
+  test("runs a command, keeps the folder it moved to, and reports the exit code", async () => {
+    const { root, run } = host();
+    const app = join(root, "app");
+    const first = await run("t1", app, "echo hi; echo oops >&2; cd src");
+    expect(first.out).toContain("hi");
+    expect(first.out).toContain("oops");
+    expect(first.done.code).toBe(0);
+    expect(first.done.cwd).toBe(join(app, "src"));
+    const failed = await run("t2", app, "exit 3");
+    expect(failed.done.code).toBe(3);
+    expect(failed.done.cwd).toBe(app);
+  });
+
+  test("sends a file in pieces", async () => {
+    const { root, ask } = host();
+    const big = Buffer.alloc(3 * 1024 * 1024 + 10, 7);
+    writeFileSync(join(root, "app", "big.bin"), big);
+    const first = await ask({ op: "fileData", path: join(root, "app", "big.bin") });
+    expect(first.result.size).toBe(big.length);
+    const got = Buffer.from(first.result.data, "base64").length;
+    const rest = await ask({ op: "fileData", path: join(root, "app", "big.bin"), offset: got });
+    expect(got + Buffer.from(rest.result.data, "base64").length).toBe(big.length);
+    expect((await ask({ op: "fileData", path: join(root, "app", "big.bin"), offset: big.length + 1 })).ok).toBe(false);
+  });
+
+  test("gives a chat without a folder one of its own, and deletes it with the chat", async () => {
+    const root = realpathSync(mkdtempSync(join(dir, "own-")));
+    const events: any[] = [];
+    const h = new Host({
+      info: { name: "Cloud", kind: "cloud", home: root, platform: process.platform },
+      spark: SPARK,
+      root,
+      confine: true,
+      env: () => ({ SPARK_HOME: join(dir, "spark-home") }),
+      send: (e) => events.push(e),
+    });
+    try {
+      await h.handle({ id: 1, op: "new" } as any);
+      const made = events.find((e) => e.id === 1);
+      expect(made.ok).toBe(true);
+      expect(made.result.scratch).toBe(true);
+      expect(made.result.cwd.startsWith(join(root, ".spark-chats", "chat-"))).toBe(true);
+      expect(existsSync(made.result.cwd)).toBe(true);
+      await h.handle({ id: 2, op: "sessionDelete", s: made.result.id } as any);
+      expect(events.find((e) => e.id === 2).ok).toBe(true);
+      expect(existsSync(made.result.cwd)).toBe(false);
+    } finally {
+      h.stop();
+    }
+  }, 30000);
+
+  test("stops a running command", async () => {
+    const { root, ask, run } = host();
+    const going = run("t3", join(root, "app"), "sleep 30");
+    await Bun.sleep(300);
+    expect((await ask({ op: "runStop", run: "t3" })).ok).toBe(true);
+    const { done } = await going;
+    expect(done).toBeTruthy();
+    expect(done.code).not.toBe(0);
+  });
+});
+
+/** a saved session as `spark session <id> --json` prints it: one turn with a shell call and its reply */
+const DETAIL = {
+  kind: "session_detail",
+  id: "held",
+  created_at_ms: 1_700_000_000_000,
+  updated_at_ms: 1_700_000_100_000,
+  history_len: 2,
+  history: [
+    {
+      kind: "assistant",
+      user: { text: "list the files", images: [] },
+      assistant: "There are two files.",
+      execution: {
+        tool_steps: [
+          {
+            assistant: "Looking.",
+            tool_calls: [{ id: "call_1", name: "shell", arguments_json: JSON.stringify({ action: "run", command: "ls" }) }],
+            tool_results: [{ tool_call_id: "call_1", tool_name: "shell", status: "success", output: JSON.stringify({ state: "completed", exit_code: 0, output_delta: "a\nb\n" }) }],
+          },
+        ],
+        steering: [{ text: "only top level", assistant_prefix: null, after_tool_step_count: 1 }],
+      },
+    },
+    { kind: "interrupted", user: { text: "and now?", images: [] }, assistant: null, tool_call: null, completed_tool_names: [] },
+  ],
+};
+
+describe("read-only history", () => {
+  test("turns a saved session into the rows spark replays, with ids that stay put", () => {
+    const items = historyItems(DETAIL);
+    expect(items.map((i) => [i.id, i.role])).toEqual([
+      ["h1:u", "user"],
+      ["h1:a0", "assistant"],
+      ["call_1", "tool"],
+      ["h1:s0", "user"],
+      ["h1:a1", "assistant"],
+      ["h2:u", "user"],
+      ["h2:stopped", "notice"],
+    ]);
+    expect(items[2]).toMatchObject({ name: "shell", kind: "execute", status: "completed", detail: "ls", output: "a\nb\n" });
+    expect(historyItems(structuredClone(DETAIL))).toEqual(items);
+  });
+
+  test("says when earlier turns are left out", () => {
+    const items = historyItems({ ...DETAIL, first_turn: 5 });
+    expect(items[0]).toMatchObject({ role: "notice" });
+    expect(items[1].id).toBe("h5:u");
+  });
+
+  test("tolerates a damaged detail", () => {
+    expect(historyItems(null)).toEqual([]);
+    expect(historyItems({ history: [null, { kind: "assistant", execution: { tool_steps: [null] } }] })).toEqual([]);
+  });
+});
+
+/**
+ * A spark that has session "held" saved and refuses to load it, as spark does while another spark
+ * process holds its writer lock. `spark session held --json` still reads it.
+ */
+function fakeSpark(): string {
+  const path = join(dir, "spark");
+  writeFileSync(
+    path,
+    `#!/usr/bin/env bun
+const args = process.argv.slice(2);
+if (args[0] === "session") {
+  process.stdout.write(${JSON.stringify(JSON.stringify(DETAIL))});
+  process.exit(0);
+}
+const lines = require("node:readline").createInterface({ input: process.stdin });
+const reply = (id, body) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, ...body }) + "\\n");
+lines.on("line", (line) => {
+  const m = JSON.parse(line);
+  if (m.method === "initialize") reply(m.id, { result: { protocolVersion: 1 } });
+  else if (m.method === "session/list") reply(m.id, { result: { sessions: [{ sessionId: "held", title: "Held", cwd: ${JSON.stringify(dir)}, updatedAt: "2026-11-01T00:00:00Z" }] } });
+  else if (m.method === "session/load") reply(m.id, { error: { code: -32603, message: "Session is busy" } });
+  else reply(m.id, { error: { code: -32601, message: "no" } });
+});
+`,
+  );
+  chmodSync(path, 0o755);
+  return path;
+}
+
+describe("a session another spark process has open", () => {
+  const hostWith = (running: () => Promise<{ id: string; title: string; cwd: string; updatedAt: string; working?: boolean }[]>) => {
+    const events: any[] = [];
+    const h = new Host({
+      info: { name: "Studio", kind: "mac", home: dir, platform: process.platform },
+      spark: fakeSpark(),
+      root: dir,
+      filter: { phone: new PhoneSessions(join(dir, "phone.json")), running },
+      send: (e) => events.push(e),
+    });
+    const open = async () => {
+      await h.handle({ id: 1, op: "open", s: "held" } as any);
+      return events.find((e) => e.t === "reply" && e.id === 1);
+    };
+    return { h, open };
+  };
+
+  test("opens read-only, with its saved turns, while spark there works on it", async () => {
+    const { h, open } = hostWith(async () => [{ id: "held", title: "Fix it", cwd: dir, updatedAt: "", working: true }]);
+    try {
+      const r = await open();
+      expect(r.ok).toBe(true);
+      expect(r.result).toMatchObject({ id: "held", title: "Fix it", elsewhere: true, live: false, running: true, origin: "mac", config: [] });
+      expect(r.result.items.map((i: any) => i.id)).toEqual([...historyItems(DETAIL).map((i) => i.id), "elsewhere:working"]);
+    } finally {
+      h.stop();
+    }
+  }, 15000);
+
+  test("opens read-only when spark refuses to load it after the live list missed it", async () => {
+    const { h, open } = hostWith(async () => []);
+    try {
+      const r = await open();
+      expect(r.ok).toBe(true);
+      expect(r.result).toMatchObject({ id: "held", title: "Held", elsewhere: true, running: false });
+      expect(r.result.items).toHaveLength(historyItems(DETAIL).length);
+    } finally {
+      h.stop();
+    }
+  }, 15000);
+
+  test("writing to it names the host instead of spark's busy error", async () => {
+    const { h } = hostWith(async () => []);
+    const events: any[] = [];
+    (h as any).o.send = (e: any) => events.push(e);
+    try {
+      await h.handle({ id: 2, op: "prompt", s: "held", text: "hi" } as any);
+      expect(events.find((e) => e.id === 2)).toMatchObject({ ok: false, error: "This chat is open in spark on Studio. Close it there to write here." });
+    } finally {
+      h.stop();
+    }
+  }, 15000);
 });

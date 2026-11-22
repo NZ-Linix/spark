@@ -9,13 +9,17 @@ struct StreamingText: View {
   let streaming: Bool
 
   private static let tail = 40
+  /** characters revealed so far */
   @State private var shown: Int
+  /** how far the newest characters have inked in, 0 to `tail` */
+  @State private var ink: Int
 
   init(text: String, streaming: Bool) {
     self.text = text
     self.streaming = streaming
     // an answer that's already complete (reopened later) shows at once
-    _shown = State(initialValue: streaming ? 0 : text.count + Self.tail)
+    _shown = State(initialValue: streaming ? 0 : text.count)
+    _ink = State(initialValue: streaming ? 0 : Self.tail)
   }
 
   private struct Key: Equatable {
@@ -25,24 +29,32 @@ struct StreamingText: View {
 
   var body: some View {
     let count = text.count
-    let extra = Double(max(0, shown - count))
-    let settled = !streaming && extra >= Double(Self.tail)
+    let caught = shown >= count && ink >= Self.tail
+    let settled = !streaming && caught
     let visible = shown >= count ? text : String(text.prefix(shown))
-    MarkdownView(text: settled ? visible : Streaming.tidy(visible), ink: settled ? nil : extra)
+    MarkdownView(text: settled ? visible : Streaming.tidy(visible), ink: caught ? nil : Double(ink))
       .task(id: Key(count: count, streaming: streaming)) { await reveal() }
   }
 
+  /**
+   * Reveals text and inks in the tail on its own clock. Once the text is all shown the tail finishes
+   * inking even while the turn is still open, so a reply never sits half-faded waiting for the end.
+   */
   private func reveal() async {
     while !Task.isCancelled {
       let count = text.count
       // a reset (the model retried) shortens the text
-      if shown > count + Self.tail { shown = count }
-      let end = streaming ? count : count + Self.tail
-      guard shown < end else { return }
-      let behind = count - shown
-      // about 30 steps a second: each one parses the answer again, so fewer, larger steps stay smooth
-      let step = behind > 0 ? max(2, Int((Double(behind) / 6).rounded(.up))) : 4
-      shown = min(end, shown + step)
+      if shown > count { shown = count }
+      guard shown < count || ink < Self.tail else { return }
+      if shown < count {
+        // about 30 steps a second: each one parses the answer again, so fewer, larger steps stay smooth
+        let step = max(2, Int((Double(count - shown) / 6).rounded(.up)))
+        shown = min(count, shown + step)
+        // the tail slides along with the text: a glyph already inked doesn't fade back
+        ink = max(0, ink - step)
+      } else {
+        ink = min(Self.tail, ink + 4)
+      }
       try? await Task.sleep(for: .milliseconds(33))
     }
   }

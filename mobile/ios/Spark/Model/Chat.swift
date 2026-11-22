@@ -31,10 +31,18 @@ final class Chat {
   var usage: Usage?
   var loaded = false
   var problem: String?
+  /** open in another spark process on the host, such as a terminal: shown read-only until it lets go */
+  var elsewhere = false
   /** a chat the phone shows before its session exists: its first message waits for the host */
   var starting = false
   /** bumped when a reply finishes, for the haptic */
   var finished = 0
+  /** the library prompt the chat runs with; empty for spark's own */
+  var prompt = ""
+  /** bumped when the chat goes back to an earlier message: the thread is laid out afresh */
+  var epoch = 0
+  /** going back to an earlier message: the thread waits for the host */
+  var rewinding = false
 
   @ObservationIgnored private var index: [String: Int] = [:]
 
@@ -53,6 +61,8 @@ final class Chat {
     config = s.config
     permission = s.permission
     usage = s.usage
+    elsewhere = s.elsewhere ?? false
+    prompt = s.prompt ?? ""
     // rows the phone already shows keep their objects, so reopening doesn't redraw the thread
     var next: [Entry] = []
     next.reserveCapacity(s.items.count)
@@ -78,6 +88,27 @@ final class Chat {
     config = s.config
     usage = s.usage
     starting = false
+  }
+
+  /** the chat as it stands after going back to an earlier message: every row is new */
+  func rebase(_ s: Snapshot) {
+    index = [:]
+    entries = []
+    load(s)
+    problem = nil
+    epoch += 1
+  }
+
+  /** the user message that opened the turn `entry` belongs to */
+  func prompt(before entry: Entry) -> Entry? {
+    guard let i = index[entry.id] else { return nil }
+    return entries[...i].last { $0.role == .user }
+  }
+
+  /** whether a user message comes after `entry`: going back to it would drop something */
+  func hasTurn(after entry: Entry) -> Bool {
+    guard let i = index[entry.id] else { return false }
+    return entries[(i + 1)...].contains { $0.role == .user }
   }
 
   /** a message the phone shows at once; the host's copy has the same id and replaces it */

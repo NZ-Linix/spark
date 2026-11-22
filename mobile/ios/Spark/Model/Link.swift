@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SwiftUI
 import UIKit
 
 private struct Problem: Decodable { var error: String }
@@ -44,7 +45,6 @@ final class Link {
     didSet { UserDefaults.standard.set(hostID, forKey: "host") }
   }
   private(set) var sessions: [String: [SessionInfo]] = [:]
-  private(set) var loadingSessions = false
   /** the options spark last offered on each host, so a new chat can pick a model before it exists */
   private(set) var configs: [String: [ConfigOption]] = [:]
   var chat: Chat?
@@ -52,10 +52,14 @@ final class Link {
   @ObservationIgnored private var token: String? = Keychain.read("token")
   @ObservationIgnored private var socket: URLSessionWebSocketTask?
   @ObservationIgnored private var waiting: [String: CheckedContinuation<JSON, Error>] = [:]
+  /** terminal commands waiting on output, by run id; see `Terminal` */
+  @ObservationIgnored var terms: [String: (Event) -> Void] = [:]
   @ObservationIgnored private var next = 0
   @ObservationIgnored private var retry = 0
   @ObservationIgnored private var generation = 0
   @ObservationIgnored private var active = true
+  /** chats on their way out, as host/id */
+  @ObservationIgnored private var deleting: Set<String> = []
 
   var host: HostEntry? { hosts.first { $0.id == hostID } ?? hosts.first }
   var registered: Bool { relay != nil && token != nil }
@@ -264,6 +268,11 @@ final class Link {
       return
     }
     guard let host = env.host, let e = env.msg else { return }
+    if e.t == "term", let run = e.run {
+      terms[run]?(e)
+      if e.done == true { terms[run] = nil }
+      return
+    }
     if e.t == "reply" {
       guard let n = e.id?.int, let c = waiting.removeValue(forKey: "\(host)#\(n)") else { return }
       if e.ok == true { c.resume(returning: e.result ?? .null) } else { c.resume(throwing: LinkError(e.error ?? "Something went wrong.")) }
@@ -311,9 +320,11 @@ final class Link {
   // MARK: Sessions
 
   func refresh(_ host: String) async {
-    loadingSessions = true
-    defer { loadingSessions = false }
-    if let list = try? await request(host, "sessions", as: [SessionInfo].self) { sessions[host] = list }
+    guard var list = try? await request(host, "sessions", as: [SessionInfo].self) else { return }
+    // a list asked for before a delete went through still has the chat: it stays gone
+    list.removeAll { deleting.contains("\(host)/\($0.id)") }
+    // an unchanged list leaves the sidebar alone, so a poll never redraws it
+    if sessions[host] != list { sessions[host] = list }
   }
 
   /** every online host at once: the sidebar can show more than the chosen one */
@@ -342,9 +353,10 @@ final class Link {
    * already on screen so the host's copy replaces it in place.
    */
   @discardableResult
-  func begin(_ text: String, in folder: String, on host: String, options: [String: String], prompt: String?) -> Chat {
+  func begin(_ text: String, in folder: String?, on host: String, options: [String: String], prompt: String?) -> Chat {
     let now = ISO8601DateFormatter().string(from: .now)
-    let chat = Chat(host: host, info: SessionInfo(id: "", title: Self.title(text), cwd: folder, updatedAt: now, live: true, running: true, origin: "phone"))
+    // without a folder the host makes the chat one of its own; its path arrives with the session
+    let chat = Chat(host: host, info: SessionInfo(id: "", title: Self.title(text), cwd: folder ?? "", updatedAt: now, live: true, running: true, origin: "phone", scratch: folder == nil))
     chat.loaded = true
     chat.starting = true
     chat.running = true
@@ -354,7 +366,8 @@ final class Link {
     self.chat = chat
     Task {
       do {
-        var fields: [String: JSON] = ["cwd": .string(folder)]
+        var fields: [String: JSON] = [:]
+        if let folder { fields["cwd"] = .string(folder) }
         if let prompt { fields["prompt"] = .string(prompt) }
         let snap = try await request(host, "new", fields, as: Snapshot.self)
         chat.adopt(snap)
@@ -394,6 +407,19 @@ final class Link {
     }
   }
 
+  /**
+   * Keeps a chat that another spark process has open up to date, by reading it again every few
+   * seconds. Once that process lets go, the next read opens it here and the chat can be written.
+   * Ends when the view that asked goes away.
+   */
+  func follow(_ chat: Chat) async {
+    while chat.elsewhere, !Task.isCancelled {
+      try? await Task.sleep(for: .seconds(3))
+      guard !Task.isCancelled, self.chat === chat, phase == .online else { continue }
+      await reopen(chat)
+    }
+  }
+
   /** shows the message at once; the host's copy, with the same id, replaces it */
   func send(_ text: String, in chat: Chat) async {
     let item = Item(id: UUID().uuidString, role: .user, text: text)
@@ -404,6 +430,44 @@ final class Link {
       chat.problem = nil
     } catch {
       chat.running = false
+      chat.problem = error.localizedDescription
+    }
+  }
+
+  /**
+   * Takes the chat back to `entry`. Without `keep`, to just before it, and returns its text for the
+   * composer; with `keep`, to just after the reply it ends. The host forks the session at that point
+   * and drops the old one, so the chat carries on under the fork's id.
+   */
+  @discardableResult
+  func rewind(_ chat: Chat, to entry: Entry, keep: Bool) async throws -> String? {
+    let old = chat.info.id
+    chat.rewinding = true
+    defer { chat.rewinding = false }
+    let snap = try await request(chat.host, "rewind", ["s": .string(old), "item": .string(entry.id), "keep": .bool(keep)], as: Snapshot.self)
+    var t = Transaction()
+    t.disablesAnimations = true
+    withTransaction(t) { chat.rebase(snap) }
+    remember(chat)
+    if var list = sessions[chat.host] {
+      list.removeAll { $0.id == old || $0.id == chat.info.id }
+      list.insert(chat.info, at: 0)
+      sessions[chat.host] = list
+    }
+    return snap.restored
+  }
+
+  /** the library prompt a chat runs with from its next message; empty for spark's own */
+  func setPrompt(_ chat: Chat, to name: String) async {
+    let before = chat.prompt
+    chat.prompt = name
+    do {
+      let snap = try await request(chat.host, "sessionPrompt", ["s": .string(chat.info.id), "prompt": name.isEmpty ? .null : .string(name)], as: Snapshot.self)
+      chat.load(snap)
+      remember(chat)
+      chat.problem = nil
+    } catch {
+      chat.prompt = before
       chat.problem = error.localizedDescription
     }
   }
@@ -422,10 +486,20 @@ final class Link {
     if let chat, chat.host == host, chat.info.id == session.id { chat.info.title = title }
   }
 
+  /** the chat leaves the list at once; it comes back if the host couldn't delete it */
   func delete(_ session: SessionInfo, on host: String) async throws {
-    _ = try await request(host, "sessionDelete", ["s": .string(session.id)])
+    let key = "\(host)/\(session.id)"
+    let before = sessions[host]
+    deleting.insert(key)
+    defer { deleting.remove(key) }
     sessions[host]?.removeAll { $0.id == session.id }
     if let chat, chat.host == host, chat.info.id == session.id { self.chat = nil }
+    do {
+      _ = try await request(host, "sessionDelete", ["s": .string(session.id)])
+    } catch {
+      if let before, sessions[host]?.contains(where: { $0.id == session.id }) == false { sessions[host] = before }
+      throw error
+    }
   }
 
   func answer(_ chat: Chat, _ p: Permission, option: String?) async {

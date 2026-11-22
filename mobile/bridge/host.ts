@@ -1,14 +1,17 @@
-import { existsSync, readFileSync } from "node:fs";
-import { mkdir, readdir, realpath, rename, rm, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { type ChildProcess, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { Acp } from "./acp";
 import { type Library, promptFile } from "./library";
 import { writeAtomic } from "./providers";
 import { macSessions, type Running } from "./mac_sessions";
+import { describe, historyItems, readSession } from "./session_view";
 import type { PhoneSessions } from "./phone_sessions";
 import type { Profile } from "./providers";
-import type { ConfigOption, Event, Folder, HostInfo, Item, Permission, Request, SessionInfo, Snapshot } from "./protocol";
+import type { ConfigOption, Event, FileContent, FileData, FileEntry, FileListing, Folder, HostInfo, Item, Permission, Request, SessionInfo, Snapshot } from "./protocol";
 
 export type HostOptions = {
   info: HostInfo;
@@ -30,6 +33,11 @@ export type HostOptions = {
   library?: Library;
   /** the spark profile the library's prompts are copied into, and the file that remembers which prompt each session runs with */
   prompts?: { home: string; sessions: string };
+  /**
+   * Where chats started without a folder get one each, and the file that remembers whose is whose.
+   * Defaults to a hidden folder in the root, so a confined host's chats stay inside it.
+   */
+  scratch?: string;
   /** `to` is one device; without it, every device that can see this host */
   send: (event: Event, to?: string) => void;
 };
@@ -81,36 +89,50 @@ export class Host {
   private live = new Map<string, Live>();
   private opening = new Map<string, Promise<Live>>();
   private sweeper: ReturnType<typeof setInterval>;
+  /** terminal commands running now, by the phone's id for each */
+  private terms = new Map<string, ChildProcess>();
+
+  /** the real path of the folder that holds each folderless chat's own folder */
+  private scratch: string;
 
   constructor(private o: HostOptions) {
     this.sweeper = setInterval(() => this.sweep(), 5 * 60 * 1000);
+    const scratch = o.scratch ?? join(o.root, ".spark-chats");
+    mkdirSync(scratch, { recursive: true, mode: 0o700 });
+    this.scratch = realpathSync(scratch);
   }
 
   stop() {
     clearInterval(this.sweeper);
     for (const l of this.live.values()) l.acp.kill();
     this.live.clear();
+    for (const p of this.terms.values()) killGroup(p, "SIGKILL");
+    this.terms.clear();
   }
 
   async handle(req: Request, from?: string) {
     try {
-      const result = await this.run(req);
+      const result = await this.run(req, from);
       this.o.send({ t: "reply", id: req.id, ok: true, result: result ?? null }, from);
     } catch (e) {
       this.o.send({ t: "reply", id: req.id, ok: false, error: e instanceof Error ? e.message : String(e) }, from);
     }
   }
 
-  private async run(req: Request): Promise<unknown> {
+  private async run(req: Request, from?: string): Promise<unknown> {
     switch (req.op) {
       case "hello":
         return this.o.info;
       case "sessions":
         return this.sessions();
       case "open":
-        return (await this.open(req.s)).snapshot();
+        return this.withPrompt(this.marked(await this.show(req.s)));
       case "new":
-        return (await this.create(req.cwd, req.prompt)).snapshot();
+        return this.view(await this.create(req.cwd, req.prompt));
+      case "rewind":
+        return this.rewind(req.s, req.item, req.keep === true);
+      case "sessionPrompt":
+        return this.setPrompt(req.s, req.prompt);
       case "prompt":
         return this.prompt(req.s, req.text, req.item);
       case "cancel": {
@@ -147,6 +169,45 @@ export class Host {
         return this.folders(req.path);
       case "search":
         return this.search(req.query, req.path);
+      case "files":
+        return this.files(req.path);
+      case "file":
+        return this.file(req.path);
+      case "fileData":
+        return this.fileData(req.path, req.offset ?? 0);
+      case "fileWrite":
+        return this.writeFile(req.path, req.text, req.modified);
+      case "fileCreate": {
+        const parent = await this.allowed(req.path);
+        const path = join(parent, entryName(req.name));
+        if (existsSync(path)) throw new Error(`There's already something named ${basename(path)} there.`);
+        if (req.dir) await mkdir(path);
+        else await writeFile(path, "", { flag: "wx" });
+        return path;
+      }
+      case "entryRename": {
+        const from = await this.entry(req.path);
+        const to = join(dirname(from), entryName(req.name));
+        if (to === from) return to;
+        if (existsSync(to)) throw new Error(`There's already something named ${basename(to)} there.`);
+        await rename(from, to);
+        return to;
+      }
+      case "entryDelete": {
+        const path = await this.entry(req.path);
+        await rm(path, { recursive: true, force: true });
+        return dirname(path);
+      }
+      case "run":
+        return this.command(req.run, req.cwd, req.command, from);
+      case "runStop": {
+        const p = this.terms.get(req.run);
+        if (p) {
+          killGroup(p, "SIGINT");
+          setTimeout(() => this.terms.get(req.run) === p && killGroup(p, "SIGKILL"), 2000).unref?.();
+        }
+        return null;
+      }
       case "sessionRename":
         return this.renameSession(req.s, req.title);
       case "sessionDelete":
@@ -250,7 +311,114 @@ export class Host {
       out = saved.map((s) => this.live.get(s.id)?.info() ?? s);
       for (const l of live) if (!out.some((s) => s.id === l.id)) out.unshift(l);
     }
-    return out.sort((a, b) => Number(b.running) - Number(a.running) || b.updatedAt.localeCompare(a.updatedAt));
+    return out.map((s) => this.marked(s)).sort((a, b) => Number(b.running) - Number(a.running) || b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  /** a live session as the phone sees it, with the library prompt it runs with */
+  private view(l: Live): Snapshot {
+    return this.withPrompt(this.marked(l.snapshot()));
+  }
+
+  private withPrompt(s: Snapshot): Snapshot {
+    const prompt = this.sessionPrompts()[s.id];
+    return prompt ? { ...s, prompt } : s;
+  }
+
+  /**
+   * Takes a chat back to one of its messages. spark forks the session before the turn that
+   * message opened (or, with `keep`, before the turn after it), the same spark loads the fork, and
+   * the old session is removed, so the chat goes on from there under the fork's id.
+   */
+  private async rewind(id: string, itemId: string, keep: boolean): Promise<Snapshot> {
+    const l = await this.open(id);
+    if (l.running) throw new Error("spark is still working. Stop it first.");
+    const at = l.index.get(itemId);
+    if (at === undefined) throw new Error("That message is gone. Open the chat again.");
+    const r = await l.acp.call("_spark/session/turns", { sessionId: l.id });
+    const turns: { turn: number; prompt: string }[] = Array.isArray(r?.turns) ? r.turns : [];
+    // the chat's messages line up with spark's turns from the newest back; a message sent while
+    // spark worked (steering) opened no turn of its own and is passed over
+    const opened = new Map<number, { turn: number; prompt: string }>();
+    let t = turns.length - 1;
+    for (let i = l.items.length - 1; i >= 0 && t >= 0; i--) {
+      const item = l.items[i];
+      if (item.role !== "user") continue;
+      if (item.text.trim() === turns[t].prompt.trim()) opened.set(i, turns[t--]);
+    }
+    let point: { turn: number; prompt: string } | undefined;
+    if (keep) {
+      for (let i = at + 1; i < l.items.length && !point; i++) point = opened.get(i);
+      // already the last turn: nothing comes after it
+      if (!point) return this.view(l);
+    } else {
+      point = opened.get(at);
+      if (!point) throw new Error("spark can go back only to a message that started a turn.");
+    }
+    const forked = await l.acp.call("_spark/session/fork", { sessionId: l.id, beforeTurn: point.turn });
+    const next = String(forked?.sessionId ?? "");
+    if (!next) throw new Error("spark couldn't go back to that message.");
+    const old = l.id;
+    const prompt = this.sessionPrompts()[old];
+    l.loading = true;
+    l.items = [];
+    l.index = new Map();
+    l.lastRole = null;
+    l.permission = null;
+    l.id = next;
+    try {
+      const loaded = await l.acp.call("session/load", { sessionId: next, cwd: l.cwd, mcpServers: [] });
+      if (Array.isArray(loaded?.configOptions)) l.config = loaded.configOptions;
+    } finally {
+      l.loading = false;
+    }
+    l.updatedAt = new Date().toISOString();
+    this.live.delete(old);
+    this.live.set(next, l);
+    this.o.filter?.phone.add(next);
+    this.rememberPrompt(next, prompt);
+    // the old session is no longer the loaded one, so the same spark can remove it
+    try {
+      await l.acp.call("session/remove", { sessionId: old });
+      this.o.filter?.phone.remove(old);
+      this.rememberPrompt(old);
+    } catch (e) {
+      console.error(`rewind: kept ${old}: ${e instanceof Error ? e.message : e}`);
+    }
+    return { ...this.view(l), restored: keep ? undefined : point.prompt };
+  }
+
+  /** a new prompt reaches spark as it starts, so the chat's spark starts again with it */
+  private async setPrompt(id: string, name: string | null): Promise<Snapshot> {
+    const wanted = name || undefined;
+    if (wanted && !this.promptEnv(wanted).SPARK_SYSTEM_PROMPT_FILE) throw new Error(`The prompt ${wanted} hasn't reached this host yet.`);
+    const l = this.live.get(id);
+    if (l?.running) throw new Error("spark is still working. Change the prompt once it stops.");
+    if (this.sessionPrompts()[id] !== wanted) {
+      this.rememberPrompt(id, wanted);
+      if (l) {
+        this.live.delete(id);
+        await l.acp.stop();
+      }
+    }
+    return this.view(await this.open(id));
+  }
+
+  /** a session as the phone sees it: whether it runs in a folder of its own */
+  private marked<T extends SessionInfo>(s: T): T {
+    return this.ownFolder(s.cwd) ? { ...s, scratch: true } : s;
+  }
+
+  /** a folder made for one folderless chat: directly inside the scratch folder */
+  private ownFolder(path: string): boolean {
+    return dirname(path) === this.scratch;
+  }
+
+  /** a new folder for a chat started without one, named for when it started */
+  private async newScratch(): Promise<string> {
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
+    const path = join(this.scratch, `chat-${stamp}-${randomUUID().slice(0, 4)}`);
+    await mkdir(path, { recursive: true });
+    return path;
   }
 
   /**
@@ -272,6 +440,58 @@ export class Host {
   }
 
   private defaults?: { at: number; config: ConfigOption[] };
+
+  /**
+   * A session for the phone to show. One another spark process has open, such as spark in a
+   * terminal, shows read-only: spark lets one process write a session, and that one is it.
+   */
+  private async show(id: string): Promise<Snapshot> {
+    if (!this.live.get(id)?.acp.alive && !this.opening.has(id)) {
+      const held = await this.heldElsewhere(id);
+      if (held) return this.readOnly(id, held);
+    }
+    try {
+      return (await this.open(id)).snapshot();
+    } catch (e) {
+      // it was taken between the check and the load
+      if (e instanceof SessionElsewhere) return this.readOnly(id, await this.heldElsewhere(id));
+      throw e;
+    }
+  }
+
+  /** the session as another spark process here has it open, if one does; never the bridge's own */
+  private async heldElsewhere(id: string): Promise<Running | undefined> {
+    if (!this.o.filter || this.live.has(id)) return undefined;
+    // a failed live list only means the phone tries to open it, and spark says whether it can
+    const running = await this.o.filter.running().catch(() => [] as Running[]);
+    return running.find((r) => r.id === id);
+  }
+
+  /** the session's finished turns, read without taking its lock; the phone asks again to keep up */
+  private async readOnly(id: string, held?: Running): Promise<Snapshot> {
+    const [detail, known] = await Promise.all([
+      readSession(this.o.spark, id, this.env()),
+      held ? Promise.resolve(undefined) : this.saved().then((r) => r.sessions.find((s) => s.id === id)),
+    ]);
+    const working = held?.working === true;
+    const items = historyItems(detail);
+    // spark saves a turn when it ends, so the one it's working on now isn't in the history yet
+    if (working) items.push({ id: "elsewhere:working", role: "notice", text: `spark is working on this on ${this.o.info.name}. Its reply shows here when the turn ends.` });
+    const updatedAt = typeof detail.updated_at_ms === "number" ? new Date(detail.updated_at_ms).toISOString() : (held?.updatedAt ?? known?.updatedAt ?? "");
+    return {
+      id,
+      title: held?.title ?? known?.title ?? "New session",
+      cwd: held?.cwd ?? known?.cwd ?? "",
+      updatedAt,
+      live: false,
+      running: working,
+      origin: this.o.filter?.phone.all().has(id) ? "phone" : "mac",
+      elsewhere: true,
+      items,
+      config: [],
+      permission: null,
+    };
+  }
 
   private open(id: string): Promise<Live> {
     const l = this.live.get(id);
@@ -301,6 +521,8 @@ export class Host {
       if (Array.isArray(r?.configOptions)) l.config = r.configOptions;
     } catch (e) {
       acp.kill();
+      // spark's words for a session another spark process holds the writer lock for
+      if (e instanceof Error && e.message === "Session is busy") throw new SessionElsewhere(this.o.info.name);
       throw e;
     }
     l.loading = false;
@@ -334,10 +556,11 @@ export class Host {
     writeAtomic(this.o.prompts.sessions, all);
   }
 
-  private async create(path: string, prompt?: string): Promise<Live> {
-    const cwd = await this.allowed(path);
+  private async create(path: string | undefined, prompt?: string): Promise<Live> {
     const env = this.promptEnv(prompt);
     if (prompt && !env.SPARK_SYSTEM_PROMPT_FILE) throw new Error(`The prompt ${prompt} hasn't reached this host yet.`);
+    const own = !path;
+    const cwd = own ? await this.newScratch() : await this.allowed(path);
     const acp = new Acp(this.o.spark, cwd, { ...this.env(), ...env });
     const l = new Live("", cwd, "New session", new Date().toISOString(), acp, "phone");
     this.wire(l);
@@ -350,6 +573,7 @@ export class Host {
       this.rememberPrompt(l.id, prompt);
     } catch (e) {
       acp.kill();
+      if (own) await rm(cwd, { recursive: true, force: true });
       throw e;
     }
     l.loading = false;
@@ -371,6 +595,8 @@ export class Host {
   private async deleteSession(id: string) {
     const l = this.live.get(id);
     if (l?.running) throw new Error("spark is still working in that session. Stop it first.");
+    // a chat's own folder goes with it; the bridge has to find where it ran before spark forgets
+    const cwd = l?.cwd ?? (await this.saved()).sessions.find((s) => s.id === id)?.cwd;
     if (l) {
       this.live.delete(id);
       await l.acp.stop();
@@ -384,7 +610,10 @@ export class Host {
           await acp.call("session/remove", { sessionId: id });
           break;
         } catch (e) {
-          if (attempt >= 4 || !String(e instanceof Error ? e.message : e).includes("another spark")) throw e;
+          const why = String(e instanceof Error ? e.message : e);
+          // spark keeps a session only once it has a message; one it never saved is already gone
+          if (why.includes("session is gone")) break;
+          if (attempt >= 4 || !why.includes("another spark")) throw e;
           await Bun.sleep(250);
         }
       }
@@ -393,6 +622,7 @@ export class Host {
     }
     this.o.filter?.phone.remove(id);
     this.rememberPrompt(id);
+    if (cwd && this.ownFolder(cwd)) await rm(cwd, { recursive: true, force: true });
     return null;
   }
 
@@ -578,19 +808,164 @@ export class Host {
 
   /** a real, existing folder the phone may use; inside the root when the host is confined */
   private async allowed(path?: string): Promise<string> {
+    const real = await this.inside(path, "folder");
+    if (!(await stat(real)).isDirectory()) throw new Error("That isn't a folder.");
+    return real;
+  }
+
+  /** a real, existing path; inside the root when the host is confined */
+  private async inside(path: string | undefined, what: "folder" | "file"): Promise<string> {
     const wanted = resolve(path && path.length > 0 ? path.replace(/^~(?=$|\/)/, this.o.root) : this.o.root);
     let real: string;
     try {
       real = await realpath(wanted);
     } catch {
-      throw new Error("That folder doesn't exist.");
+      throw new Error(`That ${what} doesn't exist.`);
     }
-    if (!(await stat(real)).isDirectory()) throw new Error("That isn't a folder.");
     if (this.o.confine) {
       const root = await realpath(this.o.root);
-      if (real !== root && !real.startsWith(root + sep)) throw new Error("That folder is outside this host.");
+      if (real !== root && !real.startsWith(root + sep)) throw new Error(`That ${what} is outside this host.`);
     }
     return real;
+  }
+
+  /** everything in a folder, folders first, for the chat's file browser */
+  private async files(path: string): Promise<FileListing> {
+    const dir = await this.allowed(path);
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    const out: FileEntry[] = [];
+    for (const e of entries) {
+      if (out.length >= MAX_FILE_ENTRIES) break;
+      if (UNLISTED.has(e.name)) continue;
+      const full = join(dir, e.name);
+      const s = await stat(full).catch(() => null);
+      if (!s) continue;
+      out.push(s.isDirectory() ? { name: e.name, path: full, dir: true } : { name: e.name, path: full, dir: false, size: s.size });
+    }
+    out.sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true }));
+    return { path: dir, name: basename(dir), entries: out };
+  }
+
+  /**
+   * A file or folder the phone may rename or delete, by its own path: a link is the link, not what
+   * it points at. A folder also has to be one `removable` allows.
+   */
+  private async entry(path: string): Promise<string> {
+    if (!path) throw new Error("Choose a file.");
+    const wanted = resolve(path.replace(/^~(?=$|\/)/, this.o.root));
+    const full = join(await this.allowed(dirname(wanted)), basename(wanted));
+    const s = await lstat(full).catch(() => null);
+    if (!s) throw new Error("That file doesn't exist.");
+    if (s.isDirectory()) return this.removable(full);
+    return full;
+  }
+
+  /** saves text over a file, unless it changed since the phone read it */
+  private async writeFile(path: string, text: string, modified?: number): Promise<{ size: number; modified: number }> {
+    if (typeof text !== "string") throw new Error("There's nothing to save.");
+    if (text.length > MAX_TEXT_BYTES * 4) throw new Error("That's too much text to save from the phone.");
+    const real = await this.inside(path, "file");
+    const before = await stat(real);
+    if (!before.isFile()) throw new Error("That isn't a file.");
+    if (typeof modified === "number" && Math.abs(before.mtimeMs - modified) > 1) {
+      throw new Error(`${basename(real)} changed on ${this.o.info.name} since you opened it. Open it again to see the new version.`);
+    }
+    await writeFile(real, text);
+    const after = await stat(real);
+    return { size: after.size, modified: after.mtimeMs };
+  }
+
+  /**
+   * Runs one command in the user's login shell and streams what it prints to the phone that asked.
+   * A command that changes folder leaves the next one there: the shell writes where it ended up to
+   * a scratch file on the way out.
+   */
+  private async command(run: string, cwd: string, command: string, to?: string): Promise<{ cwd: string }> {
+    if (typeof run !== "string" || !run || this.terms.has(run)) throw new Error("That command id is taken.");
+    if (typeof command !== "string" || !command.trim()) throw new Error("Type a command.");
+    if (this.terms.size >= MAX_TERMS) throw new Error("Too many commands are running. Stop one first.");
+    const dir = await this.allowed(cwd);
+    const marker = join(tmpdir(), `spark-term-${randomUUID()}`);
+    const script = `${command}\n__spark_status=$?\nprintf '%s' "$PWD" > '${marker}'\nexit $__spark_status`;
+    const shell = [process.env.SHELL, "/bin/zsh", "/bin/bash", "/bin/sh"].find((s) => s && existsSync(s))!;
+    const p = spawn(shell, ["-l", "-c", script], {
+      cwd: dir,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, TERM: "dumb", NO_COLOR: "1", PAGER: "cat", GIT_PAGER: "cat", GIT_TERMINAL_PROMPT: "0" },
+    });
+    this.terms.set(run, p);
+
+    // output goes out in batches, and stops going out past a limit while the command keeps running
+    let pending = "";
+    let sent = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const flush = () => {
+      timer = null;
+      if (!pending) return;
+      this.o.send({ t: "term", run, data: pending }, to);
+      pending = "";
+    };
+    const take = (decoder: TextDecoder) => (chunk: Buffer) => {
+      if (sent >= MAX_TERM_OUTPUT) return;
+      let text = decoder.decode(chunk, { stream: true });
+      if (sent + text.length >= MAX_TERM_OUTPUT) text = text.slice(0, MAX_TERM_OUTPUT - sent) + "\n[spark stopped showing output here]\n";
+      sent += text.length;
+      pending += text;
+      timer ??= setTimeout(flush, 50);
+    };
+    p.stdout!.on("data", take(new TextDecoder()));
+    p.stderr!.on("data", take(new TextDecoder()));
+    p.on("close", async (code, signal) => {
+      if (timer) clearTimeout(timer);
+      flush();
+      this.terms.delete(run);
+      const ended = await readFile(marker, "utf8").catch(() => "");
+      await rm(marker, { force: true });
+      const next = ended ? await this.allowed(ended).catch(() => dir) : dir;
+      this.o.send({ t: "term", run, done: true, code: code ?? (signal ? 130 : 1), cwd: next }, to);
+    });
+    p.on("error", () => {});
+    return { cwd: dir };
+  }
+
+  /** a piece of a file's bytes, base64, starting at `offset` */
+  private async fileData(path: string, offset: number): Promise<FileData> {
+    const real = await this.inside(path, "file");
+    const s = await stat(real);
+    if (!s.isFile()) throw new Error("That isn't a file.");
+    if (s.size > MAX_DOWNLOAD_BYTES) throw new Error("That file is too big to send to the phone.");
+    if (!Number.isInteger(offset) || offset < 0 || offset > s.size) throw new Error("That's past the end of the file.");
+    const handle = await open(real, "r");
+    try {
+      const buf = Buffer.alloc(Math.min(DOWNLOAD_PIECE_BYTES, s.size - offset));
+      const { bytesRead } = await handle.read(buf, 0, buf.length, offset);
+      return { path: real, name: basename(real), size: s.size, offset, data: buf.subarray(0, bytesRead).toString("base64") };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /** one file to show: text up to a limit, an image whole, anything else by name and size */
+  private async file(path: string): Promise<FileContent> {
+    const real = await this.inside(path, "file");
+    const s = await stat(real);
+    if (!s.isFile()) throw new Error("That isn't a file.");
+    const base = { path: real, name: basename(real), size: s.size, modified: s.mtimeMs };
+    if (IMAGE_TYPES.has(extname(real).slice(1).toLowerCase())) {
+      if (s.size > MAX_IMAGE_BYTES) return { ...base, kind: "binary" };
+      return { ...base, kind: "image", data: (await readFile(real)).toString("base64") };
+    }
+    const handle = await open(real, "r");
+    try {
+      const buf = Buffer.alloc(Math.min(s.size, MAX_TEXT_BYTES));
+      const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+      const bytes = buf.subarray(0, bytesRead);
+      if (bytes.includes(0)) return { ...base, kind: "binary" };
+      return { ...base, kind: "text", text: new TextDecoder().decode(bytes), truncated: s.size > bytesRead };
+    } finally {
+      await handle.close();
+    }
   }
 
   /** a folder the phone may rename or delete: never the host's root, the home folder, or what holds them */
@@ -654,6 +1029,38 @@ export class Host {
   }
 }
 
+/** a whole process group: the shell and whatever it started */
+function killGroup(p: ChildProcess, signal: NodeJS.Signals) {
+  try {
+    if (p.pid) process.kill(-p.pid, signal);
+  } catch {
+    p.kill(signal);
+  }
+}
+
+/** a name for a new or renamed file or folder: one path part, dot files allowed */
+function entryName(raw: unknown): string {
+  const name = typeof raw === "string" ? raw.trim() : "";
+  if (!name || name === "." || name === ".." || name.length > 255 || /[/\\\0]/.test(name)) throw new Error("That isn't a valid name.");
+  return name;
+}
+
+const MAX_TERMS = 8;
+/** a download goes in pieces that stay under the relay's 8 MB a message once in base64 */
+const DOWNLOAD_PIECE_BYTES = 3 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024;
+/** what one command may print to the phone, in characters */
+const MAX_TERM_OUTPUT = 2 * 1024 * 1024;
+
+/** what the file browser leaves out: git's own folder and Finder's litter */
+const UNLISTED = new Set([".git", ".DS_Store"]);
+const MAX_FILE_ENTRIES = 2000;
+/** a file's text is cut here; the phone says so */
+const MAX_TEXT_BYTES = 512 * 1024;
+/** images the phone can draw, sent whole up to this size; the relay takes 8 MB a message */
+const IMAGE_TYPES = new Set(["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff", "ico"]);
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+
 /** the home folders macOS makes; the phone can't rename or delete them */
 const PROTECTED = new Set(["Desktop", "Documents", "Downloads", "Library", "Movies", "Music", "Pictures", "Public", "Applications"]);
 
@@ -666,12 +1073,11 @@ function folderName(raw: unknown): string {
 /** folders a search never walks into: big, generated, or not the user's projects */
 const SKIP = new Set(["node_modules", "Library", "Applications", "Pictures", "Music", "Movies", "build", "dist", "target", "vendor", "Pods", "DerivedData", "venv", "__pycache__"]);
 
-function describe(input: any): string | undefined {
-  if (!input || typeof input !== "object") return undefined;
-  const v = input.command ?? input.cmd ?? input.path ?? input.file_path ?? input.filePath ?? input.pattern ?? input.query ?? input.url ?? input.name;
-  if (typeof v === "string") return v.length > 400 ? v.slice(0, 400) + "…" : v;
-  if (Array.isArray(v)) return v.join(" ");
-  return undefined;
+/** a session another spark process on the host has open, which the phone can read but not write */
+class SessionElsewhere extends Error {
+  constructor(host: string) {
+    super(`This chat is open in spark on ${host}. Close it there to write here.`);
+  }
 }
 
 function contentText(content: any): string {

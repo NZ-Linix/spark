@@ -4,7 +4,7 @@ import type { SessionInfo } from "./protocol";
 const LIVE_MS = 5_000;
 
 /** a session some spark process on this Mac has open now, such as one in a terminal window */
-export type Running = { id: string; title: string; cwd: string; updatedAt: string };
+export type Running = { id: string; title: string; cwd: string; updatedAt: string; working?: boolean };
 
 /**
  * The sessions a spark process holds the writer lock for, from `spark sessions --live --all --json`.
@@ -35,6 +35,7 @@ export function parseRunning(text: string): Running[] {
       title: typeof s.title === "string" && s.title ? s.title : "New session",
       cwd: typeof s.workspace_root === "string" ? s.workspace_root : "",
       updatedAt: typeof s.updated_at_ms === "number" ? new Date(s.updated_at_ms).toISOString() : "",
+      working: s.state === "working",
     }));
 }
 
@@ -49,7 +50,7 @@ export function macSessions(saved: SessionInfo[], phone: Set<string>, running: R
   const savedById = new Map(saved.map((s) => [s.id, s]));
   for (const r of running) {
     const s = savedById.get(r.id);
-    out.set(r.id, { ...(s ?? { ...r, live: false, running: false }), origin: origin(r.id) });
+    out.set(r.id, { ...(s ?? { id: r.id, title: r.title, cwd: r.cwd, updatedAt: r.updatedAt, live: false, running: false }), origin: origin(r.id) });
   }
   for (const s of saved) if (phone.has(s.id)) out.set(s.id, { ...s, origin: "phone" });
   for (const l of live) out.set(l.id, { ...l, origin: origin(l.id) });

@@ -192,6 +192,7 @@ struct FolderPicker: View {
     guard let host = link.host?.id else { return [] }
     var seen = Set<String>()
     return (link.sessions[host] ?? [])
+      .filter { !$0.ownFolder }
       .sorted { $0.updated > $1.updated }
       .map(\.cwd)
       .filter { !$0.isEmpty && $0 != root && seen.insert($0).inserted }

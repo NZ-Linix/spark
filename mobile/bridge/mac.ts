@@ -146,6 +146,8 @@ function serve(c: Config, onPaired?: (device: string) => void, quiet = false) {
     // SPARK_MOBILE_ROOT keeps the phone's folder picker (and new sessions) inside one folder
     root: ROOT,
     confine: ROOT !== HOME,
+    // chats without a folder: in spark's own folder, unless the phone is kept inside one
+    scratch: ROOT === HOME ? join(SPARK_HOME, "mobile-chats") : undefined,
     filter: { phone: new PhoneSessions(PHONE_SESSIONS), running: () => runningSessions(bin) },
     profile,
     prompts: { home: SPARK_HOME, sessions: SESSION_PROMPTS },
@@ -222,6 +224,18 @@ async function pair() {
     process.exit(1);
   }
   const foreground = args.includes("--foreground");
+  // the relay keeps one bridge a Mac: the one at login would knock this one off while it waits
+  // for the phone, so it stops until the pairing is done, and comes back if this one ends first
+  const agent = existsSync(PLIST);
+  if (agent) {
+    await $`launchctl bootout gui/${process.getuid!()} ${PLIST}`.quiet().nothrow();
+    const restore = () => {
+      Bun.spawnSync(["launchctl", "bootstrap", `gui/${process.getuid!()}`, PLIST]);
+      process.exit(0);
+    };
+    process.once("SIGINT", restore);
+    process.once("SIGTERM", restore);
+  }
   console.log();
   console.log(`  Open spark on your iPhone and enter this code:`);
   console.log();
@@ -234,6 +248,8 @@ async function pair() {
       console.log(dim(`  ${device} can reach this Mac while this keeps running.`));
       return;
     }
+    process.removeAllListeners("SIGINT");
+    process.removeAllListeners("SIGTERM");
     await install(true);
     console.log(dim(`  This Mac stays reachable whenever it's on. To stop: spark-bridge unpair`));
     process.exit(0);

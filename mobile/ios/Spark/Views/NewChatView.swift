@@ -12,6 +12,8 @@ struct NewChatView: View {
   @State private var label = ""
   /** model and other options chosen before the chat exists; applied once it starts */
   @State private var pending: [String: String] = [:]
+  /** the effort last picked on any host: a new chat starts there on whichever host it runs */
+  @AppStorage("effort") private var lastEffort = ""
   /** a library prompt the chat runs with in place of spark's own */
   @AppStorage("prompt") private var prompt = ""
   @State private var picking = false
@@ -19,6 +21,12 @@ struct NewChatView: View {
   @State private var problem: String?
   @State private var shown = false
   @State private var sent = 0
+  /** sent: the headline dissolves before the chat takes the screen */
+  @State private var leaving = false
+  @State private var browsing = false
+  /** kept while this screen is up, so a command keeps running with the terminal closed */
+  @State private var terminal: Terminal?
+  @State private var typing: Terminal?
   @FocusState private var focused: Bool
 
   var body: some View {
@@ -45,6 +53,10 @@ struct NewChatView: View {
     .padding(.horizontal, 32)
     // scoped to the words: animating the whole screen would slide the composer in as it's first laid out
     .animation(.easeOut(duration: 0.9), value: shown)
+    .opacity(leaving ? 0 : 1)
+    .blur(radius: leaving ? 12 : 0)
+    .scaleEffect(leaving ? 0.96 : 1)
+    .animation(.smooth(duration: 0.28), value: leaving)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .contentShape(.rect)
     .onTapGesture { focused = false }
@@ -58,15 +70,14 @@ struct NewChatView: View {
           send()
         } stop: {
         } accessories: {
-          // just the folder's own name: the model is the one that gives way when the row is tight
+          // the folder's own name; how the chat runs sits in the box, beside the send button
           ComposerOption(text: folder == nil ? "Choose folder" : (label.split(separator: "/").last.map(String.init) ?? label), mono: folder != nil, muted: folder == nil) { picking = true }
-          .fixedSize()
-          .layoutPriority(1)
           .accessibilityLabel(folder == nil ? "Choose a folder" : "Folder \(label)")
-          if !link.prompts.isEmpty {
-            PromptChip(prompts: link.prompts, selection: $prompt)
-          }
-          ConfigChips(options: options) { id, value in pending[id] = value }
+        } trailing: {
+          ConfigChips(options: options, set: { id, value in
+            pending[id] = value
+            if id == "effort" { lastEffort = value }
+          }, prompts: link.prompts, prompt: $prompt, compact: true)
         }
       }
       .animation(.ease, value: folder)
@@ -78,7 +89,25 @@ struct NewChatView: View {
         Button("Chats", systemImage: "line.3.horizontal") { shell.menu() }
       }
       ToolbarItem(placement: .principal) { Wordmark() }
+      // the chosen folder can be looked through and worked in before the chat starts
+      if let folder, let host = link.host?.id {
+        ToolbarItemGroup(placement: .topBarTrailing) {
+          Button("Files", systemImage: "folder") {
+            focused = false
+            browsing = true
+          }
+          Button("Terminal", systemImage: "apple.terminal") {
+            focused = false
+            if terminal?.host != host || terminal?.root != folder { terminal = Terminal(host: host, root: folder) }
+            typing = terminal
+          }
+        }
+      }
     }
+    .sheet(isPresented: $browsing) {
+      if let folder, let host = link.host?.id { FilesView(host: host, root: folder) }
+    }
+    .sheet(item: $typing) { TerminalView(terminal: $0) }
     .sheet(isPresented: $picking) {
       FolderPicker { path, shown in
         folder = path
@@ -112,7 +141,11 @@ struct NewChatView: View {
     guard let host = link.host?.id else { return [] }
     return (link.configs[host] ?? []).map { o in
       var o = o
-      if let v = pending[o.id] { o.currentValue = v }
+      if let v = pending[o.id] {
+        o.currentValue = v
+      } else if o.id == "effort", let level = Effort.fallback(o, last: lastEffort) {
+        o.currentValue = level
+      }
       return o
     }
   }
@@ -120,45 +153,23 @@ struct NewChatView: View {
   private func send() {
     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty, let host = link.host?.id else { return }
-    guard let folder else {
-      picking = true
-      return
-    }
+    // no folder chosen: the chat runs in a new folder of its own on the host
+    guard !leaving else { return }
     sent += 1
-    let chosen = link.prompts.contains(where: { $0.name == prompt }) ? prompt : nil
-    // the chat shows at once with this message in it; the session starts behind it
-    link.begin(text, in: folder, on: host, options: pending, prompt: chosen)
+    let typing = focused
+    focused = false
     draft = ""
-  }
-}
-
-/** Which library prompt a new chat runs with; spark's own when none is chosen. */
-private struct PromptChip: View {
-  let prompts: [PromptSummary]
-  @Binding var selection: String
-
-  var body: some View {
-    let current = prompts.first { $0.name == selection }
-    Menu {
-      Picker("Prompt", selection: $selection) {
-        Text("spark's own").tag("")
-        ForEach(prompts) { p in Text(p.name).tag(p.name) }
-      }
-    } label: {
-      HStack(spacing: 4) {
-        Image(systemName: "text.quote").font(.system(size: 11, weight: .semibold))
-        Text(current?.name ?? "Prompt")
-          .font(.geist(13.5, .medium))
-          .lineLimit(1)
-        Image(systemName: "chevron.down")
-          .font(.system(size: 8, weight: .bold))
-          .foregroundStyle(Color.faint)
-      }
-      .foregroundStyle(current == nil ? Color.faint : Color.dim)
-      .padding(.horizontal, ComposerOption.slop)
-      .frame(height: 30)
-      .contentShape(.rect)
+    leaving = true
+    let chosen = link.prompts.contains(where: { $0.name == prompt }) ? prompt : nil
+    var options = pending
+    if let effort = self.options.first(where: { $0.id == "effort" }), Effort.current(effort) != nil {
+      options["effort"] = effort.currentValue
     }
-    .accessibilityLabel(current.map { "Prompt \($0.name)" } ?? "Choose a prompt")
+    Task {
+      // the keyboard and the headline go first, so the chat opens onto a still screen instead of
+      // landing while everything under it moves; the session starts behind the message
+      try? await Task.sleep(for: .milliseconds(typing ? 300 : 180))
+      link.begin(text, in: folder, on: host, options: options, prompt: chosen)
+    }
   }
 }

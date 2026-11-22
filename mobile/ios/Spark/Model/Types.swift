@@ -56,10 +56,13 @@ nonisolated struct SessionInfo: Codable, Identifiable, Hashable, Sendable {
   var running: Bool
   /** "phone": started here. "mac": open in spark on the Mac, such as in a terminal. Older bridges send none. */
   var origin: String?
+  /** started without a folder: it runs in one of its own, which goes when the chat is deleted */
+  var scratch: Bool? = nil
 
   var updated: Date { Self.parse(updatedAt) ?? .distantPast }
   var inTerminal: Bool { origin == "mac" }
-  var folder: String { cwd.split(separator: "/").last.map(String.init) ?? cwd }
+  var ownFolder: Bool { scratch == true }
+  var folder: String { ownFolder ? "no folder" : cwd.split(separator: "/").last.map(String.init) ?? cwd }
 
   private static func parse(_ s: String) -> Date? {
     try? Date(s, strategy: .iso8601)
@@ -74,12 +77,19 @@ nonisolated struct Snapshot: Codable, Sendable {
   var live: Bool
   var running: Bool
   var origin: String?
+  var scratch: Bool?
+  /** open in another spark process on the host, such as a terminal: the phone can read it, not write */
+  var elsewhere: Bool?
   var items: [Item]
   var config: [ConfigOption]
   var permission: Permission?
   var usage: Usage?
+  /** the library prompt the session runs with; none for spark's own */
+  var prompt: String?
+  /** after a rewind to just before a message: that message's text, for the composer */
+  var restored: String?
 
-  var info: SessionInfo { SessionInfo(id: id, title: title, cwd: cwd, updatedAt: updatedAt, live: live, running: running, origin: origin) }
+  var info: SessionInfo { SessionInfo(id: id, title: title, cwd: cwd, updatedAt: updatedAt, live: live, running: running, origin: origin, scratch: scratch) }
 }
 
 nonisolated struct Usage: Codable, Hashable, Sendable {
@@ -172,6 +182,12 @@ nonisolated struct Event: Decodable, Sendable {
   var used: Int?
   var size: Int?
   var permission: Permission?
+  /** a terminal command's output: `data` as it comes, then `done` with its exit `code` and `cwd` */
+  var run: String?
+  var data: String?
+  var done: Bool?
+  var code: Int?
+  var cwd: String?
 }
 
 nonisolated struct Envelope: Decodable, Sendable {

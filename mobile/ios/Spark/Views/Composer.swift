@@ -5,14 +5,20 @@ import SwiftUI
  * sides and the bottom as makes its round ends run parallel to them. Once you type it widens into a
  * box with room for a few lines. Where and how the chat runs (folder, model, effort) sits above it.
  */
-struct Composer<Accessories: View>: View {
+struct Composer<Accessories: View, Trailing: View>: View {
   @Binding var text: String
   var focused: FocusState<Bool>.Binding
   let running: Bool
   let enabled: Bool
   let send: () -> Void
   let stop: () -> Void
+  var placeholder = "Message spark"
+  var working = "spark is working…"
+  /** a terminal's field: mono, and Return sends instead of making a new line */
+  var command = false
   @ViewBuilder var accessories: Accessories
+  /** inside the box, beside the send button: how the chat runs, always on the glass so it reads */
+  @ViewBuilder var trailing: Trailing
 
   /** the pill's height at rest */
   private static var height: CGFloat { 52 }
@@ -54,47 +60,93 @@ struct Composer<Accessories: View>: View {
     }
   }
 
+  /** open with something to show beside the send button: a row of its own under the text */
+  private var toolbar: Bool { open && Trailing.self != EmptyView.self }
+
   private var box: some View {
-    HStack(alignment: .bottom, spacing: 8) {
-      // Return makes a new line; the button sends. Open, it keeps room for two lines so the first
-      // wrap doesn't make it jump, and grows a line at a time up to eight before it scrolls.
-      TextField(running ? "spark is working…" : "Message spark", text: $text, axis: .vertical)
-        .font(.geist(17))
-        .lineSpacing(3)
-        .lineLimit(1...8)
-        .focused(focused)
-        .disabled(!enabled)
-        .padding(.vertical, 7)
-        .frame(maxWidth: .infinity, minHeight: open ? 64 : 36, alignment: .topLeading)
-      Button {
-        running ? stop() : send()
-      } label: {
-        Image(systemName: running ? "stop.fill" : "arrow.up")
-          .font(.system(size: running ? 12 : 15, weight: .bold))
-          .foregroundStyle(live ? .black : Color.faint)
-          .frame(width: 36, height: 36)
-          .background(live ? Color.white : Color.white.opacity(0.08), in: .circle)
-          .contentShape(.circle)
-          .contentTransition(.symbolEffect(.replace))
+    // Return makes a new line; the button sends. Open, the box is two lines high, and the field grows
+    // a line at a time up to eight.
+    TextField(running ? working : placeholder, text: $text, axis: .vertical)
+      .font(command ? .geistMono(16) : .geist(17))
+      .textInputAutocapitalization(command ? .never : nil)
+      .autocorrectionDisabled(command)
+      .onChange(of: text) { _, new in
+        // a vertical field takes Return as a new line; a command runs on it instead
+        guard command, new.hasSuffix("\n") else { return }
+        text = String(new.dropLast())
+        if !running, hasText { send() }
       }
-      .buttonStyle(.plain)
-      .accessibilityLabel(running ? "Stop" : "Send")
-      .disabled(!live)
+      .lineSpacing(3)
+      // open with a toolbar, the text's one line and the toolbar's make the two
+      .lineLimit(open && !toolbar ? 2...8 : 1...8)
+      .focused(focused)
+      .disabled(!enabled)
+      .padding(.vertical, 7)
+      .frame(maxWidth: .infinity, minHeight: 36, alignment: .topLeading)
+      // beside the send button on one line; open with a toolbar, the text gets the whole width
+      // and the row sits under it
+      .padding(.trailing, toolbar ? 0 : 44)
+      .padding(.bottom, toolbar ? 40 : 0)
+      // the send button never moves: it stays in the corner while the box grows up from it
+      .overlay(alignment: .bottomTrailing) {
+        HStack(spacing: 8) {
+          if toolbar {
+            trailing
+              .frame(height: 36)
+              .fixedSize(horizontal: true, vertical: false)
+              .transition(.asymmetric(
+                // in once the box has grown its second line, so it never sits over the text on the way
+                insertion: .opacity.combined(with: .scale(scale: 0.96, anchor: .trailing)).animation(.easeOut(duration: 0.2).delay(0.3)),
+                removal: .opacity.animation(.easeOut(duration: 0.12))))
+          }
+          sendButton
+        }
+      }
+      .padding(.leading, 18)
+      .padding([.trailing, .vertical], 8)
+      .background {
+        Color.clear
+          .glassEffect(.regular.interactive(), in: .rect(cornerRadius: open ? 24 : Self.height / 2))
+          .contentShape(.rect)
+          .onTapGesture { if enabled { focused.wrappedValue = true } }
+      }
+  }
+
+  private var sendButton: some View {
+    Button {
+      running ? stop() : send()
+    } label: {
+      Image(systemName: running ? "stop.fill" : "arrow.up")
+        .font(.system(size: running ? 12 : 15, weight: .bold))
+        .foregroundStyle(live ? .black : Color.faint)
+        .frame(width: 36, height: 36)
+        .background(live ? Color.white : Color.white.opacity(0.08), in: .circle)
+        .contentShape(.circle)
+        .contentTransition(.symbolEffect(.replace))
     }
-    .padding(.leading, 18)
-    .padding([.trailing, .vertical], 8)
-    .background {
-      Color.clear
-        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: open ? 24 : Self.height / 2))
-        .contentShape(.rect)
-        .onTapGesture { if enabled { focused.wrappedValue = true } }
-    }
+    .buttonStyle(.plain)
+    .accessibilityLabel(running ? "Stop" : "Send")
+    .disabled(!live)
+  }
+}
+
+extension Composer where Accessories == EmptyView, Trailing == EmptyView {
+  init(
+    text: Binding<String>, focused: FocusState<Bool>.Binding, running: Bool, enabled: Bool,
+    placeholder: String = "Message spark", working: String = "spark is working…", command: Bool = false,
+    send: @escaping () -> Void, stop: @escaping () -> Void
+  ) {
+    self.init(text: text, focused: focused, running: running, enabled: enabled, send: send, stop: stop, placeholder: placeholder, working: working, command: command, accessories: { EmptyView() }, trailing: { EmptyView() })
   }
 }
 
 extension Composer where Accessories == EmptyView {
-  init(text: Binding<String>, focused: FocusState<Bool>.Binding, running: Bool, enabled: Bool, send: @escaping () -> Void, stop: @escaping () -> Void) {
-    self.init(text: text, focused: focused, running: running, enabled: enabled, send: send, stop: stop) { EmptyView() }
+  init(
+    text: Binding<String>, focused: FocusState<Bool>.Binding, running: Bool, enabled: Bool,
+    placeholder: String = "Message spark", working: String = "spark is working…",
+    send: @escaping () -> Void, stop: @escaping () -> Void, @ViewBuilder trailing: () -> Trailing
+  ) {
+    self.init(text: text, focused: focused, running: running, enabled: enabled, send: send, stop: stop, placeholder: placeholder, working: working, command: false, accessories: { EmptyView() }, trailing: trailing)
   }
 }
 
@@ -125,157 +177,241 @@ struct ComposerOption: View {
       .contentShape(.rect)
       .contentTransition(.opacity)
     }
-    .buttonStyle(Quiet())
+    .buttonStyle(QuietPress())
+  }
+}
+
+/**
+ * How the chat runs, as one chip: the model, then the effort, with a quote mark when a library
+ * prompt is chosen. It opens one sheet with the effort slider, the prompt, and the models, so the
+ * row above the composer never has to fit four names.
+ */
+struct ConfigChips: View {
+  let options: [ConfigOption]
+  let set: (String, String) -> Void
+  /** a new chat's library prompts and the one chosen; a running chat keeps its prompt */
+  var prompts: [PromptSummary] = []
+  var prompt: Binding<String>? = nil
+  /** inside the composer: a small filled pill with a short name, so it reads over anything */
+  var compact = false
+  @State private var open = false
+
+  private var model: ConfigOption? { options.first { $0.id == "model" } }
+  private var effort: ConfigOption? {
+    options.first { $0.id == "effort" && Effort.levels($0).count > 1 }
+  }
+  private var modelName: String {
+    guard let model else { return "" }
+    let name = model.current.map { $0.label(model.id) } ?? ConfigOption.Choice.pretty(model.currentValue)
+    guard compact else { return name }
+    // the maker's family name says little next to the send button: "Claude Opus 4.6" reads "Opus 4.6"
+    let words = name.split(separator: " ")
+    if words.count > 2, words[0].lowercased() == "claude" {
+      return words.dropFirst().joined(separator: " ")
+    }
+    return name
+  }
+  private var promptChosen: Bool {
+    guard let name = prompt?.wrappedValue, !name.isEmpty else { return false }
+    return prompts.contains { $0.name == name }
   }
 
-  private struct Quiet: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-      configuration.label
-        .opacity(configuration.isPressed ? 0.45 : 1)
-        .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+  var body: some View {
+    if let model {
+      Button { open = true } label: {
+        HStack(spacing: 5) {
+          if promptChosen {
+            Image(systemName: "text.quote")
+              .font(.system(size: 10.5, weight: .semibold))
+              .foregroundStyle(Color.dim)
+          }
+          Text(modelName)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: compact ? 200 : nil, alignment: .leading)
+            .fixedSize(horizontal: !compact, vertical: false)
+          if let effort, let level = Effort.current(effort) {
+            Text(Effort.name(level))
+              .foregroundStyle(Effort.accent)
+              .lineLimit(1)
+              .fixedSize()
+          }
+          if !compact {
+            Image(systemName: "chevron.down")
+              .font(.system(size: 8, weight: .bold))
+              .foregroundStyle(Color.faint)
+          }
+        }
+        .font(.geist(compact ? 12.5 : 13.5, .medium))
+        .foregroundStyle(compact ? Color(white: 0.82) : Color.dim)
+        .padding(.horizontal, compact ? 10 : ComposerOption.slop)
+        .frame(height: compact ? 30 : 30)
+        .background { if compact { Capsule().fill(Color.white.opacity(0.09)) } }
+        .contentShape(.capsule)
+        .contentTransition(.opacity)
+      }
+      .buttonStyle(QuietPress())
+      .accessibilityLabel("Model")
+      .accessibilityValue([model.current?.label(model.id), effort.flatMap(Effort.current).map(Effort.name)].compactMap { $0 }.joined(separator: ", "))
+      .sheet(isPresented: $open) {
+        ModelSheet(options: options, set: set, prompts: prompts, prompt: prompt)
+      }
     }
   }
 }
 
-/** The model and effort chips, each opening its own picker. */
-struct ConfigChips: View {
-  let options: [ConfigOption]
-  let set: (String, String) -> Void
-  @State private var models = false
-  @State private var effort = false
-
-  var body: some View {
-    if let model = options.first(where: { $0.id == "model" }) {
-      ComposerOption(text: model.current.map { $0.label(model.id) } ?? ConfigOption.Choice.pretty(model.currentValue)) {
-        models = true
-      }
-      .accessibilityLabel("Model")
-      .sheet(isPresented: $models) {
-        ModelSheet(options: options, set: set)
-      }
-    }
-    if let option = options.first(where: { $0.id == "effort" }), EffortPicker.levels(option).count > 1 {
-      ComposerOption(text: EffortPicker.chip(option)) { effort = true }
-      .fixedSize()
-      .layoutPriority(1)
-      .accessibilityLabel("Reasoning effort")
-      .popover(isPresented: $effort, arrowEdge: .bottom) {
-        EffortPicker(option: option) { value in
-          if value != option.currentValue { set(option.id, value) }
-          Task {
-            try? await Task.sleep(for: .milliseconds(220))
-            effort = false
-          }
-        }
-        .presentationCompactAdaptation(.popover)
-      }
-    }
+/** Dims the label while pressed, the quiet press every chip above the composer shares. */
+struct QuietPress: ButtonStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .opacity(configuration.isPressed ? 0.45 : 1)
+      .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
   }
 }
 
 // MARK: Effort
 
-/**
- * Reasoning effort as one row of levels: tap one and it's set, the light slides over, and the
- * popover closes. Sliding a finger along the row moves the light too.
- */
-struct EffortPicker: View {
-  let option: ConfigOption
-  let set: (String) -> Void
-  @Namespace private var ns
-  @State private var picked: String?
-  @State private var width: CGFloat = 0
-
-  private var levels: [ConfigOption.Choice] { Self.levels(option) }
-  private var current: String { picked ?? option.currentValue }
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 12) {
-      Text("Reasoning effort")
-        .font(.geist(13, .medium))
-        .foregroundStyle(Color.dim)
-        .padding(.leading, 4)
-      HStack(spacing: 0) {
-        ForEach(levels, id: \.value) { level in
-          let on = level.value == current
-          Text(Self.name(level))
-            .font(.geist(14, on ? .semibold : .medium))
-            .foregroundStyle(on ? .black : Color(white: 0.75))
-            .lineLimit(1)
-            .frame(maxWidth: .infinity)
-            .frame(height: 38)
-            .background {
-              if on { Capsule().fill(.white).matchedGeometryEffect(id: "lit", in: ns) }
-            }
-            .contentShape(.capsule)
-        }
-      }
-      .padding(3)
-      .background(Color.white.opacity(0.08), in: .capsule)
-      .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
-      .gesture(
-        DragGesture(minimumDistance: 0)
-          .onChanged { g in
-            let value = levels[index(g.location.x)].value
-            if value != current { picked = value }
-          }
-          .onEnded { g in
-            let value = levels[index(g.location.x)].value
-            picked = value
-            // even the same level closes the popover
-            set(value)
-          }
-      )
-    }
-    .padding(14)
-    .frame(width: max(240, CGFloat(levels.count) * 72 + 28))
-    .animation(.spring(duration: 0.24, bounce: 0.12), value: current)
-    .sensoryFeedback(.selection, trigger: current)
-    .accessibilityElement()
-    .accessibilityLabel("Reasoning effort")
-    .accessibilityValue(levels.first { $0.value == current }.map(Self.name) ?? "")
-    .accessibilityAdjustableAction { direction in
-      let i = levels.firstIndex { $0.value == current } ?? 0
-      let next = direction == .increment ? min(i + 1, levels.count - 1) : max(i - 1, 0)
-      picked = levels[next].value
-      set(levels[next].value)
-    }
-  }
-
-  private func index(_ x: CGFloat) -> Int {
-    guard width > 0, !levels.isEmpty else { return 0 }
-    return min(max(Int(x / width * CGFloat(levels.count)), 0), levels.count - 1)
-  }
+/** The levels a model offers and how they read. */
+enum Effort {
+  static let accent = Color(red: 0.69, green: 0.55, blue: 0.98)
 
   /** the levels the model offers; "auto" is spark's own default, not a level to pick */
   static func levels(_ option: ConfigOption) -> [ConfigOption.Choice] {
     option.options.filter { $0.value != "auto" }
   }
 
-  static func chip(_ option: ConfigOption) -> String {
-    option.current.flatMap { $0.value == "auto" ? nil : name($0) + " effort" } ?? "Effort"
+  /**
+   * The level a new chat starts on: the one last picked, on whichever host, when this model has it;
+   * else the host's own; else High, or the top level, while the host leaves it to spark.
+   */
+  static func fallback(_ option: ConfigOption, last: String) -> String? {
+    let levels = levels(option)
+    return (levels.first { $0.value == last } ?? current(option) ?? levels.first { $0.value == "high" } ?? levels.last)?.value
+  }
+
+  /** the chosen level, or nil while spark picks */
+  static func current(_ option: ConfigOption) -> ConfigOption.Choice? {
+    levels(option).first { $0.value == option.currentValue }
   }
 
   static func name(_ level: ConfigOption.Choice) -> String {
     switch level.name.lowercased() {
     case "xhigh", "x-high": return "X-High"
-    case "minimal": return "Min"
-    case "medium": return "Med"
     default: return level.name.prefix(1).uppercased() + level.name.dropFirst()
     }
   }
 }
 
+/**
+ * Reasoning effort as a track with a stop for each level. Tap a stop or drag the knob: it snaps to
+ * the nearest level as the finger moves, and the level is set the moment the finger lifts.
+ */
+struct EffortSlider: View {
+  let option: ConfigOption
+  let set: (String) -> Void
+  /** the level under the finger while it's down */
+  @State private var dragging: Int?
+  @State private var width: CGFloat = 0
+
+  private static let height: CGFloat = 44
+  private static let knob: CGFloat = 36
+  private static let pad: CGFloat = 4
+
+  private var levels: [ConfigOption.Choice] { Effort.levels(option) }
+  /** nil while spark picks the effort itself: no stop is lit and there's no knob until one is tapped */
+  private var chosen: Int? { levels.firstIndex { $0.value == option.currentValue } }
+  private var shown: Int? { dragging ?? chosen }
+  private var picked: Bool { shown != nil }
+
+  var body: some View {
+    VStack(spacing: 14) {
+      Text(shown.map { Effort.name(levels[$0]) } ?? "Effort")
+        .font(.geist(17, .semibold))
+        .foregroundStyle(picked ? Effort.accent : Color.dim)
+        .contentTransition(.numericText())
+        .frame(maxWidth: .infinity)
+      ZStack(alignment: .leading) {
+        Capsule().fill(Color.white.opacity(0.09))
+        if let i = shown, picked {
+          Capsule()
+            .fill(Effort.accent)
+            .frame(width: x(i) + Self.knob / 2 + Self.pad)
+        }
+        ForEach(levels.indices, id: \.self) { i in
+          Circle()
+            .fill(Color.white.opacity(i <= (shown ?? -1) ? 0.55 : 0.28))
+            .frame(width: 6, height: 6)
+            .position(x: x(i), y: Self.height / 2)
+        }
+        Circle()
+          .fill(.white)
+          .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
+          .frame(width: Self.knob, height: Self.knob)
+          .scaleEffect(dragging == nil ? 1 : 1.08)
+          .opacity(picked ? 1 : 0)
+          .position(x: x(shown ?? 0), y: Self.height / 2)
+      }
+      .frame(height: Self.height)
+      .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+      .contentShape(.capsule)
+      .gesture(
+        DragGesture(minimumDistance: 0)
+          .onChanged { g in dragging = index(g.location.x) }
+          .onEnded { g in
+            let i = index(g.location.x)
+            dragging = nil
+            if levels[i].value != option.currentValue { set(levels[i].value) }
+          }
+      )
+    }
+    .animation(.spring(duration: 0.22, bounce: 0.15), value: shown)
+    .animation(.spring(duration: 0.22, bounce: 0.15), value: dragging == nil)
+    .sensoryFeedback(.selection, trigger: shown)
+    .accessibilityElement()
+    .accessibilityLabel("Reasoning effort")
+    .accessibilityValue(shown.map { Effort.name(levels[$0]) } ?? "Not set")
+    .accessibilityAdjustableAction { direction in
+      let i = chosen ?? 0
+      let next = direction == .increment ? min(i + 1, levels.count - 1) : max(i - 1, 0)
+      set(levels[next].value)
+    }
+  }
+
+  /** the center of level `i`'s stop */
+  private func x(_ i: Int) -> CGFloat {
+    let start = Self.pad + Self.knob / 2
+    guard levels.count > 1, width > 0 else { return start }
+    return start + CGFloat(i) * (width - 2 * start) / CGFloat(levels.count - 1)
+  }
+
+  /** the level whose stop is nearest `x` */
+  private func index(_ x: CGFloat) -> Int {
+    guard levels.count > 1, width > 0 else { return 0 }
+    let start = Self.pad + Self.knob / 2
+    let step = (width - 2 * start) / CGFloat(levels.count - 1)
+    return min(max(Int(((x - start) / step).rounded()), 0), levels.count - 1)
+  }
+}
+
 // MARK: Models
 
-/** The models spark can use: tap one and you're done. Provider and mode sit up top as two menus. */
+/**
+ * How the chat runs. The effort slider sits up top and takes effect as you let go; provider, mode,
+ * and a new chat's prompt are menus below it; then the models: tap one and you're done.
+ */
 struct ModelSheet: View {
   let options: [ConfigOption]
   let set: (String, String) -> Void
+  var prompts: [PromptSummary] = []
+  var prompt: Binding<String>? = nil
   @Environment(\.dismiss) private var dismiss
   @State private var query = ""
 
   private var model: ConfigOption? { options.first { $0.id == "model" } }
+  private var effort: ConfigOption? {
+    options.first { $0.id == "effort" && Effort.levels($0).count > 1 }
+  }
+  private var showsPrompt: Bool { prompt != nil && !prompts.isEmpty }
   private var menus: [ConfigOption] {
     options.filter { ["provider", "mode"].contains($0.id) && $0.options.count > 1 }
   }
@@ -289,7 +425,7 @@ struct ModelSheet: View {
   /** a short list gets a sheet just its size */
   private var fits: Bool { (model?.options.count ?? 0) <= 8 }
   private var fitHeight: CGFloat {
-    64 + (menus.isEmpty ? 0 : 44) + CGFloat(model?.options.count ?? 0) * 52 + 40
+    64 + (effort == nil ? 0 : 138) + (menus.isEmpty && !showsPrompt ? 0 : 44) + CGFloat(model?.options.count ?? 0) * 52 + 40
   }
 
   private var makers: Set<String> { Set(shown.map { ConfigOption.Choice.maker($0.value) }) }
@@ -313,12 +449,22 @@ struct ModelSheet: View {
       .padding(.top, 20)
       .padding(.bottom, 14)
 
-      if !menus.isEmpty {
-        HStack(spacing: 8) {
-          ForEach(menus) { o in OptionMenu(option: o) { set(o.id, $0) } }
-          Spacer(minLength: 0)
+      if let effort {
+        EffortSlider(option: effort) { set(effort.id, $0) }
+          .padding(14)
+          .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 26, style: .continuous))
+          .padding(.horizontal, 12)
+          .padding(.bottom, 14)
+      }
+
+      if !menus.isEmpty || showsPrompt {
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(spacing: 8) {
+            if showsPrompt, let prompt { PromptMenu(prompts: prompts, selection: prompt) }
+            ForEach(menus) { o in OptionMenu(option: o) { set(o.id, $0) } }
+          }
+          .padding(.horizontal, 20)
         }
-        .padding(.horizontal, 20)
         .padding(.bottom, 12)
       }
 
@@ -380,6 +526,40 @@ struct ModelSheet: View {
     .presentationBackground(Color(white: 0.06))
     .presentationCornerRadius(Screen.cornerRadius)
     .sensoryFeedback(.selection, trigger: options.map(\.currentValue))
+  }
+}
+
+/** Which library prompt a new chat runs with; spark's own when none is chosen. */
+private struct PromptMenu: View {
+  let prompts: [PromptSummary]
+  @Binding var selection: String
+
+  var body: some View {
+    let current = prompts.first { $0.name == selection }
+    Menu {
+      Picker("Prompt", selection: $selection) {
+        Text("Default").tag("")
+        ForEach(prompts) { p in Text(p.name).tag(p.name) }
+      }
+    } label: {
+      HStack(spacing: 6) {
+        Image(systemName: "text.quote")
+          .font(.system(size: 11, weight: .semibold))
+          .foregroundStyle(Color.dim)
+        Text(current?.name ?? "Default")
+          .font(.geist(13, .medium))
+          .lineLimit(1)
+        Image(systemName: "chevron.up.chevron.down")
+          .font(.system(size: 9, weight: .bold))
+          .foregroundStyle(Color.faint)
+      }
+      .foregroundStyle(Color(white: 0.9))
+      .padding(.horizontal, 12)
+      .frame(height: 32)
+      .background(Color.white.opacity(0.08), in: .capsule)
+    }
+    .menuOrder(.fixed)
+    .accessibilityLabel(current.map { "Prompt \($0.name)" } ?? "Choose a prompt")
   }
 }
 
