@@ -1,8 +1,35 @@
 # spark
 
-## 26.11.21.1
+## 26.11.22
 
 <!-- release:start -->
+
+**Go back, edit, and retry messages in the iPhone app and in spark.**
+
+### New Features
+
+- Press and hold one of your messages in the iPhone app to edit it or send it again, or tap the arrow under a reply to go back to it. The chat continues in a fork of the session from that point.
+- `/rewind` is a new name for `/fork`: pick an earlier prompt, edit it, and continue in a fork.
+- A chat in the iPhone app can switch to another system prompt between messages.
+- Browse, open, and edit the files in a chat's folder from the iPhone app, and run commands in a terminal there.
+- A chat that spark has open on the Mac, for example in a terminal, opens read-only on the iPhone and becomes writable once spark on the Mac closes it.
+
+### Improvements
+
+- The iPhone chat follows a streaming reply while you're at the bottom, stops when you scroll up, and shows a button to jump back down.
+- Sent messages animate into the chat, and the keyboard stays open after you send.
+- The model picker sits next to the send button and only shows while you write, and the open message box is two lines tall.
+- The swipe that opens the sidebar no longer gets in the way of selecting text or scrolling code blocks.
+
+### Bug Fixes
+
+- Sending a second message in the iPhone app no longer shows a black screen or scrolls to empty space.
+- `spark pair` no longer stops with "Another bridge for this Mac connected to the relay" while the background bridge is running.
+
+<!-- release:end -->
+
+## 26.11.21.1
+
 
 **Providers and prompts now live in one shared library that the iPhone, the cloud, and every paired Mac use.**
 
@@ -23,8 +50,6 @@
 
 - spark no longer shows the interrupted turn hint on every launch. It appears once after a turn is interrupted.
 - `/quit` clears the screen when spark exits.
-
-<!-- release:end -->
 
 ## 26.11.21
 
