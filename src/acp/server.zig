@@ -72,6 +72,10 @@ const AcpMethod = enum {
     session_remove,
     /// `_spark/session/rename`: a title the user chose for the loaded session.
     session_rename,
+    /// `_spark/session/turns`: the loaded session's prompts, for a fork point.
+    session_turns,
+    /// `_spark/session/fork`: a copy of the loaded session before a turn.
+    session_fork,
     session_prompt,
     session_set_config_option,
     session_set_mode,
@@ -89,6 +93,8 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "session/list")) return .session_list;
         if (std.mem.eql(u8, method, "session/remove")) return .session_remove;
         if (std.mem.eql(u8, method, "_spark/session/rename")) return .session_rename;
+        if (std.mem.eql(u8, method, "_spark/session/turns")) return .session_turns;
+        if (std.mem.eql(u8, method, "_spark/session/fork")) return .session_fork;
         if (std.mem.eql(u8, method, "session/prompt")) return .session_prompt;
         if (std.mem.eql(u8, method, "session/set_config_option")) return .session_set_config_option;
         if (std.mem.eql(u8, method, "session/set_mode")) return .session_set_mode;
@@ -111,6 +117,8 @@ const AcpMethod = enum {
             => false,
             .session_list,
             .session_remove,
+            .session_turns,
+            .session_fork,
             .session_prompt,
             .session_set_config_option,
             .mcp_message,
@@ -1336,6 +1344,8 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .session_list => sessions.handleListSessions(state, alloc, msg),
         .session_remove => sessions.handleRemoveSession(state, alloc, msg),
         .session_rename => sessions.handleRenameSession(state, alloc, msg),
+        .session_turns => sessions.handleSessionTurns(state, alloc, msg),
+        .session_fork => sessions.handleForkSession(state, alloc, msg),
         .session_prompt => startPrompt(state, alloc, msg),
         .session_set_config_option => handleSetConfigOption(state, alloc, msg),
         .session_set_mode => handleSetMode(state, alloc, msg),

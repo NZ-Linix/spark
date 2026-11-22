@@ -9385,6 +9385,49 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "_spark/session/fork copies the loaded session's turns before a prompt",
+    async () => {
+      const fixture = createConfiguredProviderFixture();
+      const acp = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+      try {
+        await acp.request("initialize", { protocolVersion: 1, clientCapabilities: {} }, 1);
+        const created = await acp.request("session/new", { cwd: fixture.workspace, mcpServers: [] }) as any;
+        const source = created.result.sessionId;
+        for (const text of ["First prompt", "Second prompt", "Third prompt"]) {
+          const turn = await acp.request("session/prompt", { sessionId: source, prompt: [{ type: "text", text }] }) as any;
+          expect(turn.result?.stopReason).toBe("end_turn");
+        }
+        await acp.request("_spark/session/rename", { sessionId: source, title: "Forked chat" });
+
+        const turns = await acp.request("_spark/session/turns", { sessionId: source }) as any;
+        expect(turns.result?.turns.map((t: any) => t.prompt)).toEqual(["First prompt", "Second prompt", "Third prompt"]);
+        const second = turns.result.turns[1].turn;
+
+        const bad = await acp.request("_spark/session/fork", { sessionId: source, beforeTurn: 99 }) as any;
+        expect(bad.error?.message).toContain("isn't in the session");
+        const forked = await acp.request("_spark/session/fork", { sessionId: source, beforeTurn: second }) as any;
+        expect(forked.error).toBeUndefined();
+        const fork = forked.result.sessionId;
+        expect(fork).not.toBe(source);
+
+        const loaded = await acp.request("session/load", { sessionId: fork, cwd: fixture.workspace, mcpServers: [] }) as any;
+        expect(loaded.error).toBeUndefined();
+        const left = await acp.request("_spark/session/turns", { sessionId: fork }) as any;
+        expect(left.result?.turns.map((t: any) => t.prompt)).toEqual(["First prompt"]);
+        const listed = await acp.request("session/list", {}) as any;
+        expect(listed.result?.sessions).toContainEqual(expect.objectContaining({ sessionId: fork, title: "Forked chat" }));
+        const removed = await acp.request("session/remove", { sessionId: source }) as any;
+        expect(removed.error).toBeUndefined();
+        expect(acp.stderr).toBe("");
+      } finally {
+        await acp.close();
+        fixture.close();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/list exposes bounded titled pages",
     async () => {
       const root = createIsolatedRoot("spark-acp-paged-session-list-");

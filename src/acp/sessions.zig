@@ -348,6 +348,74 @@ pub fn handleRenameSession(state: *server.ServerState, alloc: Allocator, msg: *j
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
+/// The loaded session named by `sessionId`, or null after writing the error.
+fn loadedSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message, parsed: *const std.json.Parsed(std.json.Value)) !?*session_adapter.Session {
+    const session_id = (try stringParam(state, alloc, msg, parsed, "sessionId")) orelse return null;
+    const active = if (state.active_session) |*a| (if (sameSessionId(a.session_id, session_id)) a else null) else null;
+    if (active) |a| if (a.v2) |v2| return v2;
+    try state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Load the session first." });
+    return null;
+}
+
+/// `_spark/session/turns`: every prompt of the loaded session that opened a
+/// turn, oldest first, as `{turns:[{turn,prompt}]}`. `_spark/session/fork`
+/// takes one of these turns.
+pub fn handleSessionTurns(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
+    defer parsed.deinit();
+    const v2 = (try loadedSession(state, alloc, msg, &parsed)) orelse return;
+    const points = v2.forkPoints(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "The session's turns could not be read." }),
+    };
+    defer session_adapter.Session.freeForkPoints(alloc, points);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"turns\":[");
+    for (points, 0..) |point, i| {
+        if (i > 0) try out.writer.writeByte(',');
+        try out.writer.print("{{\"turn\":{d},\"prompt\":", .{point.turn});
+        try writeJsonStr(point.prompt, &out.writer);
+        try out.writer.writeByte('}');
+    }
+    try out.writer.writeAll("]}");
+    try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
+/// `_spark/session/fork`: a new session holding the loaded one's turns before
+/// `beforeTurn`, under the same title, as `/fork` makes (D58). The loaded
+/// session stays loaded and unchanged; the client loads the fork to go on
+/// from that point. Answers `{sessionId}`.
+pub fn handleForkSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
+    const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid params" });
+    defer parsed.deinit();
+    const v2 = (try loadedSession(state, alloc, msg, &parsed)) orelse return;
+    const before_turn: u64 = blk: {
+        if (parsed.value == .object) if (parsed.value.object.get("beforeTurn")) |v| if (v == .integer and v.integer > 0) break :blk @intCast(v.integer);
+        return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing beforeTurn" });
+    };
+    const workspace = state.active_session.?.workspace_root;
+    const info = v2.info(alloc) catch null;
+    defer if (info) |i| if (i.title) |t| alloc.free(t);
+    const fork = v2.fork(alloc, .{ .before_turn = before_turn, .workspace = workspace, .host = .acp }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidForkPoint => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "That turn isn't in the session." }),
+        else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.internal_error, .message = "The session could not be forked." }),
+    };
+    defer fork.close();
+    if (info) |i| if (i.title) |title| fork.rename(title) catch |err| debug_trace.logf("acp", "fork title not kept err={s}", .{@errorName(err)});
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(fork.id(), &out.writer);
+    try out.writer.writeByte('}');
+    try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+}
+
 const RestoreKind = enum {
     load,
     reconnect,
