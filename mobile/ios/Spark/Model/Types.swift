@@ -80,12 +80,15 @@ nonisolated struct Snapshot: Codable, Sendable {
   var scratch: Bool?
   /** open in another spark process on the host, such as a terminal: the phone can read it, not write */
   var elsewhere: Bool?
+  var terminalOwner: String?
+  var terminalRevision: String?
   var items: [Item]
   var config: [ConfigOption]
   var permission: Permission?
   var usage: Usage?
   /** the library prompt the session runs with; none for spark's own */
   var prompt: String?
+  var mcpDisabled: [String]?
   /** after a rewind to just before a message: that message's text, for the composer */
   var restored: String?
 

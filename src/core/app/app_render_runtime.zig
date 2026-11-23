@@ -851,8 +851,17 @@ pub fn Runtime(comptime App: type) type {
                 items.git_branch = identity.git_branch;
             }
             if (app.statusline_context) {
-                items.context_used = agents.loadTotal(&agent.total_input_tokens);
+                items.context_used = agents.loadTotal(&agent.total_input_tokens) +| agents.loadTotal(&agent.total_output_tokens);
                 items.context_total = model_capabilities.resolveForApp(App, app, visible_model).context_window;
+                if (comptime @hasField(AppAgent, "status_usage")) {
+                    items.usage = .{
+                        .input = agents.loadTotal(&agent.status_usage.input),
+                        .output = agents.loadTotal(&agent.status_usage.output),
+                        .read = agents.loadTotal(&agent.status_usage.read),
+                        .write = agents.loadTotal(&agent.status_usage.write),
+                        .cacheable = agents.loadTotal(&agent.status_usage.cacheable),
+                    };
+                }
             }
             if (comptime @hasField(App, "statusline_session")) {
                 if (app.statusline_session) {

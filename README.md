@@ -100,6 +100,8 @@ spark ask --json "summarize the failing tests" | jq -r .final_output
 
 Ctrl+O opens the full transcript, including tool details and reasoning.
 
+The footer shows the latest reported context usage and this run's token totals: `↑` uncached input, `↓` output, `R` cache reads, `W` cache writes, and `CH` the cache hit rate for requests that report cache usage. Hide the segment with `spark config set status_line.context false`.
+
 ## Extend it
 
 - **Custom system prompts.** Add a folder of `.md` or `.txt` files with `/prompt dir add PATH`, then choose one with `/prompt`. spark sends the chosen file alone as the system prompt.

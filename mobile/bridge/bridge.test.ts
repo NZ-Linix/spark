@@ -310,6 +310,24 @@ describe("library", () => {
     expect(readdirSync(join(home, PROMPT_DIR))).toEqual([]);
   });
 
+  test("mirrors cloud MCP definitions without copying OAuth state", () => {
+    const lib = new Library({ dir: join(dir, "lib"), spark: SPARK });
+    const home = join(dir, "home");
+    mkdirSync(home);
+    const file = join(home, "mcp.json");
+    const matches = (servers: unknown) => expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ mcpServers: servers });
+    writeFileSync(file, JSON.stringify({ mcpServers: { local: { command: "local-mcp" } } }));
+    applySnapshot(home, lib.snapshot());
+    matches({ local: { command: "local-mcp" } });
+    const shared = { remote: { type: "http", url: "https://mcp.example.test", headers: { Authorization: "Bearer test-key" } } };
+    writeFileSync(join(dir, "lib", "mcp.json"), JSON.stringify({ mcpServers: shared }));
+    mkdirSync(join(dir, "lib", "mcp-credentials"));
+    applySnapshot(home, lib.snapshot());
+    matches(shared);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(existsSync(join(home, "mcp-credentials"))).toBe(false);
+  });
+
   test("starts from the providers the cloud profiles already had", () => {
     for (const [d, p] of [["one", "a"], ["two", "b"]]) {
       mkdirSync(join(dir, d));

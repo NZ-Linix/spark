@@ -1705,6 +1705,15 @@ pub fn projectProviderReplay(
     return projected;
 }
 
+/// Cumulative provider usage for the current interactive run of a conversation.
+pub const SessionUsageCounters = struct {
+    input: u64 = 0,
+    output: u64 = 0,
+    read: u64 = 0,
+    write: u64 = 0,
+    cacheable: u64 = 0,
+};
+
 pub const Usage = struct {
     input_tokens: ?u64 = null,
     output_tokens: ?u64 = null,

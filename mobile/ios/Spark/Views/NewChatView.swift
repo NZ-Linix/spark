@@ -12,6 +12,7 @@ struct NewChatView: View {
   @State private var label = ""
   /** model and other options chosen before the chat exists; applied once it starts */
   @State private var pending: [String: String] = [:]
+  @State private var mcpDisabled: Set<String> = []
   /** the effort last picked on any host: a new chat starts there on whichever host it runs */
   @AppStorage("effort") private var lastEffort = ""
   /** a library prompt the chat runs with in place of spark's own */
@@ -77,7 +78,8 @@ struct NewChatView: View {
           ConfigChips(options: options, set: { id, value in
             pending[id] = value
             if id == "effort" { lastEffort = value }
-          }, prompts: link.prompts, prompt: $prompt, compact: true)
+          }, prompts: link.prompts, prompt: $prompt, mcpNames: link.mcpServers[link.host?.id ?? ""] ?? [],
+            mcpDisabled: $mcpDisabled, refreshMcp: { if let host = link.host?.id { await link.loadMcpServers(host) } }, compact: true)
         }
       }
       .animation(.ease, value: folder)
@@ -128,10 +130,15 @@ struct NewChatView: View {
     .onChange(of: link.hostID) {
       folder = nil
       pending = [:]
+      mcpDisabled = []
     }
     .task(id: "\(link.host?.id ?? "")-\(link.phase == .online)") {
       guard link.phase == .online else { return }
-      if let host = link.host?.id { await link.loadOptions(host) }
+      if let host = link.host?.id {
+        async let list: Void = link.loadMcpServers(host)
+        async let options: Void = link.loadOptions(host)
+        _ = await (list, options)
+      }
       if link.hosts.contains(where: { $0.kind == .cloud }) { _ = try? await link.loadPrompts() }
     }
   }
@@ -169,7 +176,7 @@ struct NewChatView: View {
       // the keyboard and the headline go first, so the chat opens onto a still screen instead of
       // landing while everything under it moves; the session starts behind the message
       try? await Task.sleep(for: .milliseconds(typing ? 300 : 180))
-      link.begin(text, in: folder, on: host, options: options, prompt: chosen)
+      link.begin(text, in: folder, on: host, options: options, prompt: chosen, mcpDisabled: mcpDisabled)
     }
   }
 }

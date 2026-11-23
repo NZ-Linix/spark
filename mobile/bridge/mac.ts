@@ -14,6 +14,7 @@ import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { $ } from "bun";
 import { Host } from "./host";
+import { TerminalSessions } from "./terminal_sessions";
 import { runningSessions } from "./mac_sessions";
 import { PhoneSessions } from "./phone_sessions";
 import { loginShellVariable, Profile } from "./providers";
@@ -151,6 +152,7 @@ function serve(c: Config, onPaired?: (device: string) => void, quiet = false) {
     filter: { phone: new PhoneSessions(PHONE_SESSIONS), running: () => runningSessions(bin) },
     profile,
     prompts: { home: SPARK_HOME, sessions: SESSION_PROMPTS },
+    terminal: new TerminalSessions(SPARK_HOME),
     send: (msg, to) => {
       if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ to, msg }));
     },

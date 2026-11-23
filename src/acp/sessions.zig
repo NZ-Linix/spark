@@ -126,6 +126,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     if (state.cfg.allow_acp_mcp) {
         try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
         try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
+        try filterProfileMcpConfigs(alloc, msg.params_raw, &mcp_configs);
     }
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
@@ -496,6 +497,7 @@ fn handleRestoreSession(
     } else {
         try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
         try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
+        try filterProfileMcpConfigs(alloc, msg.params_raw, &mcp_configs);
     }
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
@@ -667,6 +669,28 @@ fn appendProfileMcpConfigsIfRequested(
     }
     debug_trace.logf("mcp", "ACP profile MCP servers requested count={d}", .{profile.items.len});
     try project_config.appendWorkspaceAfterAcpPrimary(alloc, &configs.items, &profile);
+}
+
+fn filterProfileMcpConfigs(alloc: Allocator, params_raw: ?[]const u8, configs: *mcp_servers.OwnedServerConfigs) !void {
+    const raw = params_raw orelse return;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object or !(acp_types.fxMetaBool(parsed.value.object, "profileMcpServers") orelse false)) return;
+    const excluded = acp_types.fxMetaField(parsed.value.object, "profileMcpDisabled") orelse return;
+    if (excluded != .array) return;
+    var i: usize = 0;
+    while (i < configs.items.items.len) {
+        const config = &configs.items.items[i];
+        const disabled = for (excluded.array.items) |name| {
+            if (name == .string and std.mem.eql(u8, name.string, config.name)) break true;
+        } else false;
+        if (config.source == .profile and disabled) {
+            var removed = configs.items.orderedRemove(i);
+            removed.deinit(alloc);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn profileMcpRequested(alloc: Allocator, params_raw: ?[]const u8) bool {

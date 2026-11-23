@@ -5,11 +5,12 @@ import { lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, writ
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { Acp } from "./acp";
-import { type Library, promptFile } from "./library";
+import { type Library, promptFile, readMcp, fingerprint } from "./library";
 import { writeAtomic } from "./providers";
 import { macSessions, type Running } from "./mac_sessions";
 import { describe, historyItems, readSession } from "./session_view";
 import type { PhoneSessions } from "./phone_sessions";
+import { type TerminalSessions, type TerminalView } from "./terminal_sessions";
 import type { Profile } from "./providers";
 import type { ConfigOption, Event, FileContent, FileData, FileEntry, FileListing, Folder, HostInfo, Item, Permission, Request, SessionInfo, Snapshot } from "./protocol";
 
@@ -29,6 +30,7 @@ export type HostOptions = {
   filter?: { phone: PhoneSessions; running: () => Promise<Running[]> };
   /** the providers in this host's spark profile */
   profile?: Profile;
+  terminal?: TerminalSessions;
   /** the cloud only: the shared providers and prompts, which the phone edits through it */
   library?: Library;
   /** the spark profile the library's prompts are copied into, and the file that remembers which prompt each session runs with */
@@ -64,6 +66,8 @@ class Live {
   dirty = new Set<string>();
   flushTimer: ReturnType<typeof setTimeout> | null = null;
   lastRole: string | null = null;
+  mcpStamp = "";
+  preparing = false;
 
   constructor(
     public id: string,
@@ -88,6 +92,7 @@ class Live {
 export class Host {
   private live = new Map<string, Live>();
   private opening = new Map<string, Promise<Live>>();
+  private attached = new Map<string, { held: Running; committed: number; owner: string; items: Item[]; historyLength: number }>();
   private sweeper: ReturnType<typeof setInterval>;
   /** terminal commands running now, by the phone's id for each */
   private terms = new Map<string, ChildProcess>();
@@ -106,6 +111,7 @@ export class Host {
     clearInterval(this.sweeper);
     for (const l of this.live.values()) l.acp.kill();
     this.live.clear();
+    this.attached.clear();
     for (const p of this.terms.values()) killGroup(p, "SIGKILL");
     this.terms.clear();
   }
@@ -127,15 +133,34 @@ export class Host {
         return this.sessions();
       case "open":
         return this.withPrompt(this.marked(await this.show(req.s)));
+      case "watchTerminal": {
+        const held = this.attached.get(req.s)?.held;
+        const view = held && await this.o.terminal?.view(req.s);
+        if (view && view.revision === req.revision) return null;
+        if (view) return this.withPrompt(this.marked(await this.terminalView(held, view)));
+        this.attached.delete(req.s);
+        return this.withPrompt(this.marked(await this.show(req.s)));
+      }
       case "new":
-        return this.view(await this.create(req.cwd, req.prompt));
+        return this.view(await this.create(req.cwd, req.prompt, req.mcpDisabled));
+      case "mcpServers":
+        return this.mcpNames();
+      case "sessionMcp": {
+        const l = await this.open(req.s);
+        if (l.running || l.preparing) throw new Error("Change MCP servers after spark finishes its turn.");
+        const disabled = this.cleanMcp(req.disabled);
+        this.rememberMcp(l.id, disabled);
+        return disabled;
+      }
       case "rewind":
         return this.rewind(req.s, req.item, req.keep === true);
       case "sessionPrompt":
         return this.setPrompt(req.s, req.prompt);
       case "prompt":
+        if (req.terminalOwner) return this.controlTerminal(req.s, req.terminalOwner, "prompt", req.text);
         return this.prompt(req.s, req.text, req.item);
       case "cancel": {
+        if (req.terminalOwner) return this.controlTerminal(req.s, req.terminalOwner, "cancel");
         const l = this.live.get(req.s);
         if (l) {
           if (l.permission) this.answer(l, l.permission.p.id, null);
@@ -321,7 +346,7 @@ export class Host {
 
   private withPrompt(s: Snapshot): Snapshot {
     const prompt = this.sessionPrompts()[s.id];
-    return prompt ? { ...s, prompt } : s;
+    return { ...s, prompt, mcpDisabled: this.disabledMcp(s.id) };
   }
 
   /**
@@ -366,7 +391,10 @@ export class Host {
     l.permission = null;
     l.id = next;
     try {
-      const loaded = await l.acp.call("session/load", { sessionId: next, cwd: l.cwd, mcpServers: [] });
+      const disabled = this.disabledMcp(old);
+      l.mcpStamp = this.mcpStamp(disabled);
+      const loaded = await l.acp.call("session/load", { sessionId: next, cwd: l.cwd, ...this.mcpParams(disabled) });
+      this.rememberMcp(next, disabled);
       if (Array.isArray(loaded?.configOptions)) l.config = loaded.configOptions;
     } finally {
       l.loading = false;
@@ -381,6 +409,7 @@ export class Host {
       await l.acp.call("session/remove", { sessionId: old });
       this.o.filter?.phone.remove(old);
       this.rememberPrompt(old);
+      this.rememberMcp(old, []);
     } catch (e) {
       console.error(`rewind: kept ${old}: ${e instanceof Error ? e.message : e}`);
     }
@@ -448,7 +477,11 @@ export class Host {
   private async show(id: string): Promise<Snapshot> {
     if (!this.live.get(id)?.acp.alive && !this.opening.has(id)) {
       const held = await this.heldElsewhere(id);
-      if (held) return this.readOnly(id, held);
+      if (held) {
+        const permitted = !this.o.confine || (held.cwd && await this.allowed(held.cwd).catch(() => undefined));
+        const view = permitted && await this.o.terminal?.view(id);
+        return view ? this.terminalView(held, view) : this.readOnly(id, held);
+      }
     }
     try {
       return (await this.open(id)).snapshot();
@@ -465,6 +498,34 @@ export class Host {
     // a failed live list only means the phone tries to open it, and spark says whether it can
     const running = await this.o.filter.running().catch(() => [] as Running[]);
     return running.find((r) => r.id === id);
+  }
+
+  private async controlTerminal(id: string, owner: string, op: "prompt" | "cancel", text?: string) {
+    const attached = this.attached.get(id);
+    if (!this.o.terminal || attached?.owner !== owner) throw new Error("Open the Mac chat again before sending.");
+    await this.allowed(attached.held.cwd);
+    return this.o.terminal.control(id, owner, op, text);
+  }
+
+  private async terminalView(held: Running, view: TerminalView): Promise<Snapshot> {
+    const { id, title, cwd, updatedAt } = held;
+    let cached = this.attached.get(id);
+    if (!cached || cached.owner !== view.owner || cached.committed !== view.committed) {
+      const detail = await readSession(this.o.spark, id, this.env()).catch(err => {
+        if (view.committed === 0) return {};
+        throw err;
+      });
+      cached = { held, committed: view.committed, owner: view.owner, items: historyItems(detail), historyLength: detail.history_len ?? 0 };
+      this.attached.set(id, cached);
+    }
+    const next = cached.historyLength + 1;
+    const items = view.items.map(item => ({ ...item, id: item.id.replace(`h${view.turn}:`, `h${next}:`) }));
+    return {
+      id, title, cwd, updatedAt, live: true, running: view.running, elsewhere: true,
+      origin: this.o.filter?.phone.all().has(id) ? "phone" : "mac",
+      terminalOwner: view.owner, terminalRevision: view.revision,
+      items: [...cached.items, ...items], config: [], permission: null,
+    };
   }
 
   /** the session's finished turns, read without taking its lock; the phone asks again to keep up */
@@ -517,7 +578,9 @@ export class Host {
     this.wire(l);
     try {
       await acp.initialize();
-      const r = await acp.call("session/load", { sessionId: id, cwd, mcpServers: [] });
+      const disabled = this.disabledMcp(id);
+      l.mcpStamp = this.mcpStamp(disabled);
+      const r = await acp.call("session/load", { sessionId: id, cwd, ...this.mcpParams(disabled) });
       if (Array.isArray(r?.configOptions)) l.config = r.configOptions;
     } catch (e) {
       acp.kill();
@@ -528,6 +591,62 @@ export class Host {
     l.loading = false;
     this.live.set(id, l);
     return l;
+  }
+
+  private mcpNames(): string[] {
+    const configs = this.o.prompts ? readMcp(this.o.prompts.home) : undefined;
+    return Object.entries(configs ?? {}).filter(([, c]) => c.enabled !== false).map(([name]) => name).sort();
+  }
+
+  private mcpPicks(): Record<string, string[]> {
+    if (!this.o.prompts) return {};
+    try { return JSON.parse(readFileSync(`${this.o.prompts.sessions}.mcp`, "utf8")); }
+    catch { return {}; }
+  }
+
+  private disabledMcp(id: string): string[] {
+    const all = this.mcpPicks();
+    return Object.hasOwn(all, id) && Array.isArray(all[id]) ? all[id] : [];
+  }
+
+  private cleanMcp(raw: unknown): string[] {
+    if (!Array.isArray(raw)) return [];
+    return this.mcpNames().filter(name => raw.includes(name));
+  }
+
+  private rememberMcp(id: string, disabled: string[]) {
+    if (!this.o.prompts) return;
+    const all = this.mcpPicks();
+    if (disabled.length) all[id] = disabled;
+    else if (!Object.hasOwn(all, id)) return;
+    else delete all[id];
+    writeAtomic(`${this.o.prompts.sessions}.mcp`, all);
+  }
+
+  private mcpParams(disabled: string[] = []) {
+    return { mcpServers: [], _meta: { spark: { profileMcpServers: true, profileMcpDisabled: disabled } } };
+  }
+
+  private mcpStamp(disabled: string[]) {
+    return fingerprint([disabled, (this.o.prompts && readMcp(this.o.prompts.home)) ?? null]);
+  }
+
+  private async refreshMcp(l: Live) {
+    const disabled = this.disabledMcp(l.id);
+    const stamp = this.mcpStamp(disabled);
+    if (stamp === l.mcpStamp) return;
+    const previous = l.config;
+    const r = await l.acp.call("session/resume", { sessionId: l.id, ...this.mcpParams(disabled) });
+    if (Array.isArray(r?.configOptions)) l.config = r.configOptions;
+    for (const id of ["model", "effort", "mode"]) {
+      const value = previous.find(o => o.id === id)?.currentValue;
+      if (value && l.config.some(o => o.id === id && o.currentValue !== value)) {
+        const result = await l.acp.call("session/set_config_option", { sessionId: l.id, configId: id, value });
+        if (Array.isArray(result?.configOptions)) l.config = result.configOptions;
+      }
+    }
+    l.mcpStamp = stamp;
+    this.o.send({ t: "config", s: l.id, config: l.config });
   }
 
   /** what spark runs with for a session that uses library prompt `name` */
@@ -556,7 +675,7 @@ export class Host {
     writeAtomic(this.o.prompts.sessions, all);
   }
 
-  private async create(path: string | undefined, prompt?: string): Promise<Live> {
+  private async create(path: string | undefined, prompt?: string, mcpDisabled?: string[]): Promise<Live> {
     const env = this.promptEnv(prompt);
     if (prompt && !env.SPARK_SYSTEM_PROMPT_FILE) throw new Error(`The prompt ${prompt} hasn't reached this host yet.`);
     const own = !path;
@@ -566,11 +685,14 @@ export class Host {
     this.wire(l);
     try {
       await acp.initialize();
-      const r = await acp.call("session/new", { cwd, mcpServers: [] });
+      const disabled = this.cleanMcp(mcpDisabled);
+      l.mcpStamp = this.mcpStamp(disabled);
+      const r = await acp.call("session/new", { cwd, ...this.mcpParams(disabled) });
       l.id = r.sessionId;
       if (Array.isArray(r?.configOptions)) l.config = r.configOptions;
       this.o.filter?.phone.add(l.id);
       this.rememberPrompt(l.id, prompt);
+      this.rememberMcp(l.id, disabled);
     } catch (e) {
       acp.kill();
       if (own) await rm(cwd, { recursive: true, force: true });
@@ -622,6 +744,7 @@ export class Host {
     }
     this.o.filter?.phone.remove(id);
     this.rememberPrompt(id);
+    this.rememberMcp(id, []);
     if (cwd && this.ownFolder(cwd)) await rm(cwd, { recursive: true, force: true });
     return null;
   }
@@ -629,9 +752,12 @@ export class Host {
   /** `item` is the id the phone already shows the message under */
   private async prompt(id: string, text: string, item?: string) {
     const l = await this.open(id);
-    if (l.running) throw new Error("spark is still working on the last message.");
+    if (l.running || l.preparing) throw new Error("spark is still working on the last message.");
     const body = text.trim();
     if (!body) return null;
+    l.preparing = true;
+    try { await this.refreshMcp(l); }
+    finally { l.preparing = false; }
     l.touched = Date.now();
     const shown = typeof item === "string" && /^[A-Za-z0-9-]{8,64}$/.test(item) && !l.index.has(item) ? item : crypto.randomUUID();
     this.upsert(l, { id: shown, role: "user", text: body });
@@ -662,6 +788,9 @@ export class Host {
 
   private sweep() {
     const now = Date.now();
+    if (this.o.terminal) for (const id of this.attached.keys()) {
+      void this.o.terminal.view(id).then(view => { if (!view) this.attached.delete(id); });
+    }
     for (const l of this.live.values()) {
       if (!l.running && !l.permission && now - l.touched > IDLE_MS) {
         l.acp.kill();
@@ -720,14 +849,15 @@ export class Host {
         l.lastRole = "tool";
         const id = String(u.toolCallId);
         const prior = l.index.get(id);
+        const mcp = u._meta?.spark?.toolCall?.mcp;
         const item: Item = {
           ...(prior === undefined ? {} : l.items[prior]),
           id,
           role: "tool",
           text: "",
-          name: u.name,
-          title: u.title,
-          kind: u.kind,
+          name: mcp?.tool ?? u.name,
+          title: mcp?.server ? `${mcp.server} · ${u.title || mcp.tool}` : u.title,
+          kind: mcp ? "mcp" : u.kind,
           status: u.status ?? "pending",
           detail: describe(u.rawInput),
         };
@@ -741,7 +871,7 @@ export class Host {
         const text = contentText(u.content);
         const changed = u.status && u.status !== t.status;
         if (u.status) t.status = u.status;
-        if (u.title && u.title !== "Running") t.title = u.title;
+        if (t.kind !== "mcp" && u.title && u.title !== "Running") t.title = u.title;
         if (text) {
           const done = u.status === "completed" || u.status === "failed";
           const out = done ? text : (t.output ?? "") + text;

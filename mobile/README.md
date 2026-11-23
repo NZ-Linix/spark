@@ -40,9 +40,9 @@ In the folder picker, the row at the top or any part of the path goes up a level
 
 The cloud shows every chat. The Mac shows only the chats started from the phone, plus sessions running on the Mac right now, such as spark in a terminal. A running session counts when its spark process holds the session's lock. `spark-bridge` keeps the phone's chats in `mobile-sessions.json` beside its pairing file and forgets a chat once spark no longer lists it.
 
-spark lets one process write a session at a time. A chat that spark has open on the Mac, such as in a terminal, opens read-only on the phone: it shows the turns spark has finished, and the composer stays off. The phone reads it again every 3 seconds, and once spark on the Mac closes it, the chat opens on the phone and you can write in it. spark saves a turn when the turn ends, so the reply spark is working on shows up after it finishes.
+Open a running Mac chat from the sidebar to see its reply as it streams. You can send a message into the same terminal session, including while spark is working, or stop the active turn. The terminal still owns the session and uses its current model and permissions. The phone doesn't change the terminal's settings or answer its dialogs. Older Mac processes remain read-only until they close; restart them with the updated CLI for live access.
 
-## Providers and prompts
+## Providers, prompts, and MCP
 
 The relay keeps one library of providers and prompts that the cloud and every paired Mac share. It lives in `$SPARK_RELAY_DATA/library`. The first time a relay starts with a library, it fills it from the providers its cloud profiles already have.
 
@@ -53,6 +53,10 @@ Each Mac keeps a copy of the library in its own spark profile, so spark in a ter
 `spark provider set <name> [<model>] <field> <value>` changes one field without opening the `/provider` form, for example `spark provider set oc-go display_name "OpenCode Go"` or `spark provider set oc-go glm-5.3 context_window 200k`.
 
 Prompts are edited only in the app: Settings, Library, Prompts. Each prompt has a name and its text, and replaces spark's own system prompt for the chats that pick it. Pick one in the model sheet, from the chip beside the send button. A chat can change its prompt between messages: its spark starts again with the new one. Press and hold a prompt to rename or delete it. Each Mac and cloud profile gets the prompts in `~/.spark/cloud-prompts`, which spark lists with your own prompts. A chat keeps its prompt when it is reopened. After that prompt is renamed or deleted, the chat runs with spark's own prompt the next time it opens.
+
+The relay's `$SPARK_RELAY_DATA/library/mcp.json` is the shared profile MCP configuration. Edit it on the relay using spark's usual `mcpServers` object. Once present, it replaces the server list in each cloud profile and paired Mac's `mcp.json`. Workspace `.mcp.json` files and saved OAuth logins stay local. A shared server must be reachable from the machines using it; configure any required environment variables or credentials there.
+
+The phone's model picker shows the profile MCP servers available on that host. All enabled profile servers start on in a new chat. Turning one off applies to that chat's next message and is remembered when the chat is reopened. This doesn't change the library or the configuration of a session already owned by a Mac terminal.
 
 ## Build spark-bridge
 
@@ -95,10 +99,12 @@ TEST_RUNNER_SPARK_SHOTS=/tmp/shots \
 xcodebuild test -project Spark.xcodeproj -scheme Spark -destination 'platform=iOS Simulator,name=iPhone 18 Pro'
 ```
 
-`testTerminalSessionOpensReadOnly` also needs spark open in a terminal on the Mac, on a session whose title starts with `TEST_RUNNER_SPARK_HELD_TITLE`. Quit that spark after the screenshot `30-terminal-session-read-only` appears, and the test checks that the chat opens on the phone.
+`testChatScrollAndDisclosure` uses the local fixture `bun bridge/fixtures/scroll-relay.ts` and a fresh simulator with `TEST_RUNNER_SPARK_SCROLL_FIXTURE=http://127.0.0.1:18772`. It checks that opening a thought or tool block keeps the row in place, that the model sheet can turn an MCP server off, and that a follow-up reply stays on screen.
+
+`testTerminalSessionOpensReadOnly` exercises the fallback with an older spark process open in a terminal. Set `TEST_RUNNER_SPARK_HELD_TITLE` to the session's title prefix and quit that process after the screenshot `30-terminal-session-read-only` appears. To exercise live access with the new CLI, run `SPARK_TERMINAL_TEST_BIN=/absolute/path/to/spark bun test tests/e2e/tui-mobile-bridge.test.ts` from the repository root.
 
 ## Security
 
 The relay authenticates every phone and Mac with a random token and keeps only its hash. Only a Mac whose `spark-bridge` carries the relay's enrollment secret can register, and a phone can register only with a pairing code from one of those Macs, so phones need no setup and strangers can't use the relay or its cloud. `SPARK_RELAY_OPEN=1` drops the pairing code requirement and lets any phone start on the cloud. A paired phone can run anything spark can run on that Mac, so host the relay behind TLS and unpair phones you no longer use. Messages are not end-to-end encrypted: whoever runs the relay can read them.
 
-That includes API keys. Entering a key in the app, or saving a provider with a key on a Mac, sends the key through the relay. The relay stores it in the library, every cloud profile, and every paired Mac's spark settings (`settings.json`, mode 0600). Every phone paired to the relay can see and change the library. Only use a relay you trust with those keys.
+That includes API keys. Entering a key in the app, or saving a provider with a key on a Mac, sends the key through the relay. The relay stores it in the library, every cloud profile, and every paired Mac's spark settings (`settings.json`, mode 0600). Every phone paired to the relay can see and change the library. Only use a relay you trust with those keys. Shared MCP definitions can also contain credentials and are copied to every paired Mac. Only put trusted servers in the shared library.

@@ -84,16 +84,19 @@ export type ProviderExport = {
 
 export type Snapshot = SessionInfo & {
   /**
-   * Open in another spark process on the host, such as a terminal, which is the session's one
-   * writer. The phone shows its finished turns and can't write until that process lets go.
+   * Open in another spark process, which remains the session's sole writer. A terminal owner
+   * lets the phone send to that process; without one, only saved turns are available.
    */
   elsewhere?: boolean;
+  terminalOwner?: string;
+  terminalRevision?: string;
   items: Item[];
   config: ConfigOption[];
   permission: Permission | null;
   usage?: { used: number; size: number };
   /** the library prompt the session runs with instead of spark's own */
   prompt?: string;
+  mcpDisabled?: string[];
   /** after a rewind before a message: that message's text, for the composer */
   restored?: string;
 };
@@ -131,14 +134,15 @@ export type Request =
   | { id: number; op: "hello" }
   | { id: number; op: "sessions" }
   | { id: number; op: "open"; s: string }
+  | { id: number; op: "watchTerminal"; s: string; revision?: string }
   /**
    * `prompt` names a library prompt the session runs with instead of spark's own. Without `cwd` the
    * session gets a new folder of its own.
    */
-  | { id: number; op: "new"; cwd?: string; prompt?: string }
+  | { id: number; op: "new"; cwd?: string; prompt?: string; mcpDisabled?: string[] }
   /** `item` is the id the phone shows the message under until the host's copy arrives */
-  | { id: number; op: "prompt"; s: string; text: string; item?: string }
-  | { id: number; op: "cancel"; s: string }
+  | { id: number; op: "prompt"; s: string; text: string; item?: string; terminalOwner?: string }
+  | { id: number; op: "cancel"; s: string; terminalOwner?: string }
   /**
    * Takes the chat back to message `item`: without `keep`, to just before it (its text comes back
    * as `restored`); with `keep`, to just after the reply it belongs to. spark keeps the chat's turns
@@ -149,6 +153,8 @@ export type Request =
   | { id: number; op: "sessionPrompt"; s: string; prompt: string | null }
   | { id: number; op: "config"; s: string; option: string; value: string }
   | { id: number; op: "options" }
+  | { id: number; op: "mcpServers" }
+  | { id: number; op: "sessionMcp"; s: string; disabled: string[] }
   | { id: number; op: "answer"; s: string; request: string; option: string | null }
   | { id: number; op: "close"; s: string }
   | { id: number; op: "sessionRename"; s: string; title: string }

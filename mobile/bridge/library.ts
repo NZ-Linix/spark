@@ -23,6 +23,7 @@ export type LibrarySnapshot = {
   /** header values the providers read; the cloud's spark gets them as variables */
   env: Record<string, string>;
   prompts: Record<string, string>;
+  mcp?: Record<string, Json>;
 };
 
 type PromptRecord = { text: string; updatedAt: string };
@@ -127,7 +128,8 @@ export class Library {
     const providers = isObject(s.providers) ? (s.providers as Record<string, Json>) : {};
     const models = isObject(s.models) ? Object.fromEntries(Object.entries(s.models).filter(([k, v]) => typeof v === "string" && k in providers)) : {};
     const prompts = Object.fromEntries(Object.entries(this.readPrompts()).map(([k, v]) => [k, v.text]));
-    return { providers, models: models as Record<string, string>, provider: typeof s.provider === "string" ? s.provider : undefined, env: this.profile.env(), prompts };
+    const mcp = readMcp(this.o.dir);
+    return { providers, models: models as Record<string, string>, provider: typeof s.provider === "string" ? s.provider : undefined, env: this.profile.env(), prompts, mcp };
   }
 
   /**
@@ -159,6 +161,11 @@ export class Library {
     writeAtomic(file, out);
     writeAtomic(join(this.o.dir, "cloud-env.json"), env);
   }
+}
+
+export function readMcp(home: string): Record<string, Json> | undefined {
+  const servers = readJson(join(home, "mcp.json")).mcpServers;
+  return isObject(servers) ? Object.fromEntries(Object.entries(servers).filter(([, v]) => isObject(v))) : undefined;
 }
 
 function readJson(file: string): Json {
@@ -207,6 +214,13 @@ export function applySnapshot(home: string, snap: LibrarySnapshot): Record<strin
   chooseModel(s);
   writeAtomic(file, s);
   writePrompts(home, snap.prompts);
+  if (snap.mcp !== undefined) {
+    const path = join(home, "mcp.json");
+    const current = readJson(path);
+    if (fingerprint(current.mcpServers ?? null) !== fingerprint(snap.mcp)) {
+      writeAtomic(path, { ...current, mcpServers: snap.mcp });
+    }
+  }
   return Object.fromEntries(Object.entries(snap.providers).map(([k, p]) => [k, fingerprint(p)]));
 }
 

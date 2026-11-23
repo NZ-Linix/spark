@@ -770,9 +770,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.theme = if (settings.theme) |value| try alloc.dupe(u8, value) else null;
     state.effort = settings.effort orelse .auto;
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
-    // The status line segments and sounds are gone: saved settings no
-    // longer turn them on.
-    state.statusline_context = false;
+    state.statusline_context = settings.statusline_context orelse true;
     state.statusline_session = false;
     state.statusline_workspace = false;
     state.session_title_generation = settings.session_titles orelse true;

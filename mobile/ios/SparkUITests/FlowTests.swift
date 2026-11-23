@@ -13,6 +13,61 @@ final class FlowTests: XCTestCase {
   private var env: [String: String] { ProcessInfo.processInfo.environment }
 
   @MainActor
+  func testChatScrollAndDisclosure() throws {
+    let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"], "Run mobile/bridge/fixtures/scroll-relay.ts on a test simulator")
+    let app = XCUIApplication()
+    app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
+    app.launch()
+    let menu = app.buttons["Chats"]
+    XCTAssertTrue(menu.waitForExistence(timeout: 10))
+    menu.tap()
+    let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Scroll regression")).firstMatch
+    XCTAssertTrue(row.waitForExistence(timeout: 10))
+    row.tap()
+
+    let thought = app.buttons["Thought"]
+    XCTAssertTrue(thought.waitForExistence(timeout: 10))
+    let y = thought.frame.minY
+    thought.tap()
+    XCTAssertTrue(thought.isHittable)
+    XCTAssertEqual(thought.frame.minY, y, accuracy: 24)
+    shot(app, "scroll-expanded-thought")
+    thought.tap()
+
+    let tool = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "scroll-fixture.txt")).firstMatch
+    XCTAssertTrue(tool.isHittable)
+    let toolY = tool.frame.minY
+    tool.tap()
+    XCTAssertTrue(tool.isHittable)
+    XCTAssertEqual(tool.frame.minY, toolY, accuracy: 24)
+    shot(app, "scroll-expanded-tool")
+    tool.tap()
+
+    let composer = app.textFields["Message spark"]
+    composer.tap()
+    let keyboardTip = app.buttons["Continue"]
+    if keyboardTip.waitForExistence(timeout: 2) { keyboardTip.tap() }
+    let model = app.buttons["Model"]
+    XCTAssertTrue(model.waitForExistence(timeout: 5))
+    model.tap()
+    let mcp = app.buttons["fixture-mcp"]
+    XCTAssertTrue(mcp.waitForExistence(timeout: 6))
+    XCTAssertEqual(mcp.value as? String, "On")
+    mcp.tap()
+    let off = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "Off"), object: mcp)
+    wait(for: [off], timeout: 5)
+    shot(app, "scroll-mcp-off")
+    app.buttons["Close"].firstMatch.tap()
+    composer.tap()
+    composer.typeText("A second message from the phone")
+    app.buttons["Send"].tap()
+    let reply = app.staticTexts["Visible follow-up reply."]
+    XCTAssertTrue(reply.waitForExistence(timeout: 10))
+    XCTAssertTrue(reply.isHittable)
+    shot(app, "scroll-follow-up-visible")
+  }
+
+  @MainActor
   func testPairStartAndChat() throws {
     let relay = try XCTUnwrap(env["SPARK_RELAY"], "set TEST_RUNNER_SPARK_RELAY")
     let app = XCUIApplication()

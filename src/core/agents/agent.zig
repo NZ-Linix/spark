@@ -57,6 +57,7 @@ pub const Agent = struct {
     /// bytes; empty means no title has been derived or restored yet.
     session_title: std.ArrayList(u8) = .empty,
     total_input_tokens: u64 = 0,
+    status_usage: types.SessionUsageCounters = .{},
     total_output_tokens: u64 = 0,
     total_web_search_requests: u64 = 0,
     /// A top-level instance, every one alike, or a subagent.

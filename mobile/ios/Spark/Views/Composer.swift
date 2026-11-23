@@ -16,6 +16,8 @@ struct Composer<Accessories: View, Trailing: View>: View {
   var working = "spark is working…"
   /** a terminal's field: mono, and Return sends instead of making a new line */
   var command = false
+  var canSendWhileRunning = false
+  var actionEnabled = true
   @ViewBuilder var accessories: Accessories
   /** inside the box, beside the send button: how the chat runs, always on the glass so it reads */
   @ViewBuilder var trailing: Trailing
@@ -26,7 +28,8 @@ struct Composer<Accessories: View, Trailing: View>: View {
   private static var inset: CGFloat { max(12, Screen.cornerRadius - height / 2) }
 
   private var hasText: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-  private var live: Bool { enabled && (running || hasText) }
+  private var live: Bool { enabled && actionEnabled && (running || hasText) }
+  private var isStop: Bool { running && !(hasText && canSendWhileRunning) }
   private var open: Bool { focused.wrappedValue || hasText }
 
   /** off until the screen has settled, so the bar doesn't animate into place when a screen opens */
@@ -90,15 +93,12 @@ struct Composer<Accessories: View, Trailing: View>: View {
       // the send button never moves: it stays in the corner while the box grows up from it
       .overlay(alignment: .bottomTrailing) {
         HStack(spacing: 8) {
-          if toolbar {
-            trailing
-              .frame(height: 36)
-              .fixedSize(horizontal: true, vertical: false)
-              .transition(.asymmetric(
-                // in once the box has grown its second line, so it never sits over the text on the way
-                insertion: .opacity.combined(with: .scale(scale: 0.96, anchor: .trailing)).animation(.easeOut(duration: 0.2).delay(0.3)),
-                removal: .opacity.animation(.easeOut(duration: 0.12))))
-          }
+          trailing
+            .frame(height: 36)
+            .fixedSize(horizontal: true, vertical: false)
+            .opacity(toolbar ? 1 : 0)
+            .allowsHitTesting(toolbar)
+            .accessibilityHidden(!toolbar)
           sendButton
         }
       }
@@ -114,10 +114,10 @@ struct Composer<Accessories: View, Trailing: View>: View {
 
   private var sendButton: some View {
     Button {
-      running ? stop() : send()
+      isStop ? stop() : send()
     } label: {
-      Image(systemName: running ? "stop.fill" : "arrow.up")
-        .font(.system(size: running ? 12 : 15, weight: .bold))
+      Image(systemName: isStop ? "stop.fill" : "arrow.up")
+        .font(.system(size: isStop ? 12 : 15, weight: .bold))
         .foregroundStyle(live ? .black : Color.faint)
         .frame(width: 36, height: 36)
         .background(live ? Color.white : Color.white.opacity(0.08), in: .circle)
@@ -125,7 +125,7 @@ struct Composer<Accessories: View, Trailing: View>: View {
         .contentTransition(.symbolEffect(.replace))
     }
     .buttonStyle(.plain)
-    .accessibilityLabel(running ? "Stop" : "Send")
+    .accessibilityLabel(isStop ? "Stop" : "Send")
     .disabled(!live)
   }
 }
@@ -143,10 +143,10 @@ extension Composer where Accessories == EmptyView, Trailing == EmptyView {
 extension Composer where Accessories == EmptyView {
   init(
     text: Binding<String>, focused: FocusState<Bool>.Binding, running: Bool, enabled: Bool,
-    placeholder: String = "Message spark", working: String = "spark is working…",
-    send: @escaping () -> Void, stop: @escaping () -> Void, @ViewBuilder trailing: () -> Trailing
+    placeholder: String = "Message spark", working: String = "spark is working…", canSendWhileRunning: Bool = false,
+    actionEnabled: Bool = true, send: @escaping () -> Void, stop: @escaping () -> Void, @ViewBuilder trailing: () -> Trailing
   ) {
-    self.init(text: text, focused: focused, running: running, enabled: enabled, send: send, stop: stop, placeholder: placeholder, working: working, command: false, accessories: { EmptyView() }, trailing: trailing)
+    self.init(text: text, focused: focused, running: running, enabled: enabled, send: send, stop: stop, placeholder: placeholder, working: working, command: false, canSendWhileRunning: canSendWhileRunning, actionEnabled: actionEnabled, accessories: { EmptyView() }, trailing: trailing)
   }
 }
 
@@ -192,6 +192,10 @@ struct ConfigChips: View {
   /** a new chat's library prompts and the one chosen; a running chat keeps its prompt */
   var prompts: [PromptSummary] = []
   var prompt: Binding<String>? = nil
+  var mcpNames: [String] = []
+  var mcpDisabled: Binding<Set<String>>? = nil
+  var mcpEditable = true
+  var refreshMcp: (() async -> Void)? = nil
   /** inside the composer: a small filled pill with a short name, so it reads over anything */
   var compact = false
   @State private var open = false
@@ -254,7 +258,8 @@ struct ConfigChips: View {
       .accessibilityLabel("Model")
       .accessibilityValue([model.current?.label(model.id), effort.flatMap(Effort.current).map(Effort.name)].compactMap { $0 }.joined(separator: ", "))
       .sheet(isPresented: $open) {
-        ModelSheet(options: options, set: set, prompts: prompts, prompt: prompt)
+        ModelSheet(options: options, set: set, prompts: prompts, prompt: prompt, mcpNames: mcpNames, mcpDisabled: mcpDisabled, mcpEditable: mcpEditable)
+          .task { await refreshMcp?() }
       }
     }
   }
@@ -404,6 +409,9 @@ struct ModelSheet: View {
   let set: (String, String) -> Void
   var prompts: [PromptSummary] = []
   var prompt: Binding<String>? = nil
+  var mcpNames: [String] = []
+  var mcpDisabled: Binding<Set<String>>? = nil
+  var mcpEditable = true
   @Environment(\.dismiss) private var dismiss
   @State private var query = ""
 
@@ -423,7 +431,7 @@ struct ModelSheet: View {
   }
 
   /** a short list gets a sheet just its size */
-  private var fits: Bool { (model?.options.count ?? 0) <= 8 }
+  private var fits: Bool { mcpNames.isEmpty && (model?.options.count ?? 0) <= 8 }
   private var fitHeight: CGFloat {
     64 + (effort == nil ? 0 : 138) + (menus.isEmpty && !showsPrompt ? 0 : 44) + CGFloat(model?.options.count ?? 0) * 52 + 40
   }
@@ -485,6 +493,35 @@ struct ModelSheet: View {
 
       ScrollView {
         LazyVStack(spacing: 2) {
+          if query.isEmpty, let mcpDisabled, !mcpNames.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+              Text("MCP Servers").font(.geist(13, .medium)).foregroundStyle(Color.dim)
+              ForEach(mcpNames, id: \.self) { name in
+                let on = !mcpDisabled.wrappedValue.contains(name)
+                Button {
+                  var disabled = mcpDisabled.wrappedValue
+                  if on { disabled.insert(name) } else { disabled.remove(name) }
+                  mcpDisabled.wrappedValue = disabled
+                } label: {
+                  HStack {
+                    Text(name).font(.geist(15))
+                    Spacer()
+                    Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                      .font(.system(size: 20))
+                      .foregroundStyle(on ? Effort.accent : Color.dim)
+                  }
+                  .frame(minHeight: 44)
+                  .contentShape(.rect)
+                }
+                .buttonStyle(QuietPress())
+                .accessibilityLabel(name)
+                .accessibilityValue(on ? "On" : "Off")
+              }
+            }
+            .disabled(!mcpEditable)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+          }
           ForEach(shown, id: \.value) { c in
             let on = c.value == model?.currentValue
             Button {

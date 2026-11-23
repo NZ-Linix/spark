@@ -488,6 +488,7 @@ pub fn Runtime(comptime App: type) type {
             // A fresh session starts with no usage, whether or not it persists.
             agent.total_input_tokens = 0;
             agent.total_output_tokens = 0;
+            if (comptime @hasField(AppAgent, "status_usage")) agent.status_usage = .{};
             agent.total_web_search_requests = 0;
             defer syncTranscriptWindowSaveMode(app, agent);
             defer syncTranscriptArchiveAvailable(app, agent);
@@ -1347,6 +1348,7 @@ pub fn Runtime(comptime App: type) type {
             }
             agents.storeTotal(&agent.total_input_tokens, state.total_input_tokens);
             agents.storeTotal(&agent.total_output_tokens, state.total_output_tokens);
+            if (comptime @hasField(AppAgent, "status_usage")) agent.status_usage = .{};
             agents.storeTotal(&agent.total_web_search_requests, 0);
         }
 
@@ -1377,6 +1379,7 @@ pub fn Runtime(comptime App: type) type {
 
             agents.storeTotal(&agent.total_input_tokens, state.total_input_tokens);
             agents.storeTotal(&agent.total_output_tokens, state.total_output_tokens);
+            if (comptime @hasField(AppAgent, "status_usage")) agent.status_usage = .{};
             agents.storeTotal(&agent.total_web_search_requests, 0);
 
             var historical_labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };

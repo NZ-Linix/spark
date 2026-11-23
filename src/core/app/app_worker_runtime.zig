@@ -450,6 +450,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider_resolved,
                 .api_status_text,
                 .reasoning_delta,
+                .remote_assistant_source,
                 .live_text,
                 .context_compaction,
                 .credential_refreshed,
@@ -1386,7 +1387,11 @@ pub fn Runtime(comptime App: type) type {
                     // network record; nothing interactive consumes the event
                     // today. The batch drain frees the payload.
                     .provider_resolved => {},
+                    .remote_assistant_source => |text| {
+                        if (comptime @hasField(App, "remote")) if (agent == &app.main_agent) app.remote.appendText(.assistant, text) catch {};
+                    },
                     .reasoning_delta => |text| {
+                        if (comptime @hasField(App, "remote")) if (agent == &app.main_agent) app.remote.appendText(.thought, text) catch {};
                         if (comptime agents.hasAgentField(App, "reasoning")) {
                             if (agent.reasoning.items.len < 256 * 1024) try agent.reasoning.appendSlice(std.heap.c_allocator, text);
                             app.shell.render_requests.request(.footer);
@@ -1465,6 +1470,7 @@ pub fn Runtime(comptime App: type) type {
                         if (comptime agents.hasAgentField(App, "child_run")) {
                             app_agents_runtime.Runtime(App).noteChildToolLifecycle(app, agent, lifecycle);
                         }
+                        if (comptime @hasField(App, "remote")) if (agent == &app.main_agent) app.remote.tool(lifecycle) catch {};
                         try applyToolLifecycle(app, agent, handlers.tool_lifecycle, lifecycle);
                     },
                     .finish_prompt => |finished| {

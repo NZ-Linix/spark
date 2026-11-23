@@ -1,6 +1,7 @@
 {
   "version": 1,
   "intentional_exclusions": {
+    "tui-mobile-bridge.test.ts": "Exercises optional mobile bridge attachment and sync fixtures rather than the normal CLI profile.",
     "ci-shards.test.ts": "The suite validates the E2E shard planner rather than spark runtime behavior.",
     "context-limits-live.test.ts": "The suite requires a real model credential and live provider responses.",
     "notifications.test.ts": "Sound-related tests are prohibited on the production training host.",

@@ -31,14 +31,20 @@ final class Chat {
   var usage: Usage?
   var loaded = false
   var problem: String?
-  /** open in another spark process on the host, such as a terminal: shown read-only until it lets go */
+  /** The terminal owns this chat. Without a live owner token, it is read-only. */
   var elsewhere = false
+  var terminalOwner: String?
+  var terminalRevision: String?
+  var sending = false
+  var canSend: Bool { !sending && (!elsewhere || terminalOwner != nil) && (!running || terminalOwner != nil) }
   /** a chat the phone shows before its session exists: its first message waits for the host */
   var starting = false
   /** bumped when a reply finishes, for the haptic */
   var finished = 0
   /** the library prompt the chat runs with; empty for spark's own */
   var prompt = ""
+  var mcpDisabled: Set<String> = []
+  var changingMcp = false
   /** bumped when the chat goes back to an earlier message: the thread is laid out afresh */
   var epoch = 0
   /** going back to an earlier message: the thread waits for the host */
@@ -62,7 +68,10 @@ final class Chat {
     permission = s.permission
     usage = s.usage
     elsewhere = s.elsewhere ?? false
+    terminalOwner = s.terminalOwner
+    terminalRevision = s.terminalRevision
     prompt = s.prompt ?? ""
+    mcpDisabled = Set(s.mcpDisabled ?? [])
     // rows the phone already shows keep their objects, so reopening doesn't redraw the thread
     var next: [Entry] = []
     next.reserveCapacity(s.items.count)
@@ -74,8 +83,10 @@ final class Chat {
         next.append(Entry(item))
       }
     }
-    entries = next
-    reindex()
+    if entries.count != next.count || !zip(entries, next).allSatisfy({ $0 === $1 }) {
+      entries = next
+      reindex()
+    }
     loaded = true
   }
 
@@ -87,6 +98,7 @@ final class Chat {
     if !title.isEmpty { info.title = title }
     config = s.config
     usage = s.usage
+    mcpDisabled = Set(s.mcpDisabled ?? [])
     starting = false
   }
 
@@ -115,6 +127,12 @@ final class Chat {
   func add(_ item: Item) {
     index[item.id] = entries.count
     entries.append(Entry(item))
+  }
+
+  func remove(_ id: String) {
+    guard let i = index[id] else { return }
+    entries.remove(at: i)
+    reindex()
   }
 
   func apply(_ e: Event) {

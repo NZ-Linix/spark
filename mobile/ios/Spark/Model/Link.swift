@@ -46,6 +46,7 @@ final class Link {
   }
   private(set) var sessions: [String: [SessionInfo]] = [:]
   /** the options spark last offered on each host, so a new chat can pick a model before it exists */
+  private(set) var mcpServers: [String: [String]] = [:]
   private(set) var configs: [String: [ConfigOption]] = [:]
   var chat: Chat?
 
@@ -65,6 +66,15 @@ final class Link {
   var registered: Bool { relay != nil && token != nil }
 
   init() {
+    #if DEBUG
+      if let fixture = ProcessInfo.processInfo.environment["SPARK_SCROLL_FIXTURE"],
+         let url = URL(string: fixture), url.host == "127.0.0.1" {
+        relay = url
+        token = "fixture"
+        ready = true
+        hostID = "cloud"
+      }
+    #endif
     if registered { connect() }
   }
 
@@ -302,15 +312,17 @@ final class Link {
     msg["op"] = .string(op)
     let data = try JSONEncoder().encode(["host": JSON.string(host), "msg": .object(msg)])
     let key = "\(host)#\(n)"
+    let timeout = Task {
+      do { try await Task.sleep(for: .seconds(op == "watchTerminal" ? 15 : 90)) }
+      catch { return }
+      waiting.removeValue(forKey: key)?.resume(throwing: LinkError("The host took too long to answer."))
+    }
+    defer { timeout.cancel() }
     let result: JSON = try await withCheckedThrowingContinuation { c in
       waiting[key] = c
       socket.send(.string(String(decoding: data, as: UTF8.self))) { [weak self] error in
         guard let error else { return }
         Task { @MainActor in self?.waiting.removeValue(forKey: key)?.resume(throwing: error) }
-      }
-      Task {
-        try? await Task.sleep(for: .seconds(90))
-        self.waiting.removeValue(forKey: key)?.resume(throwing: LinkError("The host took too long to answer."))
       }
     }
     if T.self == JSON.self { return result as! T }
@@ -353,7 +365,7 @@ final class Link {
    * already on screen so the host's copy replaces it in place.
    */
   @discardableResult
-  func begin(_ text: String, in folder: String?, on host: String, options: [String: String], prompt: String?) -> Chat {
+  func begin(_ text: String, in folder: String?, on host: String, options: [String: String], prompt: String?, mcpDisabled: Set<String> = []) -> Chat {
     let now = ISO8601DateFormatter().string(from: .now)
     // without a folder the host makes the chat one of its own; its path arrives with the session
     let chat = Chat(host: host, info: SessionInfo(id: "", title: Self.title(text), cwd: folder ?? "", updatedAt: now, live: true, running: true, origin: "phone", scratch: folder == nil))
@@ -369,6 +381,7 @@ final class Link {
         var fields: [String: JSON] = [:]
         if let folder { fields["cwd"] = .string(folder) }
         if let prompt { fields["prompt"] = .string(prompt) }
+        fields["mcpDisabled"] = .array(mcpDisabled.sorted().map(JSON.string))
         let snap = try await request(host, "new", fields, as: Snapshot.self)
         chat.adopt(snap)
         remember(chat)
@@ -407,30 +420,52 @@ final class Link {
     }
   }
 
-  /**
-   * Keeps a chat that another spark process has open up to date, by reading it again every few
-   * seconds. Once that process lets go, the next read opens it here and the chat can be written.
-   * Ends when the view that asked goes away.
-   */
   func follow(_ chat: Chat) async {
     while chat.elsewhere, !Task.isCancelled {
-      try? await Task.sleep(for: .seconds(3))
-      guard !Task.isCancelled, self.chat === chat, phase == .online else { continue }
-      await reopen(chat)
+      try? await Task.sleep(for: chat.terminalOwner != nil ? .milliseconds(350) : .seconds(3))
+      guard !Task.isCancelled, self.chat === chat, active, phase == .online else { continue }
+      guard let revision = chat.terminalRevision else {
+        await reopen(chat)
+        continue
+      }
+      do {
+        let snap = try await request(chat.host, "watchTerminal", ["s": .string(chat.info.id), "revision": .string(revision)], as: Snapshot?.self)
+        guard !Task.isCancelled, chat.terminalRevision == revision, let snap else { continue }
+        chat.load(snap)
+        remember(chat)
+      } catch {
+        guard !Task.isCancelled else { return }
+        // An older bridge or a dropped connection can be recovered by a normal open.
+        await reopen(chat)
+      }
     }
   }
 
-  /** shows the message at once; the host's copy, with the same id, replaces it */
-  func send(_ text: String, in chat: Chat) async {
+  @discardableResult
+  func send(_ text: String, in chat: Chat) async -> Bool {
+    guard chat.canSend else { return false }
+    chat.sending = true
+    defer { chat.sending = false }
     let item = Item(id: UUID().uuidString, role: .user, text: text)
-    chat.add(item)
-    chat.running = true
+    let owner = chat.terminalOwner
+    var fields: [String: JSON] = ["s": .string(chat.info.id), "text": .string(text), "item": .string(item.id)]
+    if let owner {
+      fields["terminalOwner"] = .string(owner)
+    } else {
+      chat.add(item)
+      chat.running = true
+    }
     do {
-      _ = try await request(chat.host, "prompt", ["s": .string(chat.info.id), "text": .string(text), "item": .string(item.id)])
+      _ = try await request(chat.host, "prompt", fields)
       chat.problem = nil
+      return true
     } catch {
-      chat.running = false
+      if owner == nil {
+        chat.remove(item.id)
+        chat.running = false
+      }
       chat.problem = error.localizedDescription
+      return false
     }
   }
 
@@ -474,7 +509,13 @@ final class Link {
 
   func cancel(_ chat: Chat) async {
     guard !chat.info.id.isEmpty else { return }
-    _ = try? await request(chat.host, "cancel", ["s": .string(chat.info.id)])
+    var fields: [String: JSON] = ["s": .string(chat.info.id)]
+    if let owner = chat.terminalOwner { fields["terminalOwner"] = .string(owner) }
+    do {
+      _ = try await request(chat.host, "cancel", fields)
+    } catch {
+      chat.problem = error.localizedDescription
+    }
   }
 
   func rename(_ session: SessionInfo, on host: String, to title: String) async throws {
@@ -522,6 +563,25 @@ final class Link {
   }
 
   /** what a new chat on this host starts with, when no chat there has told us yet */
+  func loadMcpServers(_ host: String) async {
+    if let names = try? await request(host, "mcpServers", as: [String].self) { mcpServers[host] = names }
+  }
+
+  func setMcp(_ chat: Chat, disabled: Set<String>) async {
+    guard !chat.changingMcp, !chat.running, !chat.elsewhere else { return }
+    chat.changingMcp = true
+    let before = chat.mcpDisabled
+    chat.mcpDisabled = disabled
+    defer { chat.changingMcp = false }
+    do {
+      let saved = try await request(chat.host, "sessionMcp", ["s": .string(chat.info.id), "disabled": .array(disabled.sorted().map(JSON.string))], as: [String].self)
+      chat.mcpDisabled = Set(saved)
+    } catch {
+      chat.mcpDisabled = before
+      chat.problem = error.localizedDescription
+    }
+  }
+
   func loadOptions(_ host: String) async {
     guard configs[host] == nil else { return }
     if let options = try? await request(host, "options", [:], as: [ConfigOption].self), !options.isEmpty {

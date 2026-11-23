@@ -2055,6 +2055,15 @@ pub const Session = struct {
         return self.handle.id();
     }
 
+    pub fn terminalTurnPosition(self: *Session) struct { committed: u64, current: u64 } {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return .{
+            .committed = self.last_turn -| @as(u64, @intFromBool(self.turn_open)),
+            .current = if (self.turn_open) self.last_turn else self.last_turn +| 1,
+        };
+    }
+
     /// Appends through the manager; a host session also traces the turn and
     /// child lines `Wiring.tla` models. The first item lists every blob the
     /// stores kept since the last such line, so verify and recover see a

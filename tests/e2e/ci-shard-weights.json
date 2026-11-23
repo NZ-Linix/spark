@@ -51,6 +51,7 @@
   { "file": "tui-interrupt-recovery.test.ts", "weight": 9 },
   { "file": "tui-keybindings.test.ts", "weight": 1 },
   { "file": "tui-mcp-deny-rules.test.ts", "weight": 8 },
+  { "file": "tui-mobile-bridge.test.ts", "weight": 2 },
   { "file": "tui-native-clear-recovery.test.ts", "weight": 35 },
   { "file": "tui-permissions.test.ts", "weight": 127 },
   { "file": "tui-permissions-panel.test.ts", "weight": 25 },

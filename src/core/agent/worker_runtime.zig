@@ -531,6 +531,7 @@ pub const WorkerEvent = union(enum) {
     api_status_text: []u8,
     /// A piece of the model's reasoning, shown as a thinking block.
     reasoning_delta: []u8,
+    remote_assistant_source: []u8,
     /// The reply's line in progress, for the live preview; empty when done.
     live_text: []u8,
     credential_refreshed: credentials.Credential,
@@ -3713,6 +3714,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .provider_resolved => |slug| .{ .provider_resolved = try alloc.dupe(u8, slug) },
         .api_status_text => |text| .{ .api_status_text = try alloc.dupe(u8, text) },
         .reasoning_delta => |text| .{ .reasoning_delta = try alloc.dupe(u8, text) },
+        .remote_assistant_source => |text| .{ .remote_assistant_source = try alloc.dupe(u8, text) },
         .live_text => |text| .{ .live_text = try alloc.dupe(u8, text) },
         .credential_refreshed => |credential| .{
             .credential_refreshed = try credential.clone(alloc),
@@ -3799,7 +3801,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .route_recovery_status => {},
         .clear_route_recovery_status => {},
         .provider_resolved => |slug| alloc.free(slug),
-        .api_status_text, .reasoning_delta, .live_text => |text| alloc.free(text),
+        .api_status_text, .reasoning_delta, .remote_assistant_source, .live_text => |text| alloc.free(text),
         .credential_refreshed => |credential| {
             var owned = credential;
             owned.deinit(alloc);

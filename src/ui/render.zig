@@ -217,6 +217,7 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
 }
 
 pub const StatuslineItems = struct {
+    usage: ?types.SessionUsageCounters = null,
     ultrafast_indicator_active: bool = false,
     workspace_label: []const u8 = "",
     git_branch: ?[]const u8 = null,
@@ -428,20 +429,40 @@ fn appendSessionStatusSegments(
     if (statusline.session_title) |title| {
         appendStatusSegment(out, end, display_width.prefixByWidth(title, max_session_title_cells));
     }
-    if (statusline.context_used > 0) {
-        if (statusline.context_total) |total| {
-            const used_k = statusline.context_used / 1000;
-            const total_k: u64 = @as(u64, total) / 1000;
-            const pct = if (total > 0) (statusline.context_used * 100) / @as(u64, total) else 0;
-            var ctx_buf: [48]u8 = undefined;
-            appendStatusSegment(out, end, std.mem.print(&ctx_buf, "{d}k/{d}k {d}%", .{ used_k, total_k, pct }) catch "");
-        } else {
-            const used_k = statusline.context_used / 1000;
-            var ctx_buf: [32]u8 = undefined;
-            appendStatusSegment(out, end, std.mem.print(&ctx_buf, "{d}k", .{used_k}) catch "");
-        }
+    var ctx_buf: [48]u8 = undefined;
+    var count_buf: [32]u8 = undefined;
+    if (statusline.context_total) |total| {
+        if (total != 0) appendStatusSegment(out, end, std.fmt.bufPrint(&ctx_buf, "{d:.1}%/{s}", .{
+            percent(statusline.context_used, total), compactTokens(&count_buf, total),
+        }) catch "");
+    } else if (statusline.context_used > 0) {
+        appendStatusSegment(out, end, compactTokens(&count_buf, statusline.context_used));
+    }
+    if (statusline.usage) |usage| {
+        var bufs: [4][32]u8 = undefined;
+        var usage_buf: [160]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&usage_buf);
+        w.print("↑{s} ↓{s} R{s} W{s}", .{
+            compactTokens(&bufs[0], usage.input), compactTokens(&bufs[1], usage.output),
+            compactTokens(&bufs[2], usage.read),  compactTokens(&bufs[3], usage.write),
+        }) catch unreachable;
+        if (usage.cacheable > 0) w.print(" CH{d:.1}%", .{percent(usage.read, usage.cacheable)}) catch unreachable;
+        appendStatusSegment(out, end, w.buffered());
     }
     appendWorkspaceIdentity(out, end, status_limit, statusline);
+}
+
+fn percent(n: u64, d: u64) f64 {
+    return @as(f64, @floatFromInt(n)) * 100 / @as(f64, @floatFromInt(d));
+}
+
+fn compactTokens(buf: []u8, n: u64) []const u8 {
+    const scale: u64, const suffix: []const u8 = if (n >= 1_000_000) .{ 1_000_000, "M" } else if (n >= 1_000) .{ 1_000, "k" } else .{ 1, "" };
+    const tenths = (n % scale) * 10 / scale;
+    return if (tenths > 0 and n / scale < 100)
+        std.fmt.bufPrint(buf, "{d}.{d}{s}", .{ n / scale, tenths, suffix }) catch ""
+    else
+        std.fmt.bufPrint(buf, "{d}{s}", .{ n / scale, suffix }) catch "";
 }
 
 pub const subagent_status_width: u16 = 200;

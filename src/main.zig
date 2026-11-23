@@ -123,6 +123,7 @@ const question_prompt = @import("core/agent/question_prompt.zig");
 const gateway_client = @import("gateway/client.zig");
 const url_opener = @import("core/hosts/url_opener.zig");
 const event_loop = @import("ui/event_loop.zig");
+const terminal_remote = @import("core/app/terminal_remote.zig");
 const footer_runtime = @import("ui/footer/runtime.zig");
 const question_ui = @import("ui/footer/question_ui.zig");
 const ui_input = @import("ui/input/runtime.zig");
@@ -549,6 +550,7 @@ const App = struct {
     manual_update: app_upgrade_runtime.ManualUpdate = .{},
 
     statusline_context: bool = false,
+    remote: terminal_remote.State = .{},
     statusline_session: bool = false,
     /// Resolved `session_titles` preference: generate a model-written session
     /// title from the first prompt of a fresh session.
@@ -884,6 +886,7 @@ const App = struct {
         shutdown_trace.mark("credentials_saved");
         self.mcp.deinitForProcessExit();
         shutdown_trace.mark("mcp_children_terminated");
+        self.remote.deinit(self.alloc);
         shutdown_trace.mark("complete");
         if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
         return .{ .handoff = resume_handoff, .failure = shutdown_failure };
@@ -924,6 +927,7 @@ const App = struct {
         AgentsAppRuntime.stopChildren(self, .cooperative);
         if (main_agent.worker_thread) |thread| thread.join();
         shutdown_trace.mark("worker_thread_joined");
+        self.remote.deinit(self.alloc);
         // No agent turn can arm the warmer now, and its pings must stop
         // before the providers they use are released below. Each other
         // agent's session closed its own warmer with it.
@@ -1132,6 +1136,10 @@ const App = struct {
     }
 
     pub fn enqueuePromptWithSkillBindings(self: *App, agent: *agents.Agent, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
+        return self.admitInteractiveText(agent, prompt, skill_tokens, null);
+    }
+
+    fn admitInteractiveText(self: *App, agent: *agents.Agent, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan, images: ?[]const types.ImageAttachment) !bool {
         try AgentAppRuntime.refreshProjectContext(self, agent);
         self.noteModelCatalogActivity();
         agent.session.setConversationLanguageFromUserMessage(prompt);
@@ -1146,11 +1154,11 @@ const App = struct {
                 debug_trace.preview(prompt, 120),
             },
         );
-        if (!try self.snapshotAndAdmitInteractivePromptWithSkillBindings(
-            agent,
-            prompt,
-            skill_tokens,
-        )) return false;
+        const queued = try self.snapshotPrompt(agent, prompt, skill_tokens, null, images, 0, false);
+        agent.worker.admitInteractivePrompt(std.heap.c_allocator, queued) catch |err| {
+            releaseUnadmittedPrompt(agent, queued);
+            return err;
+        };
         WorkerAppRuntime.syncState(
             self,
             agent,
@@ -1215,6 +1223,9 @@ const App = struct {
     }
 
     pub fn acceptPresentedPrompt(self: *App, agent: *agents.Agent, turn_id: u64) !void {
+        if (agent.submission.pending) |pending| {
+            if (pending.draft.turn_id == turn_id) self.remoteUser(agent, pending.draft.prompt);
+        }
         try InputSubmitRuntime.acceptPresentedPrompt(self, agent, turn_id);
     }
 
@@ -1405,26 +1416,6 @@ const App = struct {
 
     pub fn flushDirectTerminalShutdownOutcome(self: *App) !void {
         try RenderAppRuntime.flushRequestedFrame(@as(*Self, self), self.screenAgent());
-    }
-
-    fn snapshotAndAdmitInteractivePromptWithSkillBindings(
-        self: *App,
-        agent: *agents.Agent,
-        prompt: []const u8,
-        skill_tokens: []const registered_entities.SkillTokenSpan,
-    ) !bool {
-        const queued = try self.snapshotPrompt(
-            agent,
-            prompt,
-            skill_tokens,
-            null,
-            null,
-            0,
-            false,
-        );
-        errdefer releaseUnadmittedPrompt(agent, queued);
-        try agent.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
-        return true;
     }
 
     fn snapshotAndQueuePrompt(
@@ -2925,6 +2916,46 @@ const App = struct {
         };
     }
 
+    pub fn remoteUser(self: *App, agent: *agents.Agent, text: []const u8) void {
+        if (agent != &self.main_agent) return;
+        const v2 = agent.session_persistence.v2 orelse return;
+        if (!std.mem.eql(u8, v2.id(), self.remote.session) and !self.remote.poll(self.alloc, v2.id(), io_mod.milliTimestamp())) return;
+        self.remote.user(self.alloc, v2.terminalTurnPosition().current, text) catch {};
+    }
+
+    fn pollRemote(self: *App) void {
+        const agent = &self.main_agent;
+        const now = io_mod.milliTimestamp();
+        if (!self.remote.poll(self.alloc, SessionAppRuntime.activeSessionId(agent), now)) return;
+        const v2 = agent.session_persistence.v2 orelse return;
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        if (self.remote.read(scratch.allocator(), now)) |request| {
+            const result = self.applyRemote(agent, request);
+            self.remote.ack(request.ticket, result);
+        }
+        const active = agent.stream.active or agent.worker.isProcessing() or agent.worker.queuedPromptCount() > 0;
+        self.remote.publish(now, v2.terminalTurnPosition().committed, active);
+    }
+
+    fn applyRemote(self: *App, agent: *agents.Agent, request: terminal_remote.Request) ?[]const u8 {
+        switch (request.op) {
+            .prompt => {
+                const text = std.mem.trim(u8, request.text, " \t\r\n");
+                if (text.len == 0 or text.len > 16 * 1024) return "Send a message between 1 byte and 16 KB.";
+                if (self.screenAgent() != agent) return "Switch to the main chat in the Mac terminal first.";
+                if (agent.worker.queuedPromptCount() >= 8) return "Too many messages are queued.";
+                const accepted = self.admitInteractiveText(agent, text, &.{}, &.{}) catch return "spark couldn't accept the message on the Mac.";
+                if (!accepted) return "spark couldn't accept the message on the Mac.";
+            },
+            .cancel => {
+                if (self.screenAgent() != agent) return "Switch to the main chat in the Mac terminal first.";
+                @import("core/app/input_interrupt_runtime.zig").InterruptRuntime(App).cancelActiveOperation(self, agent) catch return "spark couldn't stop the turn on the Mac.";
+            },
+        }
+        return null;
+    }
+
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self, self.screenAgent())) return;
@@ -3089,6 +3120,7 @@ const App = struct {
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendPrompt(self);
         HerdrAppRuntime.reconcile(self);
+        self.pollRemote();
     }
 
     /// Gives a subagent's question lent to main's prompt back to it, before

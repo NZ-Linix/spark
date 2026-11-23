@@ -8,7 +8,6 @@ struct ChatView: View {
   @State private var draft = ""
   @FocusState private var focused: Bool
   @State private var sent = 0
-  @State private var position = ScrollPosition(edge: .bottom)
   /** following the newest text: on at the bottom, off once you scroll up, on again back down */
   @State private var pinned = true
   /** a finger is on the thread, or it's still gliding from one */
@@ -39,8 +38,6 @@ struct ChatView: View {
         ProgressView().tint(Color.dim).transition(.opacity)
       }
     }
-    .animation(.smooth(duration: 0.3), value: chat.loaded)
-    .animation(.smooth(duration: 0.3), value: chat.isEmpty)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .page()
     .safeAreaInset(edge: .bottom, spacing: 0) { bottom }
@@ -63,6 +60,7 @@ struct ChatView: View {
     .onChange(of: chat.loaded) { _, loaded in if loaded, chat.isEmpty { focused = true } }
     .task(id: chat.elsewhere) { if chat.elsewhere { await link.follow(chat) } }
     .task(id: link.phase == .online) {
+      if link.phase == .online { await link.loadMcpServers(chat.host) }
       // the chat's prompt can change from the model sheet once the library's prompts are known
       guard link.phase == .online, link.prompts.isEmpty, link.hosts.contains(where: { $0.kind == .cloud }) else { return }
       _ = try? await link.loadPrompts()
@@ -95,9 +93,12 @@ struct ChatView: View {
         .transition(Settle(distance: 12))
       }
       Composer(
-        text: $draft, focused: $focused, running: chat.running && !chat.elsewhere,
-        enabled: chat.loaded && !chat.elsewhere && !chat.rewinding && link.phase == .online,
-        placeholder: editing == nil ? "Message spark" : "Edit your message"
+        text: $draft, focused: $focused, running: chat.running && (!chat.elsewhere || chat.terminalOwner != nil),
+        enabled: chat.loaded && (!chat.elsewhere || chat.terminalOwner != nil) && !chat.rewinding && link.phase == .online,
+        placeholder: editing == nil ? "Message spark" : "Edit your message",
+        working: chat.terminalOwner != nil ? "Message the Mac…" : "spark is working…",
+        canSendWhileRunning: chat.terminalOwner != nil,
+        actionEnabled: !chat.sending && !chat.changingMcp
       ) {
         send()
       } stop: {
@@ -106,12 +107,11 @@ struct ChatView: View {
         ConfigChips(options: chat.config, set: { id, value in
           if id == "effort" { UserDefaults.standard.set(value, forKey: "effort") }
           Task { await link.set(chat, id, to: value) }
-        }, prompts: link.prompts, prompt: promptBinding, compact: true)
+        }, prompts: link.prompts, prompt: promptBinding, mcpNames: link.mcpServers[chat.host] ?? [],
+          mcpDisabled: Binding(get: { chat.mcpDisabled }, set: { disabled in Task { await link.setMcp(chat, disabled: disabled) } }),
+          mcpEditable: !chat.running && !chat.changingMcp, refreshMcp: { await link.loadMcpServers(chat.host) }, compact: true)
       }
     }
-    .animation(.spring(duration: 0.45, bounce: 0.18), value: chat.permission)
-    .animation(.smooth, value: chat.problem)
-    .animation(.smooth(duration: 0.28), value: editing?.id)
   }
 
   /** the chat's library prompt; a change starts its spark again with the new one */
@@ -126,6 +126,7 @@ struct ChatView: View {
   private var elsewhereNote: String? {
     guard chat.elsewhere else { return nil }
     let name = link.hosts.first { $0.id == chat.host }?.name ?? "the Mac"
+    if chat.terminalOwner != nil { return "Live on \(name)" }
     return "Open in spark on \(name). Close it there to write here."
   }
 
@@ -142,87 +143,72 @@ struct ChatView: View {
     // while a message is being edited, it and everything after it fade: sending replaces them
     let cut = editing.flatMap { e in chat.entries.firstIndex { $0.id == e.id } }
     let order = cut == nil ? [:] : Dictionary(uniqueKeysWithValues: chat.entries.enumerated().map { ($1.id, $0) })
-    return ScrollView {
-      LazyVStack(alignment: .leading, spacing: 0) {
-        ForEach(units) { unit in
-          Group {
-            switch unit.kind {
-            case .one(let entry):
-              Row(entry: entry, live: entry.id == liveID, arriving: entry.id == first, ends: ends.contains(entry.id), changeable: changeable, act: act)
-            case .tools(let entries):
-              ToolGroup(entries: entries, live: entries.last?.id == liveID)
+    return ScrollViewReader { reader in
+      ScrollView {
+        VStack(alignment: .leading, spacing: 0) {
+          ForEach(units) { unit in
+            Group {
+              switch unit.kind {
+              case .one(let entry):
+                Row(entry: entry, live: entry.id == liveID, arriving: entry.id == first, ends: ends.contains(entry.id), changeable: changeable, disclose: pauseFollowing, act: act)
+              case .tools(let entries):
+                ToolGroup(entries: entries, live: entries.last?.id == liveID, disclose: pauseFollowing)
+              }
             }
+            .padding(.top, unit.gap)
+            .opacity(cut.map { (order[unit.id] ?? 0) >= $0 ? 0.3 : 1 } ?? 1)
           }
-          .padding(.top, unit.gap)
-          .opacity(cut.map { (order[unit.id] ?? 0) >= $0 ? 0.3 : 1 } ?? 1)
-          .transition(unit.role == .user ? AnyTransition(Sent()) : AnyTransition(Settle(distance: 8)))
+          if chat.running {
+            WorkingLine(chat: chat)
+          }
         }
-        if chat.running {
-          WorkingLine(chat: chat)
+        .padding(.horizontal, 18)
+        .padding(.top, 8)
+        .padding(.bottom, 24)
+        Color.clear.frame(height: 1).id("chat-bottom").accessibilityHidden(true)
+      }
+      // going back to an earlier message lays the thread out afresh, from the bottom
+      .id(chat.epoch)
+      .transition(.opacity)
+      .defaultScrollAnchor(.bottom, for: .initialOffset)
+      // a short chat reads from the top, so a new one starts under the title and grows down
+      .defaultScrollAnchor(.top, for: .alignment)
+      .scrollDismissesKeyboard(.interactively)
+      .onScrollPhaseChange { _, phase in
+        scrolling = phase == .tracking || phase == .interacting || phase == .decelerating
+      }
+      .onScrollGeometryChange(for: Fill.self, of: Fill.init) { old, new in
+        if scrolling, new.offset != old.offset { pinned = new.distance < 44 }
+        if away != (new.distance > 160) { away = new.distance > 160 }
+        if pinned, !scrolling, new.end != old.end, new.distance > 1 { follow(reader) }
+      }
+      .onChange(of: chat.epoch) { _, _ in follow(reader) }
+      .onChange(of: sent) { _, _ in follow(reader) }
+      .overlay(alignment: .bottom) {
+        if away && !pinned {
+          Button {
+            pinned = true
+            follow(reader)
+          } label: {
+            Image(systemName: "arrow.down")
+              .font(.system(size: 14, weight: .semibold))
+              .frame(width: 38, height: 38)
+              .glassEffect(.regular.interactive(), in: .circle)
+              .contentShape(.circle)
+          }
+          .buttonStyle(.plain)
+          .accessibilityLabel("Scroll to the newest")
+          .padding(.bottom, 12)
+          .transition(.scale(0.8).combined(with: .opacity))
         }
       }
-      .padding(.horizontal, 18)
-      .padding(.top, 8)
-      .padding(.bottom, 24)
-      .animation(.spring(duration: 0.5, bounce: 0.14), value: units.count)
-      .animation(.smooth(duration: 0.25), value: cut)
-    }
-    // going back to an earlier message lays the thread out afresh, from the bottom
-    .id(chat.epoch)
-    .transition(.opacity)
-    .scrollPosition($position)
-    .defaultScrollAnchor(.bottom)
-    // a short chat reads from the top, so a new one starts under the title and grows down
-    .defaultScrollAnchor(.top, for: .alignment)
-    .scrollDismissesKeyboard(.interactively)
-    .onScrollPhaseChange { _, phase in
-      scrolling = phase == .tracking || phase == .interacting || phase == .decelerating
-      // a glide that came to rest at the bottom follows again from there
-      if phase == .idle, pinned { follow() }
-    }
-    .onScrollGeometryChange(for: Fill.self, of: Fill.init) { old, new in
-      if scrolling, new.end == old.end {
-        // only a finger decides: scrolled up stops following, back at the bottom starts again
-        pinned = new.distance < 56
-      }
-      let far = new.distance > 320
-      if far != away { withAnimation(.smooth(duration: 0.25)) { away = far } }
-      guard !scrolling else { return }
-      if pinned, new.end != old.end {
-        // the reply grew a line, or the composer or keyboard moved: glide down with it. A jump as
-        // big as a screen is the thread being laid out, which lands at once
-        follow(duration: abs(new.end - old.end) > 300 ? nil : 0.3)
-      } else if new.distance < -1 {
-        // past the end, after the content got shorter: never leave the page on empty space
-        follow()
-      }
-    }
-    .overlay(alignment: .bottom) {
-      if away {
-        Button {
-          pinned = true
-          follow(duration: 0.45)
-        } label: {
-          Image(systemName: "arrow.down")
-            .font(.system(size: 14, weight: .semibold))
-            .frame(width: 38, height: 38)
-            .glassEffect(.regular.interactive(), in: .circle)
-            .contentShape(.circle)
+      .overlay {
+        if chat.rewinding {
+          ProgressView().tint(Color.dim).transition(.opacity)
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Scroll to the newest")
-        .padding(.bottom, 12)
-        .transition(.scale(0.8).combined(with: .opacity))
       }
+      .animation(.smooth(duration: 0.2), value: chat.rewinding)
     }
-    .overlay {
-      if chat.rewinding {
-        ProgressView().tint(Color.dim).transition(.opacity)
-      }
-    }
-    .animation(.smooth(duration: 0.2), value: chat.rewinding)
-    // a tap anywhere in the thread puts the keyboard away; buttons and links still get theirs
-    .simultaneousGesture(TapGesture().onEnded { focused = false })
   }
 
   /** the last answer in each turn, which gets the copy, retry and go-back buttons */
@@ -241,11 +227,13 @@ struct ChatView: View {
     return ends
   }
 
-  /** the scroll view's bottom edge follows the newest text; short, smooth glides keep up with streaming */
-  private func follow(duration: Double? = 0.3) {
-    guard let duration else { return position.scrollTo(edge: .bottom) }
-    withAnimation(.smooth(duration: duration)) { position.scrollTo(edge: .bottom) }
+  private func follow(_ reader: ScrollViewProxy) {
+    var transaction = Transaction()
+    transaction.disablesAnimations = true
+    withTransaction(transaction) { reader.scrollTo("chat-bottom", anchor: .bottom) }
   }
+
+  private func pauseFollowing() { pinned = false }
 
   @ToolbarContentBuilder private var toolbar: some ToolbarContent {
     ToolbarItem(placement: .topBarLeading) {
@@ -326,7 +314,7 @@ struct ChatView: View {
 
   private func send() {
     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !text.isEmpty, !chat.running, !chat.rewinding else { return }
+    guard !text.isEmpty, chat.canSend, !chat.rewinding, !chat.changingMcp else { return }
     draft = ""
     pinned = true
     if let target = editing {
@@ -335,8 +323,7 @@ struct ChatView: View {
       return
     }
     sent += 1
-    // the keyboard stays up: the message rises from the composer without the page moving under it
-    Task { await link.send(text, in: chat) }
+    Task { if !(await link.send(text, in: chat)), draft.isEmpty { draft = text } }
   }
 }
 
@@ -344,11 +331,13 @@ struct ChatView: View {
 private struct Fill: Equatable {
   var distance: CGFloat
   var end: CGFloat
+  var offset: CGFloat
 
   init(_ g: ScrollGeometry) {
     let end = max(-g.contentInsets.top, g.contentSize.height + g.contentInsets.bottom - g.containerSize.height)
     self.end = end.rounded()
-    distance = (end - g.contentOffset.y).rounded()
+    offset = g.contentOffset.y.rounded()
+    distance = self.end - offset
   }
 }
 
@@ -394,7 +383,6 @@ private struct Unit: Identifiable {
 
   let id: String
   let kind: Kind
-  let role: Item.Role
   let gap: CGFloat
 
   /** groups by role only, which never changes for a row, so streaming text doesn't rebuild the list */
@@ -408,11 +396,11 @@ private struct Unit: Identifiable {
         var j = i
         while j < entries.count, entries[j].role == .tool { j += 1 }
         let run = Array(entries[i..<j])
-        out.append(Unit(id: e.id, kind: run.count == 1 ? .one(e) : .tools(run), role: .tool, gap: gap(prev, .tool)))
+        out.append(Unit(id: e.id, kind: run.count == 1 ? .one(e) : .tools(run), gap: gap(prev, .tool)))
         prev = .tool
         i = j
       } else {
-        out.append(Unit(id: e.id, kind: .one(e), role: e.role, gap: gap(prev, e.role)))
+        out.append(Unit(id: e.id, kind: .one(e), gap: gap(prev, e.role)))
         prev = e.role
         i += 1
       }
@@ -488,6 +476,7 @@ private struct Row: View {
   var ends = false
   /** spark isn't working on the chat, so it can go back or try again */
   var changeable = false
+  let disclose: () -> Void
   var act: (RowAction, Entry) -> Void = { _, _ in }
 
   var body: some View {
@@ -509,9 +498,8 @@ private struct Row: View {
             .transition(.opacity)
         }
       }
-      .animation(.smooth(duration: 0.3), value: live)
-    case .thought: ThoughtRow(text: item.text, live: live)
-    case .tool: ToolRow(entry: entry)
+    case .thought: ThoughtRow(text: item.text, live: live, disclose: disclose)
+    case .tool: ToolRow(entry: entry, disclose: disclose)
     case .notice:
       Text(item.text)
         .font(.geist(13))
@@ -596,12 +584,14 @@ private struct UserBubble<Menu: View>: View {
 private struct ThoughtRow: View {
   let text: String
   let live: Bool
+  let disclose: () -> Void
   @State private var open = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       Button {
-        withAnimation(.fold) { open.toggle() }
+        disclose()
+        open.toggle()
       } label: {
         HStack(spacing: 6) {
           Text(live ? "Thinking" : "Thought")
@@ -626,27 +616,10 @@ private struct ThoughtRow: View {
           .padding(.leading, 12)
           .overlay(alignment: .leading) { Capsule().fill(Color.hairline).frame(width: 2) }
           .padding(.top, 8)
-          .transition(.unfold)
       }
     }
     .clipped()
-    .animation(.smooth(duration: 0.3), value: live)
     .sensoryFeedback(.selection, trigger: open)
-  }
-}
-
-extension Animation {
-  /** a fold opening or closing: one smooth curve for the height and the chevron */
-  fileprivate static let fold = Animation.smooth(duration: 0.34)
-}
-
-extension AnyTransition {
-  /** folded content fades in just under its line, and fades out quicker than the fold closes */
-  fileprivate static var unfold: AnyTransition {
-    .asymmetric(
-      insertion: .opacity.combined(with: .offset(y: -6)).animation(.smooth(duration: 0.3).delay(0.05)),
-      removal: .opacity.animation(.easeOut(duration: 0.12))
-    )
   }
 }
 
@@ -657,22 +630,12 @@ private struct MaybeShimmer: ViewModifier {
   }
 }
 
-/** spark is between steps: a terminal's block cursor, blinking while it waits. */
 private struct Working: View {
-  @State private var on = true
-
   var body: some View {
-    HStack(spacing: 8) {
-      RoundedRectangle(cornerRadius: 1.5)
-        .fill(Color.dim)
-        .frame(width: 8, height: 15)
-        .opacity(on ? 1 : 0.15)
-        .onAppear { withAnimation(.easeInOut(duration: 0.5).repeatForever()) { on = false } }
-      Text("Working")
-        .font(.geist(14, .medium))
-        .modifier(Shimmer())
-    }
-    .foregroundStyle(Color.dim)
+    Text("Working")
+      .font(.geist(14, .medium))
+      .modifier(Shimmer())
+      .foregroundStyle(Color.dim)
   }
 }
 
@@ -680,12 +643,14 @@ private struct Working: View {
 private struct ToolGroup: View {
   let entries: [Entry]
   let live: Bool
+  let disclose: () -> Void
   @State private var open = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       Button {
-        withAnimation(.fold) { open.toggle() }
+        disclose()
+        open.toggle()
       } label: {
         HStack(spacing: 9) {
           Image(systemName: "square.stack.3d.up")
@@ -714,13 +679,12 @@ private struct ToolGroup: View {
 
       if open {
         VStack(alignment: .leading, spacing: 0) {
-          ForEach(entries) { ToolRow(entry: $0) }
+          ForEach(entries) { ToolRow(entry: $0, disclose: disclose) }
         }
         .padding(.leading, 8)
         .overlay(alignment: .leading) { Capsule().fill(Color.hairline).frame(width: 1.5).padding(.vertical, 6) }
-        .transition(.unfold)
       } else if live, let last = entries.last {
-        ToolRow(entry: last)
+        ToolRow(entry: last, disclose: disclose)
           .id(last.id)
           .transition(.opacity)
       }
@@ -759,6 +723,7 @@ private struct ToolGroup: View {
 /** One thing spark did: what it ran or touched on one line, the output a tap away. */
 private struct ToolRow: View {
   let entry: Entry
+  let disclose: () -> Void
   @State private var open = false
 
   var body: some View {
@@ -766,7 +731,8 @@ private struct ToolRow: View {
     VStack(alignment: .leading, spacing: 0) {
       Button {
         guard hasOutput(item) else { return }
-        withAnimation(.fold) { open.toggle() }
+        disclose()
+        open.toggle()
       } label: {
         HStack(alignment: .center, spacing: 9) {
           Image(systemName: symbol(item))
@@ -797,7 +763,6 @@ private struct ToolRow: View {
         OutputBlock(text: output)
           .padding(.top, 4)
           .padding(.bottom, 6)
-          .transition(.unfold)
       }
     }
     .clipped()
@@ -851,6 +816,7 @@ private struct ToolRow: View {
     case "search": "magnifyingglass"
     case "fetch": "globe"
     case "think": "list.bullet"
+    case "mcp": "point.3.connected.trianglepath.dotted"
     default: "wrench.and.screwdriver"
     }
   }

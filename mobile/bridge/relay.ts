@@ -15,7 +15,7 @@
  */
 import type { ServerWebSocket } from "bun";
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, watchFile } from "node:fs";
 import { dirname, join } from "node:path";
 import { Host } from "./host";
 import { applySnapshot, Library } from "./library";
@@ -101,6 +101,7 @@ function spreadLibrary() {
   for (const ws of hostSockets.values()) ws.send(text);
 }
 library.onChange(spreadLibrary);
+watchFile(join(DATA, "library", "mcp.json"), { interval: 2_000, persistent: false }, spreadLibrary);
 
 /** a Mac's own provider edit, from spark on that Mac */
 async function macLibraryOp(op: any): Promise<unknown> {

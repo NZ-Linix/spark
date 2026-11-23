@@ -1088,7 +1088,13 @@ pub fn Bindings(comptime App: type) type {
                 .assistant_started => try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{
                     .assistant_presentation = .attempt_start,
                 }),
-                .assistant_source => {},
+                .assistant_source => |text| {
+                    if (comptime @hasField(App, "remote")) {
+                        if (agent == &app.main_agent and app.remote.enabled.load(.monotonic)) {
+                            app_worker_runtime.Runtime(App).pushEvent(app, agent, .{ .remote_assistant_source = @constCast(text) }) catch {};
+                        }
+                    }
+                },
                 .assistant_pending => |text| try app_worker_runtime.Runtime(App).pushEvent(app, agent, .{ .live_text = @constCast(text) }),
                 .assistant_rendered => |text| try app_worker_runtime.Runtime(App).pushText(app, agent, text),
                 // pushEvent copies the payload into the queue's ownership.
@@ -1277,6 +1283,20 @@ pub fn Bindings(comptime App: type) type {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             if (usage.input_tokens) |input| agents.storeTotal(&agent.total_input_tokens, input);
             if (usage.output_tokens) |output| agents.storeTotal(&agent.total_output_tokens, output);
+            if (comptime @hasField(AppAgent, "status_usage")) {
+                const stats = &agent.status_usage;
+                if (usage.input_tokens) |input| {
+                    const read = @min(input, usage.cache_read_tokens orelse 0);
+                    const written = @min(input - read, usage.cache_write_tokens orelse 0);
+                    agents.addTotal(&stats.input, input - read - written);
+                    agents.addTotal(&stats.read, read);
+                    agents.addTotal(&stats.write, written);
+                    if (usage.cache_read_tokens != null or usage.cache_write_tokens != null) {
+                        agents.addTotal(&stats.cacheable, input);
+                    }
+                }
+                agents.addTotal(&stats.output, usage.output_tokens orelse 0);
+            }
         }
 
         fn agentReportInnerToolUsage(ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void {
@@ -1289,6 +1309,7 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeWriteUserPrompt(ctx: *anyopaque, prompt: types.UserTurn) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
+            if (comptime @hasDecl(App, "remoteUser")) app.remoteUser(agent, prompt.text);
             try app.writeUserPromptCard(agent, prompt);
         }
 
@@ -1300,6 +1321,7 @@ pub fn Bindings(comptime App: type) type {
         ) !void {
             const agent: *AppAgent = @ptrCast(@alignCast(ctx));
             const app = appOf(agent);
+            if (comptime @hasDecl(App, "remoteUser")) app.remoteUser(agent, prompt.text);
             if (comptime @hasDecl(App, "writeUserPromptCardWithSkillBindings")) {
                 try app.writeUserPromptCardWithSkillBindings(agent, prompt, skill_bindings, skill_display_spans);
             } else {
