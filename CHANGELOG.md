@@ -1,8 +1,26 @@
 # spark
 
-## 26.11.22
+## 26.11.23
 
 <!-- release:start -->
+
+**Follow live Mac terminal chats from your iPhone, and save chats and update Spark on iSH.**
+
+### New Features
+
+- Watch a Mac terminal chat stream on your iPhone. You can also send messages or stop the current reply without closing the terminal.
+- Paired Macs and cloud chats share the relay's MCP server list. Use the model picker on your iPhone to turn individual servers off or on for a chat.
+- The CLI footer shows context usage, uncached input, output, cache reads and writes, and cache hit rate.
+
+### Bug Fixes
+
+- The iPhone chat no longer scrolls into empty space when you send a follow-up or jumps to the bottom when you expand thinking or tool details.
+- Failed sends restore your draft, and the cursor beside “Working” is gone.
+- On iSH, Spark saves and resumes conversations and can update without crashing.
+
+<!-- release:end -->
+
+## 26.11.22
 
 **Go back, edit, and retry messages in the iPhone app and in spark.**
 
@@ -25,8 +43,6 @@
 
 - Sending a second message in the iPhone app no longer shows a black screen or scrolls to empty space.
 - `spark pair` no longer stops with "Another bridge for this Mac connected to the relay" while the background bridge is running.
-
-<!-- release:end -->
 
 ## 26.11.21.1
 
