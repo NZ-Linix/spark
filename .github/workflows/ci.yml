@@ -220,34 +220,63 @@ jobs:
       - name: Test i386 file and clock compatibility
         run: zig test src/core/shared/i386_syscall_fallbacks.zig -OReleaseSafe -target x86-linux-musl -mcpu i686 -lc --test-filter 'legacy i386 metadata'
 
-      - name: Test streamed chat, session resume, and upgrades in App Store iSH
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y clang lld meson ninja-build libsqlite3-dev libarchive-dev
-          dir="$RUNNER_TEMP/ish-test"
-          mkdir -p "$dir"
-          git clone --depth 1 --branch builds/494 --recurse-submodules https://github.com/ish-app/ish.git "$dir/ish"
-          test "$(git -C "$dir/ish" rev-parse HEAD)" = 216cf98a7cda1d68221add374630ede00aae9cd4
-          CC=clang meson setup "$dir/ish/build" "$dir/ish"
-          ninja -C "$dir/ish/build" ish tools/fakefsify
-          curl -fsSL --retry 3 https://dl-cdn.alpinelinux.org/alpine/v3.16/releases/x86/alpine-minirootfs-3.16.9-x86.tar.gz -o "$dir/alpine.tar.gz"
-          echo "eaec6686160cf426e90874fca12df3b3716777a850d6a7941510f65c687a8579  $dir/alpine.tar.gz" | sha256sum -c
-          "$dir/ish/build/tools/fakefsify" "$dir/alpine.tar.gz" "$dir/alpine"
-          "$dir/ish/build/ish" -f "$dir/alpine" /bin/sh -c 'mknod -m 666 /dev/null c 1 3'
-          python3 scripts/smoke-ish.py zig-out/bin/spark "$dir/ish/build/ish" "$dir/alpine"
-
       - name: Check the binary is 32-bit x86
         run: file zig-out/bin/spark | grep -Eq "ELF 32-bit LSB.*Intel 80386.*statically linked"
 
       - name: Smoke test fresh binary
         run: scripts/smoke-binary.sh zig-out/bin/spark
 
+      - name: Share the binary with the iSH smoke test
+        uses: actions/upload-artifact@v4
+        with:
+          name: spark-linux-x86
+          path: zig-out/bin/spark
+          retention-days: 1
+          if-no-files-found: error
+
       - name: Save Zig cache
         uses: ./.github/actions/save-zig-cache
         with:
           cache-key: ${{ steps.zig.outputs.cache-key }}
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
+  ish-smoke:
+    name: Smoke test App Store iSH on macOS
+    needs: build-x86
+    # iSH translates guest syscalls to the host kernel; the App Store build uses Darwin.
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the x86 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: spark-linux-x86
+          path: zig-out/bin
+
+      - name: Test streamed chat, session resume, and upgrades
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          brew install llvm@22 lld@22 meson ninja pkgconf libarchive
+          llvm=$(brew --prefix llvm@22)
+          lld=$(brew --prefix lld@22)
+          archive=$(brew --prefix libarchive)
+          export PATH="$llvm/bin:$lld/bin:$PATH"
+          export PKG_CONFIG_PATH="$archive/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          dir="$RUNNER_TEMP/ish-test"
+          mkdir -p "$dir"
+          git clone --depth 1 --branch builds/494 --recurse-submodules https://github.com/ish-app/ish.git "$dir/ish"
+          test "$(git -C "$dir/ish" rev-parse HEAD)" = 216cf98a7cda1d68221add374630ede00aae9cd4
+          CC=clang meson setup "$dir/ish/build" "$dir/ish" -Dlog=strace
+          ninja -C "$dir/ish/build" ish tools/fakefsify
+          curl -fsSL --retry 3 https://dl-cdn.alpinelinux.org/alpine/v3.16/releases/x86/alpine-minirootfs-3.16.9-x86.tar.gz -o "$dir/alpine.tar.gz"
+          echo "eaec6686160cf426e90874fca12df3b3716777a850d6a7941510f65c687a8579  $dir/alpine.tar.gz" | shasum -a 256 -c
+          "$dir/ish/build/tools/fakefsify" "$dir/alpine.tar.gz" "$dir/alpine"
+          "$dir/ish/build/ish" -f "$dir/alpine" /bin/sh -c 'mknod -m 666 /dev/null c 1 3'
+          python3 scripts/smoke-ish.py zig-out/bin/spark "$dir/ish/build/ish" "$dir/alpine"
 
   # The two TLA+ MCP jobs take about 20 minutes each, and the TLA+ transcript
   # window and subagent models a few each. A pull request runs each only when
