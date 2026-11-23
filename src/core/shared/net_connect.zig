@@ -158,6 +158,25 @@ fn openSocket(family: posix.sa_family_t, options: net.IpAddress.ConnectOptions) 
     }
 }
 
+const SocketTimeout = enum { receive, send };
+
+/// Use the kernel ABI, not libc's public timeval layout, on 32-bit Linux.
+/// iSH only recognizes the NEW option numbers and forwards their 16-byte
+/// payload to Darwin. Older Linux kernels need OLD with two 32-bit fields.
+pub fn setSocketTimeout(fd: posix.socket_t, direction: SocketTimeout, seconds: u31) posix.E {
+    const old: u32 = if (direction == .receive) posix.SO.RCVTIMEO else posix.SO.SNDTIMEO;
+    if (comptime builtin.target.os.tag == .linux and builtin.target.cpu.arch == .x86) {
+        const wide = [2]i64{ seconds, 0 };
+        const option: u32 = if (direction == .receive) 66 else 67;
+        const result = posix.errno(std.c.setsockopt(fd, posix.SOL.SOCKET, option, &wide, @sizeOf(@TypeOf(wide))));
+        if (result != .NOPROTOOPT and result != .INVAL) return result;
+        const narrow = [2]i32{ seconds, 0 };
+        return posix.errno(std.c.setsockopt(fd, posix.SOL.SOCKET, old, &narrow, @sizeOf(@TypeOf(narrow))));
+    }
+    const timeout: posix.timeval = .{ .sec = seconds, .usec = 0 };
+    return posix.errno(std.c.setsockopt(fd, posix.SOL.SOCKET, old, &timeout, @sizeOf(posix.timeval)));
+}
+
 const nonblock_flag: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
 
 /// Closes `fd` when the process runs another program.

@@ -42,6 +42,8 @@ irm https://raw.githubusercontent.com/NZ-Linix/spark/main/install.ps1 | iex
 
 The installer puts `spark` in `~/.local/bin`. Run `sh -s -- --help` after the pipe for options such as `--version` and `--uninstall`.
 
+On iSH for iPhone or iPad, use the `wget` command above. The installer selects the static 32-bit `linux-x86` build. If an older binary can't update itself, re-run the installer; it replaces the binary without touching your sessions or settings.
+
 ### Update
 
 ```bash

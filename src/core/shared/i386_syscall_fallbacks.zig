@@ -28,7 +28,7 @@ const Io = std.Io;
 const Dir = Io.Dir;
 const File = Io.File;
 
-var metadata_available: ?bool = null;
+var capabilities: ?struct { statx: bool, boot_clock: bool } = null;
 var compatible_vtable: Io.VTable = undefined;
 var metadata_inner: ?*const Io.VTable = null;
 
@@ -36,14 +36,19 @@ var metadata_inner: ?*const Io.VTable = null;
 /// invalid descriptor so the check never touches the filesystem.
 pub fn wrapIo(inner: Io) Io {
     if (comptime !active) return inner;
-    if (metadata_available == null) {
+    if (capabilities == null) {
         var result: linux.Statx = undefined;
-        metadata_available = linux.errno(linux.statx(-1, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &result)) != .NOSYS;
+        var now: std.c.timespec = undefined;
+        capabilities = .{
+            .statx = linux.errno(linux.statx(-1, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &result)) != .NOSYS,
+            .boot_clock = std.c.clock_gettime(.BOOTTIME, &now) == 0,
+        };
     }
-    return compatibleIo(inner, !metadata_available.?);
+    const have = capabilities.?;
+    return compatibleIo(inner, !have.statx, !have.boot_clock);
 }
 
-fn compatibleIo(inner: Io, use_legacy_metadata: bool) Io {
+fn compatibleIo(inner: Io, use_legacy_metadata: bool, use_monotonic_clock: bool) Io {
     if (metadata_inner) |vtable| {
         std.debug.assert(vtable == inner.vtable);
     } else {
@@ -54,10 +59,73 @@ fn compatibleIo(inner: Io, use_legacy_metadata: bool) Io {
             compatible_vtable.fileLength = fileLength;
             compatible_vtable.dirStat = dirStat;
             compatible_vtable.dirStatFile = dirStatFile;
+            compatible_vtable.dirCreateDirPath = dirCreateDirPath;
+            compatible_vtable.dirCreateDirPathOpen = dirCreateDirPathOpen;
+        }
+        if (use_monotonic_clock) {
+            compatible_vtable.now = nowCompat;
+            compatible_vtable.clockResolution = resolutionCompat;
+            compatible_vtable.sleep = sleepCompat;
         }
         metadata_inner = inner.vtable;
     }
     return .{ .userdata = inner.userdata, .vtable = &compatible_vtable };
+}
+
+fn compatClock(clock: Io.Clock) Io.Clock {
+    return if (clock == .boot) .awake else clock;
+}
+
+fn nowCompat(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
+    return metadata_inner.?.now(userdata, compatClock(clock));
+}
+
+fn resolutionCompat(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.ResolutionError!Io.Duration {
+    return metadata_inner.?.clockResolution(userdata, compatClock(clock));
+}
+
+fn sleepCompat(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
+    return metadata_inner.?.sleep(userdata, switch (timeout) {
+        .none => .none,
+        .duration => |d| .{ .duration = .{ .clock = compatClock(d.clock), .raw = d.raw } },
+        .deadline => |d| .{ .deadline = .{ .clock = compatClock(d.clock), .raw = d.raw } },
+    });
+}
+
+/// std's mkdir-p implementation calls statx internally on EEXIST, bypassing
+/// the metadata vtable. Keep its no-follow check on an already existing leaf.
+fn dirCreateDirPath(userdata: ?*anyopaque, dir: Dir, path: []const u8, permissions: Dir.Permissions) Dir.CreateDirPathError!Dir.CreatePathStatus {
+    const inner = metadata_inner.?;
+    var it = Dir.path.componentIterator(path);
+    var status: Dir.CreatePathStatus = .existed;
+    var component = it.last() orelse return error.BadPathName;
+    while (true) {
+        if (inner.dirCreateDir(userdata, dir, component.path, permissions)) |_| {
+            status = .created;
+        } else |err| switch (err) {
+            error.PathAlreadyExists => {
+                const existing = try dirStatFile(userdata, dir, component.path, .{ .follow_symlinks = false });
+                if (existing.kind != .directory) return error.NotDir;
+            },
+            error.FileNotFound => |e| {
+                component = it.previous() orelse return e;
+                continue;
+            },
+            else => |e| return e,
+        }
+        component = it.next() orelse return status;
+    }
+}
+
+fn dirCreateDirPathOpen(userdata: ?*anyopaque, dir: Dir, path: []const u8, permissions: Dir.Permissions, options: Dir.OpenOptions) Dir.CreateDirPathOpenError!Dir {
+    const inner = metadata_inner.?;
+    return inner.dirOpenDir(userdata, dir, path, options) catch |err| switch (err) {
+        error.FileNotFound => {
+            _ = try dirCreateDirPath(userdata, dir, path, permissions);
+            return inner.dirOpenDir(userdata, dir, path, options);
+        },
+        else => |e| return e,
+    };
 }
 
 /// Linux i386's stat64 syscall layout. The kernel aligns the 64-bit fields
@@ -170,7 +238,7 @@ test "legacy i386 metadata and deletion preserve no-follow semantics" {
         std.debug.assert(@offsetOf(Stat64, "size") == 44);
         std.debug.assert(@offsetOf(Stat64, "inode") == 88);
     }
-    const io = compatibleIo(std.testing.io, true);
+    const io = compatibleIo(std.testing.io, true, true);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "history.jsonl", .data = "saved\n" });
@@ -188,6 +256,17 @@ test "legacy i386 metadata and deletion preserve no-follow semantics" {
     try std.testing.expectEqual(File.Kind.sym_link, (try tmp.dir.statFile(io, "history-link", .{ .follow_symlinks = false })).kind);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "missing", .{}));
     try tmp.dir.createDir(io, "profile", .default_dir);
+    try std.testing.expectEqual(Dir.CreatePathStatus.existed, try tmp.dir.createDirPathStatus(io, "profile", .default_dir));
+    try std.testing.expectEqual(Dir.CreatePathStatus.created, try tmp.dir.createDirPathStatus(io, "profile/one/two", .default_dir));
+    try std.testing.expectError(error.NotDir, tmp.dir.createDirPathStatus(io, "history-link", .default_dir));
+    try tmp.dir.symLink(io, "profile", "profile-link", .{});
+    try std.testing.expectError(error.NotDir, tmp.dir.createDirPathStatus(io, "profile-link", .default_dir));
+    var opened = try tmp.dir.createDirPathOpen(io, "profile/one/other", .{});
+    opened.close(io);
+    const awake = Io.Clock.awake.now(io);
+    const boot = Io.Clock.boot.now(io);
+    try std.testing.expect(boot.nanoseconds >= awake.nanoseconds);
+    try std.testing.expect(boot.nanoseconds - awake.nanoseconds < std.time.ns_per_s);
     try tmp.dir.writeFile(io, .{ .sub_path = "profile/history.jsonl", .data = "saved\n" });
     try tmp.dir.symLink(io, "../history.jsonl", "profile/outside", .{});
     try tmp.dir.deleteTree(io, "profile");

@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const net_connect = @import("../shared/net_connect.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -444,28 +445,13 @@ fn writePreflightResponse(stream: std.Io.net.Stream, origin: []const u8) !void {
 }
 
 fn setSocketTimeouts(socket: std.posix.socket_t) void {
-    const timeout = std.posix.timeval{ .sec = socket_timeout_seconds, .usec = 0 };
-    const receive_rc = std.c.setsockopt(
-        socket,
-        std.c.SOL.SOCKET,
-        std.c.SO.RCVTIMEO,
-        &timeout,
-        @sizeOf(std.posix.timeval),
-    );
-    if (receive_rc != 0) {
-        const err = std.posix.errno(receive_rc);
-        debug_trace.logf("auth", "OAuth callback receive timeout setup failed errno={s}", .{@tagName(err)});
+    const receive = net_connect.setSocketTimeout(socket, .receive, socket_timeout_seconds);
+    if (receive != .SUCCESS) {
+        debug_trace.logf("auth", "OAuth callback receive timeout setup failed errno={s}", .{@tagName(receive)});
     }
-    const send_rc = std.c.setsockopt(
-        socket,
-        std.c.SOL.SOCKET,
-        std.c.SO.SNDTIMEO,
-        &timeout,
-        @sizeOf(std.posix.timeval),
-    );
-    if (send_rc != 0) {
-        const err = std.posix.errno(send_rc);
-        debug_trace.logf("auth", "OAuth callback send timeout setup failed errno={s}", .{@tagName(err)});
+    const send = net_connect.setSocketTimeout(socket, .send, socket_timeout_seconds);
+    if (send != .SUCCESS) {
+        debug_trace.logf("auth", "OAuth callback send timeout setup failed errno={s}", .{@tagName(send)});
     }
 }
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const atomic_value = @import("../shared/atomic_value.zig");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const net_connect = @import("../shared/net_connect.zig");
 const testing_listener = @import("../shared/testing_listener.zig");
 const update_target = @import("update_target.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -17,8 +18,7 @@ const Target = update_target.Target;
 
 fn setRecvTimeout(conn: *std.http.Client.Connection) void {
     const sock = conn.stream_writer.stream.socket.handle;
-    const timeout = std.posix.timeval{ .sec = recv_timeout_sec, .usec = 0 };
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    _ = net_connect.setSocketTimeout(sock, .receive, recv_timeout_sec);
 }
 
 /// spark's releases on GitHub. Each release carries `latest.txt` (its tag),
