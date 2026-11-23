@@ -113,7 +113,7 @@ zig build test          # unit tests
 zig fmt src/            # format
 ```
 
-The end-to-end tests in [`tests/e2e/`](tests/e2e) drive the built binary through tmux and need [Bun](https://bun.sh). See [CONTRIBUTING.md](CONTRIBUTING.md) for more.
+The end-to-end tests in [`tests/e2e/`](tests/e2e) drive the built binary through tmux and need [Bun](https://bun.sh).
 
 ## License
 

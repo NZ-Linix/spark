@@ -1,7 +1,1 @@
-# Review changes to the README and the contributor guide. Feature docs belong in --help and spark.sh/docs; see Documentation
-# in AGENTS.md.
 /README.md @fazxes
-/CONTRIBUTING.md @fazxes
-
-# Changes to the repository rules need the maintainer's approval (RULES.md R0.1).
-/RULES.md @fazxes
