@@ -84,11 +84,12 @@ struct NewChatView: View {
       }
       .animation(.ease, value: folder)
       .animation(.ease, value: problem)
+      .readable()
     }
     .navigationBarTitleDisplayMode(.inline)
     .toolbar {
       ToolbarItem(placement: .topBarLeading) {
-        Button("Chats", systemImage: "line.3.horizontal") { shell.menu() }
+        Button("Chats", systemImage: shell.menuSymbol) { shell.menu() }
       }
       ToolbarItem(placement: .principal) { Wordmark() }
       // the chosen folder can be looked through and worked in before the chat starts

@@ -4,18 +4,40 @@ import SwiftUI
 struct ShellActions {
   var menu: () -> Void = {}
   var newChat: () -> Void = {}
+  /** the sidebar sits beside the chat (an iPad, or any wide window): the menu button shows or hides it */
+  var docked = false
 }
 
 extension EnvironmentValues {
   @Entry var shell = ShellActions()
 }
 
+extension ShellActions {
+  /** the menu button's symbol: a sidebar beside the chat, or the list that slides in over it */
+  var menuSymbol: String { docked ? "sidebar.left" : "line.3.horizontal" }
+}
+
+/** How wide a chat's text and composer grow: past this, lines get too long to read. */
+enum Reading {
+  static let width: CGFloat = 760
+}
+
+extension View {
+  /** at most the reading width, centered in whatever room there is */
+  func readable(_ width: CGFloat = Reading.width) -> some View {
+    frame(maxWidth: width).frame(maxWidth: .infinity)
+  }
+}
+
 /**
- * The app once paired: the open chat fills the screen, and the sidebar of chats slides in from the
- * left. Swipe right anywhere to open it, left to close it; it follows the finger and settles by speed.
+ * The app once paired. On a phone the open chat fills the screen, and the sidebar of chats slides
+ * in from the left: swipe right anywhere to open it, left to close it; it follows the finger and
+ * settles by speed. In a wide window, as on an iPad, the sidebar stays beside the chat instead, and
+ * the menu button tucks it away or brings it back.
  */
 struct Shell: View {
   @Environment(Link.self) private var link
+  @Environment(\.horizontalSizeClass) private var sizeClass
   @State private var open = false
   @State private var drag: CGFloat = 0
   @State private var showSettings = false
@@ -23,43 +45,88 @@ struct Shell: View {
   @State private var opened = 0
   /** bumped to show the folder picker for a new chat */
   @State private var newChat = 0
+  /** in a wide window: the sidebar is out beside the chat */
+  @AppStorage("sidebarDocked") private var docked = true
+
+  /** the narrowest window that keeps the sidebar beside the chat */
+  private static let splitWidth: CGFloat = 700
+  private static let dockedWidth: CGFloat = 320
 
   var body: some View {
     GeometryReader { geo in
-      let width = min(geo.size.width * 0.84, 340)
-      let progress = max(0, min(1, ((open ? width : 0) + drag) / width))
-      ZStack(alignment: .leading) {
-        Sidebar(visible: open, close: { set(false) }, newChat: startNew, cleared: clear, settings: { showSettings = true }, pair: { showPair = true })
-          .frame(width: width)
-          .offset(x: (progress - 1) * width * 0.35)
-          .opacity(0.4 + progress * 0.6)
-          .accessibilityHidden(progress < 0.5)
-
-        main
-          .frame(width: geo.size.width)
-          .clipShape(.rect(cornerRadius: progress > 0 ? 38 * progress : 0, style: .continuous))
-          .overlay {
-            Color.black.opacity(0.45 * progress)
-              .ignoresSafeArea()
-              .allowsHitTesting(progress > 0.01)
-              .onTapGesture { set(false) }
-          }
-          .offset(x: progress * width)
-          .accessibilityHidden(progress >= 0.5)
-          // full height always: the corner clip mustn't cut what reaches into the bottom inset
-          .ignoresSafeArea(.container, edges: .vertical)
+      let wide = sizeClass == .regular && geo.size.width >= Self.splitWidth
+      Group {
+        if wide { split } else { overlay(geo.size.width) }
       }
-      .background(SidebarSwipe(open: open, began: began, changed: { dx in
-        drag = open ? min(0, dx) : max(0, dx)
-      }, ended: { dx, vx in
-        set((open ? width : 0) + dx + vx * 0.2 > width / 2)
-      }))
+      .environment(\.shell, ShellActions(menu: { wide ? toggleDock() : set(true) }, newChat: startNew, docked: wide))
+      .background {
+        // a hardware keyboard's shortcuts, whatever has focus
+        Group {
+          Button("New Chat", action: startNew).keyboardShortcut("n", modifiers: .command)
+          Button("Show Chats") { wide ? toggleDock() : set(!open) }.keyboardShortcut("s", modifiers: [.command, .control])
+        }
+        .opacity(0)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+      }
     }
     .page()
-    .environment(\.shell, ShellActions(menu: { set(true) }, newChat: startNew))
     .sensoryFeedback(.impact(weight: .light), trigger: opened)
     .sheet(isPresented: $showSettings) { SettingsView(pair: { showSettings = false; showPair = true }) }
     .sheet(isPresented: $showPair) { PairView() }
+  }
+
+  /** the sidebar beside the chat, with a hairline between them */
+  private var split: some View {
+    HStack(spacing: 0) {
+      if docked {
+        sidebar(visible: true, close: {})
+          .frame(width: Self.dockedWidth)
+          .background(Color(white: 0.035).ignoresSafeArea())
+          .overlay(alignment: .trailing) {
+            Rectangle().fill(Color.hairline).frame(width: 1).ignoresSafeArea()
+          }
+          .transition(.move(edge: .leading).combined(with: .opacity))
+      }
+      main
+        .frame(maxWidth: .infinity)
+    }
+  }
+
+  /** the phone's layout: the chat on top, the sidebar under it, pulled out by a swipe */
+  private func overlay(_ full: CGFloat) -> some View {
+    let width = min(full * 0.84, 340)
+    let progress = max(0, min(1, ((open ? width : 0) + drag) / width))
+    return ZStack(alignment: .leading) {
+      sidebar(visible: open, close: { set(false) })
+        .frame(width: width)
+        .offset(x: (progress - 1) * width * 0.35)
+        .opacity(0.4 + progress * 0.6)
+        .accessibilityHidden(progress < 0.5)
+
+      main
+        .frame(width: full)
+        .clipShape(.rect(cornerRadius: progress > 0 ? 38 * progress : 0, style: .continuous))
+        .overlay {
+          Color.black.opacity(0.45 * progress)
+            .ignoresSafeArea()
+            .allowsHitTesting(progress > 0.01)
+            .onTapGesture { set(false) }
+        }
+        .offset(x: progress * width)
+        .accessibilityHidden(progress >= 0.5)
+        // full height always: the corner clip mustn't cut what reaches into the bottom inset
+        .ignoresSafeArea(.container, edges: .vertical)
+    }
+    .background(SidebarSwipe(open: open, began: began, changed: { dx in
+      drag = open ? min(0, dx) : max(0, dx)
+    }, ended: { dx, vx in
+      set((open ? width : 0) + dx + vx * 0.2 > width / 2)
+    }))
+  }
+
+  private func sidebar(visible: Bool, close: @escaping () -> Void) -> some View {
+    Sidebar(visible: visible, close: close, newChat: startNew, cleared: clear, settings: { showSettings = true }, pair: { showPair = true })
   }
 
   @ViewBuilder private var main: some View {
@@ -85,6 +152,13 @@ struct Shell: View {
   private func clear() {
     newChat = 0
     link.chat = nil
+  }
+
+  private func toggleDock() {
+    if !docked {
+      opened += 1
+    }
+    withAnimation(.spring(duration: 0.38, bounce: 0.08)) { docked.toggle() }
   }
 
   private func set(_ value: Bool) {

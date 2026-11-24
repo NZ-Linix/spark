@@ -59,6 +59,8 @@ private struct WelcomeView: View {
     }
     .padding(.horizontal, 24)
     .padding(.bottom, 8)
+    // an iPad's page is wide: the panel keeps a phone's proportions in the middle of it
+    .readable(480)
     .animation(.ease, value: link.cloudAvailable)
     .animation(.ease, value: problem)
     .task { await link.probe() }

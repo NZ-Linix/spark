@@ -10,7 +10,7 @@ iPhone ──wss──▶ relay ◀──wss── spark-bridge ──stdio─�
 
 - `bridge/mac.ts` builds into `spark-bridge`, a single binary that installs beside spark. `spark pair` runs it.
 - `bridge/relay.ts` pairs phones with Macs, carries their messages, and runs cloud sessions when `SPARK_CLOUD_ROOT` is set. Cloud sessions keep working while the Mac is asleep or off.
-- `ios/` is the SwiftUI app (iOS 26).
+- `ios/` is the SwiftUI app for iPhone and iPad (iOS 26).
 
 The relay address is built into both the app and `spark-bridge`, so pairing is just a code.
 
@@ -31,6 +31,8 @@ The sidebar shows the chats on the cloud and on the Mac. Settings, Sidebar picks
 - **Sections** (the default): one list, with a section for the cloud and one for the Mac.
 - **Switch**: one host at a time, chosen with the switch at the top.
 - **Merged**: one list by date, with a cloud or Mac badge on each row.
+
+On an iPad, or in any window wide enough, the sidebar stays beside the chat; the sidebar button in the top corner hides it and brings it back, and the chat keeps a readable width. With a hardware keyboard, Command-N starts a new chat, Control-Command-S shows or hides the chats, and Command-Return sends.
 
 With Sections or Merged, a chat opens on its own host, and the new-chat screen has a Cloud and Mac picker that starts on the host you used last. The sidebar checks for new chats every 15 seconds while it's open.
 

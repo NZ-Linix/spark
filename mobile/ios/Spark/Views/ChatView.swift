@@ -112,6 +112,7 @@ struct ChatView: View {
           mcpEditable: !chat.running && !chat.changingMcp, refreshMcp: { await link.loadMcpServers(chat.host) }, compact: true)
       }
     }
+    .readable()
   }
 
   /** the chat's library prompt; a change starts its spark again with the new one */
@@ -165,6 +166,7 @@ struct ChatView: View {
         .padding(.horizontal, 18)
         .padding(.top, 8)
         .padding(.bottom, 24)
+        .readable()
         Color.clear.frame(height: 1).id("chat-bottom").accessibilityHidden(true)
       }
       // going back to an earlier message lays the thread out afresh, from the bottom
@@ -237,7 +239,7 @@ struct ChatView: View {
 
   @ToolbarContentBuilder private var toolbar: some ToolbarContent {
     ToolbarItem(placement: .topBarLeading) {
-      Button("Chats", systemImage: "line.3.horizontal") { shell.menu() }
+      Button("Chats", systemImage: shell.menuSymbol) { shell.menu() }
     }
     ToolbarItem(placement: .principal) {
       Text(chat.info.title)

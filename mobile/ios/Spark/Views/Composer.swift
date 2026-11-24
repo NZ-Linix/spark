@@ -93,10 +93,15 @@ struct Composer<Accessories: View, Trailing: View>: View {
       // the send button never moves: it stays in the corner while the box grows up from it
       .overlay(alignment: .bottomTrailing) {
         HStack(spacing: 8) {
+          // The chip is laid out where the open box will end up, while the box still rides up
+          // with the keyboard: shown at once, it would float above the box and drop into it. It
+          // waits for the box to land, then fades in; closing hides it at once.
           trailing
             .frame(height: 36)
             .fixedSize(horizontal: true, vertical: false)
-            .opacity(toolbar ? 1 : 0)
+            .animation(toolbar ? .easeOut(duration: 0.18).delay(0.3) : nil) {
+              $0.opacity(toolbar ? 1 : 0)
+            }
             .allowsHitTesting(toolbar)
             .accessibilityHidden(!toolbar)
           sendButton
@@ -125,6 +130,8 @@ struct Composer<Accessories: View, Trailing: View>: View {
         .contentTransition(.symbolEffect(.replace))
     }
     .buttonStyle(.plain)
+    // Return makes a new line; with a hardware keyboard, Command-Return sends (it never stops)
+    .keyboardShortcut(isStop ? nil : KeyboardShortcut(.return, modifiers: .command))
     .accessibilityLabel(isStop ? "Stop" : "Send")
     .disabled(!live)
   }
