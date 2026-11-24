@@ -2206,6 +2206,10 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.eventf("host", "agent_switched", .{}, "agent={s} from={s}", .{ nameOf(target), nameOf(from) });
             // The tab names the agent on screen, as a second spark's would.
             app_session_runtime.Runtime(App).syncTerminalTitle(app, agents.screenAgentOf(app));
+            // A thinking toggle made while this agent was hidden applies now.
+            var styles = app.shell.retainedTranscriptStyles();
+            styles.expand_thinking = ui_render.expand_thinking;
+            app.shell.setCommandOutputRenderPolicy(styles);
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.footer);
             debug_trace.eventf("host", "screen_reprinted", .{}, "agent={s} entries={d}", .{

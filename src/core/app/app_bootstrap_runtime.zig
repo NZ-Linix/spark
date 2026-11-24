@@ -276,9 +276,9 @@ pub fn Runtime(comptime App: type) type {
             app_session_runtime.Runtime(App).enableSessionStores(app, &app.main_agent);
         }
 
-        // Neutral one-line summary inline; the full detail stays behind Ctrl+O.
+        // Neutral one-line summary inline; the full detail stays behind Alt+O.
         fn writeCollapsedStartupNotice(app: *App, topic: []const u8, summary_lead: []const u8, detail: []const u8) !void {
-            const summary = try app.alloc.print("{s} (ctrl+o to view)", .{summary_lead});
+            const summary = try app.alloc.print("{s} (alt+o to view)", .{summary_lead});
             defer app.alloc.free(summary);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = summary }, true);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = detail, .visibility = .full_only }, true);

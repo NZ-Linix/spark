@@ -1336,8 +1336,8 @@ describe("gateway stream lifecycle", () => {
       expect(first).toContain("2 requested skills loaded");
       expect(first).toContain("Loaded skill status-first");
       expect(first).toContain("Loaded skill status-second");
-      expect(first).toMatch(/^├ Loaded skill status-first$/m);
-      expect(first).toMatch(/^└ Loaded skill status-second$/m);
+      expect(first).toMatch(/^  ⎿ Loaded skill status-first$/m);
+      expect(first).toMatch(/^  ⎿ Loaded skill status-second$/m);
       expect(first.indexOf("2 requested skills loaded")).toBeLessThan(first.indexOf("STATUS_FIRST_COMPLETE"));
       expect(first).not.toContain("tool call");
       await tui.resizeWindow(48, 36);
@@ -1347,18 +1347,18 @@ describe("gateway stream lifecycle", () => {
       expect(mixed.replace(/\s+/g, " ")).toContain("Requested skills · 1 loaded · 1 failed");
       expect(mixed).toContain("Could not load status-duplicate");
       expect(mixed).toContain("ambiguous");
-      expect(mixed).toMatch(/^└ Could not load status-duplicate/m);
+      expect(mixed).toMatch(/^  ⎿ Could not load status-duplicate/m);
       expect(mixed.replace(/\s+/g, " ")).toContain("ctrl+o");
       expect(mixed).not.toContain("duplicate-a");
       expect(mixed).not.toContain("duplicate-b");
       expect(mixed).not.toContain("Loaded skill status-duplicate");
       expect(mixed).not.toContain("tool call");
-      await tui.sendKeys("C-o");
+      await tui.sendKeys("M-o");
       await tui.waitForText("Could not load status-duplicate", 5_000);
       const details = await tui.waitForText("duplicate-a", 5_000);
       // At 48 columns a long path wraps inside itself under the indent.
       expect(details.replace(/\n {4}/g, "")).toContain("duplicate-b");
-      await tui.sendKeys("C-o");
+      await tui.sendKeys("M-o");
       await tui.waitForComposer(5_000);
       expect(gateway.requests).toHaveLength(2);
       await tui.sendText("/quit");
@@ -2601,7 +2601,7 @@ describe("gateway stream lifecycle", () => {
           "project_instruction_file_bytes",
         );
 
-        await tui.sendKeys("C-o");
+        await tui.sendKeys("M-o");
         const full = await tui.waitForPane(
           (text) =>
             text.includes("project instruction file") &&
@@ -2620,7 +2620,7 @@ describe("gateway stream lifecycle", () => {
         );
         expect(fullNavigationRow).toBeGreaterThan(0);
         expect(fullGrid[fullNavigationRow - 1]!.trim()).toBe("");
-        await tui.sendKeys("C-o");
+        await tui.sendKeys("M-o");
         const restored = await tui.waitForPane(
           (text) =>
             text.includes("CONTEXT_LIMIT_FIRST_COMPLETE") &&
@@ -2641,7 +2641,7 @@ describe("gateway stream lifecycle", () => {
         expect(resizedCompact).not.toContain("project instruction file");
         expect(resizedCompact).not.toContain("toolbox menu shortened");
 
-        await tui.sendKeys("C-o");
+        await tui.sendKeys("M-o");
         const finalFull = await tui.waitForPane(
           (text) =>
             text.includes("project instruction file") &&
@@ -2650,7 +2650,7 @@ describe("gateway stream lifecycle", () => {
         );
         expect(finalFull.split("project instruction file").length - 1).toBe(1);
         expect(finalFull.split("toolbox menu shortened").length - 1).toBe(1);
-        await tui.sendKeys("C-o");
+        await tui.sendKeys("M-o");
 
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         expect(readFileSync(stderrPath, "utf8")).not.toContain(
@@ -2759,7 +2759,7 @@ describe("gateway stream lifecycle", () => {
         expect(compactScrollback).not.toContain("reason=selection cap");
         expect(gateway.requests).toHaveLength(2);
 
-        await tui.sendKeys("C-o");
+        await tui.sendKeys("M-o");
         const full = await tui.waitForPane(
           (text) =>
             text.includes("reason=oversized rule file") &&
@@ -2769,7 +2769,7 @@ describe("gateway stream lifecycle", () => {
         expect(full.indexOf("reason=oversized rule file")).toBeLessThan(
           full.indexOf("reason=selection cap"),
         );
-        await tui.sendKeys("C-o");
+        await tui.sendKeys("M-o");
         await tui.waitForPane(
           (text) =>
             text.includes("PROJECT_OMISSION_TUI_COMPLETE") &&
@@ -2849,7 +2849,7 @@ describe("gateway stream lifecycle", () => {
         expect(compactScrollback).not.toContain("MCP schema");
         expect(gateway.requests).toHaveLength(3);
 
-        await tui.sendKeys("C-o");
+        await tui.sendKeys("M-o");
         const full = await tui.waitForPane(
           (text) =>
             text.includes("skill resource") &&
@@ -2862,7 +2862,7 @@ describe("gateway stream lifecycle", () => {
         // A notice line leads with its time, then its topic.
         expect(full).toMatch(/\d{2}:\d{2}:\d{2} · context:/);
         expect(full).not.toContain("[context]");
-        await tui.sendKeys("C-o");
+        await tui.sendKeys("M-o");
         await tui.waitForPane(
           (text) =>
             text.includes("TOOL_TIME_CONTEXT_COMPLETE") &&

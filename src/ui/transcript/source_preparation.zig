@@ -1514,6 +1514,7 @@ fn buildCompactTranscriptProjectionInterruptible(
             .text_style = ui_render.statusline_style,
             .reset_style = "\x1b[0m",
             .failure_style = ui_render.failure_style,
+            .header_text_style = ui_render.system_notice_text_style,
         },
         self.command_output_render.styles,
         checkpoint,

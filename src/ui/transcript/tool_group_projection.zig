@@ -142,7 +142,22 @@ pub const SummaryStyle = struct {
     reset_style: []const u8 = "",
     /// A failed call's ✗ and the words that say it failed.
     failure_style: []const u8 = "",
+    /// The group's header line, a step brighter than its rows. Empty: the
+    /// rows' `text_style`.
+    header_text_style: []const u8 = "",
+
+    /// The style a group's header is drawn in.
+    fn header(self: SummaryStyle) SummaryStyle {
+        var out = self;
+        if (self.header_text_style.len > 0) out.text_style = self.header_text_style;
+        return out;
+    }
 };
+
+/// What leads each row under a group's header, as under a Claude Code call.
+pub const child_lead = "  \u{23bf} ";
+/// The indent of a line under a row, level with the row's text.
+const child_detail_indent = "    ";
 
 const BuildStats = struct {
     detail_lookups: usize = 0,
@@ -1205,11 +1220,9 @@ fn writeDiffCount(writer: *std.Io.Writer, sign: []const u8, count: usize, accent
 /// as " · N failed" instead, so the mark never blames a command for them.
 fn writeResultMark(writer: *std.Io.Writer, tally: StoryTally, style: SummaryStyle) !void {
     const latest_failed = tally.last_command_failed orelse return;
-    if (latest_failed) {
-        try writeFailureMark(writer, style);
-    } else if (tally.commands_running == 0 and tally.commands_still_running == 0) {
-        try writer.writeAll(" ✓");
-    }
+    // A solid marker already says the group finished; only a failure
+    // gets a mark.
+    if (latest_failed) try writeFailureMark(writer, style);
 }
 
 /// " ✗" in the failure style, then the text style again.
@@ -2997,25 +3010,20 @@ fn writeGroupBlock(
         if (!focused_in_group and (!collapse_tool_calls or (row.identity.kind != .commands and !rowListsNames(row)))) row else null
     else
         null;
-    const single_text: ?StoryRowText = if (single_row) |row| try storyRowText(scratch, row, style, cols) else null;
+    const header_style = style.header();
+    const single_text: ?StoryRowText = if (single_row) |row| try storyRowText(scratch, row, header_style, cols) else null;
 
     const header = if (single_row) |row| blk: {
         const text = single_text.?;
-        const succeeded_command = if (row.detail) |record|
-            isShellCommandCall(scratch, record) and record.outcome == .completed and
-                !storyCallFailed(row.detail) and !phraseNamesFailure(text.display) and
-                !phraseShowsProgress(text.display)
-        else
-            false;
         // A failure the phrase does not name, such as a status line `spark ask`
         // never rewrites, still shows on the header.
         const unnamed_failure = storyCallFailed(row.detail) and !phraseNamesFailure(text.display);
-        const mark = if (succeeded_command) " ✓" else if (unnamed_failure) try std.mem.concat(scratch, u8, &.{ " ", try inFailureStyle(scratch, "✗", style) }) else "";
-        break :blk try applySummaryStyle(scratch, try clipStoryRow(scratch, "● ", row, &text, mark, cols, style), style);
-    } else if (try formatStoryHeader(scratch, tally, summary, style, collapse_tool_calls)) |story|
-        try applySummaryStyle(scratch, try clipStoryHeader(scratch, story, cols), style)
+        const mark = if (unnamed_failure) try std.mem.concat(scratch, u8, &.{ " ", try inFailureStyle(scratch, "✗", header_style) }) else "";
+        break :blk try applySummaryStyle(scratch, try clipStoryRow(scratch, "● ", row, &text, mark, cols, header_style), header_style);
+    } else if (try formatStoryHeader(scratch, tally, summary, header_style, collapse_tool_calls)) |story|
+        try applySummaryStyle(scratch, try clipStoryHeader(scratch, story, cols), header_style)
     else
-        try formatGroupHeader(scratch, summary, cols, style);
+        try formatGroupHeader(scratch, summary, cols, header_style);
     const header_entry_id = if (single_row) |row| row.entry_id else entries[status_indices[0]].id();
     try lines.append(alloc, .{ .entry = .{ .entry_id = header_entry_id, .entry_class = .tool_status, .projection_part = .group_header } });
     if (collapse_tool_calls) return header;
@@ -3023,12 +3031,11 @@ fn writeGroupBlock(
 
     if (single_row) |row| {
         try writeRowDetails(alloc, scratch, out, lines, row, "  ", cols, style);
-    } else for (rows.items, 0..) |*row, row_index| {
+    } else for (rows.items) |*row| {
         const text = try storyRowText(scratch, row, style, cols);
-        const last_static_row = !focused_in_group and row_index + 1 == rows.items.len;
-        const clipped = try clipStoryRow(scratch, if (last_static_row) "└ " else "├ ", row, &text, "", cols, style);
+        const clipped = try clipStoryRow(scratch, child_lead, row, &text, "", cols, style);
         try writeChildLine(alloc, out, lines, row.entry_id, style.text_style, clipped, childLineClose(style));
-        try writeRowDetails(alloc, scratch, out, lines, row, if (last_static_row) "  " else "│ ", cols, style);
+        try writeRowDetails(alloc, scratch, out, lines, row, child_detail_indent, cols, style);
     }
 
     for (status_indices) |status_index| {
@@ -4516,7 +4523,72 @@ fn fillProjection(
         } else try projection.setOwnedGroup(alloc, first_index, bytes);
     }
 
+    if (!styles.expand_thinking) try mergeThinkingRuns(alloc, projection, entries, cols, styles, checkpoint);
     try recapTurnSummaries(alloc, projection, entries, details, detail_indices, cols, checkpoint);
+}
+
+fn thoughtMs(entry: TranscriptEntry) ?u64 {
+    return switch (entry) {
+        .semantic_notice => |notice| notice.thought_ms,
+        else => null,
+    };
+}
+
+/// Collapsed thinking blocks that end up next to each other, as when a
+/// turn's later calls join the group above them, show as one line with
+/// their summed time, not a stack of "Thought for 1s" lines.
+fn mergeThinkingRuns(
+    alloc: std.mem.Allocator,
+    projection: *Projection,
+    entries: []const TranscriptEntry,
+    cols: u16,
+    styles: transcript_blocks.Styles,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
+    const actions = projection.entry_actions.items;
+    var index: usize = 0;
+    while (index < entries.len) : (index += 1) {
+        try build_checkpoint.tick(checkpoint);
+        var total_ms = thoughtMs(entries[index]) orelse continue;
+        if (actions[index] != .keep or !transcript_blocks.isEntryVisibleInCompactPresentation(entries[index])) continue;
+        const first = index;
+        var merged: usize = 0;
+        var next = index + 1;
+        while (next < entries.len) : (next += 1) {
+            if (actions[next] == .hide or !transcript_blocks.isEntryVisibleInCompactPresentation(entries[next])) continue;
+            const ms = thoughtMs(entries[next]) orelse break;
+            if (actions[next] != .keep) break;
+            total_ms +|= ms;
+            actions[next] = .hide;
+            merged += 1;
+            index = next;
+        }
+        if (merged == 0) continue;
+        const bytes = try transcript_blocks.renderThinkingNotice(alloc, "", total_ms, styles, cols);
+        try projection.setOwnedOverride(alloc, first, transcript_blocks.blockKindForNoticeTone(.neutral), bytes);
+    }
+}
+
+test "collapsed thinking blocks that meet show as one line with their summed time" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .semantic_notice = .{ .id = 1, .topic = "", .tone = .neutral, .body = "first", .visibility = .compact_and_full, .thought_ms = 2_000 } },
+        .{ .semantic_notice = .{ .id = 2, .topic = "", .tone = .neutral, .body = "second", .visibility = .compact_and_full, .thought_ms = 3_500 } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "hello", .class = .welcome } },
+        .{ .semantic_notice = .{ .id = 4, .topic = "", .tone = .neutral, .body = "third", .visibility = .compact_and_full, .thought_ms = 1_000 } },
+    };
+    var projection = try buildWithStyleAndStats(alloc, &entries, &.{}, 80, null, false, .{}, .{}, .compact, null, null);
+    defer projection.deinit(alloc);
+    const actions = projection.entry_actions.items;
+    try std.testing.expect(actions[0] == .override);
+    try std.testing.expect(std.mem.find(u8, actions[0].override.bytes, "Thought for 5s") != null);
+    try std.testing.expect(actions[1] == .hide);
+    try std.testing.expect(actions[3] == .keep);
+
+    var expanded = try buildWithStyleAndStats(alloc, &entries, &.{}, 80, null, false, .{}, .{ .expand_thinking = true }, .compact, null, null);
+    defer expanded.deinit(alloc);
+    try std.testing.expect(expanded.entry_actions.items[0] == .keep);
+    try std.testing.expect(expanded.entry_actions.items[1] == .keep);
 }
 
 /// Leads each visible turn summary with its turn's recap. A function of its
@@ -4691,8 +4763,8 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
         "● Running commands\n" ++
-            "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
-            "└ Running \x1b[38;5;252msecond\x1b[39m",
+            "  ⎿ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
+            "  ⎿ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
 }

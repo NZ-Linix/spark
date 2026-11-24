@@ -108,9 +108,11 @@ fn modifiedArrowAction(byte: u8, modifiers: u16, meta_prefixed: bool) ?InputEsca
     return null;
 }
 
+/// Ctrl+O expands or collapses the model's thinking in the transcript;
+/// Alt+O or Cmd+O opens the full transcript.
 fn ctrlOKeyAction(meta_prefixed: bool, modifiers: u16) InputEscapeAction {
-    if (!meta_prefixed and modifiers == 0x04) return .toggle_full_transcript;
-    if (meta_prefixed or modifiers == super_modifier or modifiers == alt_modifier) return .toggle_reasoning;
+    if (!meta_prefixed and modifiers == 0x04) return .toggle_reasoning;
+    if (meta_prefixed or modifiers == super_modifier or modifiers == alt_modifier) return .toggle_full_transcript;
     return .ignore;
 }
 
@@ -268,7 +270,7 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
 
 pub fn controlByteFeatureAction(byte: u8) ?InputEscapeAction {
     return switch (byte) {
-        15 => .toggle_full_transcript,
+        15 => .toggle_reasoning,
         16 => .open_model_catalog,
         20 => .cycle_effort,
         24 => .open_agent_list,
@@ -525,8 +527,8 @@ pub fn consumeInputEscapeByteWithMouse(
                 stage.* = 0;
                 param.* = 0;
                 param2.* = 0;
-                // ESC o is Meta-O, not a Ctrl-O terminal report.
-                return .ignore;
+                // ESC o is Meta-O (Alt+O): the full transcript.
+                return .toggle_full_transcript;
             }
             if (byte == 'b') {
                 stage.* = 0;

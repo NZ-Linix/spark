@@ -511,7 +511,7 @@ async function runActiveToolPlacement(
     );
     await capture(context, session, "active-tool-terminal");
 
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     await session.waitForPane(
       (pane) => pane.includes("esc close · pgup/pgdn scroll"),
       10_000,
@@ -560,7 +560,7 @@ async function runActiveToolPlacement(
       ACTIVE_TOOL_RESIZE_CAPTURE_TIMEOUT_MS,
     );
 
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     await captureMatching(
       context,
       session,

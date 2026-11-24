@@ -463,13 +463,13 @@ describe("modern MCP stdio compatibility", () => {
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the MCP fixture three times.");
-      const toolRows = (pane: string) => pane.split("\n").filter((line) => /^[●├└] /.test(line) && line.includes(`MCP ${TOOL_NAME}`));
+      const toolRows = (pane: string) => pane.split("\n").filter((line) => /^(?:●|  ⎿) /.test(line) && line.includes(`MCP ${TOOL_NAME}`));
       // The held call's arguments name its tool and nothing more: it waits
       // in that tool's row, which says it runs, and shows no row of its own.
       await tui.waitForPane((pane) => sendRest !== undefined && pane.includes(`Running MCP ${TOOL_NAME} ×3`), 20_000);
       for (let sample = 0; sample < 6; sample += 1) {
         const pane = await tui.capturePane();
-        expect(pane).not.toMatch(/^[●├└] Using\b/m);
+        expect(pane).not.toMatch(/^(?:●|  ⎿) Using\b/m);
         expect(toolRows(pane)).toHaveLength(1);
         await Bun.sleep(100);
       }
@@ -2645,7 +2645,7 @@ exec "$SPARK_MCP_FIXTURE_RUNTIME" "$SPARK_MCP_FIXTURE_PATH"`,
       await tui.waitForText("MCP failure detail complete.", 20_000);
 
       const scrollback = await tui.captureFullScrollback();
-      expect(scrollback).toContain(`└ Couldn't run ${TOOL_NAME} · Invalid input: labels require at least one item retry rejected`);
+      expect(scrollback).toContain(`  ⎿ Couldn't run ${TOOL_NAME} · Invalid input: labels require at least one item retry rejected`);
       expect(scrollback).not.toContain("\\x0a");
       expect(activeGateway.requests.at(-1)?.body).toContain(
         "Invalid input: labels require at least one item",
@@ -4958,9 +4958,9 @@ describe("spark mcp call", () => {
       const scrollback = await tui.captureFullScrollback();
       // The calls of one tool share a row that counts them, in the
       // command's group.
-      expect(scrollback).toContain("● Used MCP tools, ran a command ✓");
+      expect(scrollback).toContain("● Used MCP tools, ran a command");
       expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(2);
-      expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
+      expect(scrollback).toContain(`  ⎿ Ran MCP ${TOOL_NAME} ×3`);
       expect(scrollback).not.toContain("Running MCP");
       expect(seen).toContain("calls=3 items=9");
       // The model sees the command's output, not the rows.
@@ -4988,7 +4988,7 @@ describe("spark mcp call", () => {
       await tui.sendText("Page through the list.");
       await tui.waitForText("BRIDGE_ROWS_SAVED", 30_000);
       await tui.waitForComposer(10_000);
-      expect(await tui.captureFullScrollback()).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
+      expect(await tui.captureFullScrollback()).toContain(`  ⎿ Ran MCP ${TOOL_NAME} ×3`);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
       tui = null;
@@ -5009,18 +5009,18 @@ describe("spark mcp call", () => {
       await tui.waitForComposer(15_000);
       await tui.waitForText("BRIDGE_ROWS_SAVED", 15_000);
       const resumed = await tui.captureFullScrollback();
-      expect(resumed).toContain("● Used MCP tools, ran a command ✓");
+      expect(resumed).toContain("● Used MCP tools, ran a command");
       expect(resumed.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(2);
-      expect(resumed).toContain(`└ Ran MCP ${TOOL_NAME} ×3`);
+      expect(resumed).toContain(`  ⎿ Ran MCP ${TOOL_NAME} ×3`);
       expect(resumed).not.toContain("Running MCP");
 
       // Ctrl+O shows each call's row, and neither the arguments the
       // command sent nor the pages the tool returned.
-      await tui.sendKeys("C-o");
+      await tui.sendKeys("M-o");
       const full = await tui.waitForPane((pane) => pane.split(`Ran MCP ${TOOL_NAME}`).length === 4, 10_000);
       expect(full).not.toContain('"text":"1"');
       expect(full).not.toContain("item-0");
-      await tui.sendKeys("C-o");
+      await tui.sendKeys("M-o");
       await tui.waitForComposer(10_000);
       await tui.sendText("/quit");
       expect(await tui.waitForSessionEnd(10_000)).toBe(true);
@@ -5065,10 +5065,10 @@ describe("spark mcp call", () => {
       // The compact rows of the cancelled turn: its command by its short
       // name, in one group with the call.
       const compactRows = (screen: string) =>
-        screen.split("\n").map((line) => line.trimEnd()).filter((line) => /^\s*[●├└▪] /.test(line));
+        screen.split("\n").map((line) => line.trimEnd()).filter((line) => /^\s*[●⎿▪] /.test(line));
       const live = compactRows(liveScreen);
-      expect(live.some((line) => /^[├└] Cancelled /.test(line) && !line.includes(TOOL_NAME))).toBe(true);
-      expect(live).toContain(`└ Cancelled ${TOOL_NAME}`);
+      expect(live.some((line) => /^  ⎿ Cancelled /.test(line) && !line.includes(TOOL_NAME))).toBe(true);
+      expect(live).toContain(`  ⎿ Cancelled ${TOOL_NAME}`);
       // The command's notice names no command, so no row holds the command
       // line, its spark path, or its arguments; the call's own notice names its
       // tool, as before.

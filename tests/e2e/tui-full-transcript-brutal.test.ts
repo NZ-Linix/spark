@@ -44,7 +44,8 @@ const RESUME_DRAFT = "CTRL_O_BRUTAL_RESUME_DRAFT";
 const TAIL_SENTINEL = "CTRL_O_TAIL_SENTINEL";
 const VIEWPORT_ALLOWANCE_BYTES = 64 * 1024;
 const RESIZE_SIZES = [[48, 18], [132, 42], [80, 24], [104, 30]] as const;
-const CTRL_O = ["0f"] as const;
+// Alt+O (ESC o) opens the full transcript; Ctrl+O expands thinking.
+const CTRL_O = ["1b", "6f"] as const;
 const PAGE_UP = ["1b", "5b", "35", "7e"] as const;
 const PAGE_DOWN = ["1b", "5b", "36", "7e"] as const;
 const WHEEL_UP = ["1b", "5b", "3c", "36", "34", "3b", "31", "3b", "31", "4d"] as const;
@@ -790,11 +791,11 @@ async function thrashViewer(
     );
 
     const closeTraceStart = traceSize(tracePath);
-    const closeKey = cycle % 3 === 0 ? "C-o" : cycle % 3 === 1 ? "Escape" : "C-c";
+    const closeKey = cycle % 3 === 0 ? "M-o" : cycle % 3 === 1 ? "Escape" : "C-c";
     await timeTransition(
       metrics,
       "close",
-      () => closeKey === "C-o" ? session.sendHexBytes(CTRL_O) : session.sendKeys(closeKey),
+      () => closeKey === "M-o" ? session.sendHexBytes(CTRL_O) : session.sendKeys(closeKey),
       async () => {
         await waitForCommittedFrameAfter(tracePath, closeTraceStart, [
           "close_full_transcript restore=resized",
@@ -1003,7 +1004,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
 
     const immediateTraceStart = traceSize(paths.tracePath);
     const escapeStarted = performance.now();
-    session.sendKeysImmediate(["C-o"]);
+    session.sendKeysImmediate(["M-o"]);
     await waitForAnyTraceAfter(
       paths.tracePath,
       immediateTraceStart,
@@ -1022,7 +1023,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
 
     const repeatedOpenTraceStart = traceSize(paths.tracePath);
     const repeatedOpenStarted = performance.now();
-    session.sendKeysImmediate(["C-o"]);
+    session.sendKeysImmediate(["M-o"]);
     await waitForTraceAfter(paths.tracePath, repeatedOpenTraceStart, [
       "depth_transition from=inline to=full route=root trigger=ctrl_o",
     ]);
@@ -1033,7 +1034,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     await session.sendKeys("Escape");
     await waitForMode(session, "main", DRAFT);
 
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     await waitForMode(session, "full", DRAFT);
     const burstScrollWindow = await waitForScrollableProjection(paths.tracePath);
     const burstScrollTraceStart = traceSize(paths.tracePath);
@@ -1229,7 +1230,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       ]);
       const resumeTraceStart = traceSize(paths.resumedTracePath);
       const resumeInputStarted = performance.now();
-      session.sendKeysImmediate(["C-o"]);
+      session.sendKeysImmediate(["M-o"]);
       const resumeInputTrace = await waitForTraceAfter(
         paths.resumedTracePath,
         resumeTraceStart,

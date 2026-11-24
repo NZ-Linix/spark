@@ -7,6 +7,8 @@ const render_request = @import("../render_request.zig");
 const ui_render = @import("../render.zig");
 const render_engine = @import("../render_engine.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
+const activity_status = @import("../../core/output/activity_status.zig");
+const thinking_label = @import("../../core/output/thinking_label.zig");
 
 const frame_surface = render_engine.frame_surface;
 const paint_plan = render_engine.paint_plan;
@@ -221,6 +223,7 @@ fn paintPlannedActivityRow(
         .thinking, .live => writeThinkingBlinkText(
             &buf,
             preview.bytes,
+            input.shimmer_pos,
             input.thinking_blink orelse markerBlinkVisible(input.shimmer_pos),
         ),
         .tool_marker => writeToolMarkerBlinkText(&buf, preview.bytes, input.shimmer_pos),
@@ -261,8 +264,80 @@ fn markerBlinkVisible(shimmer_pos: i16) bool {
     return @mod(shimmer_pos + render_request.animation_padding, 2 * half) < half;
 }
 
-fn writeThinkingBlinkText(out: []u8, label: []const u8, marker_visible: bool) []const u8 {
-    const marker = "•";
+/// The spinner frame at `shimmer_pos`: two animation frames (100ms) each,
+/// so the ten frames loop twice in the phase cycle and never jump at the wrap.
+fn spinnerFrame(shimmer_pos: i16) []const u8 {
+    const frames = thinking_label.spinner_frames;
+    const phase: usize = @intCast(@mod(shimmer_pos + render_request.animation_padding, 2 * @as(i16, frames.len)));
+    return frames[phase / 2];
+}
+
+/// Where the glint over the status verb is at `shimmer_pos`, in cells from
+/// the verb's start. It crosses once per phase cycle, half a cell a frame,
+/// then rests off the word so the sweep reads as a pulse.
+fn glintCell(shimmer_pos: i16) i32 {
+    const cycle = 2 * @as(i32, render_request.blink_half_period_frames) * 2;
+    const phase = @mod(@as(i32, shimmer_pos) + render_request.animation_padding, cycle);
+    return @divTrunc(phase, 2) - 2;
+}
+
+/// The status verb ("Thinking") in the muted gray with a brighter glint
+/// sweeping across it.
+fn writeGlintVerb(w: *std.Io.Writer, verb: []const u8, shimmer_pos: i16) !void {
+    const glint = glintCell(shimmer_pos);
+    var cell: i32 = 0;
+    var i: usize = 0;
+    var current: u8 = 0;
+    while (i < verb.len) {
+        const len = std.unicode.utf8ByteSequenceLength(verb[i]) catch 1;
+        const end = @min(i + len, verb.len);
+        const distance = @abs(cell - glint);
+        const level: u8 = if (distance == 0) 2 else if (distance == 1) 1 else 0;
+        if (level != current or i == 0) {
+            if (current == 2) try w.writeAll("\x1b[22m");
+            try w.writeAll(switch (level) {
+                2 => ui_render.permission_auto_style,
+                1 => ui_render.permission_auto_style,
+                else => ui_render.system_notice_text_style,
+            });
+            if (level == 2) try w.writeAll("\x1b[1m");
+            current = level;
+        }
+        try w.writeAll(verb[i..end]);
+        cell += 1;
+        i = end;
+    }
+    if (current == 2) try w.writeAll("\x1b[22m");
+}
+
+/// The turn's status row. A label led by the spinner marker
+/// (`activity_status.activity_marker`) gets the spinner's current frame and
+/// a glint over its verb; the time after the verb and the token counts stay
+/// in the muted gray. A label led by "•" keeps that bullet, blinking.
+fn writeThinkingBlinkText(out: []u8, label: []const u8, shimmer_pos: i16, marker_visible: bool) []const u8 {
+    if (std.mem.startsWith(u8, label, activity_status.activity_marker)) {
+        var w: std.Io.Writer = .fixed(out);
+        const rest = label[activity_status.activity_marker.len..];
+        const verb_start: usize = if (rest.len > 0 and rest[0] == ' ') 1 else 0;
+        const verb_end = blk: {
+            var end = verb_start;
+            while (end < rest.len and rest[end] != ' ' and rest[end] != '.') end += 1;
+            break :blk end;
+        };
+        const tail = rest[verb_end..];
+        const token_suffix = std.mem.find(u8, tail, " (\u{2191}") orelse tail.len;
+        w.print("{s}{s}{s} ", .{ ui_render.permission_auto_style, spinnerFrame(shimmer_pos), ui_render.reset_style }) catch return label;
+        writeGlintVerb(&w, rest[verb_start..verb_end], shimmer_pos) catch return label;
+        w.print("{s}{s}{s}{s}{s}", .{
+            ui_render.dim_style,
+            tail[0..token_suffix],
+            ui_render.dim_style,
+            tail[token_suffix..],
+            ui_render.reset_style,
+        }) catch return label;
+        return w.buffered();
+    }
+    const marker = "\u{2022}";
     if (!std.mem.startsWith(u8, label, marker)) {
         return writeStaticStyledText(out, label, ui_render.dim_style);
     }
@@ -275,7 +350,7 @@ fn writeThinkingBlinkText(out: []u8, label: []const u8, marker_visible: bool) []
     const rest = label[marker.len..];
     // The token suffix recedes into the muted gray; the verb and elapsed
     // counter keep the brighter label gray.
-    if (std.mem.find(u8, rest, " (↑")) |token_suffix| {
+    if (std.mem.find(u8, rest, " (\u{2191}")) |token_suffix| {
         w.print("{s}{s}{s}{s}{s}", .{
             ui_render.permission_auto_style,
             rest[0..token_suffix],
@@ -295,16 +370,44 @@ fn writeThinkingBlinkText(out: []u8, label: []const u8, marker_visible: bool) []
 
 test "thinking blink keeps the counter bright and dims only the token suffix" {
     var out: [256]u8 = undefined;
-    const result = writeThinkingBlinkText(&out, "• Thinking (5s) (↑10 ↓20)", true);
+    const result = writeThinkingBlinkText(&out, "\u{2022} Thinking (5s) (\u{2191}10 \u{2193}20)", 0, true);
 
     const label_idx = std.mem.find(u8, result, "Thinking (5s)") orelse return error.TestUnexpectedResult;
     const dim_idx = std.mem.find(u8, result, ui_render.dim_style) orelse return error.TestUnexpectedResult;
-    const tokens_idx = std.mem.find(u8, result, "(↑10 ↓20)") orelse return error.TestUnexpectedResult;
+    const tokens_idx = std.mem.find(u8, result, "(\u{2191}10 \u{2193}20)") orelse return error.TestUnexpectedResult;
     try std.testing.expect(label_idx < dim_idx);
     try std.testing.expect(dim_idx < tokens_idx);
 
-    const plain = writeThinkingBlinkText(&out, "• Thinking (5s)", true);
+    const plain = writeThinkingBlinkText(&out, "\u{2022} Thinking (5s)", 0, true);
     try std.testing.expect(std.mem.find(u8, plain, ui_render.dim_style) == null);
+}
+
+test "the spinner row swaps the marker for a frame and keeps every word" {
+    var out: [512]u8 = undefined;
+    const result = writeThinkingBlinkText(&out, "\u{273b} Thinking for 5s... (\u{2191}10 \u{2193}20)", 0, true);
+    var plain_buf: [256]u8 = undefined;
+    var plain: std.Io.Writer = .fixed(&plain_buf);
+    var i: usize = 0;
+    while (i < result.len) {
+        if (result[i] == 0x1b) {
+            i = display_width.ansiSequenceEnd(result, i);
+            continue;
+        }
+        try plain.writeByte(result[i]);
+        i += 1;
+    }
+    const text = plain.buffered();
+    try std.testing.expect(std.mem.endsWith(u8, text, " Thinking for 5s... (\u{2191}10 \u{2193}20)"));
+    const frame = text[0 .. text.len - " Thinking for 5s... (\u{2191}10 \u{2193}20)".len];
+    var known = false;
+    for (thinking_label.spinner_frames) |f| known = known or std.mem.eql(u8, f, frame);
+    try std.testing.expect(known);
+}
+
+test "the spinner advances every two frames and loops without a jump" {
+    try std.testing.expectEqualStrings(spinnerFrame(-8), spinnerFrame(-7));
+    try std.testing.expect(!std.mem.eql(u8, spinnerFrame(-8), spinnerFrame(-6)));
+    try std.testing.expectEqualStrings(spinnerFrame(-8), spinnerFrame(12));
 }
 
 fn writeStaticStyledText(out: []u8, label: []const u8, style: []const u8) []const u8 {
@@ -331,6 +434,9 @@ fn writeToolMarkerBlinkText(out: []u8, label: []const u8, shimmer_pos: i16) []co
     if (marker_unit.byte_len == 0) return label;
     const marker_end = @min(marker_start + marker_unit.byte_len, label.len);
     const marker = label[marker_start..marker_end];
+    if (std.mem.startsWith(u8, label[marker_start..], connected_lead)) {
+        return writeConnectedRowGlint(out, label, marker_start, shimmer_pos);
+    }
     if (!std.mem.eql(u8, marker, "●") and !std.mem.eql(u8, marker, "└")) return label;
 
     var marker_buf: [64]u8 = undefined;
@@ -362,6 +468,34 @@ fn writeToolMarkerBlinkText(out: []u8, label: []const u8, shimmer_pos: i16) []co
     @memcpy(out[end .. end + ui_render.reset_style.len], ui_render.reset_style);
     end += ui_render.reset_style.len;
     return out[0..end];
+}
+
+const connected_lead = "  \u{23bf} ";
+
+/// A running call drawn as the next row of its group ("  ⎿ Running ls"):
+/// the glint sweeps its verb, as on the status line, and the rest stays in
+/// the row's gray.
+fn writeConnectedRowGlint(out: []u8, label: []const u8, lead_start: usize, shimmer_pos: i16) []const u8 {
+    const prefix = label[0..lead_start];
+    const body = label[lead_start + connected_lead.len ..];
+    var verb_end: usize = 0;
+    while (verb_end < body.len and body[verb_end] != ' ' and body[verb_end] != 0x1b) verb_end += 1;
+    var w: std.Io.Writer = .fixed(out);
+    w.writeAll(prefix) catch return label;
+    w.writeAll(connected_lead) catch return label;
+    writeGlintVerb(&w, body[0..verb_end], shimmer_pos) catch return label;
+    w.writeAll(ui_render.reset_style) catch return label;
+    w.writeAll(prefix) catch return label;
+    w.writeAll(body[verb_end..]) catch return label;
+    w.writeAll(ui_render.reset_style) catch return label;
+    return w.buffered();
+}
+
+test "a connected tool row keeps its text and lead" {
+    var out: [512]u8 = undefined;
+    const result = writeToolMarkerBlinkText(&out, "\x1b[38;5;245m  \u{23bf} Running ls -la", 0);
+    try std.testing.expect(std.mem.startsWith(u8, result, "\x1b[38;5;245m  \u{23bf} "));
+    try std.testing.expect(std.mem.endsWith(u8, result, " ls -la" ++ "\x1b[0m") or std.mem.find(u8, result, " ls -la") != null);
 }
 
 fn traceSurfaceShimmerPaint(surface: *const frame_surface.FrameSurface, row: u16, label: []const u8) void {

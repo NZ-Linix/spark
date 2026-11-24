@@ -101,10 +101,10 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
         const scrollback = await session.captureFullScrollbackEscapes();
         expect(scrollback).toContain("Run /help for commands");
         expect(scrollback).not.toMatch(/No context to compact|Context:|Compacting/);
-        await session.sendKeys("C-o");
+        await session.sendKeys("M-o");
         const transcript = await session.waitForText("esc close · pgup/pgdn scroll", 5_000);
         expect(transcript).not.toMatch(/No context to compact|Context:|Compacting/);
-        await session.sendKeys("C-o");
+        await session.sendKeys("M-o");
         await session.waitForComposer(5_000);
         await session.sendLiteral("composer-after-noop");
         await session.waitForText("composer-after-noop", 5_000);

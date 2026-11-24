@@ -643,7 +643,7 @@ type ToolPayloadHoldState = HoldState & {
 
 function streamingOutputTokens(scrollback: string): number | null {
   const matches = [...scrollback.matchAll(
-    /^• Generating \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
+    /^[·✢✳✶✻✽] Writing for \d+(?:h \d+m \d+s|m \d+s|s)\.\.\. \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
   )];
   const value = matches.at(-1)?.[1];
   if (!value) return null;
@@ -654,7 +654,7 @@ function streamingOutputTokens(scrollback: string): number | null {
 
 function quietToolPayloadOutputTokens(scrollback: string): number | null {
   const matches = [...scrollback.matchAll(
-    /^• Running \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
+    /^[·✢✳✶✻✽] Running for \d+(?:h \d+m \d+s|m \d+s|s)\.\.\. \(↑\d+(?:\.\d)?k? ↓(\d+(?:\.\d)?k?)\)$/gm,
   )];
   const value = matches.at(-1)?.[1];
   if (!value) return null;
@@ -2613,7 +2613,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const nextStepPane = await waitForScrollback(
         session!,
         (value) =>
-          /• Thinking \(\d+(?:h\d+m\d+s|m\d+s|s)\) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)/.test(
+          /[·✢✳✶✻✽] Thinking for \d+(?:h \d+m \d+s|m \d+s|s)\.\.\. \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)/.test(
             value,
           ) && !value.includes(finalSentinel),
         "thinking activity during the next admitted model step",
@@ -2695,10 +2695,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           pane
             .split("\n")
             .map((line) => line.trim())
-            .filter((line) => /^(●|├|└) /.test(line));
+            .filter((line) => /^(●|  ⎿) /.test(line));
         // No frame shows a row that names nothing, such as a bare
         // "● Searching".
-        const bare = /^(●|├|└) [A-Z][a-z]+$/;
+        const bare = /^(●|  ⎿) [A-Z][a-z]+$/;
         const held: string[][] = [];
         if (scenario.whileHeld) await session!.waitForText(scenario.whileHeld, TIMEOUT);
         for (let frame = 0; frame < 20; frame += 1) {
@@ -2817,7 +2817,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => fakeGatewayFinalText(finalSentinel),
       ]);
       const treeRows = (pane: string) =>
-        pane.split("\n").map((line) => line.trim()).filter((line) => /^(●|├|└) /.test(line));
+        pane.split("\n").map((line) => line.trim()).filter((line) => /^(●|  ⎿) /.test(line));
       await session!.sendText("Check the subagents twice.");
       // While the second call's action streams, it waits in the status row
       // instead of showing a row of its own that later folds into it.
@@ -6849,12 +6849,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         );
       }
       expect(
-        countOccurrences(normalizedPane, `├ Read ${CANONICAL_READ_PATH}`),
+        countOccurrences(normalizedPane, `  ⎿ Read ${CANONICAL_READ_PATH}`),
       ).toBe(1);
       expect(
         countOccurrences(
           normalizedPane,
-          `└ Searched ${CANONICAL_GREP_PATTERN}`,
+          `  ⎿ Searched ${CANONICAL_GREP_PATTERN}`,
         ),
       ).toBe(1);
       expect(countOccurrences(normalizedPane, CANONICAL_FINAL_TEXT)).toBe(1);
@@ -7504,7 +7504,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The deferred call did not run, so the group ran one command.
       // The hold for project instructions gets no row, so the command that
       // ran is the group's only row and its header.
-      const header = "● Ran cat, printf ✓";
+      const header = "● Ran cat, printf";
       mkdirSync(join(home, ".spark"), { recursive: true });
       mkdirSync(nested, { recursive: true });
       writeFileSync(join(home, ".spark", "settings.json"), "{}");
@@ -7696,9 +7696,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The failed call is not a command, so the header keeps the command's
       // mark. The turn went on after it, so its row says only that it
       // failed, and the header does not count it.
-      const header = "● Ran a command ✓";
-      const failedRow = `├ Couldn't run ${unsupportedToolName}`;
-      const completedRow = `└ Ran ${supportedCommand}`;
+      const header = "● Ran a command";
+      const failedRow = `  ⎿ Couldn't run ${unsupportedToolName}`;
+      const completedRow = `  ⎿ Ran ${supportedCommand}`;
       const compact = await session.captureFullScrollback();
       expect(compact).toContain(`${header}\n${failedRow}\n${completedRow}`);
       expect(countOccurrences(compact, `Couldn't run ${unsupportedToolName}`)).toBe(1);
@@ -7712,7 +7712,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(resized).toContain(`Couldn't run ${unsupportedToolName}`);
       expect(resized).toContain(`Ran ${supportedCommand}`);
 
-      await session.sendKeys("C-o");
+      await session.sendKeys("M-o");
       // Ctrl+O gives each call its own line with its mark, without the tree marks.
       const full = await session.waitForText(
         `● Failed ${unsupportedToolName}`,
@@ -7722,7 +7722,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(full).toContain(`● Ran ${supportedCommand}`);
       expect(countOccurrences(full, `Failed ${unsupportedToolName}`)).toBe(1);
       expect(countOccurrences(full, `Ran ${supportedCommand}`)).toBe(1);
-      await session.sendKeys("C-o");
+      await session.sendKeys("M-o");
       await session.waitForText(header, TIMEOUT);
       expect(unsupportedGateway.requests).toHaveLength(2);
       expect(
@@ -8174,7 +8174,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         const narrow = await session.captureFullScrollback();
         expect(narrow).toContain("Messaged checker");
         await session.resizeWindow(110, 35);
-        await session.sendKeys("C-o");
+        await session.sendKeys("M-o");
         await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
         let details = await session.capturePane();
         for (let page = 0; page < 12 && !(details.includes("CHILD_ROW_REPLY_0") && details.includes("Check one-off cleanup")); page += 1) {
@@ -8184,7 +8184,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         // The full transcript holds each report's whole text.
         expect(details).toContain("CHILD_ROW_REPLY_0");
         expect(details).toContain("Check one-off cleanup");
-        await session.sendKeys("C-o");
+        await session.sendKeys("M-o");
         const requestCount = rowGateway.requests.length;
         // Six parent steps, three children, and three report turns.
         expect(requestCount).toBe(12);
@@ -8425,13 +8425,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       // The three commands share one row by their steps, which is the
       // group's line; printf ran again after pwd, so it comes last. Ctrl+O
       // shows each.
-      expect(compact).toContain("● Ran pwd, printf ✓\n");
+      expect(compact).toContain("● Ran pwd, printf\n");
       expect(withoutWorkspaceStatusline(compact)).not.toContain(workspace);
       expect(compact).not.toContain(`Ran ${firstCommand}`);
 
       await session.resizeWindow(80, 24);
-      await session.waitForText("● Ran pwd, printf ✓", TIMEOUT);
-      await session.sendKeys("C-o");
+      await session.waitForText("● Ran pwd, printf", TIMEOUT);
+      await session.sendKeys("M-o");
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
       let fullAtNested = fullAtTail;
       for (let page = 0; page < 10 && !fullAtNested.includes(
@@ -8476,8 +8476,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(summaryGateway.requests).toHaveLength(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
-      await session.sendKeys("C-o");
-      await session.waitForText("● Ran pwd, printf ✓", TIMEOUT);
+      await session.sendKeys("M-o");
+      await session.waitForText("● Ran pwd, printf", TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       await session.kill();
@@ -8493,7 +8493,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       await session.waitForText(finalText, TIMEOUT);
       const resumed = await session.captureFullScrollback();
-      expect(resumed).toContain("● Ran pwd, printf ✓\n");
+      expect(resumed).toContain("● Ran pwd, printf\n");
       expect(resumed).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(resumed)).not.toContain(workspace);
       expect(summaryGateway.requests).toHaveLength(2);
@@ -8596,7 +8596,7 @@ test.skipIf(!tmuxAvailable())("long command rows show their steps while running 
     await session.waitForPane((pane) => pane.includes("RECLIP_LIVE_DONE"), TIMEOUT);
     const ranRow = stripSgr(await session.captureFullScrollback()).split("\n")
       .find((line) => line.includes("Ran printf"));
-    expect(ranRow).toBe("● Ran printf, sleep, printf ✓");
+    expect(ranRow).toBe("● Ran printf, sleep, printf");
     expect(stripSgr(await session.captureFullScrollback())).not.toContain(tail);
 
     await session.sendText("/quit");

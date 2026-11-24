@@ -273,9 +273,9 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(gateway.requests[1]!.body).not.toContain("<user_steering>");
       expect(countOccurrences(readTrace(tracePath), "event=worker_begin")).toBe(2);
 
-      await session.sendKeys("C-o");
+      await session.sendKeys("M-o");
       await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
-      await session.sendKeys("C-o");
+      await session.sendKeys("M-o");
       await session.waitForText("Thinking", TIMEOUT);
       await session.sendKeys("C-c");
       await waitForCondition(() => followUp.cancelled, "follow-up cancellation");

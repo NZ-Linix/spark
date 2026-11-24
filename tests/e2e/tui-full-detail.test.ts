@@ -163,7 +163,7 @@ function expectNoClutter(rows: string[]) {
   const text = rows.join("\n");
   for (const row of rows) {
     expect(row).not.toMatch(/· (Prompt|Response|Tool|Usage|Notice|Task|Issue)$/);
-    expect(row.trimStart()).not.toMatch(/^[│├└]/);
+    expect(row.trimStart()).not.toMatch(/^[│├└⎿]/);
     expect(row).not.toMatch(/^\s*● \d+ tool calls?\b/);
     if (row.trimStart().startsWith("●")) expect(row).toMatch(/^● \S/);
   }

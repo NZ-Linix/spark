@@ -238,7 +238,7 @@ function group(lines: string[], header: string | RegExp): string[] {
 }
 
 function treeRows(block: string[]): string[] {
-  return block.filter((line) => line.startsWith("├ ") || line.startsWith("└ "));
+  return block.filter((line) => line.startsWith("  ⎿ "));
 }
 
 test.skipIf(!tmuxAvailable())(
@@ -254,21 +254,21 @@ test.skipIf(!tmuxAvailable())(
     // The two passing checks share a row by their step; the failure keeps
     // its own, with the error's line after it.
     expect(treeRows(checks)).toEqual([
-      "├ Ran sh check.sh",
-      expect.stringMatching(/^└ .*sh build\.sh · Expected 1 arguments, but got 3\.$/),
+      "  ⎿ Ran sh check.sh",
+      expect.stringMatching(/^  ⎿ .*sh build\.sh · Expected 1 arguments, but got 3\.$/),
     ]);
     expect(checks.some((line) => line.includes("✗ exit"))).toBe(false);
 
     // Edits come first; the other kinds tie, and the fourth is "more".
-    const fix = group(lines, "● Edited a file, ran a command, read a file, and more ✓");
+    const fix = group(lines, "● Edited a file, ran a command, read a file, and more");
     const fixRows = treeRows(fix);
     expect(fixRows).toHaveLength(4);
-    expect(fixRows[0]).toStartWith("├ Searched");
+    expect(fixRows[0]).toStartWith("  ⎿ Searched");
     // A read shows the file by name.
-    expect(fixRows[1]).toBe("├ Read window.ts");
+    expect(fixRows[1]).toBe("  ⎿ Read window.ts");
     // An edit shows the file by name, with its counts.
-    expect(fixRows[2]).toBe("├ Edited main.ts +1/-1");
-    expect(fixRows[3]).toBe("└ Ran sh build.sh");
+    expect(fixRows[2]).toBe("  ⎿ Edited main.ts +1/-1");
+    expect(fixRows[3]).toBe("  ⎿ Ran sh build.sh");
     expect(lines.some((line) => /^ {2}1 file changed \+1 -1 · ran 4 commands · /.test(line))).toBe(true);
     expect(lines.some((line) => / tool calls? · /.test(line))).toBe(false);
 
@@ -286,7 +286,7 @@ test.skipIf(!tmuxAvailable())(
     await resumed.waitForText("Fixed the build.", TIMEOUT);
     const resumedLines = paneLines(await resumed.waitForComposer(TIMEOUT));
     expect(group(resumedLines, "● Ran commands ✗")).toEqual(checks);
-    expect(group(resumedLines, "● Edited a file, ran a command, read a file, and more ✓")).toEqual(fix);
+    expect(group(resumedLines, "● Edited a file, ran a command, read a file, and more")).toEqual(fix);
   },
   TIMEOUT * 3,
 );
@@ -339,10 +339,10 @@ test.skipIf(!tmuxAvailable())(
       const message = lines.findIndex((line) => line.includes("Read it again."));
       expect(message).toBeGreaterThan(0);
       // The first read keeps its own row, without the later one.
-      expect(lines.slice(0, message)).toContain("├ Read README.md");
+      expect(lines.slice(0, message)).toContain("  ⎿ Read README.md");
       // The failed edit names its file, also when the saved session is
       // read back.
-      expect(lines.slice(0, message)).toContain("└ Couldn't edit README.md");
+      expect(lines.slice(0, message)).toContain("  ⎿ Couldn't edit README.md");
       expect(lines.some((line) => line.includes("· 2 parts"))).toBe(false);
       // The later read shows under the message that asked for it.
       expect(lines.slice(message + 1)).toContain("● Read README.md");
@@ -376,7 +376,7 @@ test.skipIf(!tmuxAvailable())(
     const expectFixedRequest = (lines: string[]) => {
       // The fixed request says which try it was. The refused ones never ran,
       // so they get no row, no failure count, and no "run" of the command.
-      expect(lines).toContain("● Ran ls, printf · 3rd try ✓");
+      expect(lines).toContain("● Ran ls, printf · 3rd try");
       expect(lines.some((line) => /Failed|invalid field|Couldn't run|passed on|failed/.test(line))).toBe(false);
     };
     expectFixedRequest(paneLines(pane));
@@ -409,7 +409,7 @@ test.skipIf(!tmuxAvailable())(
       const header = lines.find((line) => line.startsWith("● ") && line.includes("✗"));
       expect(header).toBeDefined();
       expect(header!).toEndWith("✗ · 2 failed");
-      expect(lines.filter((line) => /^[├└] (Exited|Couldn't)/.test(line))).toHaveLength(2);
+      expect(lines.filter((line) => /^  ⎿ (Exited|Couldn't)/.test(line))).toHaveLength(2);
     };
     expectCount(paneLines(pane));
 
@@ -439,7 +439,7 @@ test.skipIf(!tmuxAvailable())(
     const expectReason = (lines: string[]) => {
       // Like any failure a turn ends on, its row says why, as core counted
       // it, but not the error the model got.
-      expect(lines).toContain("└ Couldn't run ls, printf · 2 invalid fields");
+      expect(lines).toContain("  ⎿ Couldn't run ls, printf · 2 invalid fields");
       expect(lines.some((line) => /Choose either|Failed /.test(line))).toBe(false);
     };
     expectReason(paneLines(pane));
@@ -469,7 +469,7 @@ test.skipIf(!tmuxAvailable())(
     });
     const expectSteps = (lines: string[]) => {
       // The document's text is not shell words, so the row shows the steps.
-      expect(lines).toContain("● Ran cat, wc ✓");
+      expect(lines).toContain("● Ran cat, wc");
       expect(lines.some((line) => line.includes("model's") || line.includes("<<"))).toBe(false);
     };
     expectSteps(paneLines(pane));
@@ -556,7 +556,7 @@ test.skipIf(!tmuxAvailable())(
     sessions.push(session);
     await session.waitForComposer();
     await session.sendText("ask the reviewer twice");
-    const rowsOf = (pane: string) => paneLines(pane).filter((line) => /^(●|├|└) /.test(line));
+    const rowsOf = (pane: string) => paneLines(pane).filter((line) => /^(●|  ⎿) /.test(line));
     await session.waitForText("Read main.ts", TIMEOUT);
     // While the second message streams, it joins the reviewer's row at once
     // instead of showing a row of its own that folds into it later, so the
@@ -578,7 +578,7 @@ test.skipIf(!tmuxAvailable())(
       const start = frame.findIndex((row) => row.startsWith("● "));
       const rows: string[] = [];
       for (const row of frame.slice(start + 1)) {
-        if (!/^(├|└) /.test(row)) break;
+        if (!/^(  ⎿) /.test(row)) break;
         rows.push(row);
       }
       return rows;
@@ -586,7 +586,7 @@ test.skipIf(!tmuxAvailable())(
     for (let i = 1; i < frames.length; i += 1) {
       expect(firstGroupRows(frames[i]).length).toBeGreaterThanOrEqual(firstGroupRows(frames[i - 1]).length);
     }
-    expect(frames.every((frame) => frame.filter((row) => /^(├|└) .*reviewer/.test(row)).length <= 1)).toBe(true);
+    expect(frames.every((frame) => frame.filter((row) => /^(  ⎿) .*reviewer/.test(row)).length <= 1)).toBe(true);
   },
   TIMEOUT * 2,
 );
@@ -648,9 +648,9 @@ test.skipIf(!tmuxAvailable())(
       // Main's calls share a group; the report is a line of its own after
       // it, not a row of that group.
       const calls = treeRows(group(lines, /^● /));
-      expect(calls).toEqual(["├ Messaged reviewer", "└ Read main.ts"]);
+      expect(calls).toEqual(["  ⎿ Messaged reviewer", "  ⎿ Read main.ts"]);
       expect(lines.filter((line) => /^● reviewer finished\b/.test(line))).toHaveLength(1);
-      expect(lines.some((line) => /^(├|└) reviewer finished\b/.test(line))).toBe(false);
+      expect(lines.some((line) => /^(  ⎿) reviewer finished\b/.test(line))).toBe(false);
     };
     expectOwnLine(paneLines(await session.waitForComposer(TIMEOUT)));
 
@@ -681,8 +681,8 @@ test.skipIf(!tmuxAvailable())(
     const lines = paneLines(pane);
     expect(lines).toContain("● Ran commands ✗");
     // With no rows to show them, the header keeps the edit's counts.
-    expect(lines).toContain("● Edited a file +1 -1, ran a command, read a file, and more ✓");
-    expect(lines.filter((line) => line.startsWith("├ ") || line.startsWith("└ "))).toEqual([]);
+    expect(lines).toContain("● Edited a file +1 -1, ran a command, read a file, and more");
+    expect(lines.filter((line) => line.startsWith("  ⎿ "))).toEqual([]);
   },
   TIMEOUT * 2,
 );
@@ -696,11 +696,11 @@ test.skipIf(!tmuxAvailable())(
       height: 100,
     });
     const lines = paneLines(pane);
-    expect(lines).toContain("● Ran sh test.sh ×3 · passed on the 3rd run ✓");
+    expect(lines).toContain("● Ran sh test.sh ×3 · passed on the 3rd run");
     expect(lines).toContain("● Read main.ts · 3 parts");
     expect(lines.filter((line) => line.includes("sh test.sh"))).toHaveLength(1);
 
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     const full = await session.waitForText("esc close", TIMEOUT);
     expect(full.split("sh test.sh").length - 1).toBeGreaterThanOrEqual(3);
     expect(full.split("Read desktop/src/main.ts").length - 1).toBeGreaterThanOrEqual(3);
@@ -718,11 +718,11 @@ test.skipIf(!tmuxAvailable())(
     const lines = paneLines(pane);
     // The row names both folders the pattern was searched in.
     expect(treeRows(group(lines, "● Searched"))).toEqual([
-      "├ Searched createWindow in src, desktop",
-      "└ Matched *.ts",
+      "  ⎿ Searched createWindow in src, desktop",
+      "  ⎿ Matched *.ts",
     ]);
 
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     const full = await session.waitForText("esc close", TIMEOUT);
     expect(full.split("Searched createWindow").length - 1).toBeGreaterThanOrEqual(2);
   },
@@ -741,14 +741,14 @@ test.skipIf(!tmuxAvailable())(
     // them, where it was last read or searched, so window.ts, read again
     // after main.ts, comes last. The header names the kinds of work with no
     // counts.
-    expect(treeRows(group(lines, "● Read files, searched, ran a command ✓"))).toEqual([
-      "├ Read main.ts, window.ts",
-      "├ Searched createWindow, BrowserWindow",
-      "└ Ran sh check.sh status",
+    expect(treeRows(group(lines, "● Read files, searched, ran a command"))).toEqual([
+      "  ⎿ Read main.ts, window.ts",
+      "  ⎿ Searched createWindow, BrowserWindow",
+      "  ⎿ Ran sh check.sh status",
     ]);
 
     // Ctrl+O still shows each call.
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     const full = await session.waitForText("esc close", TIMEOUT);
     expect(full.split("desktop/src/window.ts").length - 1).toBeGreaterThanOrEqual(2);
   },
@@ -769,8 +769,8 @@ test.skipIf(!tmuxAvailable())(
     expect(rows).toHaveLength(4);
     // Each row names the action and the subagent, with no message; Ctrl+O
     // shows the message.
-    expect(rows[0]).toBe("├ Messaged reviewer");
-    expect(rows[1]).toBe("├ Messaged tester");
+    expect(rows[0]).toBe("  ⎿ Messaged reviewer");
+    expect(rows[1]).toBe("  ⎿ Messaged tester");
     expect(lines.join("\n")).not.toContain("Review the createWindow change");
     expect(rows.filter((row) => row.includes("Waited for"))).toHaveLength(1);
     expect(rows[3]).toContain("Checked");

@@ -7,6 +7,7 @@
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
 const ui_render = @import("../render.zig");
+const thinking_label = @import("../../core/output/thinking_label.zig");
 
 const Allocator = std.mem.Allocator;
 const Row = std.ArrayList(u8);
@@ -40,6 +41,9 @@ pub const Preview = struct {
     gap_above: u16 = 0,
     /// The newest words, drawn faint until they settle.
     fresh_words: u16 = 0,
+    /// How long the model has been thinking, for reasoning's header row
+    /// ("Thinking for 3s...").
+    thinking_ms: u64 = 0,
 
     pub fn withGapAbove(self: Preview, gap: u16) Preview {
         var out = self;
@@ -179,13 +183,15 @@ fn cleanReply(arena: Allocator, text: []const u8) ![]const u8 {
     return out.items;
 }
 
-/// Lays text out like the transcript: reasoning as a notice (`* ` then
-/// rows indented by two), a reply indented by two. Each source line starts
-/// a row. Returns the rows' text, without the indent.
+/// Lays text out like the transcript: reasoning as an expanded thinking
+/// block (a header row, then the reasoning indented by two), a reply
+/// indented by two. Each source line starts a row. Returns the rows' text,
+/// without the indent; reasoning's header row is empty here.
 fn layout(arena: Allocator, text: []const u8, kind: Kind, width: u16) ![]const []const u8 {
     const body = if (kind == .reply) try cleanReply(arena, text) else text;
     const avail: usize = @max(@as(usize, width) -| 2, 8);
     var rows: std.ArrayList([]const u8) = .empty;
+    if (kind == .reasoning) try rows.append(arena, "");
     var lines = std.mem.splitScalar(u8, body, '\n');
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r");
@@ -256,8 +262,20 @@ pub fn composeRow(alloc: Allocator, preview: Preview, index_in: u16, width: u16)
     const reasoning = preview.kind == .reasoning;
     const fade = !reasoning and preview.fresh_words > 0;
     try row.appendSlice(alloc, reset);
-    if (reasoning) try row.appendSlice(alloc, ui_render.system_notice_text_style);
-    try row.appendSlice(alloc, if (reasoning and line_index == 0) "* " else "  ");
+    if (reasoning and line_index == 0) {
+        var label_buf: [64]u8 = undefined;
+        try row.appendSlice(alloc, ui_render.dim_style);
+        try row.appendSlice(alloc, thinking_label.glyph);
+        try row.append(alloc, ' ');
+        try row.appendSlice(alloc, thinking_label.thinking(&label_buf, preview.thinking_ms));
+        try row.appendSlice(alloc, reset);
+        return row;
+    }
+    if (reasoning) {
+        try row.appendSlice(alloc, ui_render.system_notice_text_style);
+        try row.appendSlice(alloc, "\x1b[3m");
+    }
+    try row.appendSlice(alloc, "  ");
     var word_index = words_before;
     var in_word = false;
     var faint = false;

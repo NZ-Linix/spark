@@ -84,6 +84,7 @@ pub const ResumeProjection = struct {
             .body = owned.body,
             .visibility = owned.visibility,
             .detail = owned.detail,
+            .thought_ms = owned.thought_ms,
         } });
     }
 

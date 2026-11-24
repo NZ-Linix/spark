@@ -528,8 +528,9 @@ const App = struct {
     /// The profiles `/launch` completes.
     launch_completion: app_profile_runtime.LaunchCompletion = .{},
     prompt_completion: prompts.Completion = .{},
-    /// Whether thinking blocks show in the transcript; Cmd+O toggles it.
-    show_reasoning: bool = true,
+    /// Whether thinking blocks show their reasoning (Ctrl+O). Off: each is
+    /// one "Thought for 3s" line, and the status line counts the thinking.
+    show_reasoning: bool = false,
     /// The launch animation under the composer; gone after the first keystroke.
     splash: splash_mod.State = .{},
     /// Reveals reasoning and the reply's line in progress word by word.
@@ -2274,11 +2275,32 @@ const App = struct {
         return live_preview_mod.pickSource(agent.reasoning.items, self.show_reasoning, agent.live_text.items, agent.live_generation);
     }
 
+    /// Applies `show_reasoning` to the transcript and reprints it, so the
+    /// thinking blocks already written expand or collapse too.
+    pub fn redrawForThinkingToggle(self: *App) !void {
+        ui_render.expand_thinking = self.show_reasoning;
+        self.shell.setCommandOutputRenderPolicy(RenderAppRuntime.shellStyles());
+        // A mutation may not land while the transcript hands rows to the
+        // terminal's scrollback; the next paint then picks up the styles.
+        self.shell.rerenderEntries(self.alloc, "thinking toggle") catch |err| {
+            debug_trace.logf("render", "thinking_toggle_rerender_failed err={s}", .{@errorName(err)});
+        };
+        try self.shell.requestTerminalReset(&self.metrics);
+        self.shell.render_requests.request(.transcript);
+        self.shell.render_requests.request(.footer);
+    }
+
     pub fn livePreview(self: *App, agent: *agents.Agent) ?live_preview_mod.Preview {
         const preview = self.live_pacer.preview(self.liveSource(agent), self.shell.layout.cols) orelse return null;
         // The transcript puts a gap above the thinking block when it writes
         // it; the preview leaves the same one.
-        if (preview.kind == .reasoning) return preview.withGapAbove(@min(1, self.shell.transientAssistantGapRows()));
+        if (preview.kind == .reasoning) {
+            var shown = preview.withGapAbove(@min(1, self.shell.transientAssistantGapRows()));
+            const now_ms = io_mod.milliTimestamp();
+            if (agent.reasoning_started_ms > 0 and now_ms > agent.reasoning_started_ms)
+                shown.thinking_ms = @intCast(now_ms - agent.reasoning_started_ms);
+            return shown;
+        }
         return preview;
     }
 
@@ -4172,6 +4194,7 @@ test {
     _ = @import("core/config/model_capabilities.zig");
     _ = @import("core/output/output_contracts.zig");
     _ = @import("core/output/session_list_text.zig");
+    _ = @import("core/output/thinking_label.zig");
     _ = @import("core/workspace/pathing.zig");
     _ = @import("core/workspace/current_branch.zig");
     _ = @import("core/workspace/repo_root.zig");

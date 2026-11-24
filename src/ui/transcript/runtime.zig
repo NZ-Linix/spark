@@ -3924,6 +3924,10 @@ pub const TranscriptRuntime = struct {
         return transcript_store.retintEntriesForTheme(self, alloc, from, to);
     }
 
+    pub fn rerenderEntries(self: *TranscriptRuntime, alloc: Allocator, label: []const u8) !void {
+        return transcript_store.rerenderEntries(self, alloc, label);
+    }
+
     pub fn setTranscriptPresentationDepth(
         self: *TranscriptRuntime,
         alloc: Allocator,
@@ -5993,8 +5997,13 @@ pub const TranscriptRuntime = struct {
                         projection_area,
                     );
                 }
+                // A flow that has not scrolled at all owes the normal buffer
+                // nothing: every row is still on screen, and the frame that
+                // rewrote it painted it. Without this, a rewrite above the
+                // tail with no footer change in between kept the debt, and
+                // its follow-up frames, alive for the rest of the turn.
                 if (target.normal_buffer_recovery_pending and
-                    scroll_facts.geometry_rebase and
+                    (scroll_facts.geometry_rebase or target.visual_offset == 0) and
                     target.history_visual_offset >= target.visual_offset)
                 {
                     target.normal_buffer_recovery_pending = false;
@@ -7491,7 +7500,10 @@ pub const TranscriptRuntime = struct {
                     transition.cursor_col,
                 },
             );
-            if (transition.normal_buffer_recovery_pending or
+            // A frame that kept the committed body could not pay the
+            // recovery debt, and the next one, with the same inputs, would
+            // not either; new content requests its own frame.
+            if ((transition.normal_buffer_recovery_pending and !retained_body) or
                 (commit.accepted.semantic_rows > 0 and if (self.committedRetentionIdentity()) |identity| identity.publication_entries.len > 0 else false))
             {
                 self.markTranscriptDirty();

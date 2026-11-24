@@ -513,6 +513,7 @@ pub fn Runtime(comptime App: type) type {
                 .notice_error_style = ui_render.red_style,
                 .notice_cancelled_style = ui_render.dim_style,
                 .code_highlight_theme = if (ui_render.is_light) .light else .dark,
+                .expand_thinking = ui_render.expand_thinking,
             };
         }
 

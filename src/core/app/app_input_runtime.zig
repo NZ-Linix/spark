@@ -1047,15 +1047,17 @@ pub fn Runtime(comptime App: type) type {
             // works while a prompt is open: the prompt belongs to the agent
             // on screen, and comes back with it. The open list takes the key
             // first, as Esc, in `routeAgentsMenuInput`.
+            // Ctrl+O expands every thinking block to its reasoning, or
+            // collapses them back to "Thought for 3s". The transcript is
+            // reprinted, as for a theme change, so earlier blocks change too.
             if (resolved == .toggle_reasoning) {
                 if (comptime @hasField(App, "show_reasoning")) {
                     app.show_reasoning = !app.show_reasoning;
-                    try app.writeDomainNotice(.{
-                        .topic = "thinking",
-                        .tone = .neutral,
-                        .body = if (app.show_reasoning) "Reasoning is shown. Cmd+O hides it." else "Reasoning is hidden; ctrl+o still shows it. Cmd+O shows it again.",
-                    }, true);
-                    app.shell.render_requests.request(.footer);
+                    if (comptime @hasDecl(App, "redrawForThinkingToggle")) {
+                        try app.redrawForThinkingToggle();
+                    } else {
+                        app.shell.render_requests.request(.footer);
+                    }
                 }
                 return .done;
             }

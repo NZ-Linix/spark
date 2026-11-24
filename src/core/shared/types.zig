@@ -45,6 +45,10 @@ pub const SemanticNotice = struct {
     /// An optional dim line under the body, indented like a wrapped body row
     /// and without its own glyph.
     detail: []const u8 = "",
+    /// Set on a thinking block: how long the model thought, in milliseconds.
+    /// The transcript shows it as "Thought for 3s", with the body (the
+    /// reasoning) under it only while thinking is expanded (Ctrl+O).
+    thought_ms: ?u64 = null,
 };
 
 /// Status glyph leading every semantic notice, keyed by tone. Tool activity
@@ -75,6 +79,7 @@ pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.
         .body = body,
         .visibility = notice.visibility,
         .detail = try alloc.dupe(u8, notice.detail),
+        .thought_ms = notice.thought_ms,
     };
 }
 
@@ -268,6 +273,9 @@ pub const StreamState = struct {
     /// When the turn started; 0 hides the elapsed counter and activity blink.
     /// Monotonic for the whole turn: phase and tool boundaries never reset it.
     turn_started_ms: i64 = 0,
+    /// When `phase` last changed; the status line counts the current phase
+    /// from here ("Thinking for 3s..."). 0 falls back to `turn_started_ms`.
+    phase_started_ms: i64 = 0,
     /// When the turn started waiting, on user input (approval or question)
     /// or on a compaction; 0 means not waiting. While set, the turn clock
     /// freezes at this instant; on resume the wait is excluded by shifting

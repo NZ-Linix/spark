@@ -659,20 +659,24 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Writes the reasoning gathered since the last block as a thinking
-        /// block: in the transcript when reasoning is shown, otherwise only
-        /// in the full transcript (ctrl+o).
+        /// block. The transcript shows it as "Thought for 3s", with the
+        /// reasoning under it while thinking is expanded (Ctrl+O).
         fn flushReasoning(app: *App, agent: *AppAgent, handlers: anytype) !void {
+            _ = app;
             if (comptime !agents.hasAgentField(App, "reasoning")) return;
             defer agent.reasoning.clearRetainingCapacity();
+            const started_ms = agent.reasoning_started_ms;
+            defer agent.reasoning_started_ms = 0;
             if (agent.reasoning.items.len > 0) agent.live_generation +%= 1;
             const text = std.mem.trim(u8, agent.reasoning.items, " \t\r\n");
             if (text.len == 0) return;
-            const shown = if (comptime @hasField(App, "show_reasoning")) app.show_reasoning else true;
+            const now_ms = io_mod.milliTimestamp();
+            const thought_ms: u64 = if (started_ms > 0 and now_ms > started_ms) @intCast(now_ms - started_ms) else 0;
             try handlers.semantic_notice(handlers.ctx, .{
                 .topic = "",
                 .tone = .neutral,
                 .body = text,
-                .visibility = if (shown) .compact_and_full else .full_only,
+                .thought_ms = thought_ms,
             });
         }
 
@@ -1221,7 +1225,7 @@ pub fn Runtime(comptime App: type) type {
                         const author: types.MessageAuthor = if (event == .append_agent_message) .child else .user;
                         try handlers.write_user_prompt(handlers.ctx, .{ .text = text, .author = author });
                         if (agent.stream.active and agent.stream.phase != .thinking) {
-                            agent.stream.phase = .thinking;
+                            activity_status.setPhase(&agent.stream, .thinking, io_mod.milliTimestamp());
                             app.shell.render_requests.request(.footer);
                         }
                     },
@@ -1393,6 +1397,7 @@ pub fn Runtime(comptime App: type) type {
                     .reasoning_delta => |text| {
                         if (comptime @hasField(App, "remote")) if (agent == &app.main_agent) app.remote.appendText(.thought, text) catch {};
                         if (comptime agents.hasAgentField(App, "reasoning")) {
+                            if (agent.reasoning_started_ms == 0) agent.reasoning_started_ms = thinkingStartedMs(agent.stream, io_mod.milliTimestamp());
                             if (agent.reasoning.items.len < 256 * 1024) try agent.reasoning.appendSlice(std.heap.c_allocator, text);
                             app.shell.render_requests.request(.footer);
                         }
@@ -1645,12 +1650,21 @@ pub fn Runtime(comptime App: type) type {
             }
 
             const focused_activity_kind = transition.snapshot.focused_activity_kind;
-            if (tool_work_active) agent.stream.phase = .running;
+            if (tool_work_active) activity_status.setPhase(&agent.stream, .running, io_mod.milliTimestamp());
             agent.stream.last_activity_kind = focused_activity_kind;
             if (transition.focus_changed()) {
                 app.shell.render_requests.requestAnimationReset();
             }
             app.shell.render_requests.request(.footer);
+        }
+
+        /// When the thinking that first reasoning arriving now belongs to
+        /// began: the start of the thinking phase, which counts the time the
+        /// model spent before it wrote anything, or now.
+        fn thinkingStartedMs(stream: types.StreamState, now_ms: i64) i64 {
+            if (stream.active and stream.phase == .thinking and stream.phase_started_ms > 0 and stream.phase_started_ms <= now_ms)
+                return stream.phase_started_ms;
+            return now_ms;
         }
 
         fn resetStream(app: *App, agent: *AppAgent, clear_route_recovery: bool) void {
@@ -1694,7 +1708,7 @@ pub fn Runtime(comptime App: type) type {
             if (update.step_id < agent.stream.phase_step_id) return;
 
             const changed = agent.stream.phase != update.phase;
-            agent.stream.phase = update.phase;
+            activity_status.setPhase(&agent.stream, update.phase, io_mod.milliTimestamp());
             agent.stream.phase_step_id = update.step_id;
             if (changed) app.shell.render_requests.request(.footer);
         }

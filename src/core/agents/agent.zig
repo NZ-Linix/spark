@@ -88,6 +88,10 @@ pub const Agent = struct {
     custom_prompt: prompts.Selected = .{},
     /// Reasoning streamed since the last thinking block was written.
     reasoning: std.ArrayList(u8) = .empty,
+    /// When the thinking that `reasoning` holds began, or 0 when none has
+    /// streamed since the last thinking block. The block's "Thought for"
+    /// time runs from here.
+    reasoning_started_ms: i64 = 0,
     /// The reply's line in progress, shown live under the transcript.
     live_text: std.ArrayList(u8) = .empty,
     /// Bumped whenever the live preview starts over: a new line, or new

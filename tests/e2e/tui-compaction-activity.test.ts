@@ -280,7 +280,7 @@ async function assertCompactionQuiet(terminal: InstanceType<typeof TmuxSession>,
   expect(inline.length).toBeGreaterThan(0);
   expect(compactedSeconds(inline)).toHaveLength(compacted);
   expect(withoutCompactedLines(inline)).not.toMatch(COMPACTION_OUTPUT);
-  await terminal.sendKeys("C-o");
+  await terminal.sendKeys("M-o");
   await terminal.waitForText("esc close · pgup/pgdn scroll", 5000);
   await terminal.sendKeys("End");
   const full = await terminal.waitForPane((pane) => pane.includes("esc close · pgup/pgdn scroll"), 5000);
@@ -288,7 +288,7 @@ async function assertCompactionQuiet(terminal: InstanceType<typeof TmuxSession>,
   // The full transcript shows one page, which may not reach the line.
   expect(compactedSeconds(full).length).toBeLessThanOrEqual(compacted);
   expect(withoutCompactedLines(withoutCompactionCallLines(full))).not.toMatch(COMPACTION_OUTPUT);
-  await terminal.sendKeys("C-o");
+  await terminal.sendKeys("M-o");
   await terminal.waitForComposer(5000);
 }
 
@@ -321,10 +321,10 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         expect(f.durable()).toBe(0);
         expect(f.counts().ordinary).toBe(f.seedTurns + (trigger === "overflow" ? 1 : 0));
         if (trigger === "manual") {
-          await terminal.sendKeys("C-o");
+          await terminal.sendKeys("M-o");
           await terminal.waitForText("esc close · pgup/pgdn scroll", 5000);
           expect(await terminal.capturePane()).not.toMatch(COMPACTION_OUTPUT);
-          await terminal.sendKeys("C-o");
+          await terminal.sendKeys("M-o");
           await terminal.waitForText(ACTIVITY, 5000);
           await terminal.resizeWindow(52, 24);
           await terminal.waitForText(ACTIVITY, 5000);
@@ -658,14 +658,14 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         expect(conversationLines(f.savedEvents())).toEqual(conversationLines(cancelledEvents));
 
         const reopened = await f.launch();
-        await reopened.sendKeys("C-o");
+        await reopened.sendKeys("M-o");
         await reopened.waitForText("esc close · pgup/pgdn scroll", 5000);
         await reopened.sendKeys("End");
         const full = await reopened.waitForPane((pane) => pane.includes("Cancel this held response."), 5000);
         writeFileSync(join(f.root, "cancellation-reopened.txt"), full);
         expect(full.includes("Cancelled")).toBe(trigger === "ordinary");
         expect(withoutCompactionCallLines(full)).not.toMatch(COMPACTION_OUTPUT);
-        await reopened.sendKeys("C-o");
+        await reopened.sendKeys("M-o");
         await reopened.waitForComposer(5000);
         expect(await reopened.captureFullScrollbackEscapes()).not.toMatch(COMPACTION_OUTPUT);
         await f.close();
@@ -738,12 +738,12 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const terminal = await f.launch(true);
       const authMessage = "spark needs access to the model connection";
       async function authNotices(label: string) {
-        await terminal.sendKeys("C-o");
+        await terminal.sendKeys("M-o");
         await terminal.waitForText("esc close · pgup/pgdn scroll", 5000);
         await terminal.sendKeys("End");
         const pane = await terminal.waitForPane((text) => text.includes("esc close · pgup/pgdn scroll") && text.includes(authMessage), 5000);
         writeFileSync(join(f.root, `${label}.txt`), pane);
-        await terminal.sendKeys("C-o");
+        await terminal.sendKeys("M-o");
         await terminal.waitForComposer(5000);
         return pane.split(authMessage).length - 1;
       }
@@ -954,7 +954,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       // Between turns the cycle is read in the background and kept.
       await until(() => trace().includes("archive_loaded back=1"), "the background read of the joined cycle", 15_000);
       const openAt = trace().length;
-      await terminal.sendKeys("C-o");
+      await terminal.sendKeys("M-o");
       await terminal.waitForText("esc close", 15_000);
       await terminal.waitForText("CTRLO_OLDER_ROW_40_5c1", 15_000);
       const atOpen = trace().slice(openAt);

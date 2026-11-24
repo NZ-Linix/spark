@@ -3802,7 +3802,7 @@ describe("Vision route fake Gateway", () => {
         expect(screen).not.toContain("None of the requested images were read");
         expect(screen).not.toContain("spark_recovery_prompt");
 
-        await session.sendKeys("C-o");
+        await session.sendKeys("M-o");
         const full = await session.waitForPane(
           (pane) => pane.includes("esc close · pgup/pgdn scroll"),
           TIMEOUT,

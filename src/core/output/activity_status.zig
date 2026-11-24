@@ -4,6 +4,11 @@ const types = @import("../shared/types.zig");
 pub const StreamState = types.StreamState;
 const compaction_activity = @import("compaction_activity.zig");
 const turn_clock = @import("turn_clock.zig");
+const thinking_label = @import("thinking_label.zig");
+
+/// The status line's marker. The painter swaps it for the spinner's current
+/// frame (`thinking_label.spinner_frames`).
+pub const activity_marker = thinking_label.glyph;
 const ActivityProjection = @import("activity_runtime.zig").ActivityProjection;
 
 /// A compaction's own clock, which starts at zero whatever started it. The
@@ -34,9 +39,9 @@ pub fn compactionProjection(
     const op = snapshot.operation orelse return .none;
     if (!op.visible(now_ms)) return .none;
     const label: []const u8, const percent: ?u8 = switch (op.phase) {
-        .preparing => .{ "• Compacting", compactionPercent(op, .preparation) },
-        .running => |stage| .{ "• Compacting", compactionPercent(op, stage) },
-        .stopping => .{ "• Stopping compaction", null },
+        .preparing => .{ activity_marker ++ " Compacting", compactionPercent(op, .preparation) },
+        .running => |stage| .{ activity_marker ++ " Compacting", compactionPercent(op, stage) },
+        .stopping => .{ activity_marker ++ " Stopping compaction", null },
         .terminal => |feedback| return .{ .turn_thinking = .{
             .label = compactionFeedbackLabel(feedback),
             .tone = switch (feedback.outcome) {
@@ -132,22 +137,68 @@ fn streamStatusVerb(stream: StreamState) []const u8 {
     };
 }
 
-fn markedTurnPhaseLabel(phase: types.TurnPhase) []const u8 {
+fn turnPhaseVerb(phase: types.TurnPhase) []const u8 {
     return switch (phase) {
-        .thinking => "• Thinking",
-        .generating => "• Generating",
-        .running, .waiting_for_subagent => "• Running",
+        .thinking => "Thinking",
+        .generating => "Writing",
+        .running => "Running",
+        .waiting_for_subagent => "Waiting",
     };
 }
 
+/// The status line before any turn clock runs, such as while a prompt is
+/// being sent.
+pub const pending_turn_label = activity_marker ++ " Thinking...";
+
+/// Moves the turn to `phase`, restarting the phase clock when it changes.
+pub fn setPhase(stream: *StreamState, phase: types.TurnPhase, now_ms: i64) void {
+    if (stream.phase != phase or stream.phase_started_ms == 0) stream.phase_started_ms = now_ms;
+    stream.phase = phase;
+}
+
+fn phaseMarks(stream: StreamState) turn_clock.Marks {
+    const started = if (stream.phase_started_ms > 0) @max(stream.phase_started_ms, stream.turn_started_ms) else stream.turn_started_ms;
+    return .{ .started_ms = started, .waiting_since_ms = stream.waiting_since_ms };
+}
+
+/// "✻ Thinking for 3s... (↑5 ↓80)": the turn's phase, how long it has
+/// been in it, and the tokens so far.
 pub fn buildTurnLabel(buf: []u8, stream: StreamState, now_ms: i64) ?[]const u8 {
     if (stream.last_activity_kind != null) return null;
     var out: std.Io.Writer = .fixed(buf);
-    const marked_phase = markedTurnPhaseLabel(stream.phase);
-    out.writeAll(marked_phase) catch return marked_phase;
-    appendTurnElapsedSuffix(&out, stream, now_ms) catch return out.buffered();
+    const verb = turnPhaseVerb(stream.phase);
+    out.print("{s} ", .{activity_marker}) catch return pending_turn_label;
+    if (turn_clock.elapsedMs(phaseMarks(stream), now_ms)) |elapsed| {
+        var phase_buf: [64]u8 = undefined;
+        out.writeAll(thinking_label.activePhase(&phase_buf, verb, @intCast(elapsed))) catch return out.buffered();
+    } else {
+        out.print("{s}...", .{verb}) catch return out.buffered();
+    }
     appendTurnTokenSuffix(&out, stream) catch return out.buffered();
     return out.buffered();
+}
+
+test "the status line counts the current phase, not the whole turn" {
+    var buf: [128]u8 = undefined;
+    var stream: StreamState = .{ .active = true, .turn_started_ms = 1_000 };
+    try std.testing.expectEqualStrings("✻ Thinking for 4s...", buildTurnLabel(&buf, stream, 5_500).?);
+    setPhase(&stream, .running, 6_000);
+    try std.testing.expectEqualStrings("✻ Running for 1s...", buildTurnLabel(&buf, stream, 7_200).?);
+    setPhase(&stream, .thinking, 70_000);
+    stream.token_progress = .{ .input_tokens = 1200, .output_tokens = 80 };
+    try std.testing.expectEqualStrings("✻ Thinking for 1m 5s... (↑1.2k ↓80)", buildTurnLabel(&buf, stream, 135_000).?);
+    // The same phase again keeps its clock.
+    setPhase(&stream, .thinking, 100_000);
+    try std.testing.expectEqual(@as(i64, 70_000), stream.phase_started_ms);
+}
+
+test "a wait holds the phase clock and leaves it out afterwards" {
+    var stream: StreamState = .{ .active = true, .turn_started_ms = 1_000 };
+    setPhase(&stream, .running, 1_000);
+    syncWaitingClock(&stream, true, 3_000);
+    syncWaitingClock(&stream, false, 13_000);
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("✻ Running for 3s...", buildTurnLabel(&buf, stream, 14_000).?);
 }
 
 pub const activity_blink_half_period_ms: i64 = 500;
@@ -206,6 +257,9 @@ pub fn writeElapsed(writer: *std.Io.Writer, seconds: i64) !void {
 /// have changed.
 pub fn syncWaitingClock(stream: *StreamState, waiting: bool, now_ms: i64) void {
     const marks = turn_clock.sync(turnMarks(stream.*), stream.active, waiting, now_ms);
+    // The phase clock skips the same wait the turn clock does.
+    if (stream.phase_started_ms > 0 and marks.started_ms > stream.turn_started_ms)
+        stream.phase_started_ms += marks.started_ms - stream.turn_started_ms;
     stream.turn_started_ms = marks.started_ms;
     stream.waiting_since_ms = marks.waiting_since_ms;
 }

@@ -23,6 +23,9 @@ const user_message_card = @import("assistant/user_message_card.zig");
 pub const welcome_message_reserved_rows: u16 = 11;
 
 pub var is_light: bool = false;
+/// Whether the transcript shows the model's reasoning under each "Thought
+/// for" line. Ctrl+O flips it; off by default.
+pub var expand_thinking: bool = false;
 pub var divider_style: []const u8 = shared_theme.spark_dark.divider_style;
 pub var hint_style: []const u8 = shared_theme.spark_dark.hint_style;
 pub var statusline_style: []const u8 = shared_theme.spark_dark.statusline_style;

@@ -125,9 +125,9 @@ tmuxTest("native-clear recovery after a tool call keeps spark running and the to
     expect(history).not.toContain("TOOL_TURN_DONE");
     expect(history).toContain("-=✦ v");
 
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     await session.waitForText("echo TOOL_BEFORE_CLEAR", 10_000);
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     await session.waitForPane((pane) => composerContains(pane, "abc"), 10_000);
 
     expect(session.isAlive()).toBe(true);
@@ -275,14 +275,14 @@ tmuxTest("typing inside the ctrl+o full transcript never starts the native-clear
 
     // While the full transcript owns the alternate screen, the terminal cursor
     // no longer reflects the main-grid footer row, so the probe must not begin.
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     await session.waitForText("esc close · pgup/pgdn scroll", 10_000);
     await session.sendLiteral("j");
 
     // The typed byte still reaches the composer through the modal fallthrough.
     // Waiting for it first proves the byte traversed the input path while the
     // transcript owned the screen, so the no-probe assertion needs no sleep.
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     await session.waitForPane((pane) => composerContains(pane, "aj"), 10_000);
 
     const trace = readFileSync(trace_path, "utf8");

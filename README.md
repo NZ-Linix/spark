@@ -98,7 +98,7 @@ spark ask --json "summarize the failing tests" | jq -r .final_output
 | `/mcp`     | Manage MCP servers                                                   |
 | `/help`    | List every command                                                   |
 
-Ctrl+O opens the full transcript, including tool details and reasoning.
+The model's thinking shows as one `Thought for 3s` line; Ctrl+O expands every thinking block to the reasoning behind it, and collapses them again. Alt+O (or Cmd+O) opens the full transcript, including tool details and reasoning.
 
 The footer shows the latest reported context usage and this run's token totals: `↑` uncached input, `↓` output, `R` cache reads, `W` cache writes, and `CH` the cache hit rate for requests that report cache usage. Hide the segment with `spark config set status_line.context false`.
 

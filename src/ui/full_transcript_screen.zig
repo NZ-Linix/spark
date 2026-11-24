@@ -11,6 +11,7 @@ const session_child_store = @import("../core/session/session_child_store.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const transcript_presentation = @import("../core/output/transcript_presentation.zig");
 const full_transcript_metadata = @import("../core/output/full_transcript_metadata.zig");
+const thinking_label = @import("../core/output/thinking_label.zig");
 const assistant_wrap = @import("render_engine/assistant_wrap.zig");
 const build_checkpoint = @import("render_engine/build_checkpoint.zig");
 const transcript_blocks = @import("render_engine/transcript_blocks.zig");
@@ -2670,6 +2671,13 @@ const ProjectionComposeContext = struct {
         var safe: std.Io.Writer.Allocating = .init(self.alloc);
         defer safe.deinit();
         var encoder = TerminalSafeIndentedWriter{ .prefix = "" };
+        // A thinking block leads with how long it took; the reasoning goes
+        // under it.
+        if (notice.thought_ms) |ms| {
+            var label_buf: [64]u8 = undefined;
+            try encoder.append(&safe.writer, thinking_label.thought(&label_buf, ms));
+            try encoder.append(&safe.writer, "\n");
+        }
         try encoder.append(&safe.writer, notice.body);
         if (notice.detail.len > 0) {
             try encoder.append(&safe.writer, "\n");

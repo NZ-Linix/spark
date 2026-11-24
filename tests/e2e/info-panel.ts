@@ -287,14 +287,14 @@ export function panelSession(panel: InfoPanel): { id: string | null; saved: bool
 
 /// The transcript `grid` shows: the rows above the composer, its bottom-most
 /// `┃` row, without trailing blank rows, and with a running turn's live
-/// activity row, such as `• Thinking (1s) (↑2 ↓0)`, as one placeholder: its
-/// glyph blinks and its counters tick. The footer is left out, since its
+/// activity row, such as `✻ Thinking for 1s... (↑2 ↓0)`, as one placeholder:
+/// its spinner turns and its counters tick. The footer is left out, since its
 /// status line may change on its own, as a timed warning ends.
 function transcriptRows(grid: string[]): string[] {
   const all = grid.map((row) => row.trimEnd());
   const composer = all.findLastIndex((row) => row.startsWith("┃"));
   if (composer < 0) throw new Error(`no composer row in the grid:\n${all.join("\n")}`);
-  const rows = all.slice(0, composer).map((row) => (/^[• ] [A-Z][^()]* \(\d+s\)/.test(row) ? "<activity>" : row));
+  const rows = all.slice(0, composer).map((row) => (/^[·✢✳✶✻✽• ] [A-Z]\w* for \d+(?:m \d+)?s\.\.\./.test(row) ? "<activity>" : row));
   while (rows.length > 0 && rows.at(-1) === "") rows.pop();
   return rows;
 }

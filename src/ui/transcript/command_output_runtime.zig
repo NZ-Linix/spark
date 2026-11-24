@@ -1866,8 +1866,8 @@ fn appendDimmedCommandRows(
 fn foldedHint(alloc: Allocator, hidden_records: usize, cols: u16) ![]u8 {
     const noun = if (hidden_records == 1) "line" else "lines";
     const candidates = [_][]u8{
-        try alloc.print("│ … {d} {s} more (ctrl+o to view)", .{ hidden_records, noun }),
-        try alloc.print("│ … {d} more (ctrl+o)", .{hidden_records}),
+        try alloc.print("│ … {d} {s} more (alt+o to view)", .{ hidden_records, noun }),
+        try alloc.print("│ … {d} more (alt+o)", .{hidden_records}),
         try alloc.print("│ … {d} more", .{hidden_records}),
     };
     defer for (candidates) |candidate| alloc.free(candidate);

@@ -910,7 +910,7 @@ tmuxTest(
     const fullFooter = "esc close · pgup/pgdn scroll";
     const response = "history prompt complete";
     const openRetainedTranscript = async () => {
-      await active.sendKeys("C-o");
+      await active.sendKeys("M-o");
       const pane = await active.waitForPane(
         (pane) => pane.includes(fullFooter) && pane.includes(response),
         READY_TIMEOUT,
@@ -945,7 +945,7 @@ tmuxTest(
 
     // Establish that the viewer has the response before clearing the display.
     await openRetainedTranscript();
-    await active.sendKeys("C-o");
+    await active.sendKeys("M-o");
     await waitForActiveFooter(active, (footer) => footer === `┃ ${draft}`);
     await active.waitForPane(
       (pane) => !pane.includes(fullFooter) && pane.includes(response),
@@ -959,13 +959,13 @@ tmuxTest(
     );
 
     await openRetainedTranscript();
-    await active.sendKeys("C-o");
+    await active.sendKeys("M-o");
     await expectClearedInline();
 
     await active.resizeWindow(72, 20, 300);
     await expectClearedInline();
     await openRetainedTranscript();
-    await active.sendKeys("C-o");
+    await active.sendKeys("M-o");
     await expectClearedInline();
     expect(gateway?.requests).toHaveLength(1);
 
@@ -1002,7 +1002,7 @@ tmuxTest(
     expect(inline).not.toContain("session: provider:");
     expect(inline).not.toMatch(callLine);
 
-    await active.sendKeys("C-o");
+    await active.sendKeys("M-o");
     await active.waitForText("esc close · pgup/pgdn scroll", READY_TIMEOUT);
     // The session's assembly opens the full transcript.
     let top = await active.capturePane();
@@ -1026,7 +1026,7 @@ tmuxTest(
     const call = rows.findIndex((row) => callLine.test(row));
     expect(response, view).toBeGreaterThanOrEqual(0);
     expect(call, view).toBe(response + 1);
-    await active.sendKeys("C-o");
+    await active.sendKeys("M-o");
     await active.waitForComposer(READY_TIMEOUT);
     expectCleanStderr();
   },

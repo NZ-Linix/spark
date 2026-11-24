@@ -1149,7 +1149,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           // makes the message start a new worker instead. The worker's row
           // reads "Messaged worker" after the first message and "worker
           // working" while the second one waits.
-          await session.waitForPane((pane) => /^[●├└] worker working$/m.test(pane), 15_000);
+          await session.waitForPane((pane) => /^(?:●|  ⎿) worker working$/m.test(pane), 15_000);
           await selectAgent(session, "worker");
           await session.sendKeys("BSpace");
           await session.waitForText("press delete again to close this subagent", 10_000);
@@ -3352,9 +3352,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   // How many times the trace log shows `event`.
   const eventCount = (trace: string, event: string) => trace.split("\n").filter((line) => line.includes(`event=${event} `)).length;
 
-  // The previewed worker is mid-turn, and its "Thinking (Ns)" line blinks its
-  // bullet and counts seconds, so two captures never match with it in.
-  const withoutThinkingTimer = (pane: string) => pane.replace(/^[ •]*Thinking \(\d+s\)$/gm, "Thinking");
+  // The previewed worker is mid-turn, and its "Thinking for Ns..." line turns
+  // its spinner and counts seconds, so two captures never match with it in.
+  const withoutThinkingTimer = (pane: string) => pane.replace(/^[·✢✳✶✻✽ ]*Thinking for \d+(?:m \d+)?s\.\.\.(?: \(.*\))?$/gm, "Thinking");
 
   // The pane once it has held still for 300 ms, so every key sent before is
   // handled.

@@ -1058,7 +1058,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
 
       await session.waitForComposer(10_000);
-      await session.sendKeys("C-o");
+      await session.sendKeys("M-o");
       await session.waitForPane(
         (pane) => pane.replace(/\s+/g, " ").includes(
           "linked skill directory could not be resolved to an authorized readable directory",
@@ -1070,7 +1070,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(detail).not.toContain("SKILL.md is unreadable or not a regular file");
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
-      await session.sendKeys("C-o");
+      await session.sendKeys("M-o");
       await session.waitForComposer(5_000);
       // The warning exists (Ctrl+O showed it) but never reaches the inline transcript.
       const inline = await session.captureFullScrollback();
@@ -4294,7 +4294,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendText("/skills");
       await waitForSkillsMenu(session, 4);
-      await session.sendKeys("C-o");
+      await session.sendKeys("M-o");
       await session.sendKeys("C-x");
 
       const grid = await waitForSkillsMenu(session, 4);
@@ -4661,7 +4661,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
 
       await session.waitForComposer(10_000);
-      await session.sendKeys("C-o");
+      await session.sendKeys("M-o");
       await session.waitForText("skill discovery warning:", 5_000);
       const tracePathPattern = tracePath
         .split("/")
@@ -4670,7 +4670,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect((await session.capturePane()).replace(/\s+/g, " ")).toMatch(
         new RegExp(`see "${tracePathPattern}" for details`),
       );
-      await session.sendKeys("C-o");
+      await session.sendKeys("M-o");
       await session.waitForComposer(5_000);
       const inline = await session.captureFullScrollback();
       expect(inline).not.toContain("skills:");

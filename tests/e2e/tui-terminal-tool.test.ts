@@ -682,9 +682,9 @@ test.skipIf(!tmuxAvailable())(
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
     // The run, the session's input, and its stop share one row with its
     // latest state, so the row is the group's line.
-    expect(row("● Stopped ")).toBe("● Stopped echo, sleep · 3 calls ✓");
-    expect(row("├ Still running ")).toBeUndefined();
-    expect(row("├ Observed ")).toBeUndefined();
+    expect(row("● Stopped ")).toBe("● Stopped echo, sleep · 3 calls");
+    expect(row("  ⎿ Still running ")).toBeUndefined();
+    expect(row("  ⎿ Observed ")).toBeUndefined();
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
@@ -751,7 +751,7 @@ test.skipIf(!tmuxAvailable())(
     // run, the session's input, and its stop share one row, whose note stays.
     const mainRows = (await session.capturePaneGrid()).map((line) => line.trimEnd());
     const mainSession = mainRows.find((line) => line.startsWith("● Stopped "));
-    expect(mainSession).toBe("● Stopped echo, sleep · 3 calls ✓");
+    expect(mainSession).toBe("● Stopped echo, sleep · 3 calls");
     expect(mainRows.join("\n")).not.toContain("FULL_LAUNCH_TAIL");
 
     // `interact` carries no command argument, so the Observed heading is the
@@ -780,7 +780,7 @@ test.skipIf(!tmuxAvailable())(
       }
       return grid;
     };
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
     let grid = await settledFullGrid();
     expect(fullObservedHeading(grid), grid.join("\n")).toBe(expectedHeading);
@@ -794,10 +794,10 @@ test.skipIf(!tmuxAvailable())(
 
     // Closing Ctrl-O returns to the trailing main view and leaks none of the
     // full-detail rows into scrollback.
-    await session.sendKeys("C-o");
+    await session.sendKeys("M-o");
     await session.waitForPane((pane) => !pane.includes("esc close · pgup/pgdn scroll"), TIMEOUT);
     const scrollback = await session.captureFullScrollback();
-    expect(scrollback).toContain("● Stopped echo, sleep · 3 calls ✓");
+    expect(scrollback).toContain("● Stopped echo, sleep · 3 calls");
     expect(scrollback).not.toContain("FULL_LAUNCH_TAIL");
     expect(scrollback).not.toContain("action: interact");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
@@ -882,9 +882,9 @@ test.skipIf(!tmuxAvailable())(
       grid.map((line) => line.trimEnd()).find((line) => line.startsWith(prefix));
     // The run, the session's input, and its stop share one row with its
     // latest state, so the row is the group's line.
-    expect(row("● Stopped ")).toBe("● Stopped echo, sleep · 3 calls ✓");
-    expect(row("├ Still running ")).toBeUndefined();
-    expect(row("├ Observed ")).toBeUndefined();
+    expect(row("● Stopped ")).toBe("● Stopped echo, sleep · 3 calls");
+    expect(row("  ⎿ Still running ")).toBeUndefined();
+    expect(row("  ⎿ Observed ")).toBeUndefined();
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT * 2,

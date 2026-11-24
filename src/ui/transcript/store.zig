@@ -488,7 +488,7 @@ test "retention rebase compact group cutoff follows surviving children" {
         }
         var before = try source_preparation.prepareRetentionSource(&runtime, alloc);
         defer before.deinit(alloc);
-        try std.testing.expect(std.mem.find(u8, before.bytes, "├ second-child") != null);
+        try std.testing.expect(std.mem.find(u8, before.bytes, "⎿ second-child") != null);
         var retained = try cloneRecordedMutationState(&runtime, alloc);
         defer retained.deinit(alloc);
         var ids: EntryIdSet = .empty;
@@ -502,8 +502,8 @@ test "retention rebase compact group cutoff follows surviving children" {
         var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after);
         defer mapping.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 0), mapping.line(0));
-        const old_cut = std.mem.find(u8, before.bytes, "└ third-child").?;
-        const new_cut = std.mem.find(u8, after.bytes, "└ third-child").?;
+        const old_cut = std.mem.find(u8, before.bytes, "⎿ third-child").?;
+        const new_cut = std.mem.find(u8, after.bytes, "⎿ third-child").?;
         try std.testing.expectEqual(new_cut, mapping.byte(old_cut));
         const old_line = std.mem.count(u8, before.bytes[0..old_cut], "\n");
         const new_line = std.mem.count(u8, after.bytes[0..new_cut], "\n");
@@ -948,6 +948,7 @@ fn appendSemanticNoticeEntry(
         .body = owned.body,
         .visibility = owned.visibility,
         .detail = owned.detail,
+        .thought_ms = owned.thought_ms,
         .pending_replacement = pending_replacement,
     } });
     self.notebook.next_entry_id +%= 1;
@@ -1050,6 +1051,7 @@ pub fn replaceSemanticNoticeAtomic(
         .body = owned.body,
         .visibility = owned.visibility,
         .detail = owned.detail,
+        .thought_ms = owned.thought_ms,
     } };
     handed_off = true;
     previous.deinit(alloc);
@@ -1851,6 +1853,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
                 .body = notice.body,
                 .visibility = notice.visibility,
                 .detail = notice.detail,
+                .thought_ms = notice.thought_ms,
             });
             break :blk .{ .semantic_notice = .{
                 .id = notice.id,
@@ -1861,6 +1864,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
                 .body = owned.body,
                 .visibility = owned.visibility,
                 .detail = owned.detail,
+                .thought_ms = owned.thought_ms,
                 .pending_replacement = notice.pending_replacement,
             } };
         },
@@ -2937,6 +2941,19 @@ pub fn retintEntriesForTheme(
         "theme retint",
         .preserve_same_epoch,
     );
+}
+
+/// Renders the transcript again from its entries, under the styles now in
+/// force, as after Ctrl+O expands or collapses the thinking blocks. The
+/// entries themselves do not change.
+pub fn rerenderEntries(self: anytype, alloc: Allocator, label: []const u8) !void {
+    try self.assertCanMutateTranscript();
+    var shadow = try cloneMutationState(self, alloc);
+    defer shadow.deinit(alloc);
+    try rebuildTranscriptCacheFromEntries(&shadow, alloc, label);
+    shadow.recomputeCursorFromTranscript();
+    requestTranscriptPaint(&shadow);
+    try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, label, .preserve_same_epoch);
 }
 
 fn themeOwnsRawEntry(class: RawEntryClass) bool {

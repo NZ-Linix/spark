@@ -17,6 +17,7 @@ const assistant_presentation = @import("../../core/agent/assistant_presentation.
 const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
 const ui_render = @import("../render.zig");
+const thinking_label = @import("../../core/output/thinking_label.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -45,6 +46,9 @@ pub const Styles = struct {
     notice_error_style: []const u8 = "",
     notice_cancelled_style: []const u8 = "",
     code_highlight_theme: CodeHighlightTheme = .dark,
+    /// Whether thinking blocks show the reasoning under their "Thought for"
+    /// line (Ctrl+O), or the line alone.
+    expand_thinking: bool = false,
 };
 
 pub const ToolFallbackDisposition = enum {
@@ -351,6 +355,8 @@ pub const TranscriptEntry = union(enum) {
         body: []const u8,
         visibility: types.NoticeVisibility,
         detail: []const u8 = "",
+        /// Set on a thinking block; see `types.SemanticNotice.thought_ms`.
+        thought_ms: ?u64 = null,
         // The producer will replace this entry in place; its bytes are not
         // final and must not be released into terminal history.
         pending_replacement: bool = false,
@@ -1870,6 +1876,58 @@ fn appendNoticeRow(
     }
 }
 
+const thinking_body_style = "\x1b[3m";
+
+/// A thinking block: "✻ Thought for 3s" in the muted gray, and, when
+/// `styles.expand_thinking`, the reasoning under it, italic and indented by
+/// two. The live preview lays reasoning out the same way, so nothing moves
+/// when the transcript takes it over.
+pub fn renderThinkingNotice(
+    alloc: Allocator,
+    body_in: []const u8,
+    thought_ms: u64,
+    styles: Styles,
+    cols: u16,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var label_buf: [64]u8 = undefined;
+    const label = thinking_label.thought(&label_buf, thought_ms);
+    try out.appendSlice(alloc, styles.dim_style);
+    try out.appendSlice(alloc, thinking_label.glyph);
+    try out.append(alloc, ' ');
+    try out.appendSlice(alloc, label);
+    try out.appendSlice(alloc, styles.reset_style);
+
+    const body = std.mem.trim(u8, body_in, " \t\r\n");
+    if (!styles.expand_thinking or body.len == 0) return out.toOwnedSlice(alloc);
+
+    const indent: usize = if (cols > 4) 2 else 0;
+    const available: usize = @max(@as(usize, cols) -| indent, 1);
+    var active_hyperlink: ?[]const u8 = null;
+    var cursor: usize = 0;
+    while (cursor < body.len) {
+        const line = scanNoticeLine(body, cursor, available);
+        try out.append(alloc, '\n');
+        try out.appendNTimes(alloc, ' ', indent);
+        if (line.end > cursor) {
+            if (active_hyperlink) |opener| try out.appendSlice(alloc, opener);
+            try out.appendSlice(alloc, styles.system_notice_text_style);
+            try out.appendSlice(alloc, thinking_body_style);
+            try appendNoticeText(&out, alloc, body[cursor..line.end], active_hyperlink != null);
+            try out.appendSlice(alloc, styles.reset_style);
+            updateNoticeHyperlinkState(body[cursor..line.end], &active_hyperlink);
+            if (active_hyperlink != null) {
+                try out.appendSlice(alloc, notice_link_underline_off);
+                try out.appendSlice(alloc, notice_osc8_close);
+            }
+        }
+        std.debug.assert(line.next > cursor);
+        cursor = line.next;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 /// Returns an owned semantic notice block without surrounding blank rows.
 pub fn renderSemanticNotice(
     alloc: Allocator,
@@ -1877,6 +1935,7 @@ pub fn renderSemanticNotice(
     styles: Styles,
     cols: u16,
 ) ![]u8 {
+    if (notice.thought_ms) |ms| return renderThinkingNotice(alloc, notice.body, ms, styles, cols);
     var logical: std.ArrayList(u8) = .empty;
     defer logical.deinit(alloc);
     try logical.appendSlice(alloc, types.noticeGlyph(notice.tone));
@@ -2001,8 +2060,14 @@ fn renderEntryToBlockForPresentationInterruptible(
                     .body = e.body,
                     .visibility = e.visibility,
                     .detail = e.detail,
+                    .thought_ms = e.thought_ms,
                 },
-                styles,
+                // Ctrl+O's full transcript always shows the reasoning.
+                if (presentation == .full) blk_styles: {
+                    var full_styles = styles;
+                    full_styles.expand_thinking = true;
+                    break :blk_styles full_styles;
+                } else styles,
                 cols,
             );
             break :blk try normalizeOwnedRenderedBlock(alloc, kind, rendered);

@@ -468,10 +468,10 @@ describe("tui: render record/replay", () => {
       );
       expect(statSync(launched.tapePath).mode & 0o077).toBe(0);
 
-      await session.sendKeys("C-o");
+      await session.sendKeys("M-o");
       await session.waitForText("esc close · pgup/pgdn scroll", 5_000);
       await session.waitForText("visual terminal capture:", 5_000);
-      await session.sendKeys("C-o");
+      await session.sendKeys("M-o");
       await session.waitForComposer(5_000);
       expect(await session.captureFullScrollback()).not.toContain(
         "visual terminal capture:",

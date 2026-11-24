@@ -722,7 +722,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       await session.waitForText("PERF_TRANSCRIPT_TAIL", TIMEOUT);
 
       // One correctness cycle also fences the inline prewarm before timing.
-      session.sendKeysImmediate(["C-o"]);
+      session.sendKeysImmediate(["M-o"]);
       await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       expect(await session.captureFullScrollback()).toContain("PERF_TRANSCRIPT_HEAD");
       session.sendKeysImmediate(["Escape"]);
@@ -740,7 +740,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
         const open = await measureAction(
           fixture.tapePath,
-          () => session!.sendKeysImmediate(["C-o"]),
+          () => session!.sendKeysImmediate(["M-o"]),
           () => session!.waitForText("esc close · pgup/pgdn scroll", TIMEOUT),
           "esc close · pgup/pgdn scroll",
         );
@@ -761,7 +761,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         }
       }
 
-      session.sendKeysImmediate(["C-o"]);
+      session.sendKeysImmediate(["M-o"]);
       await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       let beforePrime = await session.capturePane();
       // The first key moves one viewport into the three-viewport prepared
@@ -1081,7 +1081,7 @@ test.skipIf(!LIVE_ENABLED || !tmuxAvailable())(
       );
       await session.waitForText("LIVE_PERFORMANCE_DONE", TIMEOUT);
 
-      session.sendKeysImmediate(["C-o"]);
+      session.sendKeysImmediate(["M-o"]);
       await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       session.sendKeysImmediate(["Up"]);
       await Bun.sleep(25);

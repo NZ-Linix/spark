@@ -1,6 +1,7 @@
 const std = @import("std");
 const question_prompt = @import("../../core/agent/question_prompt.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
+const tool_group_projection = @import("../transcript/tool_group_projection.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
 const app_mcp_runtime = @import("../../core/app/app_mcp_runtime.zig");
 const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
@@ -693,7 +694,7 @@ pub fn frameOwnedActivityProjection(
     if (ctx.live_preview != null or ctx.live_preview_recent) return .none;
     const compaction = activity_status.compactionProjection(buf, ctx.compaction, ctx.now_ms);
     if (compaction == .none and !ctx.stream.active and ctx.pending_prompt_activity) {
-        return .{ .turn_thinking = .{ .label = "• Thinking" } };
+        return .{ .turn_thinking = .{ .label = activity_status.pending_turn_label } };
     }
     switch (ctx.activity) {
         .tool_slot => {},
@@ -763,7 +764,7 @@ fn turnActivityProjection(
         return .{ .turn_thinking = .{ .label = label } };
     }
     return .{ .turn_thinking = .{
-        .label = "• Thinking",
+        .label = activity_status.pending_turn_label,
     } };
 }
 
@@ -799,8 +800,9 @@ fn appendConnectedToolLabel(
     try connected.appendSlice(alloc, ui_render.statusline_style);
     // `■` is the cancelled marker older sessions recorded before `▪`.
     if (std.mem.eql(u8, marker_bytes, "●") or std.mem.eql(u8, marker_bytes, "▪") or std.mem.eql(u8, marker_bytes, "■")) {
-        try connected.appendSlice(alloc, "└");
-        try appendWithoutAnsi(alloc, &connected, label[marker_end .. marker_end + line_end]);
+        // The running call stands as the next row of the group above it.
+        try connected.appendSlice(alloc, tool_group_projection.child_lead);
+        try appendWithoutAnsi(alloc, &connected, std.mem.trimStart(u8, label[marker_end .. marker_end + line_end], " "));
     } else {
         try appendWithoutAnsi(alloc, &connected, label[0 .. marker_end + line_end]);
     }
