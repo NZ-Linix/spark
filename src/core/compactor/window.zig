@@ -38,6 +38,8 @@ pub const Size = struct {
     /// definitions, measured like the request. When unknown, half of the
     /// room after compaction is set aside for it.
     fixed_tokens: ?usize = null,
+    /// A session may compact to a smaller window than the summarizer can read.
+    summary_usable_tokens: ?usize = null,
     /// How far spark's token estimate ran from the provider's count on a recent
     /// request. The compactor measures text with that estimate, so its room
     /// is scaled by the same ratio.
@@ -70,7 +72,7 @@ pub const Size = struct {
     /// input. After the provider rejected a request as too large, estimates
     /// ran low, so a summary request stays well below the rejected one.
     pub fn summaryRequestTokens(self: Size) usize {
-        var room = self.usable_tokens orelse std.math.maxInt(usize);
+        var room = self.summary_usable_tokens orelse self.usable_tokens orelse std.math.maxInt(usize);
         if (self.overflow) if (self.request_tokens) |rejected| {
             room = @min(room, rejected / 4 * 3);
         };
@@ -82,7 +84,7 @@ pub const Size = struct {
     /// nothing is left, or the provider rejected that conversation as too
     /// large.
     pub fn roomAfterConversation(self: Size) ?usize {
-        const usable = self.usable_tokens orelse return null;
+        const usable = self.summary_usable_tokens orelse self.usable_tokens orelse return null;
         const conversation = self.request_tokens orelse return null;
         if (self.overflow or conversation >= usable) return null;
         return self.estimate(usable - conversation);
@@ -137,6 +139,19 @@ pub const Size = struct {
         return self.overflow or request > (self.usable_tokens orelse std.math.maxInt(usize));
     }
 };
+
+test "session ceiling compacts early without shrinking the summarizer's read window" {
+    var size = Size.of(.{ .context_window = 64_000, .max_output_tokens = 8_000 }, 80);
+    size.summary_usable_tokens = 168_000;
+    size.request_tokens = 90_000;
+    try std.testing.expect(size.due());
+    try std.testing.expect(size.required());
+    try std.testing.expectEqual(@as(usize, 11_200), size.afterTokens());
+    try std.testing.expectEqual(@as(?usize, 78_000), size.roomAfterConversation());
+    size.overflow = true;
+    try std.testing.expectEqual(@as(?usize, null), size.roomAfterConversation());
+    try std.testing.expectEqual(@as(usize, 67_500), size.summaryRequestTokens());
+}
 
 /// Request size, in tokens, at which automatic compaction starts: `percent`
 /// of the model's usable input.

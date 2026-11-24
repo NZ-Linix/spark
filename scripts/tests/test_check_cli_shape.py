@@ -369,6 +369,10 @@ class CheckCliShapeTests(unittest.TestCase):
         self.edit(check_cli_shape.ACP_SERVER, '"model")) {}\n', '"model")) {}\n    if (std.mem.eql(u8, config_id, "fast")) {}\n')
         self.assertOnly(self.run_check(), "names", 'ACP set_config_option takes "fast"')
 
+    def test_session_option_needs_a_matching_slash_command(self) -> None:
+        self.registry["run_options"]["model"] = {"slash": "/unknown", "acp": "model"}
+        self.assertOnly(self.run_check(), "names", 'run_options "model" must name a matching slash command')
+
     def test_run_options_row_must_name_a_listed_flag(self) -> None:
         self.registry["run_options"]["model"]["flag"] = "--modle"
         self.assertOnly(self.run_check(), "names", "names flag --modle")

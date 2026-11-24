@@ -68,6 +68,33 @@ final class FlowTests: XCTestCase {
   }
 
   @MainActor
+  func testSessionContextInModelPicker() throws {
+    let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"])
+    let app = XCUIApplication()
+    app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
+    app.launch()
+    let chats = app.buttons["Chats"]
+    if chats.waitForExistence(timeout: 5), chats.isHittable { chats.tap() }
+    let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Scroll regression")).firstMatch
+    XCTAssertTrue(row.waitForExistence(timeout: 10))
+    row.tap()
+
+    app.textFields["Message spark"].tap()
+    let keyboardTip = app.buttons["Continue"]
+    if keyboardTip.waitForExistence(timeout: 2) { keyboardTip.tap() }
+    app.buttons["Model"].tap()
+    let context = app.buttons["Context limit"]
+    XCTAssertTrue(context.waitForExistence(timeout: 5))
+    context.tap()
+    app.buttons["64k tokens"].tap()
+    XCTAssertTrue(eventually("value == '64k tokens'", context, timeout: 5))
+    shot(app, "context-limit-64k")
+    context.tap()
+    app.buttons["Model default"].tap()
+    XCTAssertTrue(eventually("value == 'Model default'", context, timeout: 5))
+  }
+
+  @MainActor
   func testScrollButtonAndFollowing() throws {
     let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"], "Run mobile/bridge/fixtures/scroll-relay.ts on a test simulator")
     let app = XCUIApplication()

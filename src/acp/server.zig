@@ -13,6 +13,7 @@ const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
 const compactor = @import("../core/compactor/compactor.zig");
+const session_context = @import("../core/config/session_context.zig");
 const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
@@ -214,6 +215,7 @@ pub const ActiveSessionState = struct {
     max_tool_result_bytes: usize,
     fast_mode: bool,
     ultrafast_mode: bool = false,
+    context_limit: ?u32 = null,
     effort: types.ReasoningEffort,
     first_call_tool_choice: types.ToolChoice,
     permission_mode: types.PermissionMode,
@@ -2400,6 +2402,19 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
         defer state.subagent_authority_mutex.unlock(io_mod.getIo());
         if (!try applyActiveSessionFast(state, alloc, msg, session, fast)) return;
+    } else if (std.mem.eql(u8, config_id, "context")) {
+        const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "No active session",
+        });
+        const limit = session_context.parse(value) catch return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Context must be auto or at least 8192 tokens",
+        });
+        commitActiveSessionContextLimit(session, limit) catch return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.internal_error,
+            .message = "Failed to persist session context limit",
+        });
     } else if (std.mem.eql(u8, config_id, "effort")) {
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
@@ -2456,6 +2471,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     );
     try out.writer.writeAll(",");
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
+    if (state.active_session) |active| {
+        try out.writer.writeByte(',');
+        try sessions.writeContextConfigOption(&out.writer, active.context_limit);
+    }
     if (sessions.effortConfigState(state)) |config| {
         try out.writer.writeAll(",");
         try sessions.writeEffortConfigOption(&out.writer, config.efforts, config.current);
@@ -2470,6 +2489,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     }
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+    if (std.mem.eql(u8, config_id, "context")) try sessions.sendActiveSessionUsageUpdate(state, alloc);
 }
 
 /// Loads the catalog when it is due, before a reply that lists its models. A
@@ -2523,6 +2543,17 @@ fn commitActiveSessionProvider(
     session.provider = provider;
 }
 
+fn commitActiveSessionContextLimit(session: *ActiveSessionState, limit: ?u32) !void {
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = session.v2 orelse return error.SessionPersistenceUnavailable;
+    var preferences = try v2.currentPreferences(v2.alloc);
+    defer preferences.deinit(v2.alloc);
+    preferences.context_limit = limit;
+    try v2.setPreferences(preferences);
+    session.context_limit = limit;
+}
+
 /// A v2 session stores its preferences as one value, so every change
 /// writes the whole set.
 fn setV2Preferences(
@@ -2540,6 +2571,7 @@ fn setV2Preferences(
         .effort = effort,
         .fast_mode = session.fast_mode,
         .ultrafast_mode = durable.ultrafast_mode,
+        .context_limit = durable.context_limit,
     });
 }
 

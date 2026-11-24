@@ -88,6 +88,8 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             .provider = &identity,
             .request_fields = request_fields,
             .effort_fields = level,
+            // Anthropic-compatible servers need not implement automatic caching.
+            .automatic_cache = std.ascii.eqlIgnoreCase(definition.base_url, "https://api.anthropic.com/v1"),
         }),
     };
 }

@@ -9,6 +9,7 @@ const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const session_context = @import("../config/session_context.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -853,7 +854,9 @@ pub fn Runtime(comptime App: type) type {
             }
             if (app.statusline_context) {
                 items.context_used = agents.loadTotal(&agent.total_input_tokens) +| agents.loadTotal(&agent.total_output_tokens);
-                items.context_total = model_capabilities.resolveForApp(App, app, visible_model).context_window;
+                const advertised = model_capabilities.resolveForApp(App, app, visible_model).context_window;
+                const limit = if (comptime @hasField(@TypeOf(agent.worker), "agent_turn_settings")) agent.worker.agent_turn_settings.context_limit else null;
+                items.context_total = session_context.window(advertised, limit);
                 if (comptime @hasField(AppAgent, "status_usage")) {
                     items.usage = .{
                         .input = agents.loadTotal(&agent.status_usage.input),

@@ -549,11 +549,15 @@ final class Link {
   }
 
   func set(_ chat: Chat, _ option: String, to value: String) async {
+    let previous = chat.config.first(where: { $0.id == option })?.currentValue
     if let i = chat.config.firstIndex(where: { $0.id == option }) { chat.config[i].currentValue = value }
     do {
       chat.config = try await request(chat.host, "config", ["s": .string(chat.info.id), "option": .string(option), "value": .string(value)], as: [ConfigOption].self)
       remember(chat)
     } catch {
+      if let previous, let i = chat.config.firstIndex(where: { $0.id == option && $0.currentValue == value }) {
+        chat.config[i].currentValue = previous
+      }
       chat.problem = error.localizedDescription
     }
   }

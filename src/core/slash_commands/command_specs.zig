@@ -44,6 +44,7 @@ pub const SlashKind = enum {
     images,
     model,
     effort,
+    context,
     mcp,
     skills,
     copy,

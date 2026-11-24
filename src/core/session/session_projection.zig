@@ -193,7 +193,8 @@ fn durablePreferencesEqual(
         left.provider.same_authority(right.provider) and
         left.effort.eql(right.effort) and
         left.fast_mode == right.fast_mode and
-        left.ultrafast_mode == right.ultrafast_mode;
+        left.ultrafast_mode == right.ultrafast_mode and
+        left.context_limit == right.context_limit;
 }
 
 pub fn encodeCheckpoint(alloc: Allocator, checkpoint: Checkpoint) ![]u8 {

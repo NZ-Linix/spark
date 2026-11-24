@@ -14,6 +14,7 @@ const command_router = @import("../slash_commands/command_router.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const session_context = @import("../config/session_context.zig");
 const editor_state = @import("../input/editor_state.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -482,6 +483,7 @@ pub fn Handlers(comptime App: type) type {
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
                 .handle_effort = commandHandleEffort,
+                .handle_context = commandHandleContext,
                 .show_stats = commandShowStats,
                 .undo_last = commandUndoLast,
                 .handle_mcp = commandHandleMcp,
@@ -756,6 +758,38 @@ pub fn Handlers(comptime App: type) type {
                     app.shell.render_requests.request(.footer);
                 },
             }
+        }
+
+        fn commandHandleContext(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const agent = agents.screenAgentOf(app);
+            if (comptime !@hasField(AppAgent, "session_persistence") or !@hasDecl(@TypeOf(agent.worker), "syncQueuedPromptContextLimit")) return;
+            const arg = std.mem.trim(u8, rest, " \t\r\n");
+            const limit = if (arg.len == 0) agent.worker.agent_turn_settings.context_limit else session_context.parse(arg) catch {
+                try app.writeDomainNotice(.{ .topic = "context", .tone = .warning, .body = "Enter at least 8192 tokens (e.g. /context 64k), or /context auto." }, true);
+                return;
+            };
+            if (arg.len != 0) {
+                app_session_runtime.Runtime(App).setContextLimit(agent, limit) catch {
+                    try app.writeDomainNotice(.{ .topic = "context", .tone = .warning, .body = "Could not save the session context limit." }, true);
+                    return;
+                };
+                app.shell.render_requests.request(.footer);
+            }
+            const model = provider_runtime.modelOf(app, agent);
+            const advertised = model_capabilities.resolveForApp(App, app, model).context_window;
+            var buf: [256]u8 = undefined;
+            const body = if (limit) |tokens| blk: {
+                const effective = session_context.window(advertised, limit).?;
+                break :blk if (effective < tokens)
+                    try std.fmt.bufPrint(&buf, "{d} tokens (model max; session limit {d}).", .{ effective, tokens })
+                else
+                    try std.fmt.bufPrint(&buf, "{d} tokens for this session.", .{tokens});
+            } else if (advertised) |tokens|
+                try std.fmt.bufPrint(&buf, "Model default ({d} tokens). {s}", .{ tokens, session_context.usage })
+            else
+                "Model default (window unknown). " ++ session_context.usage;
+            try app.writeDomainNotice(.{ .topic = "context", .tone = .neutral, .body = body }, true);
         }
 
         /// Bare `/permissions` opens its panel and writes nothing to the

@@ -30,6 +30,7 @@ pub const Options = struct {
     request_fields: request_fragment.Fragment = .{},
     /// Fields of the effort level the request carries; null when the model does not declare it.
     effort_fields: ?request_fragment.Fragment = null,
+    automatic_cache: bool = false,
 };
 
 pub const Error = error{
@@ -274,8 +275,19 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             });
         }
     }
-    // Last, so every field above is spark's own: the settings cannot name one.
     const effort_fields = if (request.provider_options.reasoning != null) options.effort_fields orelse request_fragment.Fragment{} else request_fragment.Fragment{};
+    // When the agent marks its prompt cacheable, let Anthropic advance the
+    // breakpoint with the conversation. Leave stateless helpers and custom
+    // cache settings alone.
+    const cacheable = for (request.instructions) |instruction| {
+        if (instruction.cache_breakpoint) break true;
+    } else false;
+    if (options.automatic_cache and cacheable and request.messages.len != 0 and
+        !request.provider_options.skip_cache_writes and
+        !options.request_fields.has("cache_control") and !effort_fields.has("cache_control"))
+    {
+        try writer.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
+    }
     try request_fragment.write(writer, options.request_fields, effort_fields);
     try writer.writeByte('}');
 }
@@ -293,6 +305,35 @@ fn write_system(writer: *std.Io.Writer, alloc: Allocator, instructions: []const 
     if (joined.items.len == 0) return;
     try writer.writeAll(",\"system\":");
     try std.json.Stringify.value(joined.items, .{}, writer);
+}
+
+test "automatic Anthropic caching marks only eligible session requests" {
+    const alloc = std.testing.allocator;
+    var request: stream_provider.RequestData = .{
+        .model = "claude-sonnet",
+        .instructions = &.{.{ .role = .system, .content = "Instructions", .cache_breakpoint = true }},
+        .messages = &.{.{ .role = .user, .content = "Hello" }},
+        .tool_choice = .auto,
+        .provider_options = .{},
+    };
+    const marker = "\"cache_control\":{\"type\":\"ephemeral\"}";
+    const cached = try build_request(alloc, request, .{ .automatic_cache = true });
+    defer alloc.free(cached);
+    try std.testing.expect(std.mem.find(u8, cached, marker) != null);
+    const compatible = try build_request(alloc, request, .{});
+    defer alloc.free(compatible);
+    try std.testing.expect(std.mem.find(u8, compatible, "cache_control") == null);
+    const custom = try build_request(alloc, request, .{
+        .automatic_cache = true,
+        .request_fields = .{ .fields = &.{.{ .key = "cache_control", .value_json = "{\"type\":\"ephemeral\",\"ttl\":\"1h\"}" }} },
+    });
+    defer alloc.free(custom);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, custom, "cache_control"));
+    try std.testing.expect(std.mem.find(u8, custom, "\"ttl\":\"1h\"") != null);
+    request.instructions = &.{.{ .role = .system, .content = "Helper instructions" }};
+    const stateless = try build_request(alloc, request, .{ .automatic_cache = true });
+    defer alloc.free(stateless);
+    try std.testing.expect(std.mem.find(u8, stateless, "cache_control") == null);
 }
 
 const WireRole = enum { user, assistant };

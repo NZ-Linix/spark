@@ -13,7 +13,12 @@ const items = [
   { id: "tool", role: "tool", text: "", kind: "read", status: "completed", detail: "scroll-fixture.txt", output: "Expanded tool output.\n" + "line of output\n".repeat(20) },
   { id: "last", role: "assistant", text: "The last saved answer." },
 ];
-const config = [{ id: "model", name: "Model", currentValue: "local", options: [{ value: "local", name: "Local" }] }];
+const config = [
+  { id: "model", name: "Model", currentValue: "local", options: [{ value: "local", name: "Local" }] },
+  { id: "context", name: "Context limit", currentValue: "auto", options: [
+    { value: "auto", name: "Model default" }, { value: "65536", name: "64k tokens" },
+  ] },
+];
 Bun.serve({
   hostname: "127.0.0.1", port: 18772,
   fetch(req, server) {
@@ -39,7 +44,12 @@ Bun.serve({
         }
         return;
       }
+      if (req.op === "config") {
+        const option = config.find(o => o.id === req.option);
+        if (option?.options.some(o => o.value === req.value)) option.currentValue = req.value;
+      }
       const results: Record<string, unknown> = {
+        config,
         sessions: [session], open: { ...session, items, config, permission: null }, options: config,
         prompts: [], mcpServers: ["fixture-mcp"], sessionMcp: req.disabled,
       };

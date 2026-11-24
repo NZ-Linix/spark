@@ -411,9 +411,8 @@ class Checker:
                 )
 
     def check_run_options(self) -> None:
-        """Each option a run can set has one row naming it on every surface,
-        so an ACP config option can't drift from the flag, setting, and
-        variable it stands for."""
+        """Keep the ACP option names aligned with their agent-run controls
+        or with a slash command when the option is session-only."""
         rows = {name: row for name, row in self.registry.get("run_options", {}).items() if not name.startswith("_")}
         if not rows:
             self.report(None, "names", "the registry needs a run_options table")
@@ -422,6 +421,12 @@ class Checker:
         settings = {match.group(1) for line in self.lines(SETTINGS_KEYS) if (match := SETTING_ENTRY.search(line.text))}
         env = self.registry.get("env", {})
         for name, row in sorted(rows.items()):
+            if "slash" in row:
+                if row.get("slash") != f"/{name}" or f'.command = "/{name}"' not in commands:
+                    self.report(None, "names", f'run_options "{name}" must name a matching slash command in {COMMANDS}')
+                if any(key in row for key in ("flag", "setting", "env")) or row.get("acp") != name:
+                    self.report(None, "names", f'run_options "{name}" must name a matching ACP option and no run-wide controls')
+                continue
             if not re.search(rf'"{re.escape(str(row.get("flag")))}(?=[ ",])', commands):
                 self.report(None, "names", f'run_options "{name}" names flag {row.get("flag")}, which {COMMANDS} doesn\'t list')
             if row.get("setting") not in settings:
@@ -439,7 +444,7 @@ class Checker:
         named_acp = {row["acp"] for row in rows.values() if "acp" in row}
         for config_id, line in sorted(acp_ids.items()):
             if config_id not in named_acp:
-                self.report(line, "names", f'ACP config option "{config_id}" needs a run_options row in {REGISTRY} naming its flag, setting, and variable')
+                self.report(line, "names", f'ACP config option "{config_id}" needs a run_options row in {REGISTRY} naming its controls')
         for config_id in sorted(named_acp - acp_ids.keys()):
             self.report(None, "names", f'run_options names ACP config option "{config_id}", which {ACP_SESSIONS} doesn\'t offer')
         set_ids: dict[str, Line] = {}

@@ -151,6 +151,8 @@ struct NewChatView: View {
       var o = o
       if let v = pending[o.id] {
         o.currentValue = v
+      } else if o.id == "context" {
+        o.currentValue = "auto"
       } else if o.id == "effort", let level = Effort.fallback(o, last: lastEffort) {
         o.currentValue = level
       }
@@ -170,6 +172,7 @@ struct NewChatView: View {
     leaving = true
     let chosen = link.prompts.contains(where: { $0.name == prompt }) ? prompt : nil
     var options = pending
+    pending.removeValue(forKey: "context")
     if let effort = self.options.first(where: { $0.id == "effort" }), Effort.current(effort) != nil {
       options["effort"] = effort.currentValue
     }

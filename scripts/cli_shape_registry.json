@@ -346,7 +346,11 @@
     "--no-": "Pairs each --x with --no-x at compile time to build the launch usage line from launch_options; no argument is read."
   },
   "run_options": {
-    "_about": "One row per option a run can set, named on every surface: the agent-run flag, the setting, its SPARK_* variable when it has one, and the ACP config option. Names may differ by surface, as ACP's mode does, but each one is written here. check_cli_shape fails when ACP offers a config option that no row names, or when a row names something that doesn't exist.",
+    "_about": "One row per run option: the flag, setting, optional SPARK_* override and ACP config option. Session-only options name a slash command and its ACP counterpart instead. check_cli_shape checks that every named control exists and every ACP option has a row.",
+    "context": {
+      "slash": "/context",
+      "acp": "context"
+    },
     "effort": {
       "flag": "--effort",
       "setting": "effort",

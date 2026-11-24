@@ -6568,6 +6568,7 @@ fn encodePreferences(alloc: Allocator, preferences: session_codec.DurableSession
         effort: []const u8,
         fast_mode: bool,
         ultrafast_mode: ?bool,
+        context_limit: ?u32,
         instructions: ?[]const u8,
     };
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -6578,6 +6579,7 @@ fn encodePreferences(alloc: Allocator, preferences: session_codec.DurableSession
         .effort = preferences.effort.label(),
         .fast_mode = preferences.fast_mode,
         .ultrafast_mode = if (preferences.ultrafast_mode) true else null,
+        .context_limit = preferences.context_limit,
         .instructions = instructions,
     }, .{ .emit_null_optional_fields = false }, &out.writer);
     return out.toOwnedSlice();
@@ -6589,6 +6591,20 @@ fn decodePreferences(alloc: Allocator, raw: []const u8) !session_codec.DurableSe
     // v1's codec knows every field but a child's instructions.
     if (parsed.value == .object) _ = parsed.value.object.swapRemove(instructions_key);
     return session_codec.parse_preferences(alloc, parsed.value);
+}
+
+test "persisted context limit round-trips, including reset to model default" {
+    const alloc = std.testing.allocator;
+    var model = [_]u8{'m'};
+    var preferences: session_codec.DurableSessionPreferences = .{ .model = &model, .effort = .auto, .fast_mode = false };
+    for ([_]?u32{ 65_536, null }) |limit| {
+        preferences.context_limit = limit;
+        const raw = try encodePreferences(alloc, preferences, null);
+        defer alloc.free(raw);
+        var decoded = try decodePreferences(alloc, raw);
+        defer decoded.deinit(alloc);
+        try std.testing.expectEqual(limit, decoded.context_limit);
+    }
 }
 
 /// A child's instructions from its `prefs`, or null. Caller owns.

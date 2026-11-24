@@ -8,6 +8,7 @@ const skill_invocation = @import("../../skills/skill_invocation.zig");
 const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const context_limits = @import("../../config/context_limits.zig");
+const session_context = @import("../../config/session_context.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const model_catalog = @import("../../gateway/model_catalog.zig");
@@ -5226,8 +5227,9 @@ pub const BeforeSummary = struct {
 /// The sizes compaction works with for `model`, including what `agent`
 /// measured of its recent requests: their fixed part, and how far spark's token
 /// estimate ran from the provider's count.
-pub fn compactionSize(agent: *const runtime_agent.Agent, capabilities: model_capabilities.Capabilities, percent: u8, model: []const u8) compactor.Size {
-    var size = compactor.Size.of(capabilities, percent);
+pub fn compactionSize(agent: *const runtime_agent.Agent, capabilities: model_capabilities.Capabilities, limit: ?u32, percent: u8, model: []const u8) compactor.Size {
+    var size = compactor.Size.of(session_context.apply(capabilities, limit), percent);
+    if (limit != null) size.summary_usable_tokens = compactor.Size.of(capabilities, percent).usable_tokens;
     size.fixed_tokens = agent.request_fixed_tokens;
     if (agent.request_token_calibration) |*calibration| {
         const cost = calibration.cost;
@@ -6070,6 +6072,7 @@ fn processQueuedPromptLoop(
                 config.first_call_tool_choice
             else
                 .auto;
+            const budget_capabilities = session_context.apply(request_capabilities, config.context_limit);
             var request_data = agent_stream_provider.RequestData{
                 .model = gateway_model,
                 .instructions = gateway_instructions.items,
@@ -6083,7 +6086,7 @@ fn processQueuedPromptLoop(
                 .tool_choice = tool_choice,
                 .vision_mode = vision_mode,
                 .provider_options = provider_opts,
-                .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities) orelse length_retry_output_tokens,
+                .max_output_tokens = model_capabilities.requestOutputTokens(budget_capabilities) orelse length_retry_output_tokens,
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
             // The request re-sends every image the session keeps, and
@@ -6158,7 +6161,7 @@ fn processQueuedPromptLoop(
                     const fixed = if (applicable_calibration) |calibration| runtime_prompt_context.calibrateProviderRequest(measured, calibration) else measured;
                     break :fixed fixed.estimated_input_tokens;
                 } else null;
-                var size = compactionSize(agent, request_capabilities, config.auto_compact_percent, gateway_model);
+                var size = compactionSize(agent, request_capabilities, config.context_limit, config.auto_compact_percent, gateway_model);
                 size.request_tokens = request_cost.estimated_input_tokens;
                 size.overflow = overflow_pending;
                 if (just_rebuilt_request) compactor.traceLog(false, "request after compaction estimated_tokens={d} fixed_tokens={any} usable_tokens={any} after_tokens={d}", .{ request_cost.estimated_input_tokens, size.fixed_tokens, size.usable_tokens, size.afterTokens() });
@@ -6190,10 +6193,6 @@ fn processQueuedPromptLoop(
                         compactor.traceFailure(step_ctx, .overflow_without_compaction, "estimated_tokens={d} usable_tokens={any}", .{ request_cost.estimated_input_tokens, usable_tokens });
                         return error.ContextCapacityExceeded;
                     }
-                    if (!has_new_compactable_context) if (usable_tokens) |tokens| if (request_cost.estimated_input_tokens > tokens) {
-                        compactor.traceFailure(step_ctx, .no_compactable_context, "estimated_tokens={d} usable_tokens={d}", .{ request_cost.estimated_input_tokens, tokens });
-                        return error.ContextCapacityExceeded;
-                    };
                 } else {
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
@@ -6351,6 +6350,12 @@ fn processQueuedPromptLoop(
                         continue;
                     }
                 }
+                if (config.context_limit != null or !has_new_compactable_context) if (usable_tokens) |tokens| {
+                    if (request_cost.estimated_input_tokens > tokens) {
+                        compactor.traceFailure(step_ctx, .no_compactable_context, "estimated_tokens={d} usable_tokens={d}", .{ request_cost.estimated_input_tokens, tokens });
+                        return error.ContextCapacityExceeded;
+                    }
+                };
             }
             if (context_overflow_recovery == .pending) {
                 compactor.traceFailure(step_ctx, .overflow_recovery_incomplete, "estimated_tokens={d}", .{if (request_cost_for_attempt) |cost| cost.estimated_input_tokens else 0});
@@ -7756,7 +7761,7 @@ fn processQueuedPromptLoop(
         const raised_limit: ?u32 = if (may_resend and
             length_retry_output_tokens == null and
             config.provider_capabilities.sends_output_limit and
-            model_capabilities.requestOutputTokens(request_capabilities) == null)
+            model_capabilities.requestOutputTokens(session_context.apply(request_capabilities, config.context_limit)) == null)
             model_capabilities.emptyLengthRetryOutputTokens(request_capabilities)
         else
             null;

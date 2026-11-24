@@ -1195,6 +1195,7 @@ fn buildAgentConfig(
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
         .auto_compact_percent = state.auto_compact_percent,
+        .context_limit = session.context_limit,
         .cancel_flag = &session.cancel_flag,
         .fast_mode = session.fast_mode,
         .ultrafast_mode = session.ultrafast_mode,

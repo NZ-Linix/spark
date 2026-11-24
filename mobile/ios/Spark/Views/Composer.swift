@@ -426,6 +426,7 @@ struct ModelSheet: View {
   private var effort: ConfigOption? {
     options.first { $0.id == "effort" && Effort.levels($0).count > 1 }
   }
+  private var context: ConfigOption? { options.first { $0.id == "context" } }
   private var showsPrompt: Bool { prompt != nil && !prompts.isEmpty }
   private var menus: [ConfigOption] {
     options.filter { ["provider", "mode"].contains($0.id) && $0.options.count > 1 }
@@ -440,7 +441,8 @@ struct ModelSheet: View {
   /** a short list gets a sheet just its size */
   private var fits: Bool { mcpNames.isEmpty && (model?.options.count ?? 0) <= 8 }
   private var fitHeight: CGFloat {
-    64 + (effort == nil ? 0 : 138) + (menus.isEmpty && !showsPrompt ? 0 : 44) + CGFloat(model?.options.count ?? 0) * 52 + 40
+    64 + (effort == nil ? 0 : 138) + (menus.isEmpty && !showsPrompt ? 0 : 44)
+      + (context == nil ? 0 : 64) + CGFloat(model?.options.count ?? 0) * 52 + 40
   }
 
   private var makers: Set<String> { Set(shown.map { ConfigOption.Choice.maker($0.value) }) }
@@ -500,6 +502,36 @@ struct ModelSheet: View {
 
       ScrollView {
         LazyVStack(spacing: 2) {
+          if query.isEmpty, let context {
+            Menu {
+              Picker(context.name, selection: Binding(get: { context.currentValue }, set: { set(context.id, $0) })) {
+                ForEach(context.options, id: \.value) { Text($0.name).tag($0.value) }
+              }
+            } label: {
+              HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                  Text("Context limit").font(.geist(15, .medium))
+                  Text("This chat only").font(.geist(12)).foregroundStyle(Color.dim)
+                }
+                Spacer()
+                Text(context.current?.name ?? context.currentValue)
+                  .font(.geist(13, .medium)).monospacedDigit()
+                  .foregroundStyle(Color.dim)
+                Image(systemName: "chevron.up.chevron.down")
+                  .font(.system(size: 9, weight: .bold))
+                  .foregroundStyle(Color.dim)
+              }
+              .foregroundStyle(Color(white: 0.9))
+              .frame(minHeight: 48)
+              .contentShape(.rect)
+            }
+            .menuOrder(.fixed)
+            .accessibilityLabel("Context limit")
+            .accessibilityValue(context.current?.name ?? context.currentValue)
+            .accessibilityHint("Sets the token limit for this chat, up to the model maximum")
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+          }
           if query.isEmpty, let mcpDisabled, !mcpNames.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
               Text("MCP Servers").font(.geist(13, .medium)).foregroundStyle(Color.dim)

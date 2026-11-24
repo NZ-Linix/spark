@@ -1174,8 +1174,8 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "providerSet")) {
                 deps.agent_stream_provider = app.providerSet().select(job.provider).agent_stream_or_unavailable();
             }
-            const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
             const settings = agent.worker.effectiveAgentTurnSettings();
+            const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
             const provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, settings.effort, settings.fast_mode);
             var summary_model: agent_runtime.CompactorCaller = .{
                 .stream_provider = deps.agent_stream_provider,
@@ -1202,7 +1202,7 @@ pub fn Runtime(comptime App: type) type {
                 .compactor = .{
                     .history = job.history,
                     .append_messages = session_runtime.appendHistoryChatMessages,
-                    .size = agent_runtime.compactionSize(&agent.session.agent, capabilities, settings.auto_compact_percent, job.model),
+                    .size = agent_runtime.compactionSize(&agent.session.agent, capabilities, settings.context_limit, settings.auto_compact_percent, job.model),
                     .caller = summary_model.caller(),
                     .records = if (app_session_runtime.Runtime(App).childCapability(agent)) |capability| result_store.compactorStore(capability) else null,
                     .cancel_flag = &agent.worker.worker_cancel_requested,
@@ -1517,6 +1517,7 @@ pub fn Runtime(comptime App: type) type {
                 .agent_step_limit = app.agent_step_limit,
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
+                .context_limit = job.agent_settings.context_limit,
                 .cancel_flag = &agent.worker.worker_cancel_requested,
                 .recovery_continue_flag = &agent.worker.recovery_continue_requested,
                 .recovery_sign_in_closed_flag = &agent.worker.recovery_sign_in_closed,

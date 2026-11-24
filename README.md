@@ -100,6 +100,10 @@ spark ask --json "summarize the failing tests" | jq -r .final_output
 
 The model's thinking shows as one `Thought for 3s` line; Ctrl+O expands every thinking block to the reasoning behind it, and collapses them again. Alt+O (or Cmd+O) opens the full transcript, including tool details and reasoning.
 
+Use `/context` to see the current session's context window, `/context 64k` to set a ceiling, or `/context auto` to use the model default. The ceiling survives resume, never raises the model's own window, and makes automatic compaction kick in earlier. `/compact` summarizes older history on demand without removing it from the saved transcript. On iPhone and iPad, choose **Context limit** in the model picker.
+
+Keeping the same model and using compaction only when needed helps preserve the cached prompt prefix. Direct Anthropic connections use automatic prompt caching for agent requests. Actual cache hits depend on the provider, prompt size, and time between requests.
+
 The footer shows the latest reported context usage and this run's token totals: `↑` uncached input, `↓` output, `R` cache reads, `W` cache writes, and `CH` the cache hit rate for requests that report cache usage. Hide the segment with `spark config set status_line.context false`.
 
 ## Extend it

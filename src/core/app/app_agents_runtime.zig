@@ -3223,14 +3223,14 @@ pub fn Runtime(comptime App: type) type {
         /// Gives a child agent its next run, replacing the last one, and takes
         /// ownership of `run`, which `app.alloc` owns. The child's turns take
         /// their effort from the admission and use ultrafast only when both main
-        /// and the admission have it; every other setting follows main's. Call
+        /// and the admission have it; fast mode and the context ceiling belong to the child. Call
         /// on the main loop while the child is idle.
         pub fn installChildRun(app: *App, child: *ChildAgent, run: agents.ChildRun) void {
             if (child.agent.child_run) |*previous| previous.deinit(app.alloc);
             var settings = (firstInstance(app) orelse &app.main_agent).worker.agent_turn_settings;
             settings.effort = run.admission.effort;
-            // Its own fast mode, not main's.
             settings.fast_mode = child.agent.worker.agent_turn_settings.fast_mode;
+            settings.context_limit = child.agent.worker.agent_turn_settings.context_limit;
             settings.ultrafast_mode = settings.ultrafast_mode and run.admission.ultrafast_mode;
             child.agent.worker.agent_turn_settings = settings;
             var owned = run;

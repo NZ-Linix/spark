@@ -7,6 +7,7 @@ const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
+const session_context = @import("../config/session_context.zig");
 const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -21,6 +22,7 @@ pub const DurableSessionPreferences = struct {
     effort: types.ReasoningEffort,
     fast_mode: bool,
     ultrafast_mode: bool = false,
+    context_limit: ?u32 = null,
 
     pub fn deinit(self: *DurableSessionPreferences, alloc: Allocator) void {
         alloc.free(self.model);
@@ -34,6 +36,7 @@ pub const DurableSessionPreferences = struct {
             .effort = self.effort,
             .fast_mode = self.fast_mode,
             .ultrafast_mode = self.ultrafast_mode,
+            .context_limit = self.context_limit,
         };
     }
 };
@@ -42,21 +45,10 @@ pub const DurableSessionPreferences = struct {
 pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessionPreferences {
     const raw = try requireObject(value);
     const legacy = raw.contains("connection_id") or raw.contains("model_id");
-    const has_ultrafast_mode = raw.contains("ultrafast_mode");
     const object = if (legacy)
-        if (has_ultrafast_mode)
-            try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode", "ultrafast_mode" })
-        else
-            try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode" })
-    else if (raw.contains("provider"))
-        if (has_ultrafast_mode)
-            try exactObject(value, &.{ "provider", "model", "effort", "fast_mode", "ultrafast_mode" })
-        else
-            try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
-    else if (has_ultrafast_mode)
-        try exactObject(value, &.{ "model", "effort", "fast_mode", "ultrafast_mode" })
+        try exactObjectWithOptionalKeys(value, &.{ "connection_id", "model_id", "effort", "fast_mode" }, &.{ "ultrafast_mode", "context_limit" })
     else
-        try exactObject(value, &.{ "model", "effort", "fast_mode" });
+        try exactObjectWithOptionalKeys(value, &.{ "model", "effort", "fast_mode" }, &.{ "provider", "ultrafast_mode", "context_limit" });
     const provider: model_provider.ProviderId = if (legacy) blk: {
         if (!std.mem.eql(u8, try requireString(object, "connection_id"), "vercel")) return error.InvalidDurableField;
         break :blk .none;
@@ -68,8 +60,20 @@ pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessio
     try validateModel(model);
     const effort = types.ReasoningEffort.parse(try requireString(object, "effort")) orelse return error.InvalidDurableField;
     const fast_mode = try requireBool(object, "fast_mode");
-    const ultrafast_mode = if (has_ultrafast_mode) try requireBool(object, "ultrafast_mode") else false;
-    return .{ .provider = provider, .model = try alloc.dupe(u8, model), .effort = effort, .fast_mode = fast_mode, .ultrafast_mode = ultrafast_mode };
+    const ultrafast_mode = if (object.contains("ultrafast_mode")) try requireBool(object, "ultrafast_mode") else false;
+    const context_limit = if (object.contains("context_limit")) blk: {
+        const tokens = std.math.cast(u32, try requireU64(object, "context_limit")) orelse return error.InvalidDurableField;
+        if (tokens < session_context.min_tokens) return error.InvalidDurableField;
+        break :blk tokens;
+    } else null;
+    return .{
+        .provider = provider,
+        .model = try alloc.dupe(u8, model),
+        .effort = effort,
+        .fast_mode = fast_mode,
+        .ultrafast_mode = ultrafast_mode,
+        .context_limit = context_limit,
+    };
 }
 
 test "legacy connection preferences decode through the shared state codec" {
@@ -1069,6 +1073,7 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
     if (state.preferences.ultrafast_mode) {
         try writer.writeAll(",\"ultrafast_mode\":true");
     }
+    if (state.preferences.context_limit) |tokens| try writer.print(",\"context_limit\":{d}", .{tokens});
     try writer.writeAll(",\"provider\":");
     try std.json.Stringify.value(state.preferences.provider, .{}, writer);
     try writer.writeAll("},\"history\":[");

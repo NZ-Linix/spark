@@ -33,6 +33,7 @@ const config_runtime = @import("../core/config/config_runtime.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const session_context = @import("../core/config/session_context.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
@@ -284,6 +285,8 @@ fn writeNewSessionResponse(
         try out.writer.writeAll(",");
         try writeUltrafastConfigOption(&out.writer, current);
     }
+    try out.writer.writeByte(',');
+    try writeContextConfigOption(&out.writer, state.active_session.?.context_limit);
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.active_session.?.mode, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
@@ -607,6 +610,7 @@ fn handleRestoreSession(
         .credential = if (staged_credential) |*credential| credential else null,
         .fast_mode = durable.preferences.fast_mode,
         .ultrafast_mode = restoredUltrafastMode(state, durable.preferences.ultrafast_mode),
+        .context_limit = durable.preferences.context_limit,
         .effort = durable.preferences.effort,
         .session_rt = session_rt,
         .mcp_host = session_host,
@@ -891,6 +895,8 @@ fn writeLoadSessionResponse(
         try out.writer.writeAll(",");
         try writeUltrafastConfigOption(&out.writer, current);
     }
+    try out.writer.writeByte(',');
+    try writeContextConfigOption(&out.writer, state.active_session.?.context_limit);
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.active_session.?.mode, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
@@ -950,6 +956,7 @@ const SessionActivation = struct {
     credential: ?*credentials.Credential = null,
     fast_mode: bool,
     ultrafast_mode: bool,
+    context_limit: ?u32 = null,
     effort: types.ReasoningEffort,
     session_rt: session_runtime.SessionRuntime,
     mcp_host: ?*mcp_host.Host = null,
@@ -1032,6 +1039,7 @@ fn activateSession(state: *server.ServerState, activation: SessionActivation) !v
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = activation.fast_mode,
         .ultrafast_mode = activation.ultrafast_mode,
+        .context_limit = activation.context_limit,
         .effort = activation.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
         .permission_mode = start.permission_mode,
@@ -1759,7 +1767,7 @@ pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator
         active.model,
         provider_bundle.fallbackModelCapabilities(active.model),
     );
-    const context_window = capabilities.context_window orelse return;
+    const context_window = session_context.window(capabilities.context_window, active.context_limit) orelse return;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -1954,6 +1962,21 @@ pub fn writeUltrafastConfigOption(w: *std.Io.Writer, current: bool) !void {
     try w.writeAll("{\"id\":\"ultrafast\",\"name\":\"Ultrafast Mode\",\"description\":\"Uses the model's ultrafast lane\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(if (current) "true" else "false", w);
     try w.writeAll(",\"options\":[{\"value\":\"false\",\"name\":\"off\"},{\"value\":\"true\",\"name\":\"on\"}]}");
+}
+
+pub fn writeContextConfigOption(w: *std.Io.Writer, current: ?u32) !void {
+    try w.writeAll("{\"id\":\"context\",\"name\":\"Context limit\",\"description\":\"Limit context for this session, up to the model maximum\",\"type\":\"select\",\"currentValue\":");
+    if (current) |tokens| try w.print("\"{d}\"", .{tokens}) else try w.writeAll("\"auto\"");
+    try w.writeAll(",\"options\":[{\"value\":\"auto\",\"name\":\"Model default\"}");
+    var listed = false;
+    for (session_context.presets) |tokens| {
+        if (current == tokens) listed = true;
+        try w.print(",{{\"value\":\"{d}\",\"name\":\"{d}k tokens\"}}", .{ tokens, tokens / 1024 });
+    }
+    if (!listed) if (current) |tokens| {
+        try w.print(",{{\"value\":\"{d}\",\"name\":\"{d} tokens\"}}", .{ tokens, tokens });
+    };
+    try w.writeAll("]}");
 }
 
 pub fn effortSupportedBy(efforts: model_capabilities.ReasoningEffortOptions, effort: types.ReasoningEffort) bool {

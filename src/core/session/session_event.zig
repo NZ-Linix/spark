@@ -2083,6 +2083,7 @@ fn writePreferences(
     if (preferences.ultrafast_mode) {
         try writer.writeAll(",\"ultrafast_mode\":true");
     }
+    if (preferences.context_limit) |tokens| try writer.print(",\"context_limit\":{d}", .{tokens});
     try writer.writeAll(",\"provider\":");
     try std.json.Stringify.value(preferences.provider, .{}, writer);
     try writer.writeByte('}');

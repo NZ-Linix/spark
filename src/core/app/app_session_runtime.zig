@@ -485,6 +485,9 @@ pub fn Runtime(comptime App: type) type {
         /// place of the workspace's preferences. The caller keeps it.
         fn beginFresh(app: *App, agent: *AppAgent, start: FreshStart, carried: ?session_codec.DurableSessionPreferences) !void {
             closeWritableSession(app, agent);
+            if (comptime @hasDecl(@TypeOf(agent.worker), "syncQueuedPromptContextLimit")) {
+                agent.worker.syncQueuedPromptContextLimit(null);
+            }
             // A fresh session starts with no usage, whether or not it persists.
             agent.total_input_tokens = 0;
             agent.total_output_tokens = 0;
@@ -543,6 +546,7 @@ pub fn Runtime(comptime App: type) type {
                 return error.SessionPreferencesUnavailable;
             var preferences = try seed.dupe(app.alloc);
             defer preferences.deinit(app.alloc);
+            preferences.context_limit = null;
             if (comptime agents.hasAgentField(App, "profile")) {
                 if (start == .instance_start) {
                     const profile = &agent.profile.profile;
@@ -1340,6 +1344,9 @@ pub fn Runtime(comptime App: type) type {
                 state.preferences,
             );
             agent.effort = state.preferences.effort;
+            if (comptime @hasDecl(@TypeOf(agent.worker), "syncQueuedPromptContextLimit")) {
+                agent.worker.syncQueuedPromptContextLimit(state.preferences.context_limit);
+            }
             // Its own fast mode from its saved preferences, which started from
             // main's. The child is in context, so this is its own slot.
             if (comptime @hasField(App, "fast_mode")) {
@@ -2166,6 +2173,20 @@ pub fn Runtime(comptime App: type) type {
             defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
             const v2 = agent.session_persistence.v2 orelse return;
             try v2.savePromptImages(alloc, images);
+        }
+
+        pub fn setContextLimit(agent: *AppAgent, limit: ?u32) !void {
+            {
+                agent.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer agent.session_persistence.write_mutex.unlock(io_mod.getIo());
+                if (agent.session_persistence.session_preferences) |*preferences| {
+                    var updated = preferences.*;
+                    updated.context_limit = limit;
+                    if (agent.session_persistence.v2) |v2| try v2.setPreferences(updated);
+                    preferences.context_limit = limit;
+                }
+            }
+            agent.worker.syncQueuedPromptContextLimit(limit);
         }
 
         pub fn commitRuntimePreferences(
@@ -5002,6 +5023,9 @@ pub fn Runtime(comptime App: type) type {
             agent.worker.syncQueuedPromptEffort(effective_effort);
             agent.worker.syncQueuedPromptFastMode(effective_fast_mode);
             agent.worker.syncQueuedPromptUltrafastMode(effective_ultrafast_mode);
+            if (comptime @hasDecl(@TypeOf(agent.worker), "syncQueuedPromptContextLimit")) {
+                agent.worker.syncQueuedPromptContextLimit(preferences.context_limit);
+            }
         }
 
         pub fn fastModeModelBound(_: *const App, agent: *const AppAgent) bool {
