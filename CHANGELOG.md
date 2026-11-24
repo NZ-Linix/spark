@@ -1,8 +1,24 @@
 # spark
 
-## 26.11.24
+## 26.11.24.1
 
 <!-- release:start -->
+
+**Set a context limit for each chat, in the terminal or on iPhone and iPad.**
+
+### New Features
+
+- Run `/context` to see the session's context window, `/context 64k` to set a ceiling, or `/context auto` to use the model default. Lower ceilings trigger automatic compaction sooner without deleting saved history.
+- The iPhone and iPad model picker includes a **Context limit** setting. Mobile Settings also lets you manage shared MCP servers.
+
+### Improvements
+
+- Direct Anthropic connections use automatic prompt caching. When a session has a lower context ceiling, compaction can still reuse the cached conversation for its summary if it fits the model's native window.
+- The iPhone chat follows new text smoothly. The button to jump to the newest reply also works while the chat is still scrolling.
+
+<!-- release:end -->
+
+## 26.11.24
 
 **See how long spark thought instead of every word, and use the mobile app on iPad.**
 
@@ -20,8 +36,6 @@
 
 - The model chip no longer slides down into the message box as it opens on the iPhone.
 - The CLI no longer redraws the transcript many times a second while a command streams output.
-
-<!-- release:end -->
 
 ## 26.11.23
 
