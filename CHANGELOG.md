@@ -1,8 +1,30 @@
 # spark
 
-## 26.11.23
+## 26.11.24
 
 <!-- release:start -->
+
+**See how long spark thought instead of every word, and use the mobile app on iPad.**
+
+### New Features
+
+- spark shows "Thinking for 3s..." while the model reasons and "Thought for 12s" when it's done. Press Ctrl+O to show or hide the full reasoning.
+- The mobile app runs on iPad. In a wide window the chats stay beside the chat, and with a keyboard Command-N starts a new chat and Command-Return sends.
+
+### Improvements
+
+- Tool calls list their steps on a tree under each call, and the status line counts each step's time with a spinner.
+- The full transcript opens with Alt+O or Cmd+O, and Ctrl+O closes it.
+
+### Bug Fixes
+
+- The model chip no longer slides down into the message box as it opens on the iPhone.
+- The CLI no longer redraws the transcript many times a second while a command streams output.
+
+<!-- release:end -->
+
+## 26.11.23
+
 
 **Follow live Mac terminal chats from your iPhone, and save chats and update Spark on iSH.**
 
