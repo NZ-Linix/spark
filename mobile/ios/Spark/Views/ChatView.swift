@@ -14,6 +14,10 @@ struct ChatView: View {
   @State private var scrolling = false
   /** far enough up that a button back down helps */
   @State private var away = false
+  /** carries the thread to its newest text, and keeps carrying it while a reply streams in */
+  @State private var follower = Follower()
+  /** the thread has been laid out at its newest text, so the anchor that put it there can let go */
+  @State private var settled = false
   /** the message being edited: sending goes back to just before it and sends the new text */
   @State private var editing: Entry?
   /** the reply to go back to, once confirmed */
@@ -168,29 +172,44 @@ struct ChatView: View {
         .padding(.bottom, 24)
         .readable()
         Color.clear.frame(height: 1).id("chat-bottom").accessibilityHidden(true)
+          .background(ScrollFinder { follower.scrollView = $0 })
       }
       // going back to an earlier message lays the thread out afresh, from the bottom
       .id(chat.epoch)
       .transition(.opacity)
-      .defaultScrollAnchor(.bottom, for: .initialOffset)
+      // opens on the newest text; once laid out the anchor lets go, since while it holds, the bottom
+      // edge sticks and growing text jumps the thread a line at a time instead of the follower gliding
+      .defaultScrollAnchor(settled ? nil : .bottom, for: .initialOffset)
       // a short chat reads from the top, so a new one starts under the title and grows down
       .defaultScrollAnchor(.top, for: .alignment)
       .scrollDismissesKeyboard(.interactively)
       .onScrollPhaseChange { _, phase in
         scrolling = phase == .tracking || phase == .interacting || phase == .decelerating
+        // a finger on the thread takes it from the follower
+        if phase == .tracking || phase == .interacting { follower.stop() }
       }
       .onScrollGeometryChange(for: Fill.self, of: Fill.init) { old, new in
         if scrolling, new.offset != old.offset { pinned = new.distance < 44 }
         if away != (new.distance > 160) { away = new.distance > 160 }
-        if pinned, !scrolling, new.end != old.end, new.distance > 1 { follow(reader) }
+        if pinned, !scrolling, new.end != old.end, new.distance > 1 { follower.glide() }
       }
-      .onChange(of: chat.epoch) { _, _ in follow(reader) }
-      .onChange(of: sent) { _, _ in follow(reader) }
+      .onChange(of: chat.epoch) { _, _ in
+        settled = false
+        follow(reader)
+      }
+      .task(id: "\(chat.epoch)-\(chat.loaded)") {
+        guard chat.loaded, !settled else { return }
+        try? await Task.sleep(for: .milliseconds(400))
+        settled = true
+      }
+      .onChange(of: sent) { _, _ in follower.glide() }
       .overlay(alignment: .bottom) {
         if away && !pinned {
           Button {
+            // a tap while the thread still glides takes over from the glide
+            scrolling = false
             pinned = true
-            follow(reader)
+            follower.glide()
           } label: {
             Image(systemName: "arrow.down")
               .font(.system(size: 14, weight: .semibold))
@@ -229,13 +248,18 @@ struct ChatView: View {
     return ends
   }
 
+  /** the newest text at once, for a thread laid out afresh */
   private func follow(_ reader: ScrollViewProxy) {
+    follower.stop()
     var transaction = Transaction()
     transaction.disablesAnimations = true
     withTransaction(transaction) { reader.scrollTo("chat-bottom", anchor: .bottom) }
   }
 
-  private func pauseFollowing() { pinned = false }
+  private func pauseFollowing() {
+    pinned = false
+    follower.stop()
+  }
 
   @ToolbarContentBuilder private var toolbar: some ToolbarContent {
     ToolbarItem(placement: .topBarLeading) {
@@ -336,10 +360,85 @@ private struct Fill: Equatable {
   var offset: CGFloat
 
   init(_ g: ScrollGeometry) {
-    let end = max(-g.contentInsets.top, g.contentSize.height + g.contentInsets.bottom - g.containerSize.height)
+    // the container leaves out the insets, so the last offset puts the content's end at the bottom inset
+    let end = max(-g.contentInsets.top, g.contentSize.height - g.containerSize.height - g.contentInsets.top)
     self.end = end.rounded()
     offset = g.contentOffset.y.rounded()
     distance = self.end - offset
+  }
+}
+
+/**
+ * Moves the thread to its end the way a hand would: a spring pulls the offset toward the bottom a
+ * frame at a time. The bottom can move while it pulls, as a reply streams in, and the motion stays
+ * one continuous glide instead of a jump per piece of text.
+ */
+@MainActor
+private final class Follower {
+  weak var scrollView: UIScrollView?
+  private var link: CADisplayLink?
+  private var velocity: CGFloat = 0
+  /** how firmly it pulls: settles in about a third of a second */
+  private let omega: CGFloat = 12
+
+  func glide() {
+    guard let view = scrollView else { return }
+    // a thread still coasting from a flick stops where it is, and the glide takes over
+    if view.isDecelerating { view.setContentOffset(view.contentOffset, animated: false) }
+    guard link == nil else { return }
+    velocity = 0
+    let link = CADisplayLink(target: self, selector: #selector(tick))
+    link.add(to: .main, forMode: .common)
+    self.link = link
+  }
+
+  func stop() {
+    link?.invalidate()
+    link = nil
+    velocity = 0
+  }
+
+  @objc private func tick(_ link: CADisplayLink) {
+    guard let view = scrollView, view.window != nil, !view.isTracking else { return stop() }
+    let dt = min(max(link.targetTimestamp - link.timestamp, 1.0 / 240), 1.0 / 30)
+    let target = max(-view.adjustedContentInset.top, view.contentSize.height + view.adjustedContentInset.bottom - view.bounds.height)
+    var y = view.contentOffset.y
+    // critically damped: as fast as it can get there without passing it
+    velocity += (omega * omega * (target - y) - 2 * omega * velocity) * dt
+    y += velocity * dt
+    if y >= target || (abs(target - y) < 0.5 && abs(velocity) < 8) {
+      y = target
+      velocity = 0
+    }
+    view.contentOffset.y = y
+    if y == target { stop() }
+  }
+}
+
+/** Hands over the UIScrollView a SwiftUI ScrollView is drawn in, once it's on screen. */
+private struct ScrollFinder: UIViewRepresentable {
+  let found: (UIScrollView) -> Void
+
+  func makeUIView(context: Context) -> Probe {
+    let probe = Probe()
+    probe.found = found
+    return probe
+  }
+
+  func updateUIView(_ probe: Probe, context: Context) {
+    probe.found = found
+  }
+
+  final class Probe: UIView {
+    var found: ((UIScrollView) -> Void)?
+
+    override func didMoveToWindow() {
+      super.didMoveToWindow()
+      guard window != nil else { return }
+      var view = superview
+      while let v = view, !(v is UIScrollView) { view = v.superview }
+      if let scroll = view as? UIScrollView { found?(scroll) }
+    }
   }
 }
 

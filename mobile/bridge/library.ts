@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, s
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { chooseModel, isObject, type Json, Profile, writeAtomic } from "./providers";
-import type { PromptSummary, ProviderSummary } from "./protocol";
+import type { McpSummary, PromptSummary, ProviderSummary } from "./protocol";
 
 /** a prompt is a file named after it, so its name can't hold a path or start with a dot */
 const PROMPT_NAME = /^(?![.\s])[^/\\\0\r\n:]{1,80}(?<!\s)$/;
@@ -121,6 +121,67 @@ export class Library {
     return this.prompts();
   }
 
+  // MARK: MCP servers
+
+  private get mcpFile() {
+    return join(this.o.dir, "mcp.json");
+  }
+
+  private readMcpFile(): Json {
+    return readJson(this.mcpFile);
+  }
+
+  private writeMcp(servers: Record<string, Json>) {
+    writeAtomic(this.mcpFile, { ...this.readMcpFile(), mcpServers: servers });
+    this.changed();
+  }
+
+  mcp(): McpSummary[] {
+    return Object.entries(readMcp(this.o.dir) ?? {})
+      .map(([name, server]) => mcpSummary(name, server))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true }));
+  }
+
+  /** adds or replaces a server; `previous` renames one, and a null env or header value keeps the saved one */
+  putMcp(input: { name: unknown; server: unknown; previous?: unknown }): McpSummary[] {
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    if (!MCP_NAME.test(name)) throw new Error("An MCP server's name is 1 to 64 characters, without line breaks or spaces at either end.");
+    const all = readMcp(this.o.dir) ?? {};
+    const previous = typeof input.previous === "string" && input.previous !== name ? input.previous : undefined;
+    if (previous && !all[previous]) throw new Error(`There's no MCP server named ${previous}.`);
+    if (previous && all[name]) throw new Error(`There's already an MCP server named ${name}.`);
+    const server = checkMcp(input.server, all[previous ?? name]);
+    const next: Record<string, Json> = {};
+    // a renamed server keeps its place in the file
+    for (const [k, v] of Object.entries(all)) {
+      if (k === previous) next[name] = server;
+      else if (k !== name || !previous) next[k] = v;
+    }
+    next[name] = server;
+    this.writeMcp(next);
+    return this.mcp();
+  }
+
+  deleteMcp(name: unknown): McpSummary[] {
+    const all = readMcp(this.o.dir) ?? {};
+    if (typeof name !== "string" || !all[name]) throw new Error("That MCP server is already gone.");
+    delete all[name];
+    this.writeMcp(all);
+    return this.mcp();
+  }
+
+  /** off writes "enabled": false, as `spark mcp off` does; on drops it */
+  setMcpEnabled(name: unknown, enabled: unknown): McpSummary[] {
+    const all = readMcp(this.o.dir) ?? {};
+    if (typeof name !== "string" || !all[name]) throw new Error("That MCP server is gone.");
+    const server = { ...all[name] };
+    if (enabled === false) server.enabled = false;
+    else delete server.enabled;
+    all[name] = server;
+    this.writeMcp(all);
+    return this.mcp();
+  }
+
   // MARK: Copies
 
   snapshot(): LibrarySnapshot {
@@ -166,6 +227,79 @@ export class Library {
 export function readMcp(home: string): Record<string, Json> | undefined {
   const servers = readJson(join(home, "mcp.json")).mcpServers;
   return isObject(servers) ? Object.fromEntries(Object.entries(servers).filter(([, v]) => isObject(v))) : undefined;
+}
+
+/** spark takes any name a terminal can show */
+const MCP_NAME = /^(?!\s)[^\x00-\x1f\x7f-\x9f]{1,64}(?<!\s)$/u;
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** a value that only names a variable: it holds no secret, so the phone sees it whole */
+const REFERENCE = /^\$\{[A-Za-z_][A-Za-z0-9_]*(:-[^}]*)?\}$/;
+
+/** the server with each value that may be a secret left out, and its last 4 characters beside it */
+function mcpSummary(name: string, server: Json): McpSummary {
+  const out: Json = structuredClone(server);
+  const hints: Record<string, string> = {};
+  for (const field of ["env", "headers"]) {
+    if (!isObject(out[field])) continue;
+    for (const [k, v] of Object.entries(out[field] as Json)) {
+      if (typeof v !== "string" || REFERENCE.test(v)) continue;
+      out[field][k] = null;
+      hints[`${field}.${k}`] = v.length > 8 ? v.slice(-4) : "";
+    }
+  }
+  return { name, server: out, hints };
+}
+
+/**
+ * A server as spark reads it: a `url` makes it an HTTP server with `headers`, otherwise it starts
+ * `command` with `args` and `env`. Fields spark doesn't read are kept as they are.
+ */
+function checkMcp(raw: unknown, saved: Json | undefined): Json {
+  if (!isObject(raw)) throw new Error("That MCP server has no settings.");
+  const server: Json = structuredClone(raw);
+  const pairs = (field: string, names: RegExp, what: string) => {
+    if (server[field] === undefined) return;
+    if (!isObject(server[field])) throw new Error(`An MCP server's ${what} are a list of names and values.`);
+    const old = isObject(saved?.[field]) ? saved[field] : {};
+    for (const [k, v] of Object.entries(server[field] as Json)) {
+      if (!names.test(k)) throw new Error(`${k} isn't a valid ${what.replace(/s$/, "")} name.`);
+      if (v === null) {
+        if (typeof old[k] !== "string") throw new Error(`Enter a value for ${k}.`);
+        server[field][k] = old[k];
+      } else if (typeof v !== "string") {
+        // spark skips a value that isn't text
+        delete server[field][k];
+      }
+    }
+    if (!Object.keys(server[field]).length) delete server[field];
+  };
+  if (typeof server.url === "string" || server.type === "http") {
+    let url: URL;
+    try {
+      url = new URL(String(server.url ?? "").trim());
+    } catch {
+      throw new Error("An HTTP MCP server needs a URL, such as https://example.com/mcp.");
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("An MCP server's URL starts with https:// or http://.");
+    server.type = "http";
+    server.url = String(server.url).trim();
+    delete server.command;
+    delete server.args;
+    delete server.env;
+    pairs("headers", /^[^\s:\x00-\x1f]+$/, "headers");
+  } else {
+    if (typeof server.command !== "string" || !server.command.trim()) throw new Error("An MCP server needs a command to run, or a URL.");
+    server.command = server.command.trim();
+    if (server.args !== undefined && (!Array.isArray(server.args) || server.args.some((a: unknown) => typeof a !== "string"))) throw new Error("An MCP server's arguments are text.");
+    if (Array.isArray(server.args) && !server.args.length) delete server.args;
+    delete server.type;
+    delete server.url;
+    delete server.headers;
+    pairs("env", ENV_NAME, "variables");
+  }
+  if (server.enabled !== undefined && typeof server.enabled !== "boolean") throw new Error("enabled is true or false.");
+  if (server.enabled === true) delete server.enabled;
+  return server;
 }
 
 function readJson(file: string): Json {

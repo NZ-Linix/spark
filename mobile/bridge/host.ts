@@ -257,6 +257,14 @@ export class Host {
         return this.library().putPrompt(req);
       case "promptDelete":
         return this.library().deletePrompt(req.name);
+      case "mcpList":
+        return this.library().mcp();
+      case "mcpPut":
+        return this.library().putMcp(req);
+      case "mcpDelete":
+        return this.library().deleteMcp(req.name);
+      case "mcpEnabled":
+        return this.library().setMcpEnabled(req.name, req.enabled);
       case "mkdir": {
         const parent = await this.allowed(req.path);
         const path = join(parent, folderName(req.name));
@@ -285,7 +293,7 @@ export class Host {
   }
 
   private library(): Library {
-    if (!this.o.library) throw new Error("Prompts live in the cloud. Open them there.");
+    if (!this.o.library) throw new Error("The library lives in the cloud. Open it there.");
     return this.o.library;
   }
 

@@ -129,6 +129,13 @@ export type FileData = { path: string; name: string; size: number; offset: numbe
 /** one prompt in the library: a whole system prompt a new chat can start with */
 export type PromptSummary = { name: string; text: string; updatedAt: string };
 
+/**
+ * One MCP server in the library. `server` is the entry as mcp.json holds it, except that each env
+ * or header value other than a ${VAR} reference is null; `hints` has its last 4 characters, keyed
+ * "env.NAME" or "headers.NAME". A null sent back keeps the saved value.
+ */
+export type McpSummary = { name: string; server: Record<string, unknown>; hints: Record<string, string> };
+
 /** phone → host */
 export type Request =
   | { id: number; op: "hello" }
@@ -187,7 +194,13 @@ export type Request =
   | { id: number; op: "prompts" }
   /** `previous` renames */
   | { id: number; op: "promptPut"; name: string; text: string; previous?: string }
-  | { id: number; op: "promptDelete"; name: string };
+  | { id: number; op: "promptDelete"; name: string }
+  /** the library's MCP servers; the cloud keeps them, and every Mac gets a copy */
+  | { id: number; op: "mcpList" }
+  /** `previous` renames */
+  | { id: number; op: "mcpPut"; name: string; server: Record<string, unknown>; previous?: string }
+  | { id: number; op: "mcpDelete"; name: string }
+  | { id: number; op: "mcpEnabled"; name: string; enabled: boolean };
 
 /** host → phone */
 export type Event =

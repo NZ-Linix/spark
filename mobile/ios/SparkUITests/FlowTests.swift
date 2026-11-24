@@ -68,6 +68,94 @@ final class FlowTests: XCTestCase {
   }
 
   @MainActor
+  func testScrollButtonAndFollowing() throws {
+    let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"], "Run mobile/bridge/fixtures/scroll-relay.ts on a test simulator")
+    let app = XCUIApplication()
+    app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
+    app.launch()
+    app.buttons["Chats"].tap()
+    let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Scroll regression")).firstMatch
+    XCTAssertTrue(row.waitForExistence(timeout: 10))
+    row.tap()
+    let last = app.staticTexts["The last saved answer."]
+    XCTAssertTrue(last.waitForExistence(timeout: 10))
+    let arrow = app.buttons["Scroll to the newest"]
+    let thread = app.scrollViews.firstMatch
+
+    // scrolling back down by hand puts the button away
+    thread.swipeDown(velocity: .slow)
+    thread.swipeDown(velocity: .slow)
+    XCTAssertTrue(arrow.waitForExistence(timeout: 3))
+    for _ in 0..<3 { thread.swipeUp(velocity: .slow) }
+    XCTAssertTrue(eventually("exists == false", arrow, timeout: 3))
+
+    // the button works while the thread is still coasting from a flick
+    thread.swipeDown(velocity: .slow)
+    thread.swipeDown(velocity: 3000)
+    arrow.tap()
+    XCTAssertTrue(eventually("isHittable == true", last, timeout: 4))
+    XCTAssertFalse(arrow.exists)
+
+    // a long reply streams in and the thread keeps up with it
+    let composer = app.textFields["Message spark"]
+    composer.tap()
+    composer.typeText("stream please")
+    app.buttons["Send"].tap()
+    let end = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Streamed to the end.")).firstMatch
+    XCTAssertTrue(end.waitForExistence(timeout: 12))
+    XCTAssertTrue(eventually("isHittable == true", end, timeout: 3))
+    XCTAssertFalse(arrow.exists)
+    shot(app, "scroll-streamed")
+  }
+
+  @MainActor
+  func testMcpServers() throws {
+    let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"], "Run mobile/bridge/fixtures/scroll-relay.ts on a test simulator")
+    let app = XCUIApplication()
+    app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
+    app.launch()
+    app.buttons["Chats"].tap()
+    app.buttons["Settings"].tap()
+    let open = app.buttons["mcpServers"]
+    XCTAssertTrue(open.waitForExistence(timeout: 5))
+    open.tap()
+
+    app.buttons["addMcp"].tap()
+    let name = app.textFields["mcpName"]
+    XCTAssertTrue(name.waitForExistence(timeout: 5))
+    name.tap()
+    name.typeText("docs")
+    app.buttons["URL"].tap()
+    let url = app.textFields["mcpURL"]
+    url.tap()
+    url.typeText("https://mcp.example.test/mcp")
+    app.buttons["mcpAddPair"].tap()
+    let key = app.textFields["Authorization"]
+    key.tap()
+    key.typeText("Authorization")
+    let value = app.secureTextFields["Value"]
+    value.tap()
+    value.typeText("Bearer secret-token-5678")
+    shot(app, "mcp-new")
+    app.buttons["saveMcp"].tap()
+
+    let row = app.buttons["mcp-docs"]
+    XCTAssertTrue(row.waitForExistence(timeout: 5))
+    let toggle = app.switches["mcpEnabled-docs"]
+    XCTAssertEqual(toggle.value as? String, "1")
+    toggle.switches.firstMatch.tap()
+    XCTAssertTrue(eventually("value == '0'", toggle, timeout: 5))
+    shot(app, "mcp-list")
+
+    // the saved token stays on the relay: the form only shows its end
+    row.tap()
+    XCTAssertTrue(app.secureTextFields["Saved …5678; empty keeps it"].waitForExistence(timeout: 5))
+    app.buttons["Delete server"].tap()
+    app.buttons["Delete"].firstMatch.tap()
+    XCTAssertTrue(eventually("exists == false", row, timeout: 5))
+  }
+
+  @MainActor
   func testPairStartAndChat() throws {
     let relay = try XCTUnwrap(env["SPARK_RELAY"], "set TEST_RUNNER_SPARK_RELAY")
     let app = XCUIApplication()
@@ -448,6 +536,11 @@ final class FlowTests: XCTestCase {
     XCTAssertTrue(composer.isEnabled)
     sleep(1)
     shot(app, "31-terminal-session-taken-over")
+  }
+
+  private func eventually(_ format: String, _ object: Any, timeout: TimeInterval) -> Bool {
+    let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: format), object: object)
+    return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
   }
 
   private func shot(_ app: XCUIApplication, _ name: String) {

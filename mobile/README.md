@@ -46,7 +46,7 @@ Open a running Mac chat from the sidebar to see its reply as it streams. You can
 
 ## Providers, prompts, and MCP
 
-The relay keeps one library of providers and prompts that the cloud and every paired Mac share. It lives in `$SPARK_RELAY_DATA/library`. The first time a relay starts with a library, it fills it from the providers its cloud profiles already have.
+The relay keeps one library of providers, prompts, and MCP servers that the cloud and every paired Mac share. It lives in `$SPARK_RELAY_DATA/library`. The first time a relay starts with a library, it fills it from the providers its cloud profiles already have.
 
 Settings, Library, Providers adds, edits, renames, or deletes a provider in a form: display name, ID, protocol, address, key, timeouts, and each model's display name, context window, output limit, tool and image support, and reasoning levels. Fields the form doesn't show, such as headers and request fields, are kept as they were. Before it saves, the relay has spark check the new settings and shows spark's reason if it refuses them. The first provider you add becomes the default.
 
@@ -56,7 +56,7 @@ Each Mac keeps a copy of the library in its own spark profile, so spark in a ter
 
 Prompts are edited only in the app: Settings, Library, Prompts. Each prompt has a name and its text, and replaces spark's own system prompt for the chats that pick it. Pick one in the model sheet, from the chip beside the send button. A chat can change its prompt between messages: its spark starts again with the new one. Press and hold a prompt to rename or delete it. Each Mac and cloud profile gets the prompts in `~/.spark/cloud-prompts`, which spark lists with your own prompts. A chat keeps its prompt when it is reopened. After that prompt is renamed or deleted, the chat runs with spark's own prompt the next time it opens.
 
-The relay's `$SPARK_RELAY_DATA/library/mcp.json` is the shared profile MCP configuration. Edit it on the relay using spark's usual `mcpServers` object. Once present, it replaces the server list in each cloud profile and paired Mac's `mcp.json`. Workspace `.mcp.json` files and saved OAuth logins stay local. A shared server must be reachable from the machines using it; configure any required environment variables or credentials there.
+MCP servers are edited in the app (Settings, Library, MCP Servers) or on any paired Mac with `spark mcp`. A server either runs a command, with arguments and environment variables, or connects to a URL, with headers. The switch beside each server turns it on or off everywhere. The app shows a saved variable or header value only by its last 4 characters, unless the value is a `${NAME}` reference, and leaving it empty keeps it. A Mac sends its own `mcp.json` edits to the relay, as it does with providers, and the first time it syncs it adds the servers only it has. The library keeps them in `$SPARK_RELAY_DATA/library/mcp.json`, spark's usual `mcpServers` object, which can also be edited on the relay. It replaces the server list in each cloud profile and paired Mac's `mcp.json`. On a relay started with `SPARK_RELAY_OPEN=1`, phones can't change MCP servers, because a server's command runs on every paired Mac. Workspace `.mcp.json` files and saved OAuth logins stay local. A shared server must be reachable from the machines using it; configure any required environment variables or credentials there.
 
 The phone's model picker shows the profile MCP servers available on that host. All enabled profile servers start on in a new chat. Turning one off applies to that chat's next message and is remembered when the chat is reopened. This doesn't change the library or the configuration of a session already owned by a Mac terminal.
 
@@ -101,7 +101,7 @@ TEST_RUNNER_SPARK_SHOTS=/tmp/shots \
 xcodebuild test -project Spark.xcodeproj -scheme Spark -destination 'platform=iOS Simulator,name=iPhone 18 Pro'
 ```
 
-`testChatScrollAndDisclosure` uses the local fixture `bun bridge/fixtures/scroll-relay.ts` and a fresh simulator with `TEST_RUNNER_SPARK_SCROLL_FIXTURE=http://127.0.0.1:18772`. It checks that opening a thought or tool block keeps the row in place, that the model sheet can turn an MCP server off, and that a follow-up reply stays on screen.
+`testChatScrollAndDisclosure`, `testScrollButtonAndFollowing`, and `testMcpServers` use the local fixture `bun bridge/fixtures/scroll-relay.ts` and a fresh simulator with `TEST_RUNNER_SPARK_SCROLL_FIXTURE=http://127.0.0.1:18772`. The first checks that opening a thought or tool block keeps the row in place, that the model sheet can turn an MCP server off, and that a follow-up reply stays on screen. The other two check that the button back to the newest text goes away when you scroll down by hand and works mid-flick, that a streaming reply is followed to its end, and that MCP servers can be added, turned off, and deleted, without the app getting a saved header value back.
 
 `testTerminalSessionOpensReadOnly` exercises the fallback with an older spark process open in a terminal. Set `TEST_RUNNER_SPARK_HELD_TITLE` to the session's title prefix and quit that process after the screenshot `30-terminal-session-read-only` appears. To exercise live access with the new CLI, run `SPARK_TERMINAL_TEST_BIN=/absolute/path/to/spark bun test tests/e2e/tui-mobile-bridge.test.ts` from the repository root.
 

@@ -103,13 +103,19 @@ function spreadLibrary() {
 library.onChange(spreadLibrary);
 watchFile(join(DATA, "library", "mcp.json"), { interval: 2_000, persistent: false }, spreadLibrary);
 
-/** a Mac's own provider edit, from spark on that Mac */
+const MCP_EDITS = new Set(["mcpPut", "mcpDelete", "mcpEnabled"]);
+
+/** a Mac's own provider or MCP server edit, from spark on that Mac */
 async function macLibraryOp(op: any): Promise<unknown> {
   switch (op?.op) {
     case "providerPut":
       return library.putProvider(op);
     case "providerDelete":
       return library.deleteProvider(op.name);
+    case "mcpPut":
+      return library.putMcp(op);
+    case "mcpDelete":
+      return library.deleteMcp(op.name);
     default:
       throw new Error("The relay doesn't know that library change.");
   }
@@ -304,6 +310,10 @@ Bun.serve<{ kind: "device" | "host"; id: string }, {}>({
         const target = String(m.host ?? "");
         const msg = m.msg as Request;
         if (!msg || typeof msg !== "object") return;
+        // a server's command runs on every paired Mac, so a relay anyone can join keeps them read-only
+        if (OPEN && target === "cloud" && MCP_EDITS.has(msg.op)) {
+          return void ws.send(JSON.stringify({ host: target, msg: { t: "reply", id: msg.id, ok: false, error: "This relay lets anyone in, so its MCP servers are edited on the server itself." } }));
+        }
         if (target === "cloud" && CLOUD) return void cloudFor(id).handle(msg, id);
         const h = state.hosts[target];
         if (!h || !h.devices.includes(id)) return void ws.send(JSON.stringify({ host: target, msg: { t: "reply", id: msg.id, ok: false, error: "This iPhone isn't paired with that Mac." } }));

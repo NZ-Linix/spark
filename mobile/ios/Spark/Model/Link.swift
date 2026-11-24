@@ -623,6 +623,43 @@ final class Link {
     return prompts
   }
 
+  /** the shared MCP servers; the cloud keeps them and every paired Mac gets a copy */
+  private(set) var mcpLibrary: [McpSummary] = []
+
+  @discardableResult
+  func loadMcpLibrary() async throws -> [McpSummary] {
+    mcpLibrary = try await request("cloud", "mcpList", as: [McpSummary].self)
+    return mcpLibrary
+  }
+
+  /** `previous` renames one; a null env or header value keeps the saved one */
+  func putMcp(_ name: String, _ server: [String: JSON], previous: String? = nil) async throws {
+    var fields: [String: JSON] = ["name": .string(name), "server": .object(server)]
+    if let previous, previous != name { fields["previous"] = .string(previous) }
+    mcpLibrary = try await request("cloud", "mcpPut", fields, as: [McpSummary].self)
+    mcpChanged()
+  }
+
+  func deleteMcp(_ name: String) async throws {
+    mcpLibrary = try await request("cloud", "mcpDelete", ["name": .string(name)], as: [McpSummary].self)
+    mcpChanged()
+  }
+
+  func setMcpEnabled(_ name: String, _ enabled: Bool) async throws {
+    mcpLibrary = try await request("cloud", "mcpEnabled", ["name": .string(name), "enabled": .bool(enabled)], as: [McpSummary].self)
+    mcpChanged()
+  }
+
+  /** each host lists the servers a chat can turn off; a Mac gets its copy a moment after the cloud */
+  private func mcpChanged() {
+    let online = hosts.filter(\.online).map(\.id)
+    Task {
+      await loadMcpServers("cloud")
+      try? await Task.sleep(for: .seconds(2))
+      for host in online where host != "cloud" { await loadMcpServers(host) }
+    }
+  }
+
   /** writes a provider into a host's profile; spark checks it first. `previous` renames one. */
   func putProvider(_ name: String, _ provider: [String: JSON], model: String?, env: [String: JSON] = [:], previous: String? = nil, on host: String = "cloud") async throws -> [ProviderSummary] {
     var fields: [String: JSON] = ["name": .string(name), "provider": .object(provider)]

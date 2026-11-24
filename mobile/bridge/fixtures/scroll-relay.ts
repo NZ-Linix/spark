@@ -1,4 +1,10 @@
-// Local responder for FlowTests.testChatScrollAndDisclosure.
+// Local responder for FlowTests: the scroll tests, and the library's MCP servers on a scratch folder.
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Library } from "../library";
+
+const library = new Library({ dir: mkdtempSync(join(tmpdir(), "spark-fixture-library-")), spark: "spark" });
 const host = { id: "cloud", name: "Cloud", kind: "cloud", online: true };
 const session = { id: "scroll", cwd: "/tmp", title: "Scroll regression", updatedAt: new Date().toISOString(), live: true, running: false };
 const items = [
@@ -24,6 +30,15 @@ Bun.serve({
       const { msg: req } = JSON.parse(String(data));
       if (!req) return;
       const send = (msg: object) => ws.send(JSON.stringify({ host: host.id, msg }));
+      if (typeof req.op === "string" && req.op.startsWith("mcp") && req.op !== "mcpServers") {
+        try {
+          const result = req.op === "mcpList" ? library.mcp() : req.op === "mcpPut" ? library.putMcp(req) : req.op === "mcpDelete" ? library.deleteMcp(req.name) : library.setMcpEnabled(req.name, req.enabled);
+          send({ t: "reply", id: req.id, ok: true, result });
+        } catch (e) {
+          send({ t: "reply", id: req.id, ok: false, error: e instanceof Error ? e.message : String(e) });
+        }
+        return;
+      }
       const results: Record<string, unknown> = {
         sessions: [session], open: { ...session, items, config, permission: null }, options: config,
         prompts: [], mcpServers: ["fixture-mcp"], sessionMcp: req.disabled,
@@ -32,6 +47,22 @@ Bun.serve({
       if (req.op === "prompt") {
         send({ t: "item", s: session.id, item: { id: req.item, role: "user", text: req.text } });
         send({ t: "state", s: session.id, running: true });
+        if (/stream/i.test(req.text)) {
+          // a long reply a few words at a time, for following the newest text
+          const id = `stream-${req.item}`;
+          send({ t: "item", s: session.id, item: { id, role: "assistant", text: "" } });
+          const words = Array.from({ length: 300 }, (_, i) => (i % 40 === 39 ? "word.\n\n" : "word "));
+          let i = 0;
+          const tick = setInterval(() => {
+            send({ t: "append", s: session.id, id, text: words.slice(i, i + 3).join("") });
+            i += 3;
+            if (i < words.length) return;
+            clearInterval(tick);
+            send({ t: "append", s: session.id, id, text: "Streamed to the end." });
+            send({ t: "state", s: session.id, running: false });
+          }, 40);
+          return;
+        }
         setTimeout(() => {
           send({ t: "item", s: session.id, item: { id: "live", role: "assistant", text: "Visible follow-up reply." } });
           send({ t: "state", s: session.id, running: false });

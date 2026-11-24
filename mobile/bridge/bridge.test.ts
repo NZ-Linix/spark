@@ -328,6 +328,32 @@ describe("library", () => {
     expect(existsSync(join(home, "mcp-credentials"))).toBe(false);
   });
 
+  test("adds, edits, renames, turns off and deletes MCP servers, keeping secrets out of the list", () => {
+    const lib = new Library({ dir: join(dir, "lib"), spark: SPARK });
+    let changes = 0;
+    lib.onChange(() => changes++);
+    const headers = { Authorization: "Bearer secret-token-5678", "X-Org": "${MCP_ORG}" };
+    let list = lib.putMcp({ name: "docs", server: { type: "http", url: " https://mcp.example.test/mcp ", headers } });
+    expect(list).toEqual([{ name: "docs", server: { type: "http", url: "https://mcp.example.test/mcp", headers: { Authorization: null, "X-Org": "${MCP_ORG}" } }, hints: { "headers.Authorization": "5678" } }]);
+    // a value sent back as null keeps the saved one, and a renamed server keeps its place
+    lib.putMcp({ name: "files", server: { command: "npx", args: ["-y", "files-mcp"], env: { ROOT: "/srv" } } });
+    lib.putMcp({ name: "remote docs", previous: "docs", server: { url: "https://mcp.example.test/v2", headers: { Authorization: null } } });
+    const file = () => JSON.parse(readFileSync(join(dir, "lib", "mcp.json"), "utf8")).mcpServers;
+    expect(Object.keys(file())).toEqual(["remote docs", "files"]);
+    expect(file()["remote docs"]).toEqual({ type: "http", url: "https://mcp.example.test/v2", headers: { Authorization: "Bearer secret-token-5678" } });
+    expect(lib.setMcpEnabled("files", false).find((m) => m.name === "files")?.server.enabled).toBe(false);
+    expect(lib.setMcpEnabled("files", true).find((m) => m.name === "files")?.server.enabled).toBeUndefined();
+    expect(() => lib.putMcp({ name: "bad", server: { url: "ftp://x" } })).toThrow("https://");
+    expect(() => lib.putMcp({ name: "bad", server: { args: [] } })).toThrow("command");
+    expect(() => lib.putMcp({ name: "bad", server: { command: "x", env: { "A-B": "1" } } })).toThrow("A-B");
+    expect(() => lib.putMcp({ name: "new", server: { command: "x", env: { KEY: null } } })).toThrow("Enter a value for KEY");
+    expect(() => lib.putMcp({ name: "files", previous: "remote docs", server: { command: "x" } })).toThrow("already");
+    expect(lib.deleteMcp("files").map((m) => m.name)).toEqual(["remote docs"]);
+    expect(() => lib.deleteMcp("files")).toThrow("already gone");
+    expect(lib.snapshot().mcp).toEqual(file());
+    expect(changes).toBe(6);
+  });
+
   test("starts from the providers the cloud profiles already had", () => {
     for (const [d, p] of [["one", "a"], ["two", "b"]]) {
       mkdirSync(join(dir, d));
@@ -392,6 +418,29 @@ describe("Mac mirror", () => {
     const s = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
     expect(Object.keys(s.providers)).toEqual(["a"]);
   });
+});
+
+test("a Mac sends the MCP servers only it has, then its own MCP edits", async () => {
+  writeFileSync(join(dir, "settings.json"), JSON.stringify({ providers: {} }));
+  writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { mine: { command: "mine-mcp" }, shared: { command: "old" } } }));
+  const sent: LibraryOp[] = [];
+  const mirror = new Mirror({
+    home: dir,
+    stateFile: join(dir, "mobile-library.json"),
+    profile: new Profile({ home: dir, spark: SPARK, role: "mac", lookup: async () => "" }),
+    send: async (op) => void sent.push(op),
+  });
+  const servers = { shared: { command: "shared-mcp" } };
+  await mirror.receive({ providers: {}, models: {}, env: {}, prompts: {}, mcp: servers });
+  expect(sent).toEqual([{ op: "mcpPut", name: "mine", server: { command: "mine-mcp" } }]);
+  // the library sent here wins; it holds "mine" once the relay has it
+  expect(JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8")).mcpServers).toEqual(servers);
+  sent.length = 0;
+  await Bun.sleep(20);
+  writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: { shared: { command: "shared-mcp", enabled: false }, added: { url: "https://mcp.example.test" } } }));
+  await mirror.poll();
+  expect(sent.map((o) => o.op + " " + o.name)).toEqual(["mcpPut shared", "mcpPut added"]);
+  expect(JSON.parse(readFileSync(join(dir, "mobile-library.json"), "utf8")).mcp).toBeDefined();
 });
 
 describe("folders from the phone", () => {

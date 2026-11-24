@@ -167,6 +167,26 @@ nonisolated struct PromptSummary: Codable, Identifiable, Hashable, Sendable {
   var id: String { name }
 }
 
+/**
+ * One MCP server in the shared library, as mcp.json holds it. An env or header value that may be a
+ * secret comes as null, with its last 4 characters in `hints` under "env.NAME" or "headers.NAME".
+ */
+nonisolated struct McpSummary: Codable, Identifiable, Hashable, Sendable {
+  var name: String
+  var server: [String: JSON]
+  var hints: [String: String]
+  var id: String { name }
+  var enabled: Bool { server["enabled"] != .bool(false) }
+  var url: String? { if case .string(let u) = server["url"] { u } else { nil } }
+  var command: String? { if case .string(let c) = server["command"] { c } else { nil } }
+  var args: [String] {
+    guard case .array(let a) = server["args"] else { return [] }
+    return a.compactMap { if case .string(let s) = $0 { s } else { nil } }
+  }
+  /** the one line a list shows: where it connects, or what it runs */
+  var detail: String { url ?? ([command ?? ""] + args).joined(separator: " ") }
+}
+
 /** One message from the bridge, with every field any kind might carry. */
 nonisolated struct Event: Decodable, Sendable {
   var t: String

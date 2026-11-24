@@ -1,17 +1,21 @@
 /**
- * Keeps this Mac's spark profile a copy of the relay's library. The library's providers replace the
- * profile's and its prompts land in ~/.spark/cloud-prompts. An edit spark makes here, such as
- * `spark provider set` or `/provider`, goes to the relay, which checks it and sends every Mac the
- * new library; one the relay refuses is undone.
+ * Keeps this Mac's spark profile a copy of the relay's library. The library's providers and MCP
+ * servers replace the profile's and its prompts land in ~/.spark/cloud-prompts. An edit spark makes
+ * here, such as `spark provider set`, `/provider` or `spark mcp add`, goes to the relay, which checks
+ * it and sends every Mac the new library; one the relay refuses is undone.
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { applySnapshot, fingerprint, type LibrarySnapshot } from "./library";
+import { applySnapshot, fingerprint, type LibrarySnapshot, readMcp } from "./library";
 import { isObject, type Profile, writeAtomic } from "./providers";
 
 const POLL_MS = 1000;
 
-export type LibraryOp = { op: "providerPut"; name: string; provider: unknown; model?: string; env?: Record<string, string> } | { op: "providerDelete"; name: string };
+export type LibraryOp =
+  | { op: "providerPut"; name: string; provider: unknown; model?: string; env?: Record<string, string> }
+  | { op: "providerDelete"; name: string }
+  | { op: "mcpPut"; name: string; server: unknown }
+  | { op: "mcpDelete"; name: string };
 
 export type MirrorOptions = {
   /** this Mac's SPARK_HOME */
@@ -27,7 +31,10 @@ export type MirrorOptions = {
 
 export class Mirror {
   private written: Record<string, string> | null = null;
+  /** each MCP server's fingerprint as last written; null until this Mac's own were sent once */
+  private writtenMcp: Record<string, string> | null = null;
   private mtime = 0;
+  private mcpMtime = 0;
   private latest: LibrarySnapshot | null = null;
   private busy = false;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -36,6 +43,7 @@ export class Mirror {
     try {
       const parsed = JSON.parse(readFileSync(o.stateFile, "utf8"));
       if (isObject(parsed) && isObject(parsed.providers)) this.written = parsed.providers as Record<string, string>;
+      if (isObject(parsed) && isObject(parsed.mcp)) this.writtenMcp = parsed.mcp as Record<string, string>;
     } catch {
       // never synced: the first library this Mac gets adds the providers only this Mac has
     }
@@ -43,6 +51,10 @@ export class Mirror {
 
   private get settingsFile() {
     return join(this.o.home, "settings.json");
+  }
+
+  private get mcpFile() {
+    return join(this.o.home, "mcp.json");
   }
 
   start() {
@@ -58,10 +70,11 @@ export class Mirror {
   async receive(snap: LibrarySnapshot) {
     this.latest = snap;
     if (this.busy) return;
-    if (this.written === null) {
+    if (this.written === null || this.writtenMcp === null) {
       this.busy = true;
       try {
-        await this.adopt(snap);
+        if (this.written === null) await this.adopt(snap);
+        if (this.writtenMcp === null) await this.adoptMcp(snap);
       } finally {
         this.busy = false;
       }
@@ -83,19 +96,35 @@ export class Mirror {
     }
   }
 
+  /** the first sync with MCP servers sends the ones only this Mac has; for one both have, the library wins */
+  private async adoptMcp(snap: LibrarySnapshot) {
+    for (const [name, server] of Object.entries(readMcp(this.o.home) ?? {})) {
+      if (snap.mcp?.[name]) continue;
+      try {
+        // the relay sends the new library before it answers, so `latest` holds the server after this
+        await this.o.send({ op: "mcpPut", name, server });
+        this.o.log?.(`Sent the MCP server ${name} to the library.`);
+      } catch (err) {
+        this.o.log?.(`Couldn't send the MCP server ${name} to the library: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }
+
   private apply(snap: LibrarySnapshot) {
     try {
       this.written = applySnapshot(this.o.home, snap);
+      this.writtenMcp = Object.fromEntries(Object.entries(readMcp(this.o.home) ?? {}).map(([k, v]) => [k, fingerprint(v)]));
       this.mtime = this.stamp();
-      writeAtomic(this.o.stateFile, { providers: this.written });
+      this.mcpMtime = this.stamp(this.mcpFile);
+      writeAtomic(this.o.stateFile, { providers: this.written, mcp: this.writtenMcp });
     } catch (e) {
       this.o.log?.(`Couldn't copy the library here: ${e instanceof Error ? e.message : e}`);
     }
   }
 
-  private stamp(): number {
+  private stamp(file = this.settingsFile): number {
     try {
-      return statSync(this.settingsFile).mtimeMs;
+      return statSync(file).mtimeMs;
     } catch {
       return 0;
     }
@@ -111,19 +140,30 @@ export class Mirror {
     }
   }
 
-  /** spark changed settings.json: send each provider that differs from what the mirror wrote */
+  /** spark changed settings.json or mcp.json: send each provider or server that differs from what the mirror wrote */
   async poll() {
     if (this.busy || this.written === null || !this.latest) return;
-    const mtime = this.stamp();
-    if (mtime === this.mtime) return;
-    this.mtime = mtime;
-    const local = this.local();
-    const written = this.written;
     const ops: LibraryOp[] = [];
-    for (const [name, p] of Object.entries(local)) {
-      if (written[name] !== fingerprint(p)) ops.push({ op: "providerPut", name, provider: p });
+    const mtime = this.stamp();
+    if (mtime !== this.mtime) {
+      this.mtime = mtime;
+      const local = this.local();
+      const written = this.written;
+      for (const [name, p] of Object.entries(local)) {
+        if (written[name] !== fingerprint(p)) ops.push({ op: "providerPut", name, provider: p });
+      }
+      for (const name of Object.keys(written)) if (!(name in local)) ops.push({ op: "providerDelete", name });
     }
-    for (const name of Object.keys(written)) if (!(name in local)) ops.push({ op: "providerDelete", name });
+    const mcpMtime = this.stamp(this.mcpFile);
+    if (this.writtenMcp && mcpMtime !== this.mcpMtime) {
+      this.mcpMtime = mcpMtime;
+      const local = readMcp(this.o.home) ?? {};
+      const written = this.writtenMcp;
+      for (const [name, server] of Object.entries(local)) {
+        if (written[name] !== fingerprint(server)) ops.push({ op: "mcpPut", name, server });
+      }
+      for (const name of Object.keys(written)) if (!(name in local)) ops.push({ op: "mcpDelete", name });
+    }
     if (!ops.length) return;
     this.busy = true;
     try {
@@ -136,7 +176,7 @@ export class Mirror {
           } else {
             await this.o.send(op);
           }
-          this.o.log?.(`${op.op === "providerPut" ? "Saved" : "Deleted"} ${op.name} in the library.`);
+          this.o.log?.(`${op.op.endsWith("Put") ? "Saved" : "Deleted"} ${op.op.startsWith("mcp") ? "the MCP server " : ""}${op.name} in the library.`);
         } catch (err) {
           this.o.log?.(`The library refused the change to ${op.name}: ${err instanceof Error ? err.message : err}`);
         }

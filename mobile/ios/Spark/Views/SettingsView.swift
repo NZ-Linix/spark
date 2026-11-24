@@ -202,9 +202,11 @@ struct SettingsView: View {
         providersLink("Providers", symbol: "server.rack", id: "cloudProviders") { CloudProvidersView() }
         Divider().overlay(Color.hairline).padding(.leading, 58)
         providersLink("Prompts", symbol: "text.quote", id: "prompts") { PromptsView() }
+        Divider().overlay(Color.hairline).padding(.leading, 58)
+        providersLink("MCP Servers", symbol: "point.3.connected.trianglepath.dotted", id: "mcpServers") { McpServersView() }
       }
       .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 22, style: .continuous))
-      Text("One set of providers and prompts for the cloud and every paired Mac. A new chat can start with any prompt instead of spark's own.")
+      Text("One set of providers, prompts and MCP servers for the cloud and every paired Mac. A new chat can start with any prompt instead of spark's own.")
         .font(.geist(13))
         .foregroundStyle(Color.faint)
         .padding(.horizontal, 6)
