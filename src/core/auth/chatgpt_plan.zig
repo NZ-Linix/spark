@@ -4,7 +4,7 @@ const oauth = @import("oauth.zig");
 const browser = @import("browser_callback.zig");
 const http = @import("oauth_transport.zig");
 const io = @import("../shared/io.zig");
-const paths = @import("../shared/profile_paths.zig");
+const store = @import("plan_store.zig");
 const host = @import("../hosts/host.zig");
 const secret = @import("secret.zig");
 const Allocator = std.mem.Allocator;
@@ -43,17 +43,7 @@ pub fn newId(alloc: Allocator) ![]u8 {
 }
 
 fn openStore(alloc: Allocator, create: bool) !io.VerifiedDir {
-    const home = io.homeDir() orelse return error.HomeNotSet;
-    const root = try paths.rootDir(alloc, home);
-    defer alloc.free(root);
-    if (create) try io.makeDirRecursive(root);
-    // Canonicalize the parent (e.g. macOS /var -> /private/var), not the
-    // final profile directory. Never follow a link standing in for the profile.
-    var base = try std.Io.Dir.openDirAbsolute(io.getIo(), paths.rootParent(home), .{});
-    defer base.close(io.getIo());
-    var parent: io.VerifiedDir = .{ .dir = try base.openDir(io.getIo(), paths.rootName(), .{ .iterate = true, .follow_symlinks = false }) };
-    defer parent.close();
-    return if (create) io.openOrCreateVerifiedPrivateDir(&parent, "chatgpt-plan") else (try io.openVerifiedPrivateDirIfPresent(&parent, "chatgpt-plan")) orelse error.FileNotFound;
+    return store.open(alloc, .chatgpt, create);
 }
 
 fn readPrivate(alloc: Allocator, dir: io.VerifiedDir, name: []const u8) ![]u8 {
@@ -367,6 +357,7 @@ fn readOrRefresh(alloc: Allocator, transport: http.Provider, dir: *io.VerifiedDi
     const saved = load(alloc, dir.*, filename) catch |err| return if (err == error.FileNotFound) error.ChatGPTSignInRequired else err;
     defer saved.deinit(alloc);
     if (saved.parsed.value.expires_at_ms > io.milliTimestamp() + 60_000) return alloc.dupe(u8, saved.parsed.value.access_token);
+    if (try store.remoteToken(alloc, transport, filename)) |token| return token;
     var lock = try io.acquireTimedAdvisoryLock(dir, "accounts.lock", lockDeadline(17_000));
     defer lock.release();
     const latest = load(alloc, dir.*, filename) catch |err| return if (err == error.FileNotFound) error.ChatGPTSignInRequired else err;

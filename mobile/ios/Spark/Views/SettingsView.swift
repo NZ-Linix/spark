@@ -161,18 +161,26 @@ struct SettingsView: View {
     VStack(alignment: .leading, spacing: 8) {
       Caption("Subscription accounts")
       VStack(spacing: 0) {
-        ForEach(link.hosts.filter { $0.kind == .mac }) { mac in
+        if link.sharedAccounts {
           ForEach(SubscriptionPlan.allCases) { plan in
-            providersLink("\(plan.title) on \(mac.name)", symbol: plan.symbol, id: "plan-\(plan.rawValue)-\(mac.id)") {
-              SubscriptionAccountsView(mac: mac, plan: plan)
+            providersLink(plan.title, symbol: plan.symbol, id: "plan-\(plan.rawValue)-cloud") {
+              SubscriptionAccountsView(mac: nil, plan: plan)
             }
-            .disabled(!mac.online)
-            .opacity(mac.online ? 1 : 0.5)
+          }
+        } else {
+          ForEach(link.hosts.filter { $0.kind == .mac }) { mac in
+            ForEach(SubscriptionPlan.allCases) { plan in
+              providersLink("\(plan.title) on \(mac.name)", symbol: plan.symbol, id: "plan-\(plan.rawValue)-\(mac.id)") {
+                SubscriptionAccountsView(mac: mac, plan: plan)
+              }
+              .disabled(!mac.online)
+              .opacity(mac.online ? 1 : 0.5)
+            }
           }
         }
       }
       .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 22, style: .continuous))
-      Text("ChatGPT, Claude and Antigravity subscriptions work in chats on your paired Mac. Sign-in opens in its browser. Accounts are not shared with Cloud.")
+      Text(link.sharedAccounts ? "Subscriptions are shared between Cloud and your paired Macs. Sign-in opens in a Mac’s browser." : "Sign in to a subscription in your paired Mac’s browser.")
         .font(.geist(13))
         .foregroundStyle(Color.faint)
         .padding(.horizontal, 6)

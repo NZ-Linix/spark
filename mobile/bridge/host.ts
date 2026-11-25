@@ -189,7 +189,7 @@ export class Host {
         return null;
       }
       case "options":
-        return this.options();
+        return this.options(req.provider);
       case "folders":
         return this.folders(req.path);
       case "search":
@@ -242,12 +242,11 @@ export class Host {
       // `chatgptAccount(s)` are what app builds before Claude and Antigravity send.
       case "planAccounts":
       case "chatgptAccounts":
-        if (this.o.info.kind !== "mac") throw new Error("Subscription accounts are available only on your paired Mac.");
-        return this.profile().accounts(req.op === "planAccounts" ? req.plan : "chatgpt");
+        return (this.o.library ?? this.profile()).accounts(req.op === "planAccounts" ? req.plan : "chatgpt");
       case "planAccount":
       case "chatgptAccount": {
-        if (this.o.info.kind !== "mac") throw new Error("Subscription accounts are available only on your paired Mac.");
-        const result = await this.profile().changeAccount(req.op === "planAccount" ? req.plan : "chatgpt", req.action, req.value);
+        const plan = req.op === "planAccount" ? req.plan : "chatgpt";
+        const result = this.o.library ? await this.o.library.removeAccount(plan, req.action, req.value) : await this.profile().changeAccount(plan, req.action, req.value);
         this.invalidate();
         return result;
       }
@@ -302,6 +301,7 @@ export class Host {
   /** forgets what a new chat would start with, after its providers changed */
   invalidate() {
     this.defaults = undefined;
+    this.optionsRevision++;
   }
 
   private library(): Library {
@@ -474,14 +474,18 @@ export class Host {
    * What a new chat would start with (provider, model, effort, ...), before there is one. spark only
    * tells these to a session, so ask an empty one; spark doesn't keep a session nobody wrote in.
    */
-  private async options(): Promise<ConfigOption[]> {
-    if (this.defaults && Date.now() - this.defaults.at < OPTIONS_MS) return this.defaults.config;
-    const acp = new Acp(this.o.spark, this.o.root, this.env());
+  private async options(provider?: string): Promise<ConfigOption[]> {
+    if (provider !== undefined && (typeof provider !== "string" || !/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(provider))) throw new Error("Invalid provider.");
+    if (!provider && this.defaults && Date.now() - this.defaults.at < OPTIONS_MS) return this.defaults.config;
+    const revision = this.optionsRevision;
+    const env = provider ? { ...this.env(), SPARK_PROVIDER: provider } : this.env();
+    const acp = new Acp(this.o.spark, this.o.root, env);
     try {
       await acp.initialize();
       const r = await acp.call("session/new", { cwd: this.o.root, mcpServers: [] });
       const config: ConfigOption[] = Array.isArray(r?.configOptions) ? r.configOptions : [];
-      this.defaults = { at: Date.now(), config };
+      if (provider && !config.some(o => o.id === "provider" && o.currentValue === provider)) throw new Error("This provider is not available on the host.");
+      if (!provider && revision === this.optionsRevision && config.length) this.defaults = { at: Date.now(), config };
       return config;
     } finally {
       acp.kill();
@@ -489,6 +493,7 @@ export class Host {
   }
 
   private defaults?: { at: number; config: ConfigOption[] };
+  private optionsRevision = 0;
 
   /**
    * A session for the phone to show. One another spark process has open, such as spark in a

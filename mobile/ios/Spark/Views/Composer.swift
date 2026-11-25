@@ -205,6 +205,7 @@ struct ConfigChips: View {
   var refreshMcp: (() async -> Void)? = nil
   /** inside the composer: a small filled pill with a short name, so it reads over anything */
   var compact = false
+  var modelsPending = false
   @State private var open = false
 
   private var model: ConfigOption? { options.first { $0.id == "model" } }
@@ -212,6 +213,7 @@ struct ConfigChips: View {
     options.first { $0.id == "effort" && Effort.levels($0).count > 1 }
   }
   private var modelName: String {
+    if modelsPending { return "Model" }
     guard let model else { return "" }
     let name = model.current.map { $0.label(model.id) } ?? ConfigOption.Choice.pretty(model.currentValue)
     guard compact else { return name }
@@ -246,7 +248,7 @@ struct ConfigChips: View {
             .truncationMode(.tail)
             .frame(maxWidth: compact ? 200 : nil, alignment: .leading)
             .fixedSize(horizontal: !compact, vertical: false)
-          if let effort, let level = Effort.current(effort) {
+          if !modelsPending, let effort, let level = Effort.current(effort) {
             Text(Effort.name(level))
               .foregroundStyle(Effort.accent)
               .lineLimit(1)
@@ -270,7 +272,7 @@ struct ConfigChips: View {
       .accessibilityLabel("Model")
       .accessibilityValue([model.current?.label(model.id), effort.flatMap(Effort.current).map(Effort.name)].compactMap { $0 }.joined(separator: ", "))
       .sheet(isPresented: $open) {
-        ModelSheet(options: options, set: set, prompts: prompts, prompt: prompt, mcpNames: mcpNames, mcpDisabled: mcpDisabled, mcpEditable: mcpEditable)
+        ModelSheet(options: options, set: set, prompts: prompts, prompt: prompt, mcpNames: mcpNames, mcpDisabled: mcpDisabled, mcpEditable: mcpEditable, modelsPending: modelsPending)
           .task { await refreshMcp?() }
       }
     }
@@ -482,21 +484,22 @@ struct ModelSheet: View {
   var mcpNames: [String] = []
   var mcpDisabled: Binding<Set<String>>? = nil
   var mcpEditable = true
+  var modelsPending = false
   @Environment(\.dismiss) private var dismiss
   @State private var query = ""
 
   private var model: ConfigOption? { options.first { $0.id == "model" } }
   private var effort: ConfigOption? {
-    options.first { $0.id == "effort" && Effort.levels($0).count > 1 }
+    modelsPending ? nil : options.first { $0.id == "effort" && Effort.levels($0).count > 1 }
   }
-  private var context: ConfigOption? { options.first { $0.id == "context" } }
+  private var context: ConfigOption? { modelsPending ? nil : options.first { $0.id == "context" } }
   private var showsPrompt: Bool { prompt != nil && !prompts.isEmpty }
   private var menus: [ConfigOption] {
-    options.filter { ["provider", "mode"].contains($0.id) && $0.options.count > 1 }
+    options.filter { option in ["provider", "mode"].contains(option.id) && option.options.contains { $0.value != option.currentValue } }
   }
 
   private var shown: [ConfigOption.Choice] {
-    guard let model else { return [] }
+    guard !modelsPending, let model else { return [] }
     let q = query.trimmingCharacters(in: .whitespaces).lowercased()
     return model.options.filter { q.isEmpty || $0.value.lowercased().contains(q) || $0.label("model").lowercased().contains(q) }
   }
@@ -556,7 +559,7 @@ struct ModelSheet: View {
         .padding(.bottom, 12)
       }
 
-      if (model?.options.count ?? 0) > 8 {
+      if !modelsPending, (model?.options.count ?? 0) > 8 {
         HStack(spacing: 8) {
           Image(systemName: "magnifyingglass").font(.system(size: 13, weight: .medium)).foregroundStyle(Color.dim)
           TextField("Search models", text: $query)
@@ -633,7 +636,9 @@ struct ModelSheet: View {
       }
       .scrollDismissesKeyboard(.immediately)
       .overlay {
-        if shown.isEmpty, !query.isEmpty {
+        if modelsPending {
+          Text("Models for this provider aren’t loaded yet.").font(.geist(15)).foregroundStyle(Color.dim)
+        } else if shown.isEmpty, !query.isEmpty {
           Text("No models match “\(query)”").font(.geist(15)).foregroundStyle(Color.faint)
         }
       }

@@ -120,6 +120,7 @@ nonisolated struct HostEntry: Codable, Identifiable, Hashable, Sendable {
   var name: String
   var kind: Kind
   var online: Bool
+  var sharedAccounts: Bool?
 
   var symbol: String { kind == .cloud ? "cloud" : "laptopcomputer" }
 }

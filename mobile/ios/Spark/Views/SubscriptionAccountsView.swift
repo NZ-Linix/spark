@@ -60,7 +60,7 @@ enum SubscriptionPlan: String, CaseIterable, Identifiable {
 
 struct SubscriptionAccountsView: View {
   @Environment(Link.self) private var link
-  let mac: HostEntry
+  let mac: HostEntry?
   let plan: SubscriptionPlan
   @State private var accounts: [ProviderSummary]?
   @State private var adding = false
@@ -69,10 +69,17 @@ struct SubscriptionAccountsView: View {
   @State private var progress: String?
   @State private var message: String?
 
+  private var shared: Bool { mac == nil }
+  private var signInMac: HostEntry? {
+    let online = link.hosts.filter { $0.kind == .mac && $0.online }
+    if let mac { return online.first { $0.id == mac.id } }
+    return online.first { $0.id == link.hostID } ?? online.first
+  }
+
   var body: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 20) {
-        Text("\(plan.summary) in Spark chats on \(mac.name). Sign-in opens in that Mac’s browser, and your credentials stay on the Mac. Spark uses its own prompt and tools with the plan.")
+        Text(shared ? "\(plan.summary) in Cloud chats and on your paired Macs. Spark saves the account on your relay. Pair an online Mac to sign in." : "\(plan.summary) in Spark chats on \(mac?.name ?? "your Mac"). Sign-in opens in its browser.")
           .font(.geist(15)).foregroundStyle(Color.dim)
         if accounts == nil && message == nil {
           ProgressView().tint(Color.dim).frame(maxWidth: .infinity)
@@ -86,6 +93,7 @@ struct SubscriptionAccountsView: View {
                 Spacer()
                 Menu {
                   Button("Sign in again") { Task { await change("reconnect", account.name) } }
+                    .disabled(signInMac == nil)
                   Button("Disconnect", role: .destructive) { removing = account }
                 } label: {
                   Image(systemName: "ellipsis").frame(width: 44, height: 44)
@@ -108,7 +116,7 @@ struct SubscriptionAccountsView: View {
             .frame(maxWidth: .infinity, minHeight: 44)
         }
         .buttonStyle(.borderedProminent)
-        .disabled(progress != nil || accounts == nil)
+        .disabled(progress != nil || accounts == nil || signInMac == nil)
         .accessibilityIdentifier("planContinue")
         if let progress {
           HStack(spacing: 10) {
@@ -132,7 +140,9 @@ struct SubscriptionAccountsView: View {
     .page()
     .navigationTitle(plan.title)
     .navigationBarTitleDisplayMode(.inline)
-    .task { await load() }
+    .task(id: "\(link.phase == .online)-\(link.optionsRevision)") {
+      if link.phase == .online { await load() }
+    }
     .refreshable { await load() }
     .alert("New \(plan.product) account", isPresented: $adding) {
       TextField("Account label (optional)", text: $label)
@@ -147,28 +157,30 @@ struct SubscriptionAccountsView: View {
         removing = nil
       }
     } message: {
-      Text("Chats on this Mac will no longer be able to use this account.")
+      Text(shared ? "Cloud and paired Mac chats will no longer be able to use this account." : "Chats on this Mac will no longer be able to use this account.")
     }
   }
 
   private func load() async {
     do {
-      accounts = try await link.planAccounts(mac.id, plan: plan)
-      message = nil
+      let list = try await link.planAccounts(mac?.id ?? "cloud", plan: plan)
+      if !Task.isCancelled { accounts = list }
     } catch {
-      message = error.localizedDescription
+      if !Task.isCancelled { message = error.localizedDescription }
     }
   }
 
   private func change(_ action: String, _ value: String) async {
     guard progress == nil else { return }
+    let target = action == "remove" && shared ? "cloud" : signInMac?.id
+    guard let target else { return }
     message = nil
-    progress = action == "remove" ? "Disconnecting…" : "Finish signing in on \(mac.name)."
+    progress = action == "remove" ? "Disconnecting…" : "Finish signing in on \(signInMac?.name ?? "your Mac")."
     defer { progress = nil }
     do {
-      let result = try await link.changePlanAccount(mac.id, plan: plan, action: action, value: value)
+      let result = try await link.changePlanAccount(target, plan: plan, action: action, value: value)
       accounts = result.accounts
-      message = result.warning ?? (action == "remove" ? "Account disconnected." : "Connected. Choose this account in the model picker for chats on \(mac.name).")
+      message = result.warning ?? (action == "remove" ? "Account disconnected." : "Connected. Choose this account in the model picker.")
     } catch {
       message = error.localizedDescription
     }

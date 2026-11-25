@@ -380,7 +380,13 @@ fn readOrRefresh(alloc: Allocator, transport: http.Provider, dir: *io.VerifiedDi
     {
         const saved = load(alloc, dir.*, name) catch |err| return if (err == error.FileNotFound) error.PlanSignInRequired else err;
         defer saved.deinit(alloc);
-        if (saved.parsed.value.expires_at_ms > io.milliTimestamp() + 60_000) return sessionOf(alloc, saved.parsed.value);
+        var account = saved.parsed.value;
+        if (account.expires_at_ms > io.milliTimestamp() + 60_000) return sessionOf(alloc, account);
+        if (try store.remoteToken(alloc, transport, name)) |token| {
+            defer secret.zeroAndFree(alloc, token);
+            account.access_token = token;
+            return sessionOf(alloc, account);
+        }
     }
     var held = try store.lock(dir);
     defer held.release();

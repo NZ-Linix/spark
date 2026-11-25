@@ -257,6 +257,7 @@ fn readOrRefresh(alloc: Allocator, transport: http.Provider, dir: *io.VerifiedDi
         defer saved.deinit(alloc);
         if (saved.parsed.value.expires_at_ms > io.milliTimestamp() + 60_000) return alloc.dupe(u8, saved.parsed.value.access_token);
     }
+    if (try store.remoteToken(alloc, transport, name)) |token| return token;
     var held = try store.lock(dir);
     defer held.release();
     const latest = load(alloc, dir.*, name) catch |err| return if (err == error.FileNotFound) error.PlanSignInRequired else err;

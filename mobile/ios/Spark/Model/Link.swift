@@ -44,16 +44,17 @@ final class Link {
   var hostID: String? = UserDefaults.standard.string(forKey: "host") {
     didSet { UserDefaults.standard.set(hostID, forKey: "host") }
   }
-  /** the host last picked by hand: it's chosen again whenever it comes back online */
+  /** the host last picked by hand */
   private var wanted: String? = UserDefaults.standard.string(forKey: "wantedHost") ?? UserDefaults.standard.string(forKey: "host") {
     didSet { UserDefaults.standard.set(wanted, forKey: "wantedHost") }
   }
-  /** where a new chat can go: the cloud, and each Mac while it's online */
-  var pickable: [HostEntry] { hosts.filter { $0.kind == .cloud || $0.online } }
+  var pickable: [HostEntry] { hosts }
+  var sharedAccounts: Bool { hosts.contains { $0.kind == .cloud && $0.sharedAccounts == true } }
   private(set) var sessions: [String: [SessionInfo]] = [:]
   /** the options spark last offered on each host, so a new chat can pick a model before it exists */
   private(set) var mcpServers: [String: [String]] = [:]
-  private(set) var configs: [String: [ConfigOption]] = [:]
+  private(set) var configs = (try? JSONDecoder().decode([String: [ConfigOption]].self, from: UserDefaults.standard.data(forKey: "hostOptions") ?? Data())) ?? [:]
+  private(set) var optionsRevision = 0
   var chat: Chat?
 
   @ObservationIgnored private var token: String? = Keychain.read("token")
@@ -108,6 +109,7 @@ final class Link {
     Keychain.write("token", joined.token)
     hosts = joined.hosts
     sessions = [:]
+    clearOptions()
     connect()
   }
 
@@ -167,6 +169,8 @@ final class Link {
     req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     struct Left: Decodable { var hosts: [HostEntry] }
     if let left: Left = try? await Self.fetch(req) { hosts = left.hosts }
+    configs[host.id] = nil
+    saveOptions()
     if wanted == host.id { wanted = nil }
     if hostID == host.id { hostID = hosts.first?.id }
   }
@@ -177,16 +181,13 @@ final class Link {
     hostID = id
   }
 
-  /**
-   * A Mac that goes offline leaves the picker, so the chosen host moves to one still there; the
-   * one picked by hand comes back once it's online again.
-   */
+  /** Keep the selected Mac visible even when it can't start a chat. */
   private func settleHost() {
     let open = pickable
     if let wanted, open.contains(where: { $0.id == wanted }) {
       if hostID != wanted { hostID = wanted }
     } else if !open.contains(where: { $0.id == hostID }) {
-      hostID = open.first?.id ?? hosts.first?.id
+      hostID = open.first(where: \.online)?.id ?? open.first?.id
     }
   }
 
@@ -196,6 +197,7 @@ final class Link {
     token = nil
     hosts = []
     sessions = [:]
+    clearOptions()
     chat = nil
     UserDefaults.standard.removeObject(forKey: "relay")
     Keychain.write("token", nil)
@@ -206,8 +208,10 @@ final class Link {
   // MARK: Connection
 
   func setActive(_ on: Bool) {
+    let resumed = on && !active
     active = on
-    if on, registered, phase != .online, phase != .connecting { connect() }
+    guard on, registered else { return }
+    if resumed || (phase != .online && phase != .connecting) { connect() }
   }
 
   private func connect() {
@@ -240,6 +244,7 @@ final class Link {
     while gen == generation {
       do {
         let message = try await task.receive()
+        guard gen == generation, socket === task else { return }
         if first {
           first = false
           retry = 0
@@ -256,7 +261,7 @@ final class Link {
         guard let env = try? JSONDecoder().decode(Envelope.self, from: data) else { continue }
         handle(env)
       } catch {
-        guard gen == generation else { return }
+        guard gen == generation, socket === task else { return }
         dropped()
         return
       }
@@ -272,9 +277,8 @@ final class Link {
   }
 
   private func dropped() {
-    socket = nil
-    for (_, c) in waiting { c.resume(throwing: LinkError("The connection dropped.")) }
-    waiting = [:]
+    disconnect()
+    generation += 1
     phase = .offline
     guard active else { return }
     retry += 1
@@ -303,7 +307,15 @@ final class Link {
       }
       return
     }
+    if env.relay == "library-changed" {
+      providersChanged()
+      return
+    }
     guard let host = env.host, let e = env.msg else { return }
+    if e.t == "optionsChanged" {
+      providersChanged()
+      return
+    }
     if e.t == "term", let run = e.run {
       terms[run]?(e)
       if e.done == true { terms[run] = nil }
@@ -339,7 +351,7 @@ final class Link {
     let data = try JSONEncoder().encode(["host": JSON.string(host), "msg": .object(msg)])
     let key = "\(host)#\(n)"
     let timeout = Task {
-      do { try await Task.sleep(for: .seconds(op == "planAccount" ? 340 : op == "watchTerminal" ? 15 : 90)) }
+      do { try await Task.sleep(for: .seconds(op == "planAccount" ? 340 : op == "watchTerminal" ? 15 : op == "options" ? 40 : 90)) }
       catch { return }
       waiting.removeValue(forKey: key)?.resume(throwing: LinkError("The host took too long to answer."))
     }
@@ -414,9 +426,13 @@ final class Link {
         var list = sessions[host] ?? []
         list.insert(chat.info, at: 0)
         sessions[host] = list
-        for (id, value) in options where chat.config.first(where: { $0.id == id })?.currentValue != value {
-          await set(chat, id, to: value)
+        for id in ["provider", "model", "mode", "context", "effort"] {
+          guard let value = options[id], let option = chat.config.first(where: { $0.id == id }), option.currentValue != value else { continue }
+          // A provider change rebuilds the model options; the new provider may also have a different effort scale.
+          if id == "effort", !option.options.contains(where: { $0.value == value }) { continue }
+          chat.config = try await request(host, "config", ["s": .string(chat.info.id), "option": .string(id), "value": .string(value)], as: [ConfigOption].self)
         }
+        remember(chat)
         _ = try await request(host, "prompt", ["s": .string(chat.info.id), "text": .string(text), "item": .string(first.id)])
         chat.problem = nil
       } catch {
@@ -612,18 +628,34 @@ final class Link {
     }
   }
 
-  func loadOptions(_ host: String) async {
-    guard configs[host] == nil else { return }
-    if let options = try? await request(host, "options", [:], as: [ConfigOption].self), !options.isEmpty {
+  @discardableResult
+  func loadOptions(_ host: String, provider: String? = nil) async throws -> [ConfigOption] {
+    let fields: [String: JSON] = provider.map { ["provider": .string($0)] } ?? [:]
+    let options = try await request(host, "options", fields, as: [ConfigOption].self)
+    try Task.checkCancellation()
+    guard options.contains(where: { $0.id == "model" }) else { throw LinkError("This host didn't offer any models.") }
+    if let provider {
+      guard options.contains(where: { $0.id == "provider" && $0.currentValue == provider }) else { throw LinkError("This provider isn't available on the host.") }
+    } else {
       configs[host] = options
+      saveOptions()
     }
+    return options
+  }
+
+  private func saveOptions() {
+    if let data = try? JSONEncoder().encode(configs) { UserDefaults.standard.set(data, forKey: "hostOptions") }
+  }
+
+  private func clearOptions() {
+    configs = [:]
+    UserDefaults.standard.removeObject(forKey: "hostOptions")
   }
 
   // MARK: Providers and prompts
 
-  /** every host's options change when the shared providers do */
   private func providersChanged() {
-    configs = [:]
+    optionsRevision += 1
   }
 
   func providers(_ host: String = "cloud") async throws -> [ProviderSummary] {
@@ -643,7 +675,7 @@ final class Link {
   /** signs in to (`connect`, `reconnect`) or removes an account; sign-in opens in the Mac's browser */
   func changePlanAccount(_ host: String, plan: SubscriptionPlan, action: String, value: String) async throws -> PlanAccountUpdate {
     let result = try await request(host, "planAccount", ["plan": .string(plan.rawValue), "action": .string(action), "value": .string(value)], as: PlanAccountUpdate.self)
-    configs[host] = nil
+    providersChanged()
     return result
   }
 

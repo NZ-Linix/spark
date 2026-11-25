@@ -159,7 +159,7 @@ export type Request =
   /** runs the session with library prompt `prompt` from its next message, or spark's own with null */
   | { id: number; op: "sessionPrompt"; s: string; prompt: string | null }
   | { id: number; op: "config"; s: string; option: string; value: string }
-  | { id: number; op: "options" }
+  | { id: number; op: "options"; provider?: string }
   | { id: number; op: "mcpServers" }
   | { id: number; op: "sessionMcp"; s: string; disabled: string[] }
   | { id: number; op: "answer"; s: string; request: string; option: string | null }

@@ -20,7 +20,7 @@ struct SparkApp: App {
         .tint(.white)
     }
     .onChange(of: phase) { _, phase in
-      link.setActive(phase == .active)
+      if phase != .inactive { link.setActive(phase == .active) }
     }
   }
 }

@@ -21,6 +21,18 @@ const Allocator = std.mem.Allocator;
 pub const Kind = plan_kind.Kind;
 pub const Operation = enum { connect, reconnect, remove };
 
+pub fn accessToken(alloc: Allocator, transport: oauth.Provider, id: []const u8) ![]u8 {
+    return switch (Kind.ofId(id) orelse return error.InvalidPlanAccount) {
+        .chatgpt => chatgpt_plan.accessToken(alloc, transport, id),
+        .claude => claude_plan.accessToken(alloc, transport, id),
+        .antigravity => blk: {
+            var session = try antigravity_plan.open(alloc, transport, id);
+            defer session.deinit(alloc);
+            break :blk try alloc.dupe(u8, session.token);
+        },
+    };
+}
+
 pub fn newId(alloc: Allocator, kind: Kind) ![]u8 {
     return switch (kind) {
         .chatgpt => chatgpt_plan.newId(alloc),

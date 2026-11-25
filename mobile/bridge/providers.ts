@@ -27,7 +27,7 @@ export type ProfileOptions = {
 };
 
 export const isObject = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
-/** the subscription plans a Mac can sign in to; their accounts never leave it */
+/** subscription plans use dedicated provider and credential handling */
 export const PLANS = {
   chatgpt: { auth: "chatgpt-plan", command: "chatgpt-account", name: "ChatGPT" },
   claude: { auth: "claude-plan", command: "claude-account", name: "Claude" },
@@ -87,18 +87,22 @@ export class Profile {
   }
 
   accounts(plan: unknown = "chatgpt"): ProviderSummary[] {
-    if (this.o.role !== "mac") throw new Error("Subscription accounts are available only on your paired Mac.");
     if (!isPlan(plan)) throw new Error("Unknown subscription.");
     const s = this.read();
     const providers = isObject(s.providers) ? s.providers : {};
     return Object.entries(providers).flatMap(([name, p]) => isObject(p) && p.auth?.type === PLANS[plan].auth ? [summarize(name, p, s)] : []);
   }
 
-  async changeAccount(plan: unknown, action: unknown, value: unknown): Promise<{ accounts: ProviderSummary[]; warning?: string }> {
-    if (this.o.role !== "mac") throw new Error("Subscription accounts are available only on your paired Mac.");
+  changeAccount(plan: unknown, action: unknown, value: unknown): Promise<{ accounts: ProviderSummary[]; warning?: string }> {
+    const run = () => this.runAccountChange(plan, action, value);
+    return this.o.role === "cloud" ? this.serial(run) : run();
+  }
+
+  private async runAccountChange(plan: unknown, action: unknown, value: unknown) {
+    if (this.o.role === "cloud" && action !== "remove") throw new Error("Sign in from a paired Mac.");
     if (!isPlan(plan)) throw new Error("Unknown subscription.");
     const { auth, command, name } = PLANS[plan];
-    if (this.accountJob) throw new Error("An account change is already in progress on this Mac.");
+    if (this.accountJob) throw new Error("An account change is already in progress.");
     if (action !== "connect" && action !== "reconnect" && action !== "remove") throw new Error("Unknown account action.");
     const id = new RegExp(`^${auth}-[0-9a-f]{32}$`);
     if (typeof value !== "string" || (action === "connect" ? Buffer.byteLength(value) > 48 || /[\u0000-\u001f\u007f]/.test(value) : !id.test(value))) throw new Error(`Invalid ${name} account label or ID.`);
@@ -110,7 +114,7 @@ export class Profile {
       });
       const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
       const detail = stderr.trim().replace(/^spark provider: /, "");
-      if (code !== 0) throw new Error(detail || `Could not update the ${name} account on this Mac.`);
+      if (code !== 0) throw new Error(detail || `Could not update the ${name} account.`);
       return { accounts: this.accounts(plan), warning: detail || undefined };
     } finally {
       this.accountJob = false;
@@ -139,7 +143,7 @@ export class Profile {
     const s = this.read();
     const found = isObject(s.providers) ? s.providers[name] : undefined;
     if (!isObject(found)) throw new Error(`There's no provider named ${name} on this Mac.`);
-    if (isLocalProvider(name, found)) throw new Error("Subscription accounts stay on this Mac.");
+    if (isLocalProvider(name, found)) throw new Error("Subscription accounts stay on this Mac unless synced by the bridge.");
     const provider: Json = structuredClone(found);
     const env: Record<string, string> = {};
     const missing: string[] = [];
@@ -174,13 +178,13 @@ export class Profile {
    * would refuse never replaces a working one. A key left out keeps the saved key. `previous` renames
    * a provider: the old name goes, and the saved model and chosen provider follow it.
    */
-  put(input: { name: string; provider: unknown; model?: unknown; env?: unknown; previous?: unknown }): Promise<ProviderSummary[]> {
+  put(input: { name: string; provider: unknown; model?: unknown; env?: unknown; previous?: unknown }, saveAccount?: () => void | Promise<void>): Promise<ProviderSummary[]> {
     const { name, provider, model, env, previous } = input;
     if (this.o.role !== "cloud" && env !== undefined && env !== null && isObject(env) && Object.keys(env).length) return Promise.reject(new Error("The Mac reads header values from its own environment."));
     if (previous !== undefined && previous !== null && (typeof previous !== "string" || !NAME.test(previous))) return Promise.reject(new Error("That old name isn't valid."));
     if (typeof name !== "string" || !NAME.test(name)) return Promise.reject(new Error("A provider's name starts with a letter and uses letters, digits, _ and -."));
     if (!isObject(provider)) return Promise.reject(new Error("That provider isn't an object."));
-    if (isLocalProvider(name, provider) || (typeof previous === "string" && isLocalProvider(previous))) return Promise.reject(new Error("Subscription accounts aren't part of the provider library."));
+    if ((!saveAccount && isLocalProvider(name, provider)) || (typeof previous === "string" && isLocalProvider(previous))) return Promise.reject(new Error("Subscription accounts aren't part of the provider library."));
     if (model !== undefined && model !== null && (typeof model !== "string" || model.length > MAX_MODEL_BYTES)) return Promise.reject(new Error("That model name isn't valid."));
     let values: Record<string, string>;
     try {
@@ -213,16 +217,16 @@ export class Profile {
       // a profile with no provider chosen starts its chats on the first one it gets
       if (typeof s.provider !== "string" || !isObject(s.providers[s.provider])) s.provider = name;
       chooseModel(s);
-      await this.save(s, { ...this.env(), ...values });
+      await this.save(s, { ...this.env(), ...values }, saveAccount);
       return this.list();
     });
   }
 
-  delete(name: unknown): Promise<ProviderSummary[]> {
+  delete(name: unknown, deleteAccount?: () => void | Promise<void>): Promise<ProviderSummary[]> {
     return this.serial(async () => {
       const s = this.read();
       if (typeof name !== "string" || !isObject(s.providers) || !isObject(s.providers[name])) throw new Error("That provider is already gone.");
-      if (isLocalProvider(name, s.providers[name])) throw new Error("Disconnect this account on your Mac instead.");
+      if (isLocalProvider(name, s.providers[name]) && !deleteAccount) throw new Error("Disconnect this account in Subscription accounts instead.");
       delete s.providers[name];
       if (isObject(s.models)) delete s.models[name];
       if (s.provider === name) {
@@ -231,7 +235,7 @@ export class Profile {
         else delete s.provider;
       }
       chooseModel(s);
-      await this.save(s, this.env());
+      await this.save(s, this.env(), deleteAccount);
       return this.list();
     });
   }
@@ -255,13 +259,14 @@ export class Profile {
   }
 
   /** checks `settings` with spark, then replaces both files; values no provider reads are dropped */
-  private async save(settings: Json, values: Record<string, string>) {
+  private async save(settings: Json, values: Record<string, string>, beforeWrite?: () => void | Promise<void>) {
     const used = new Set(Object.values(isObject(settings.providers) ? settings.providers : {}).flatMap((p) => (isObject(p) ? variables(p) : [])));
     const secrets = Object.fromEntries(Object.entries(values).filter(([k]) => used.has(k)));
     // The Mac's spark reads these from the person's shell, which the check can't see, so it stands
     // in a value: the check is of the settings, not of whether a variable is set right now.
     const checked = this.o.role === "mac" ? Object.fromEntries([...used].filter((k) => ENV_NAME.test(k) && !RESERVED_ENV.test(k)).map((k) => [k, "set-on-the-mac"])) : secrets;
     await this.check(settings, checked);
+    await beforeWrite?.();
     writeAtomic(this.settingsFile, settings);
     if (this.o.role === "cloud") writeAtomic(this.secretsFile, secrets);
   }

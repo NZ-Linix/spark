@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { chooseModel, isLocalProvider, isObject, type Json, Profile, writeAtomic } from "./providers";
 import type { McpSummary, PromptSummary, ProviderSummary } from "./protocol";
+import { accountKind, PLAN_STORE_ENV, readAccounts, readCredential, validCredential, type SharedAccounts } from "./plan_accounts";
 
 /** a prompt is a file named after it, so its name can't hold a path or start with a dot */
 const PROMPT_NAME = /^(?![.\s])[^/\\\0\r\n:]{1,80}(?<!\s)$/;
@@ -24,6 +25,8 @@ export type LibrarySnapshot = {
   env: Record<string, string>;
   prompts: Record<string, string>;
   mcp?: Record<string, Json>;
+  /** absent on older or public relays, which must not receive account secrets */
+  accounts?: SharedAccounts;
 };
 
 type PromptRecord = { text: string; updatedAt: string };
@@ -32,7 +35,7 @@ export class Library {
   readonly profile: Profile;
   private listeners = new Set<() => void>();
 
-  constructor(private o: { dir: string; spark: string }) {
+  constructor(private o: { dir: string; spark: string; shareAccounts?: boolean }) {
     mkdirSync(o.dir, { recursive: true, mode: 0o700 });
     this.profile = new Profile({ home: o.dir, spark: o.spark, role: "cloud" });
   }
@@ -73,6 +76,66 @@ export class Library {
     const list = await this.profile.delete(name);
     this.changed();
     return list;
+  }
+
+  // MARK: Subscription accounts
+
+  get planHome(): string | undefined {
+    return this.o.shareAccounts ? this.o.dir : undefined;
+  }
+
+  async putAccount(input: { name: string; provider: unknown; model?: unknown; credential?: unknown; updateOnly?: boolean }) {
+    const { name, provider, model, credential, updateOnly } = input;
+    const kind = typeof name === "string" && accountKind(name);
+    const home = this.planHome;
+    if (!home || !kind || !isObject(provider) || provider.auth?.type !== kind.auth) throw new Error("Invalid shared subscription account.");
+    if (credential !== undefined && !validCredential(name, credential)) throw new Error("Invalid subscription credentials.");
+    await this.profile.put({ name, provider, model }, async () => {
+      if ((updateOnly || credential === undefined) && !readCredential(home, name)) throw new Error("This subscription account is no longer shared.");
+      if (credential !== undefined) await this.storeAccount(name, credential);
+    });
+    this.changed();
+  }
+
+  async deleteAccount(id: string) {
+    const home = this.planHome;
+    if (!home || typeof id !== "string" || !accountKind(id)) throw new Error("Invalid shared subscription account.");
+    if (this.snapshot().accounts?.[id]) {
+      await this.profile.delete(id, () => this.storeAccount(id));
+      this.changed();
+    }
+  }
+
+  accounts(plan: unknown) {
+    if (!this.planHome) throw new Error("This relay doesn't share subscription accounts.");
+    const accounts = this.snapshot().accounts!;
+    return this.profile.accounts(plan).filter(p => Object.hasOwn(accounts, p.name));
+  }
+
+  async removeAccount(plan: unknown, action: unknown, value: unknown) {
+    if (!this.planHome) throw new Error("This relay doesn't share subscription accounts.");
+    const result = await this.profile.changeAccount(plan, action, value);
+    this.changed();
+    return result;
+  }
+
+  private async storeAccount(id: string, credential?: unknown) {
+    const child = Bun.spawn([this.o.spark, "provider", "account-store", credential === undefined ? "delete" : "put", id], {
+      env: { ...process.env, SPARK_HOME: this.o.dir, [PLAN_STORE_ENV]: this.o.dir },
+      stdin: credential === undefined ? "ignore" : new Blob([JSON.stringify(credential)]), stdout: "ignore", stderr: "ignore", timeout: 25_000,
+    });
+    if (await child.exited !== 0) throw new Error("Could not update the subscription credentials.");
+  }
+
+  /** Only authenticated Macs can request a token; renewal runs against the same locked store as Cloud. */
+  async planToken(id: string): Promise<string | undefined> {
+    if (!this.planHome || !accountKind(id) || !this.snapshot().accounts?.[id]) return;
+    const child = Bun.spawn([this.o.spark, "provider", "account-token", id], {
+      env: { ...process.env, SPARK_HOME: this.o.dir, [PLAN_STORE_ENV]: this.o.dir }, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: 35_000,
+    });
+    const [code, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+    if (code !== 0) throw new Error("Could not renew the subscription account.");
+    return stdout.trim();
   }
 
   // MARK: Prompts
@@ -187,10 +250,11 @@ export class Library {
   snapshot(): LibrarySnapshot {
     const s = readJson(join(this.o.dir, "settings.json"));
     const providers = isObject(s.providers) ? Object.fromEntries(Object.entries(s.providers).filter(([name, p]) => !isLocalProvider(name, p))) : {};
+    const accounts = this.planHome ? readAccounts(this.planHome, s) : undefined;
     const models = isObject(s.models) ? Object.fromEntries(Object.entries(s.models).filter(([k, v]) => typeof v === "string" && k in providers)) : {};
     const prompts = Object.fromEntries(Object.entries(this.readPrompts()).map(([k, v]) => [k, v.text]));
     const mcp = readMcp(this.o.dir);
-    return { providers, models: models as Record<string, string>, provider: typeof s.provider === "string" && Object.hasOwn(providers, s.provider) ? s.provider : undefined, env: this.profile.env(), prompts, mcp };
+    return { providers, models: models as Record<string, string>, provider: typeof s.provider === "string" && (Object.hasOwn(providers, s.provider) || Object.hasOwn(accounts ?? {}, s.provider)) ? s.provider : undefined, env: this.profile.env(), prompts, mcp, accounts };
   }
 
   /**
@@ -327,24 +391,26 @@ function stable(v: unknown): string {
  * the provider and models it chose while they still exist, and the prompts land in PROMPT_DIR,
  * which the profile's prompts.json lists. Returns each provider's fingerprint as written.
  */
-export function applySnapshot(home: string, snap: LibrarySnapshot, keepLocal = false): Record<string, string> {
+export function applySnapshot(home: string, snap: LibrarySnapshot, keepLocal = false, removedAccounts: ReadonlySet<string> = new Set()): Record<string, string> {
   mkdirSync(home, { recursive: true, mode: 0o700 });
   const file = join(home, "settings.json");
   const s = readJson(file);
   const shared = Object.fromEntries(Object.entries(snap.providers).filter(([name, p]) => !isLocalProvider(name, p)));
-  const local = keepLocal && isObject(s.providers) ? Object.entries(s.providers).filter(([name, p]) => isLocalProvider(name, p)) : [];
-  const providers = Object.assign(structuredClone(shared), Object.fromEntries(local));
+  const local = keepLocal && isObject(s.providers) ? Object.entries(s.providers).filter(([name, p]) => isLocalProvider(name, p) && !removedAccounts.has(name)) : [];
+  const accounts = Object.fromEntries(Object.entries(snap.accounts ?? {}).map(([id, a]) => [id, a.provider]));
+  const providers = Object.assign(structuredClone(shared), Object.fromEntries(local), accounts);
   s.providers = providers;
   const models: Json = isObject(s.models) ? s.models : {};
   for (const name of Object.keys(models)) {
     const p = Object.hasOwn(providers, name) ? providers[name] : undefined;
     const meta = isObject(p) && isObject(p.model_metadata) ? p.model_metadata : null;
-    if (!p || typeof models[name] !== "string" || (!isLocalProvider(name, p) && meta && Object.keys(meta).length && !(models[name] in meta))) delete models[name];
+    if (!p || typeof models[name] !== "string" || ((!isLocalProvider(name, p) || Object.hasOwn(accounts, name)) && meta && Object.keys(meta).length && !(models[name] in meta))) delete models[name];
   }
   for (const [name, m] of Object.entries(snap.models)) if (!(name in models) && Object.hasOwn(shared, name)) models[name] = m;
+  for (const [id, account] of Object.entries(snap.accounts ?? {})) if (!(id in models) && account.model) models[id] = account.model;
   s.models = models;
   if (typeof s.provider !== "string" || !Object.hasOwn(providers, s.provider)) {
-    const next = snap.provider && Object.hasOwn(shared, snap.provider) ? snap.provider : Object.keys(providers).sort()[0];
+    const next = snap.provider && Object.hasOwn(providers, snap.provider) ? snap.provider : Object.keys(providers).sort()[0];
     if (next) s.provider = next;
     else delete s.provider;
   }

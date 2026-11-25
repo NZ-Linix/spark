@@ -19,6 +19,8 @@ import { runningSessions } from "./mac_sessions";
 import { PhoneSessions } from "./phone_sessions";
 import { loginShellVariable, Profile } from "./providers";
 import type { Request } from "./protocol";
+import { SHARED_PLANS_FILE } from "./plan_accounts";
+import { fingerprint } from "./library";
 import { type LibraryOp, Mirror } from "./sync";
 
 const HOME = homedir();
@@ -124,10 +126,19 @@ function serve(c: Config, onPaired?: (device: string) => void, quiet = false) {
   const profile = new Profile({ home: SPARK_HOME, spark: bin, role: "mac", lookup: loginShellVariable });
   let rid = 0;
   const waiting = new Map<number, { resolve: () => void; reject: (e: Error) => void }>();
+  let optionsStamp = "";
   const mirror = new Mirror({
     home: SPARK_HOME,
     stateFile: LIBRARY_STATE,
     profile,
+    relay: c,
+    onApply: () => {
+      const stamp = fingerprint([profile.list(), ...["chatgpt", "claude", "antigravity"].map(plan => profile.accounts(plan))]);
+      if (stamp === optionsStamp) return;
+      optionsStamp = stamp;
+      host.invalidate();
+      if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ msg: { t: "optionsChanged" } }));
+    },
     log: (line) => console.log(dim(line)),
     send: (op: LibraryOp) =>
       new Promise<void>((resolve, reject) => {
@@ -147,6 +158,7 @@ function serve(c: Config, onPaired?: (device: string) => void, quiet = false) {
     // SPARK_MOBILE_ROOT keeps the phone's folder picker (and new sessions) inside one folder
     root: ROOT,
     confine: ROOT !== HOME,
+    env: () => ({ SPARK_HOME }),
     // chats without a folder: in spark's own folder, unless the phone is kept inside one
     scratch: ROOT === HOME ? join(SPARK_HOME, "mobile-chats") : undefined,
     filter: { phone: new PhoneSessions(PHONE_SESSIONS), running: () => runningSessions(bin) },
@@ -180,7 +192,7 @@ function serve(c: Config, onPaired?: (device: string) => void, quiet = false) {
         return;
       }
       if (m.relay === "library" && m.library) {
-        void mirror.receive(m.library).then(() => host.invalidate());
+        void mirror.receive(m.library);
         return;
       }
       if (m.relay === "library-reply") {
@@ -195,6 +207,9 @@ function serve(c: Config, onPaired?: (device: string) => void, quiet = false) {
     s.onclose = (e) => {
       if (socket !== s) return;
       socket = null;
+      mirror.disconnect();
+      for (const request of waiting.values()) request.reject(new Error("The relay disconnected."));
+      waiting.clear();
       if (e.code === 4000) {
         console.error("Another bridge for this Mac connected to the relay, so this one stopped.");
         process.exit(0);
@@ -273,6 +288,7 @@ async function install(quiet = false) {
   <key>ProgramArguments</key><array>${[...program, "serve"].map((a) => `<string>${a}</string>`).join("")}</array>
   <key>EnvironmentVariables</key><dict>
     <key>SPARK_BIN</key><string>${spark()}</string>
+    <key>SPARK_HOME</key><string>${SPARK_HOME}</string>
     <key>PATH</key><string>${process.env.PATH ?? "/usr/bin:/bin"}</string>${process.env.SPARK_MOBILE_ROOT ? `
     <key>SPARK_MOBILE_ROOT</key><string>${ROOT}</string>` : ""}
   </dict>
@@ -318,6 +334,7 @@ switch (command) {
     rmSync(PHONE_SESSIONS, { force: true });
     rmSync(SESSION_PROMPTS, { force: true });
     rmSync(LIBRARY_STATE, { force: true });
+    rmSync(join(SPARK_HOME, SHARED_PLANS_FILE), { force: true });
     console.log("This Mac is unpaired. Run spark pair to pair again.");
     break;
   default:

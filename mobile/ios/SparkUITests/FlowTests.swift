@@ -142,20 +142,47 @@ final class FlowTests: XCTestCase {
   }
 
   @MainActor
-  func testSubscriptionAccounts() throws {
-    let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"])
+  func testMacPickerStaysVisibleOffline() async throws {
+    let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"], "Run the scroll fixture with SPARK_HOST_SWITCH_FIXTURE=1")
+    func setMacOnline(_ online: Bool) async throws {
+      var request = URLRequest(url: try XCTUnwrap(URL(string: "\(relay)/api/fixture/mac?online=\(online ? 1 : 0)")))
+      request.httpMethod = "POST"
+      let (_, response) = try await URLSession.shared.data(for: request)
+      XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 204)
+    }
+
+    try await setMacOnline(true)
     let app = XCUIApplication()
     app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
     app.launch()
-    let settings = app.buttons["Settings"]
-    if !settings.waitForExistence(timeout: 3) {
-      let show = app.buttons["Show Chats"]
-      if show.exists, show.isHittable { show.tap() } else { app.buttons["Chats"].tap() }
-    }
-    XCTAssertTrue(settings.waitForExistence(timeout: 8))
-    settings.tap()
+    let mac = app.buttons["Demo Mac"].firstMatch
+    XCTAssertTrue(mac.waitForExistence(timeout: 8))
+    mac.tap()
+    let model = app.buttons["Model"]
+    XCTAssertTrue(model.waitForExistence(timeout: 8))
+    XCTAssertTrue(eventually("enabled == true", app.textFields["Message spark"], timeout: 5))
+
+    try await setMacOnline(false)
+    XCTAssertTrue(app.staticTexts["Demo Mac is offline. Switch to Cloud or wake your Mac."].waitForExistence(timeout: 5))
+    XCTAssertTrue(mac.exists)
+    XCTAssertTrue(model.exists)
+    XCTAssertFalse(app.textFields["Message spark"].isEnabled)
+
+    app.buttons["Cloud"].firstMatch.tap()
+    XCTAssertTrue(eventually("enabled == true", app.textFields["Message spark"], timeout: 5))
+    try await setMacOnline(true)
+  }
+
+  @MainActor
+  func testSubscriptionAccounts() throws {
+    let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"], "Run the scroll fixture with SPARK_CHATGPT_FIXTURE=1")
+    let app = XCUIApplication()
+    app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
+    app.launch()
+    app.buttons["Chats"].tap()
+    app.buttons["Settings"].tap()
     for (plan, product, button) in [("chatgpt", "Codex", "Continue with ChatGPT"), ("claude", "Claude", "Continue with Claude"), ("antigravity", "Antigravity", "Continue with Google")] {
-      let row = app.buttons["plan-\(plan)-demo-mac"]
+      let row = app.buttons["plan-\(plan)-cloud"]
       XCTAssertTrue(row.waitForExistence(timeout: 8))
       row.tap()
       let start = app.buttons["planContinue"]
@@ -178,7 +205,7 @@ final class FlowTests: XCTestCase {
       app.buttons["Disconnect"].firstMatch.tap()
       XCTAssertTrue(eventually("exists == false", app.staticTexts["\(product) (Work)"], timeout: 5))
       XCTAssertTrue(app.staticTexts[product].exists)
-      app.navigationBars.buttons.element(boundBy: 0).tap()
+      app.buttons["BackButton"].tap()
     }
   }
 

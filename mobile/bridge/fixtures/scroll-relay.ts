@@ -5,9 +5,11 @@ import { join } from "node:path";
 import { Library } from "../library";
 
 const library = new Library({ dir: mkdtempSync(join(tmpdir(), "spark-fixture-library-")), spark: "spark" });
-const host = { id: "cloud", name: "Cloud", kind: "cloud", online: true };
+const sharedAccounts = process.env.SPARK_CHATGPT_FIXTURE === "1";
+const host = { id: "cloud", name: "Cloud", kind: "cloud", online: true, sharedAccounts };
 const mac = { id: "demo-mac", name: "Demo Mac", kind: "mac", online: true };
-const hosts = process.env.SPARK_CHATGPT_FIXTURE ? [host, mac] : [host];
+const hostSwitchFixture = process.env.SPARK_HOST_SWITCH_FIXTURE === "1";
+const hosts = sharedAccounts || hostSwitchFixture ? [host, mac] : [host];
 const accounts: Record<string, unknown>[] = [];
 const session = { id: "scroll", cwd: "/tmp", title: "Scroll regression", updatedAt: new Date().toISOString(), live: true, running: false };
 const items = [
@@ -29,12 +31,22 @@ Bun.serve({
     switch (new URL(req.url).pathname) {
       case "/api/info": return Response.json({ cloud: true });
       case "/api/devices": return Response.json({ token: "fixture", hosts });
+      case "/api/fixture/mac":
+        if (hostSwitchFixture && req.method === "POST") {
+          mac.online = new URL(req.url).searchParams.get("online") === "1";
+          server.publish("hosts", JSON.stringify({ relay: "hosts", hosts }));
+          return new Response(null, { status: 204 });
+        }
+        break;
       case "/ws/device": if (server.upgrade(req)) return;
     }
     return new Response(null, { status: 404 });
   },
   websocket: {
-    open(ws) { ws.send(JSON.stringify({ relay: "hosts", hosts })); },
+    open(ws) {
+      ws.subscribe("hosts");
+      ws.send(JSON.stringify({ relay: "hosts", hosts }));
+    },
     message(ws, data) {
       const { host: target, msg: req } = JSON.parse(String(data));
       if (!req) return;
@@ -42,11 +54,11 @@ Bun.serve({
       const plan: string = req.op === "planAccounts" || req.op === "planAccount" ? req.plan : "chatgpt";
       const product = ({ chatgpt: "Codex", claude: "Claude", antigravity: "Antigravity" } as Record<string, string>)[plan];
       const ofPlan = () => accounts.filter(account => account.auth === `${plan}-plan`);
-      if (target === mac.id && (req.op === "chatgptAccounts" || req.op === "planAccounts")) {
+      if (target === host.id && (req.op === "chatgptAccounts" || req.op === "planAccounts")) {
         send({ t: "reply", id: req.id, ok: true, result: ofPlan() });
         return;
       }
-      if (target === mac.id && (req.op === "chatgptAccount" || req.op === "planAccount")) {
+      if ((req.op === "chatgptAccount" || req.op === "planAccount") && target === (req.action === "remove" ? host.id : mac.id)) {
         if (req.action === "connect") {
           accounts.push({ name: `${plan}-plan-${crypto.randomUUID().replaceAll("-", "")}`, label: req.value || String(ofPlan().length + 1), baseUrl: "https://example.com", protocol: "openai-responses", auth: `${plan}-plan`, models: ["example-model"], active: accounts.length === 0, headerEnv: [], provider: {} });
         }

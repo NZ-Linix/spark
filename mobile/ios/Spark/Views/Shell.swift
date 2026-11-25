@@ -674,6 +674,7 @@ struct HostSwitch: View {
             .contentShape(.capsule)
           }
           .buttonStyle(.plain)
+          .accessibilityValue(h.online ? "" : "Offline")
           .transition(.opacity.combined(with: .scale(0.92)))
         }
       }

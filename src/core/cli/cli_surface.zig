@@ -1138,6 +1138,10 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .provider => |rest| {
+            if (io_mod.getenv("SPARK_PLAN_HOME") != null) {
+                if (rest.len == 2 and std.mem.eql(u8, rest[0], "account-token")) return runPlanToken(alloc, rest[1], cfg, deps);
+                if (rest.len == 3 and std.mem.eql(u8, rest[0], "account-store")) return runPlanStore(alloc, rest[1], rest[2]);
+            }
             if (rest.len >= 2) if (plan_connection.Kind.fromAccountCommand(rest[0])) |kind| return runPlanAccount(alloc, kind, rest[1..], cfg, deps);
             if (cli_provider_edit.handles(rest)) {
                 const result = try cli_provider_edit.run(alloc, rest);
@@ -1792,6 +1796,24 @@ fn writeProviderActivationError(alloc: Allocator, deps: RunDeps, detail: []const
 fn writeHostManagedAuthResult(deps: RunDeps) !void {
     try writeStdout(deps, credentials.host_managed_auth_message);
     try writeStdout(deps, "\n");
+}
+
+fn runPlanStore(alloc: Allocator, action: []const u8, id: []const u8) RunResult {
+    var stdin = std.Io.File.stdin();
+    const bytes = if (std.mem.eql(u8, action, "put"))
+        io_mod.readFileToEnd(alloc, &stdin, 64 * 1024) catch return .handled_failure
+    else if (std.mem.eql(u8, action, "delete")) null else return .handled_failure;
+    defer if (bytes) |data| secret.zeroAndFree(alloc, data);
+    @import("../auth/plan_store.zig").update(alloc, id, bytes) catch return .handled_failure;
+    return .handled_success;
+}
+
+// Internal relay command. Only the bridge reads its stdout; never print a refresh token.
+fn runPlanToken(alloc: Allocator, id: []const u8, cfg: Config, deps: RunDeps) !RunResult {
+    const token = plan_connection.accessToken(alloc, cfg.oauth_transport, id) catch return .handled_failure;
+    defer secret.zeroAndFree(alloc, token);
+    try writeStdout(deps, token);
+    return .handled_success;
 }
 
 /// `spark provider claude-account connect [label] | reconnect <id> | remove <id>`,

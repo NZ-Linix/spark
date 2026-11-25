@@ -6,6 +6,7 @@ import { macSessions, parseRunning } from "./mac_sessions";
 import { PhoneSessions } from "./phone_sessions";
 import type { SessionInfo } from "./protocol";
 import { Host } from "./host";
+import { writeCredential, readCredential, PLAN_STORE_ENV } from "./plan_accounts";
 import { historyItems } from "./session_view";
 import { applySnapshot, fingerprint, Library, type LibrarySnapshot, PROMPT_DIR } from "./library";
 import { Profile } from "./providers";
@@ -240,6 +241,10 @@ describe("relay registration", () => {
       expect(device.token).toBeString();
       const paired = await post("/api/pair", { code }, { authorization: `Bearer ${device.token}` });
       expect(paired.status).toBe(200);
+      const planToken = "/api/plan-token/claude-plan-00000000000000000000000000000000";
+      expect((await post(planToken, {}, { authorization: `Bearer ${device.token}` })).status).toBe(403);
+      expect((await post(`${planToken}?token=${host.token}`, {})).status).toBe(403);
+      expect((await post(planToken, {}, { authorization: `Bearer ${host.token}` })).status).toBe(404);
       // the code is used up
       expect((await post("/api/devices", { name: "Other", code })).status).toBe(403);
     } finally {
@@ -370,6 +375,93 @@ describe("library", () => {
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
+  });
+
+  test("shares existing subscriptions with Cloud and another Mac, then mirrors changes and removal", async () => {
+    const home = join(dir, "source");
+    const second = join(dir, "second");
+    const cloud = join(dir, "cloud");
+    const lib = new Library({ dir: join(dir, "library"), spark: SPARK, shareAccounts: true });
+    const fixtures = [
+      ["chatgpt", "openai-responses", "https://api.openai.com/v1", { client_id: "oaiapp_fixture", scope: "resource.invoke chatgpt.tokens.use.direct" }],
+      ["claude", "anthropic-messages", "https://api.anthropic.com/v1", {}],
+      ["antigravity", "gemini-code-assist", "https://daily-cloudcode-pa.googleapis.com", { project: "test-project", version: "1.0.0" }],
+    ] as const;
+    const ids = fixtures.map(([plan], i) => `${plan}-plan-${String(i).padStart(32, "0")}`);
+    const providers: Record<string, unknown> = {};
+    const models: Record<string, string> = {};
+    for (const [i, [plan, protocol, base_url, extra]] of fixtures.entries()) {
+      const id = ids[i]!;
+      const model = `${plan}-test-model`;
+      providers[id] = { display_name: plan, protocol, base_url, auth: { type: `${plan}-plan` }, model_metadata: { [model]: {} } };
+      models[id] = model;
+      writeCredential(home, id, { access_token: `${plan}-access`, refresh_token: `${plan}-refresh`, expires_at_ms: Date.now() + 3_600_000, subject: plan, scope: "", ...extra });
+    }
+    writeFileSync(join(home, "settings.json"), JSON.stringify({ providers, models, provider: ids[0] }));
+    const source = new Mirror({ home, stateFile: join(home, "mirror.json"), profile: new Profile({ home, spark: SPARK, role: "mac" }), send: async op => {
+      if (op.op === "accountPut") await lib.putAccount(op);
+      else if (op.op === "accountDelete") await lib.deleteAccount(op.name);
+      else throw new Error(`Unexpected ${op.op}`);
+    } });
+    const other = new Mirror({ home: second, stateFile: join(second, "mirror.json"), profile: new Profile({ home: second, spark: SPARK, role: "mac" }), send: async op => { throw new Error(`Unexpected ${op.op}`); } });
+    lib.onChange(() => void source.receive(lib.snapshot()));
+    await source.receive(lib.snapshot());
+    await other.receive(lib.snapshot());
+    applySnapshot(cloud, lib.snapshot());
+    expect(lib.providers()).toEqual([]);
+    const cloudSettings = JSON.parse(readFileSync(join(cloud, "settings.json"), "utf8"));
+    expect(cloudSettings.providers).toEqual(providers);
+    expect(cloudSettings.models).toEqual(models);
+    for (const [i, [plan]] of fixtures.entries()) {
+      const id = ids[i]!;
+      expect(lib.accounts(plan).map(a => a.name)).toEqual([id]);
+      expect(JSON.stringify(lib.accounts(plan))).not.toContain(`${plan}-refresh`);
+      expect(readCredential(second, id)).toEqual(readCredential(home, id)!);
+      expect(readCredential(cloud, id)).toBeUndefined();
+      expect(await lib.planToken(id)).toBe(`${plan}-access`);
+    }
+
+    // Check the actual Cloud model picker, including picking a non-default provider before a chat.
+    const replies: any[] = [];
+    const cloudHost = new Host({ info: { name: "Cloud", kind: "cloud", home: cloud, platform: process.platform }, spark: SPARK, root: cloud, confine: true,
+      env: () => ({ SPARK_HOME: cloud, [PLAN_STORE_ENV]: lib.planHome }), send: event => { if (event.t === "reply") replies.push(event); } });
+    await cloudHost.handle({ id: 1, op: "options", provider: ids[1] });
+    expect(replies[0]).toMatchObject({ ok: true, result: expect.arrayContaining([
+      expect.objectContaining({ id: "provider", currentValue: ids[1], options: ids.map(value => expect.objectContaining({ value })) }),
+      expect.objectContaining({ id: "model", currentValue: models[ids[1]!] }),
+    ]) });
+
+    const claude = ids[1]!;
+    const replacement = { ...readCredential(home, claude), access_token: "new-access", refresh_token: "new-refresh" };
+    writeCredential(home, claude, replacement);
+    await source.poll();
+    await other.receive(lib.snapshot());
+    expect(readCredential(second, claude)).toEqual(replacement);
+    await lib.removeAccount("claude", "remove", claude);
+    await source.receive(lib.snapshot());
+    await other.receive(lib.snapshot());
+    applySnapshot(cloud, lib.snapshot());
+    expect(lib.accounts("claude")).toEqual([]);
+    expect(readCredential(second, claude)).toBeUndefined();
+    expect(await lib.planToken(claude)).toBeUndefined();
+    expect(JSON.parse(readFileSync(join(cloud, "settings.json"), "utf8")).providers[claude]).toBeUndefined();
+    await expect(lib.putAccount({ name: claude, provider: providers[claude], credential: replacement, updateOnly: true })).rejects.toThrow("no longer shared");
+  });
+
+  test("does not upload credentials to a relay that doesn't share subscriptions", async () => {
+    const home = join(dir, "mac");
+    const id = "claude-plan-00000000000000000000000000000000";
+    const provider = { protocol: "anthropic-messages", base_url: "https://api.anthropic.com/v1", auth: { type: "claude-plan" } };
+    const credential = { access_token: "test-access", refresh_token: "test-refresh", expires_at_ms: Date.now(), subject: "test", scope: "" };
+    writeCredential(home, id, credential);
+    writeFileSync(join(home, "settings.json"), JSON.stringify({ providers: { [id]: provider } }));
+    const lib = new Library({ dir: join(dir, "library"), spark: SPARK });
+    const sent: LibraryOp[] = [];
+    const mac = new Mirror({ home, stateFile: join(home, "mirror.json"), profile: new Profile({ home, spark: SPARK, role: "mac" }), send: async op => { sent.push(op); } });
+    await mac.receive(lib.snapshot());
+    expect(sent).toEqual([]);
+    expect(readCredential(home, id)).toEqual(credential);
+    await expect(lib.putAccount({ name: id, provider, credential })).rejects.toThrow("Invalid shared subscription account");
   });
 
   test("mirrors cloud MCP definitions without copying OAuth state", () => {

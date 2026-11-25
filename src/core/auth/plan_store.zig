@@ -6,6 +6,7 @@ const io = @import("../shared/io.zig");
 const paths = @import("../shared/profile_paths.zig");
 const secret = @import("secret.zig");
 const plan_kind = @import("plan_kind.zig");
+const http = @import("oauth_transport.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Kind = plan_kind.Kind;
@@ -39,17 +40,84 @@ pub fn newId(alloc: Allocator, kind: Kind) ![]u8 {
 /// Opens the plan's folder, creating it only when `create` is set. A missing
 /// folder fails with `FileNotFound`.
 pub fn open(alloc: Allocator, kind: Kind, create: bool) !io.VerifiedDir {
-    const home = io.homeDir() orelse return error.HomeNotSet;
-    const root = try paths.rootDir(alloc, home);
+    const root = if (io.getenv("SPARK_PLAN_HOME")) |shared| try alloc.dupe(u8, shared) else try paths.rootDir(alloc, io.homeDir() orelse return error.HomeNotSet);
     defer alloc.free(root);
+    if (!std.Io.Dir.path.isAbsolute(root) or std.mem.eql(u8, root, "/")) return error.InvalidPlanHome;
     if (create) try io.makeDirRecursive(root);
-    // Canonicalize the parent (e.g. macOS /var -> /private/var), not the
-    // final profile directory. Never follow a link standing in for the profile.
-    var base = try std.Io.Dir.openDirAbsolute(io.getIo(), paths.rootParent(home), .{});
-    defer base.close(io.getIo());
-    var parent: io.VerifiedDir = .{ .dir = try base.openDir(io.getIo(), paths.rootName(), .{ .iterate = true, .follow_symlinks = false }) };
+    var parent = try openRoot(root);
     defer parent.close();
     return if (create) io.openOrCreateVerifiedPrivateDir(&parent, kind.storeName()) else (try io.openVerifiedPrivateDirIfPresent(&parent, kind.storeName())) orelse error.FileNotFound;
+}
+
+fn openRoot(root: []const u8) !io.VerifiedDir {
+    // Canonicalize the parent (e.g. macOS /var -> /private/var), not the final directory.
+    var base = try std.Io.Dir.openDirAbsolute(io.getIo(), std.Io.Dir.path.dirname(root) orelse "/", .{});
+    defer base.close(io.getIo());
+    return .{ .dir = try base.openDir(io.getIo(), std.Io.Dir.path.basename(root), .{ .iterate = true, .follow_symlinks = false }) };
+}
+
+/// Paired Macs use the relay when a shared credential expires. The relay is the only
+/// place that refreshes it, so two devices never spend the same rotating refresh token.
+/// Null means this account is local and should refresh normally.
+pub fn remoteToken(alloc: Allocator, transport: http.Provider, name: []const u8) !?[]u8 {
+    if (io.getenv("SPARK_PLAN_HOME") != null) return null;
+    const root = try paths.rootDir(alloc, io.homeDir() orelse return null);
+    defer alloc.free(root);
+    var dir = openRoot(root) catch |err| return if (err == error.FileNotFound) null else err;
+    defer dir.close();
+    const bytes = readPrivate(alloc, dir, "shared-plan-accounts.json") catch |err| return if (err == error.FileNotFound) null else err;
+    defer secret.zeroAndFree(alloc, bytes);
+    const parsed = try std.json.parseFromSlice(struct { relay: []const u8, token: []const u8, accounts: []const []const u8 }, alloc, bytes, .{});
+    defer parsed.deinit();
+    const id = name[0 .. name.len - ".json".len];
+    for (parsed.value.accounts) |account| {
+        if (std.mem.eql(u8, account, id)) break;
+    } else return null;
+    const relay = std.mem.trimEnd(u8, parsed.value.relay, "/");
+    const uri = std.Uri.parse(relay) catch return error.InvalidPlanRelay;
+    const hostname = switch (uri.host orelse return error.InvalidPlanRelay) {
+        .raw, .percent_encoded => |text| text,
+    };
+    const secure = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    const loopback = std.ascii.eqlIgnoreCase(uri.scheme, "http") and (std.mem.eql(u8, hostname, "127.0.0.1") or std.mem.eql(u8, hostname, "localhost") or std.mem.eql(u8, hostname, "[::1]"));
+    if ((!secure and !loopback) or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null or !validToken(parsed.value.token)) return error.InvalidPlanRelay;
+    const url = try alloc.print("{s}/api/plan-token/{s}", .{ relay, id });
+    defer alloc.free(url);
+    const auth = try alloc.print("Bearer {s}", .{parsed.value.token});
+    defer secret.zeroAndFree(alloc, auth);
+    const limit: std.Io.Clock.Duration = .{ .raw = .fromSeconds(35), .clock = .awake };
+    var response = transport.execute(alloc, .{
+        .method = .post_json,
+        .url = url,
+        .payload = "{}",
+        .authorization = auth,
+        .deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), limit),
+    }) catch return error.PlanRelayUnavailable;
+    defer response.deinit(alloc);
+    if (response.status == 404) return error.PlanSignInRequired;
+    if (response.disposition != .accepted) return error.PlanRelayUnavailable;
+    const result = try std.json.parseFromSlice(struct { access_token: []const u8 }, alloc, response.body, .{});
+    defer result.deinit();
+    if (!validToken(result.value.access_token)) return error.InvalidPlanToken;
+    return try alloc.dupe(u8, result.value.access_token);
+}
+
+/// Updates from the relay must use the same lock as a running cloud session's renewal.
+pub fn update(alloc: Allocator, id: []const u8, bytes: ?[]const u8) !void {
+    const kind = Kind.ofId(id) orelse return error.InvalidPlanAccount;
+    const name = try filename(kind, id);
+    var dir = open(alloc, kind, bytes != null) catch |err| {
+        if (bytes == null and err == error.FileNotFound) return;
+        return err;
+    };
+    defer dir.close();
+    var held = try lock(&dir);
+    defer held.release();
+    if (bytes) |data| {
+        try io.durableReplaceVerified(alloc, &dir, name.slice(), data);
+    } else {
+        delete(&dir, name.slice()) catch |err| if (err != error.FileNotFound) return err;
+    }
 }
 
 /// A file of the folder, only when it is a single private regular file.

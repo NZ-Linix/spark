@@ -16,9 +16,10 @@
 import type { ServerWebSocket } from "bun";
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, watchFile } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Host } from "./host";
-import { applySnapshot, Library } from "./library";
+import { applySnapshot, fingerprint, Library } from "./library";
+import { PLAN_STORE_ENV } from "./plan_accounts";
 import type { Event, Request } from "./protocol";
 
 const PORT = Number(process.env.PORT ?? 8787);
@@ -79,16 +80,19 @@ const deviceSockets = new Map<string, Set<Socket>>();
 const hostSockets = new Map<string, Socket>();
 const clouds = new Map<string, { host: Host; home: string }>();
 
-const library = new Library({ dir: join(DATA, "library"), spark: SPARK });
+const library = new Library({ dir: resolve(DATA, "library"), spark: SPARK, shareAccounts: !OPEN });
 {
   const homes = CLOUD && existsSync(CLOUD) ? readdirSync(CLOUD).map((d) => join(CLOUD, d, "spark")) : [];
   if (CLOUD_SETTINGS && existsSync(CLOUD_SETTINGS)) homes.push(dirname(CLOUD_SETTINGS));
   library.adopt(homes);
 }
 
+let accountStamp = "";
+
 /** every Mac and cloud profile gets the library as it is now */
 function spreadLibrary() {
   const snap = library.snapshot();
+  accountStamp = fingerprint(snap.accounts ?? null);
   for (const { host, home } of clouds.values()) {
     try {
       applySnapshot(home, snap);
@@ -99,8 +103,18 @@ function spreadLibrary() {
   }
   const text = JSON.stringify({ relay: "library", library: snap });
   for (const ws of hostSockets.values()) ws.send(text);
+  for (const device of deviceSockets.keys()) toDevice(device, { relay: "library-changed" });
 }
 library.onChange(spreadLibrary);
+// Cloud spark processes can renew a token without going through the bridge.
+if (library.planHome) setInterval(() => {
+  const snap = library.snapshot();
+  const stamp = fingerprint(snap.accounts ?? null);
+  if (stamp === accountStamp) return;
+  accountStamp = stamp;
+  const text = JSON.stringify({ relay: "library", library: snap });
+  for (const ws of hostSockets.values()) ws.send(text);
+}, 2_000).unref();
 watchFile(join(DATA, "library", "mcp.json"), { interval: 2_000, persistent: false }, spreadLibrary);
 
 const MCP_EDITS = new Set(["mcpPut", "mcpDelete", "mcpEnabled"]);
@@ -112,6 +126,10 @@ async function macLibraryOp(op: any): Promise<unknown> {
       return library.putProvider(op);
     case "providerDelete":
       return library.deleteProvider(op.name);
+    case "accountPut":
+      return library.putAccount(op);
+    case "accountDelete":
+      return library.deleteAccount(op.name);
     case "mcpPut":
       return library.putMcp(op);
     case "mcpDelete":
@@ -131,10 +149,10 @@ function toDevice(device: string, payload: unknown) {
 }
 
 function hostsFor(device: string) {
-  const list = Object.entries(state.hosts)
+  const list: { id: string; name: string; kind: "mac" | "cloud"; online: boolean; sharedAccounts?: boolean }[] = Object.entries(state.hosts)
     .filter(([, h]) => h.devices.includes(device))
     .map(([hid, h]) => ({ id: hid, name: h.name, kind: "mac", online: hostSockets.has(hid) }));
-  if (CLOUD) list.push({ id: "cloud", name: "Cloud", kind: "cloud", online: true });
+  if (CLOUD) list.push({ id: "cloud", name: "Cloud", kind: "cloud", online: true, sharedAccounts: Boolean(library.planHome) });
   return list;
 }
 
@@ -156,7 +174,7 @@ function cloudFor(device: string): Host {
     spark: SPARK,
     root: work,
     confine: true,
-    env: () => ({ ...library.profile.env(), SPARK_HOME: home }),
+    env: () => ({ ...library.profile.env(), SPARK_HOME: home, [PLAN_STORE_ENV]: library.planHome }),
     library,
     prompts: { home, sessions: join(base, "session-prompts.json") },
     send: (event: Event) => toDevice(device, { host: "cloud", msg: event }),
@@ -267,6 +285,17 @@ Bun.serve<{ kind: "device" | "host"; id: string }, {}>({
       return json({ hosts: hostsFor(auth[0]) });
     }
 
+    const planToken = path.match(/^\/api\/plan-token\/([a-z0-9-]+)$/);
+    if (planToken && req.method === "POST" && library.planHome) {
+      if (!check(state.hosts, req.headers.get("authorization")?.match(/^Bearer (.+)$/)?.[1] ?? null)) return json({ error: "Unknown Mac." }, 403);
+      try {
+        const access_token = await library.planToken(planToken[1]!);
+        return access_token ? json({ access_token }) : json({ error: "Account not found." }, 404);
+      } catch {
+        return json({ error: "Could not renew the subscription account." }, 502);
+      }
+    }
+
     if (path === "/ws/device") {
       const auth = check(state.devices, bearer(req, url));
       if (!auth) return new Response("Unknown iPhone.", { status: 401 });
@@ -322,7 +351,7 @@ Bun.serve<{ kind: "device" | "host"; id: string }, {}>({
         socket.send(JSON.stringify({ from: id, msg }));
       } else {
         const h = state.hosts[id];
-        if (!h) return;
+        if (!h || hostSockets.get(id) !== ws) return;
         if (typeof m.name === "string" && m.name && m.name !== h.name) {
           h.name = name(m.name, h.name);
           save();
