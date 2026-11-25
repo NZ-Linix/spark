@@ -1,8 +1,20 @@
 # spark
 
-## 26.11.25.3
+## 26.11.25.4
 
 <!-- release:start -->
+
+**Run `spark update` even if the profile can't be read.**
+
+### Bug Fixes
+
+- Spark profiles can hold up to 1 MiB of settings, so synced subscription model catalogs no longer hit the old 64 KiB limit.
+- `spark update` reads the saved release channel without loading workspace or provider settings. If it can't read the profile, it uses the installed build's channel without changing your settings.
+- If an older Spark already reports `failed to load update settings`, use the installer below once. It keeps your settings and accounts. After that, use `spark update` as usual.
+
+<!-- release:end -->
+
+## 26.11.25.3
 
 **Use your existing subscriptions in Cloud and Mac chats from iPhone.**
 
@@ -14,8 +26,6 @@
 
 - The iPhone keeps an offline Mac in the host picker and shows its last-loaded models. Switch to Cloud to start a chat while the Mac is offline.
 - Picking a provider before starting a chat loads that provider's models and reasoning levels.
-
-<!-- release:end -->
 
 ## 26.11.25.2
 
