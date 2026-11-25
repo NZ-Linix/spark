@@ -1,8 +1,23 @@
 # spark
 
-## 26.11.25.2
+## 26.11.25.3
 
 <!-- release:start -->
+
+**Use your existing subscriptions in Cloud and Mac chats from iPhone.**
+
+### New Features
+
+- Private relays sync ChatGPT, Claude, and Antigravity accounts from paired Macs to Cloud and back to your other Macs. Existing accounts sync when their Mac reconnects. New sign-ins still open in a paired Mac's browser. Update the relay, Spark, `spark-bridge`, and the mobile app to use shared accounts.
+
+### Bug Fixes
+
+- The iPhone keeps an offline Mac in the host picker and shows its last-loaded models. Switch to Cloud to start a chat while the Mac is offline.
+- Picking a provider before starting a chat loads that provider's models and reasoning levels.
+
+<!-- release:end -->
+
+## 26.11.25.2
 
 **New sessions on a Claude connection read Spark's prompt from the cache.**
 
@@ -14,8 +29,6 @@
 
 - A reply written without thinking no longer streams in directly under your message and then drops a row when it finishes.
 - An ACP client such as the iPhone app no longer gets an empty thought, or blank lines before the reply, when the model answers without thinking.
-
-<!-- release:end -->
 
 ## 26.11.25.1
 
