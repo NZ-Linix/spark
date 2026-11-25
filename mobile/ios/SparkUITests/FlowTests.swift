@@ -92,12 +92,23 @@ final class FlowTests: XCTestCase {
       .withOffset(CGVector(dx: inset + (frame.width - 2 * inset) / 10, dy: frame.height - inset))
       .tap()
     XCTAssertTrue(eventually("value == '64k context'", context, timeout: 5))
+
+    let track = context.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 0, dy: frame.height - inset))
+    let start = track.withOffset(CGVector(dx: inset + (frame.width - 2 * inset) / 10, dy: 0))
+    let end = track.withOffset(CGVector(dx: frame.width - inset, dy: 0))
+    start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .fast, thenHoldForDuration: 0)
+    XCTAssertTrue(eventually("value == '1M context'", context, timeout: 5))
     // nothing in the sheet hands focus back to the composer behind it
     XCTAssertFalse(app.keyboards.firstMatch.exists)
     shot(app, "context-limit-64k")
     app.buttons["Use the model default"].tap()
     XCTAssertTrue(eventually("value == 'Model default'", context, timeout: 5))
     XCTAssertFalse(app.keyboards.firstMatch.exists)
+    app.buttons["Close"].firstMatch.tap()
+    XCTAssertTrue(eventually("isHittable == true", chats, timeout: 5))
+    XCTAssertFalse(row.isHittable)
+    app.swipeRight()
+    XCTAssertTrue(eventually("isHittable == true", row, timeout: 5))
   }
 
   @MainActor

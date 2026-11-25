@@ -4,6 +4,7 @@ import SwiftUI
 struct ShellActions {
   var menu: () -> Void = {}
   var newChat: () -> Void = {}
+  var modelSheetVisible: (Bool) -> Void = { _ in }
   /** the sidebar sits beside the chat (an iPad, or any wide window): the menu button shows or hides it */
   var docked = false
 }
@@ -42,6 +43,7 @@ struct Shell: View {
   @State private var drag: CGFloat = 0
   @State private var showSettings = false
   @State private var showPair = false
+  @State private var modelSheetVisible = false
   @State private var opened = 0
   /** bumped to show the folder picker for a new chat */
   @State private var newChat = 0
@@ -58,7 +60,9 @@ struct Shell: View {
       Group {
         if wide { split } else { overlay(geo.size.width) }
       }
-      .environment(\.shell, ShellActions(menu: { wide ? toggleDock() : set(true) }, newChat: startNew, docked: wide))
+      .environment(\.shell, ShellActions(
+        menu: { wide ? toggleDock() : set(true) }, newChat: startNew,
+        modelSheetVisible: { modelSheetVisible = $0 }, docked: wide))
       .background {
         // a hardware keyboard's shortcuts, whatever has focus
         Group {
@@ -118,7 +122,7 @@ struct Shell: View {
         // full height always: the corner clip mustn't cut what reaches into the bottom inset
         .ignoresSafeArea(.container, edges: .vertical)
     }
-    .background(SidebarSwipe(open: open, began: began, changed: { dx in
+    .background(SidebarSwipe(open: open, blocked: modelSheetVisible, began: began, changed: { dx in
       drag = open ? min(0, dx) : max(0, dx)
     }, ended: { dx, vx in
       set((open ? width : 0) + dx + vx * 0.2 > width / 2)
@@ -186,6 +190,7 @@ struct Shell: View {
  */
 private struct SidebarSwipe: UIViewRepresentable {
   let open: Bool
+  let blocked: Bool
   let began: () -> Void
   let changed: (CGFloat) -> Void
   let ended: (_ dx: CGFloat, _ velocity: CGFloat) -> Void
@@ -245,8 +250,8 @@ private struct SidebarSwipe: UIViewRepresentable {
     }
 
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-      // not through a sheet
-      if g.view?.window?.rootViewController?.presentedViewController != nil { return false }
+      // SwiftUI can present the model sheet below the root controller.
+      guard swipe?.blocked == false, g.view?.window?.rootViewController?.presentedViewController == nil else { return false }
       touched = touch.view
       down = touch.timestamp
       start = touch.location(in: nil)
@@ -266,7 +271,8 @@ private struct SidebarSwipe: UIViewRepresentable {
     }
 
     func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
-      guard let open = swipe?.open else { return false }
+      guard let swipe, !swipe.blocked else { return false }
+      let open = swipe.open
       let v = pan.translation(in: nil)
       // a mostly sideways swipe in the direction that makes sense; scrolling stays scrolling
       guard abs(v.x) > abs(v.y) * 1.4, open ? v.x < 0 : v.x > 0 else { return false }

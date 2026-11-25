@@ -486,6 +486,7 @@ struct ModelSheet: View {
   var mcpEditable = true
   var modelsPending = false
   @Environment(\.dismiss) private var dismiss
+  @Environment(\.shell) private var shell
   @State private var query = ""
 
   private var model: ConfigOption? { options.first { $0.id == "model" } }
@@ -643,6 +644,8 @@ struct ModelSheet: View {
         }
       }
     }
+    .onAppear { shell.modelSheetVisible(true) }
+    .onDisappear { shell.modelSheetVisible(false) }
     .presentationDetents(fits ? [.height(fitHeight)] : [.medium, .large])
     .presentationDragIndicator(.hidden)
     .presentationBackground(Color(white: 0.06))
