@@ -1,8 +1,22 @@
 # spark
 
-## 26.11.25.4
+## 26.11.25.5
 
 <!-- release:start -->
+
+**Name new chats through a private relay.**
+
+### New Features
+
+- Private relays can generate titles for terminal, Cloud, and mobile chats from a short excerpt of their first prompt. Spark requires zero data retention and no data collection on each OpenRouter request. If no private endpoint answers, the locally derived title stays in place.
+
+### Bug Fixes
+
+- The terminal footer shows the model's configured display name or its exact ID, without shortening it.
+
+<!-- release:end -->
+
+## 26.11.25.4
 
 **Run `spark update` even if the profile can't be read.**
 
@@ -11,8 +25,6 @@
 - Spark profiles can hold up to 1 MiB of settings, so synced subscription model catalogs no longer hit the old 64 KiB limit.
 - `spark update` reads the saved release channel without loading workspace or provider settings. If it can't read the profile, it uses the installed build's channel without changing your settings.
 - If an older Spark already reports `failed to load update settings`, use the installer below once. It keeps your settings and accounts. After that, use `spark update` as usual.
-
-<!-- release:end -->
 
 ## 26.11.25.3
 
