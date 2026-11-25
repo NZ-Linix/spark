@@ -1906,6 +1906,88 @@ describe("cli: status", () => {
   );
 
   test(
+    "spark reads and edits profiles larger than 64 KiB without losing provider settings",
+    async () => {
+      const home = createIsolatedTestHome();
+      const settings = join(home, ".spark", "settings.json");
+      const fixture = {
+        protocol: "openai-chat-completions", base_url: "https://example.test/v1", auth: { type: "none" },
+        model_metadata: Object.fromEntries(Array.from({ length: 240 }, (_, i) => [`model-${i}`, { context_window: 128_000, max_output_tokens: 16_000 }])),
+      };
+      const large = {
+        update_channel: "stable",
+        provider: "first",
+        models: { first: "model-0" },
+        providers: { first: fixture, second: fixture, third: fixture },
+      };
+      try {
+        mkdirSync(join(home, ".spark"), { recursive: true, mode: 0o700 });
+        const bytes = JSON.stringify(large, null, 2) + "\n";
+        expect(Buffer.byteLength(bytes)).toBeGreaterThan(64 * 1024);
+        writeFileSync(settings, bytes, { mode: 0o600 });
+        const env = { ...NO_SETTING_ENV, ...NO_GATEWAY_AUTH, HOME: home };
+        const get = await runFx(["config", "get", "update_channel"], { env });
+        expect(get.code).toBe(0);
+        expect(get.stdout.trim()).toBe("stable");
+        const set = await runFx(["config", "set", "update_channel", "dev"], { env });
+        expect(set.code).toBe(0);
+        expect(JSON.parse(readFileSync(settings, "utf8"))).toEqual({ ...large, update_channel: "dev" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "spark update checks the saved channel despite unrelated settings and falls back without writing",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "spark-updater-settings-"));
+      const home = join(root, "home");
+      const settings = join(home, ".spark", "settings.json");
+      const paths: string[] = [];
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch(request) {
+          const path = new URL(request.url).pathname;
+          paths.push(path);
+          // Serve only the current stable version; never replace the test binary.
+          if (path === "/latest/download/latest.txt") return new Response(`v${sourceVersion()}\n`);
+          return new Response(null, { status: 404 });
+        },
+      });
+      try {
+        mkdirSync(join(home, ".spark"), { recursive: true, mode: 0o700 });
+        writeFileSync(join(root, ".spark.json"), "not JSON");
+        const env = { ...NO_SETTING_ENV, HOME: home, SPARK_TEST_UPGRADE_BASE_URL: `http://127.0.0.1:${server.port}` };
+        const large = JSON.stringify({ providers: "unusable", update_channel: "dev", extra: "x".repeat(80 * 1024) });
+        const oversized = JSON.stringify({ update_channel: "dev", extra: "x".repeat(1024 * 1024) });
+        for (const [bytes, route, warning] of [
+          [large, "dev.json", null],
+          [oversized, "latest.txt", "is larger than 1 MiB"],
+          ["not JSON", "latest.txt", "isn't valid JSON"],
+        ] as const) {
+          writeFileSync(settings, bytes, { mode: 0o600 });
+          const result = await runFx(["update", "--json"], { cwd: realpathSync(root), env });
+          expect(result.code).toBe(route === "dev.json" ? 1 : 0);
+          expect(paths.splice(0)).toEqual([`/latest/download/${route}`]);
+          expect(JSON.parse(result.stdout)).toMatchObject(route === "dev.json"
+            ? { kind: "upgrade", error: "failed to fetch the latest version from GitHub" }
+            : { kind: "upgrade", status: "up_to_date" });
+          if (warning) expect(result.stderr).toContain(warning);
+          else expect(result.stderr).toBe("");
+          expect(readFileSync(settings, "utf8")).toBe(bytes);
+        }
+      } finally {
+        server.stop(true);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "spark status --json defaults permission mode to auto",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "spark-e2e-permission-default-"));

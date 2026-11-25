@@ -215,7 +215,7 @@ fn appendUnknownSettingChecksFor(
     file: settings_keys.File,
 ) !void {
     // An unreadable or malformed file is already reported by the config check.
-    const loaded = config_runtime.readSettingsFileJson(alloc, path) catch |err| switch (err) {
+    const loaded = config_runtime.readSettingsFileJson(alloc, path, file) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return,
     };

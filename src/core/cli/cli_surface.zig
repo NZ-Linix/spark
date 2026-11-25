@@ -1467,22 +1467,15 @@ fn runNonInteractiveWithDeps(
                 return usage_failure;
             };
 
-            var startup = deps.load_startup_state_without_credentials(
-                alloc,
-                cfg.default_model,
-                cfg.default_agent_step_limit,
-            ) catch |err| {
-                if (opts.format == .json) {
-                    try writeJsonCommandFailure(alloc, deps, "upgrade", err, "failed to load update settings");
-                } else {
-                    try writeStderr(deps, "spark upgrade: failed to load update settings\n");
-                }
-                return .handled_failure;
-            };
-            defer startup.deinit(alloc);
-            try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
-
-            const channel = opts.channel orelse startup.update_channel;
+            const channel = opts.channel orelse (config_runtime.loadUpdateChannel(alloc) catch |err| blk: {
+                if (err == error.OutOfMemory) return err;
+                const warning = try alloc.print("spark upgrade: {s} {s}; using the {s} channel for this update\n", .{
+                    profile_paths.displayText("~/.spark/settings.json"), cli_config.loadFailureReason(err), cfg.build_channel.label(),
+                });
+                defer alloc.free(warning);
+                try writeStderr(deps, warning);
+                break :blk cfg.build_channel;
+            }) orelse .stable;
             if (opts.channel) |selected| {
                 var outcome = config_runtime.setUserPreferences(alloc, .{ .update_channel = selected }) catch |err| {
                     if (opts.format == .json) {

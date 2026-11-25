@@ -17,7 +17,7 @@ const settings_keys = @import("settings_keys.zig");
 const theme_mod = @import("../shared/theme.zig");
 
 const Allocator = std.mem.Allocator;
-const max_settings_bytes: usize = 64 * 1024;
+pub const max_settings_bytes: usize = 1024 * 1024;
 pub const max_model_bytes: usize = 1024;
 const lock_deadline_ms: u64 = 2000;
 const backup_keep_count: usize = 5;

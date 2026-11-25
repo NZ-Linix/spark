@@ -18,7 +18,7 @@ pub const context_limits = @import("context_limits.zig");
 pub const tool_placement = @import("tool_placement.zig");
 
 const Allocator = std.mem.Allocator;
-const max_settings_bytes: usize = 64 * 1024;
+const max_project_settings_bytes: usize = 64 * 1024;
 pub const default_permission_mode: types.PermissionMode = .yolo;
 
 pub const Paths = struct {
@@ -380,6 +380,20 @@ pub fn loadUserSettingsJson(arena: Allocator) !?std.json.Value {
     return parsed;
 }
 
+/// The updater only needs the profile's release channel, not a resolved chat configuration.
+pub fn loadUpdateChannel(alloc: Allocator) !?update_target.Channel {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const settings = (try loadUserSettingsJson(arena.allocator())) orelse return null;
+    const value = settings.object.get("update_channel") orelse return null;
+    return try parseUpdateChannel(value);
+}
+
+fn parseUpdateChannel(value: std.json.Value) !update_target.Channel {
+    if (value != .string) return error.InvalidUpdateChannelType;
+    return update_target.Channel.parse(value.string) orelse error.InvalidUpdateChannelValue;
+}
+
 /// Reads only profile-global connection definitions. Caller owns the registry.
 pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
     var paths = try discoverPaths(alloc, ".");
@@ -650,7 +664,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
 
     const project_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".spark.json" });
     defer alloc.free(project_path);
-    const project_text = readOptionalFile(alloc, project_path) catch |err| blk: {
+    const project_text = readOptionalFile(alloc, project_path, .project) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         try diagnostics.append(alloc, .{
             .layer = .project,
@@ -1262,7 +1276,7 @@ fn loadStartupStatusSettingsFromPathsFast(alloc: Allocator, paths: Paths) !Start
     const user_text = try readOptionalUserSettingsFile(alloc, paths);
     defer if (user_text) |owned| alloc.free(owned);
 
-    if (try readOptionalFile(alloc, paths.workspace_settings)) |workspace_text| {
+    if (try readOptionalFile(alloc, paths.workspace_settings, .project)) |workspace_text| {
         defer alloc.free(workspace_text);
         var workspace_settings = try parseStartupStatusSettingsJson(alloc, workspace_text, null, .project);
         defer workspace_settings.deinit(alloc);
@@ -1297,10 +1311,10 @@ fn readOptionalUserSettingsFile(alloc: Allocator, paths: Paths) !?[]u8 {
                 break :blk bytes;
             },
             .invalid => error.InvalidSettingsFormat,
-            .oversized => error.StreamTooLong,
+            .oversized => error.SettingsPrimaryTooLarge,
         };
     }
-    if (paths.user_settings) |path| return try readOptionalFile(alloc, path);
+    if (paths.user_settings) |path| return try readOptionalFile(alloc, path, .profile);
     return null;
 }
 
@@ -1339,7 +1353,7 @@ fn mergeWorkspaceOverridesFromValue(target: *Settings, alloc: Allocator, root_va
 }
 
 fn mergeSettingsFile(target: *Settings, alloc: Allocator, path: []const u8) !void {
-    const bytes = (try readOptionalFile(alloc, path)) orelse return;
+    const bytes = (try readOptionalFile(alloc, path, .project)) orelse return;
     defer alloc.free(bytes);
 
     var parsed = try parseSettingsJsonForLayer(alloc, bytes, .project);
@@ -1347,7 +1361,7 @@ fn mergeSettingsFile(target: *Settings, alloc: Allocator, path: []const u8) !voi
     try mergeSettings(target, &parsed, alloc);
 }
 
-fn readOptionalFile(alloc: Allocator, path: []const u8) !?[]u8 {
+fn readOptionalFile(alloc: Allocator, path: []const u8, kind: settings_keys.File) !?[]u8 {
     var file = io_mod.openExistingRegularFile(
         std.Io.Dir.cwd(),
         path,
@@ -1359,8 +1373,10 @@ fn readOptionalFile(alloc: Allocator, path: []const u8) !?[]u8 {
     defer file.close(io_mod.getIo());
 
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.size > max_settings_bytes) return error.StreamTooLong;
-    return try io_mod.readFileToEnd(alloc, &file, max_settings_bytes + 1);
+    const limit = if (kind == .profile) settings_store.max_settings_bytes else max_project_settings_bytes;
+    const too_large = if (kind == .profile) error.SettingsPrimaryTooLarge else error.StreamTooLong;
+    if (stat.kind != .file or stat.size > limit) return too_large;
+    return io_mod.readFileToEnd(alloc, &file, limit + 1) catch |err| return if (err == error.StreamTooLong) too_large else err;
 }
 
 /// One `--config key=value` for a single run, with the value already checked
@@ -1400,8 +1416,8 @@ pub fn applySettingOverrides(alloc: Allocator, settings: *Settings, overrides: [
 /// Reads and parses one settings file for inspection, such as `spark doctor`'s
 /// unknown-key check, with the same size limit as loading. Null when the file
 /// is absent. Caller deinits the result, which owns all of its strings.
-pub fn readSettingsFileJson(alloc: Allocator, path: []const u8) !?std.json.Parsed(std.json.Value) {
-    const bytes = try readOptionalFile(alloc, path) orelse return null;
+pub fn readSettingsFileJson(alloc: Allocator, path: []const u8, kind: settings_keys.File) !?std.json.Parsed(std.json.Value) {
+    const bytes = try readOptionalFile(alloc, path, kind) orelse return null;
     defer alloc.free(bytes);
     return try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .allocate = .alloc_always });
 }
@@ -1727,12 +1743,7 @@ fn parseProfileOnlyFields(
         settings.auto_upgrade = value.bool;
     }
 
-    if (root.object.get("update_channel")) |update_channel_value| {
-        const value = update_channel_value;
-        if (value != .string) return error.InvalidUpdateChannelType;
-        settings.update_channel = update_target.Channel.parse(value.string) orelse
-            return error.InvalidUpdateChannelValue;
-    }
+    if (root.object.get("update_channel")) |value| settings.update_channel = try parseUpdateChannel(value);
 
     if (root.object.get("theme")) |theme_value| {
         const value = theme_value;
@@ -2065,7 +2076,7 @@ fn readSettingsBytesForTest(alloc: Allocator, home: []const u8) ![]u8 {
 
     var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
     defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, max_settings_bytes);
+    return io_mod.readFileToEnd(alloc, &file, settings_store.max_settings_bytes + 1);
 }
 
 fn expectOneTrailingNewline(bytes: []const u8) !void {

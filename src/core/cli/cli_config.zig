@@ -379,13 +379,13 @@ pub fn load(
     errdefer if (profile) |*parsed| parsed.deinit();
     if (paths.user_settings) |path| {
         failed_file.* = profileDisplay();
-        profile = try config_runtime.readSettingsFileJson(alloc, path);
+        profile = try config_runtime.readSettingsFileJson(alloc, path, .profile);
     }
     var project: ?std.json.Parsed(std.json.Value) = null;
     errdefer if (project) |*parsed| parsed.deinit();
     if (scope == .all) {
         failed_file.* = project_display;
-        project = try config_runtime.readSettingsFileJson(alloc, paths.workspace_settings);
+        project = try config_runtime.readSettingsFileJson(alloc, paths.workspace_settings, .project);
     }
     failed_file.* = null;
 
@@ -639,7 +639,9 @@ fn unknownSetting(key: settings_keys.UnknownKey, file: []const u8) output_contra
 pub fn loadFailureReason(err: anyerror) []const u8 {
     return switch (err) {
         error.StreamTooLong => "is larger than 64 KiB",
-        error.SyntaxError, error.UnexpectedEndOfInput, error.InvalidNumber => "isn't valid JSON",
+        error.SettingsPrimaryTooLarge => "is larger than 1 MiB",
+        error.InvalidSettingsFormat, error.SyntaxError, error.UnexpectedEndOfInput, error.InvalidNumber => "isn't valid JSON",
+        error.InvalidUpdateChannelType, error.InvalidUpdateChannelValue => "has an invalid update_channel (expected stable or dev)",
         error.DurablePathUnsafe => "can't be read: " ++ unsafe_settings_path,
         error.AccessDenied, error.PermissionDenied => "can't be read: permission denied",
         error.NotDir => "can't be read: a folder in its path is a file",
@@ -653,7 +655,7 @@ pub fn loadFailureReason(err: anyerror) []const u8 {
 pub fn saveFailureReason(err: anyerror) []const u8 {
     return switch (err) {
         error.DurablePathUnsafe => unsafe_settings_path,
-        error.SettingsPrimaryTooLarge, error.FileTooBig => "it is larger than 64 KiB; remove settings you no longer use",
+        error.SettingsPrimaryTooLarge, error.SettingsTooLarge, error.FileTooBig => "it is larger than 1 MiB; remove settings you no longer use",
         error.SettingsLockBusy => "another spark is saving settings; try again",
         error.AccessDenied, error.PermissionDenied => "permission denied",
         error.ReadOnlyFileSystem => "the disk is read-only",
