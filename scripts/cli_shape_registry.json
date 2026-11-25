@@ -65,6 +65,10 @@
       "job": "setting-override",
       "stability": "stable"
     },
+    "SPARK_PLAN_HOME": {
+      "job": "location",
+      "stability": "internal"
+    },
     "SPARK_PROVIDER": {
       "job": "setting-override",
       "stability": "stable"
