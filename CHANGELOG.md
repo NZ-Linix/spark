@@ -1,8 +1,19 @@
 # spark
 
-## 26.11.25.5
+## 26.11.25.6
 
 <!-- release:start -->
+
+**List each Antigravity Gemini model once.**
+
+### Bug Fixes
+
+- Antigravity accounts list a Gemini model once, with its extra-high and tiered variants as reasoning levels instead of separate models. This also covers Gemini models added later and models already saved in your settings. Chats that use an older model ID keep working.
+- On iPhone, dragging the effort or context slider in the model sheet no longer opens the sidebar.
+
+<!-- release:end -->
+
+## 26.11.25.5
 
 **Name new chats through a private relay.**
 
@@ -13,8 +24,6 @@
 ### Bug Fixes
 
 - The terminal footer shows the model's configured display name or its exact ID, without shortening it.
-
-<!-- release:end -->
 
 ## 26.11.25.4
 
