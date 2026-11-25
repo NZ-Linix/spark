@@ -45,8 +45,8 @@ struct Shell: View {
   @State private var showPair = false
   @State private var modelSheetVisible = false
   @State private var opened = 0
-  /** bumped to show the folder picker for a new chat */
-  @State private var newChat = 0
+  /** bumped to give each new draft its own view state */
+  @State private var draftID = 0
   /** in a wide window: the sidebar is out beside the chat */
   @AppStorage("sidebarDocked") private var docked = true
 
@@ -139,7 +139,8 @@ struct Shell: View {
         // the chat's own identity: a new chat keeps its screen when the host gives it an id
         ChatView(chat: chat).id(ObjectIdentifier(chat))
       } else {
-        NewChatView(ask: newChat)
+        let id = draftID
+        NewChatView(isCurrentDraft: { id == draftID && link.chat == nil }).id(id)
       }
     }
     .page()
@@ -148,13 +149,12 @@ struct Shell: View {
   private func startNew() {
     set(false)
     // no animation: inside one, the new screen's composer would grow into place as it's laid out
-    link.chat = nil
-    newChat += 1
+    clear()
   }
 
-  /** the open chat is gone: a blank new chat takes its place, the sidebar stays, no folder picker */
+  /** replace the current chat or draft without changing the sidebar */
   private func clear() {
-    newChat = 0
+    draftID += 1
     link.chat = nil
   }
 
@@ -469,7 +469,8 @@ private struct Sidebar: View {
 
   /** B: the chosen host only */
   @ViewBuilder private var switcherList: some View {
-    let host = link.host
+    // With no online host, still show cached chats and status for the first offline host.
+    let host = link.host ?? orderedHosts.first
     let shown = host.map { h in (link.sessions[h.id] ?? []).filter(matches).map { Listed(host: h, session: $0) } } ?? []
     if let host, !host.online { offline(host) }
     grouped(shown, badges: false)
@@ -612,7 +613,7 @@ private struct Sidebar: View {
       Button(action: tap) {
         VStack(alignment: .leading, spacing: 3) {
           Text(session.title)
-            .font(.geist(15, selected ? .semibold : .regular))
+            .font(.geist(15))
             .foregroundStyle(.white)
             .lineLimit(1)
           HStack(spacing: 5) {
@@ -648,6 +649,7 @@ private struct Sidebar: View {
 struct HostSwitch: View {
   @Environment(Link.self) private var link
   @Namespace private var ns
+  @State private var picked = 0
 
   var body: some View {
     let hosts = link.pickable
@@ -660,8 +662,10 @@ struct HostSwitch: View {
   private func track(_ hosts: [HostEntry]) -> some View {
     HStack(spacing: 0) {
         ForEach(hosts) { h in
-          let on = h.id == link.host?.id
+          let on = h.id == link.hostID
           Button {
+            guard link.pickable.contains(where: { $0.id == h.id }) else { return }
+            if link.hostID != h.id { picked += 1 }
             withAnimation(.spring(duration: 0.35, bounce: 0.15)) { link.choose(h.id) }
           } label: {
             HStack(spacing: 6) {
@@ -680,12 +684,12 @@ struct HostSwitch: View {
             .contentShape(.capsule)
           }
           .buttonStyle(.plain)
-          .accessibilityValue(h.online ? "" : "Offline")
+          .accessibilityAddTraits(on ? .isSelected : [])
           .transition(.opacity.combined(with: .scale(0.92)))
         }
       }
       .padding(3)
       .glassEffect(.regular, in: .capsule)
-      .sensoryFeedback(.selection, trigger: link.hostID)
+      .sensoryFeedback(.selection, trigger: picked)
   }
 }

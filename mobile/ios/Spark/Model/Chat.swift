@@ -34,13 +34,49 @@ final class Chat {
   var permission: Permission?
   var usage: Usage?
   var loaded = false
+  var provisionalDraft = ""
   var problem: String?
   /** The terminal owns this chat. Without a live owner token, it is read-only. */
   var elsewhere = false
   var terminalOwner: String?
   var terminalRevision: String?
   var sending = false
-  var canSend: Bool { !sending && (!elsewhere || terminalOwner != nil) && (!running || terminalOwner != nil) }
+  var changingModel = false
+  var stopping = false
+  var reopening = false
+  private var readyToWrite: Bool {
+    loaded && !starting && !info.id.isEmpty && !rewinding && !reopening && !stopping && !changingModel && !changingMcp
+  }
+  var canSend: Bool {
+    readyToWrite && !sending && queueSending == nil && queue.isEmpty && (!elsewhere || terminalOwner != nil) && (!running || terminalOwner != nil)
+  }
+  var canQueue: Bool {
+    readyToWrite && !elsewhere && (running || !queue.isEmpty)
+  }
+
+  struct Queued: Identifiable {
+    let id = UUID().uuidString
+    let text: String
+  }
+
+  enum QueuePause {
+    case stopped, turnFailed
+    case rejected(String)
+    /** a missing reply isn't evidence that the host didn't receive the message */
+    case unconfirmed(String)
+  }
+
+  var queue: [Queued] = []
+  var queueSending: String?
+  var queuePause: QueuePause?
+  var queueNeedsSync = false
+  @ObservationIgnored private(set) var stateRevision = 0
+
+  var canResumeQueue: Bool {
+    guard readyToWrite, !elsewhere, !running, !sending, queueSending == nil, let queuePause else { return false }
+    if case .unconfirmed = queuePause { return false }
+    return !queue.isEmpty
+  }
   /** a chat the phone shows before its session exists: its first message waits for the host */
   var starting = false
   /** bumped when a reply finishes, for the haptic */
@@ -153,6 +189,7 @@ final class Chat {
       guard let id = e.id.flatMap(Self.string), let text = e.text, let i = index[id] else { return }
       entries[i].item.text += text
     case "state":
+      stateRevision += 1
       let was = running
       running = e.running ?? false
       info.running = running

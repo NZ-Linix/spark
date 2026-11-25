@@ -112,6 +112,111 @@ final class FlowTests: XCTestCase {
   }
 
   @MainActor
+  func testModelPickerSearchesAcrossProviders() throws {
+    let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"])
+    let app = XCUIApplication()
+    app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
+    app.launch()
+
+    let model = app.buttons["Model"]
+    XCTAssertTrue(model.waitForExistence(timeout: 10))
+    model.tap()
+    let search = app.textFields["Search models"]
+    XCTAssertTrue(search.waitForExistence(timeout: 5))
+    XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Provider:'")).firstMatch.exists)
+    search.tap()
+    let keyboardTip = app.buttons["Continue"]
+    if keyboardTip.waitForExistence(timeout: 2) { keyboardTip.tap() }
+    search.typeText("hosted fixture-pro")
+    let hosted = app.buttons["Fixture Pro"]
+    XCTAssertTrue(hosted.waitForExistence(timeout: 5))
+    XCTAssertFalse(app.buttons["Local"].exists)
+    hosted.tap()
+    XCTAssertTrue(eventually("value CONTAINS 'Fixture Pro'", model, timeout: 5))
+
+    // The existing session starts on Local; picking a Hosted result applies both parts of the route.
+    app.buttons["Chats"].tap()
+    let row = app.buttons.matching(NSPredicate(format: "label CONTAINS 'Scroll regression'")).firstMatch
+    XCTAssertTrue(row.waitForExistence(timeout: 5))
+    row.tap()
+    XCTAssertTrue(eventually("value CONTAINS 'Local'", model, timeout: 5))
+    model.tap()
+    XCTAssertTrue(search.waitForExistence(timeout: 5))
+    search.tap()
+    search.typeText("hosted fixture-pro")
+    XCTAssertTrue(hosted.waitForExistence(timeout: 5))
+    hosted.tap()
+    XCTAssertTrue(eventually("value CONTAINS 'Fixture Pro'", model, timeout: 5))
+  }
+
+  @MainActor
+  func testQueuedMessageSendsWhenTurnEnds() throws {
+    let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"])
+    let app = XCUIApplication()
+    app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
+    app.launch()
+    let menu = app.buttons["Chats"]
+    XCTAssertTrue(menu.waitForExistence(timeout: 5))
+    menu.tap()
+    let row = app.buttons.matching(NSPredicate(format: "label CONTAINS 'Scroll regression'")).firstMatch
+    XCTAssertTrue(row.waitForExistence(timeout: 5))
+    row.tap()
+
+    let composer = app.textFields["Message spark"]
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    composer.tap()
+    let keyboardTip = app.buttons["Continue"]
+    if keyboardTip.waitForExistence(timeout: 2) { keyboardTip.tap() }
+    composer.typeText("stream please")
+    app.buttons["Send"].tap()
+
+    // while the long reply streams, the button queues instead of stopping
+    let working = app.textFields["Queue a follow-up…"]
+    XCTAssertTrue(working.waitForExistence(timeout: 5))
+    working.tap()
+    working.typeText("Queued from the phone")
+    let queue = app.buttons["Queue"]
+    XCTAssertTrue(queue.waitForExistence(timeout: 3))
+    queue.tap()
+    let queued = app.otherElements["queue"]
+    XCTAssertTrue(queued.waitForExistence(timeout: 3))
+    shot(app, "queue-waiting")
+
+    // it goes out on its own once the turn ends, and leaves the queue
+    let sent = app.staticTexts["Queued from the phone"]
+    XCTAssertTrue(eventually("exists == false", queued, timeout: 20))
+    XCTAssertTrue(sent.waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["Visible follow-up reply."].waitForExistence(timeout: 10))
+  }
+
+  @MainActor
+  func testUnsentDraftSurvivesLeavingChat() throws {
+    let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"])
+    let app = XCUIApplication()
+    app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
+    app.launch()
+    let menu = app.buttons["Chats"]
+    XCTAssertTrue(menu.waitForExistence(timeout: 5))
+    menu.tap()
+    let row = app.buttons.matching(NSPredicate(format: "label CONTAINS 'Scroll regression'")).firstMatch
+    XCTAssertTrue(row.waitForExistence(timeout: 5))
+    row.tap()
+    let composer = app.textFields["Message spark"]
+    XCTAssertTrue(composer.waitForExistence(timeout: 5))
+    composer.tap()
+    let keyboardTip = app.buttons["Continue"]
+    if keyboardTip.waitForExistence(timeout: 2) { keyboardTip.tap() }
+    composer.typeText("Unsent text for this chat")
+    menu.tap()
+    app.buttons["New chat"].firstMatch.tap()
+    XCTAssertTrue(app.staticTexts["What should we build?"].waitForExistence(timeout: 5))
+    XCTAssertNotEqual(composer.value as? String, "Unsent text for this chat")
+    menu.tap()
+    row.tap()
+    XCTAssertTrue(eventually("value == 'Unsent text for this chat'", composer, timeout: 5))
+  }
+
+  @MainActor
   func testScrollButtonAndFollowing() throws {
     let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"], "Run mobile/bridge/fixtures/scroll-relay.ts on a test simulator")
     let app = XCUIApplication()
@@ -153,7 +258,7 @@ final class FlowTests: XCTestCase {
   }
 
   @MainActor
-  func testMacPickerStaysVisibleOffline() async throws {
+  func testMacPickerFallsBackAndRestoresSelection() async throws {
     let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"], "Run the scroll fixture with SPARK_HOST_SWITCH_FIXTURE=1")
     func setMacOnline(_ online: Bool) async throws {
       var request = URLRequest(url: try XCTUnwrap(URL(string: "\(relay)/api/fixture/mac?online=\(online ? 1 : 0)")))
@@ -165,23 +270,34 @@ final class FlowTests: XCTestCase {
     try await setMacOnline(true)
     let app = XCUIApplication()
     app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
+    app.launchArguments += ["-sidebarStyle", "sections"]
     app.launch()
     let mac = app.buttons["Demo Mac"].firstMatch
+    let cloud = app.buttons["Cloud"].firstMatch
+    let cloudHeadline = app.staticTexts["in the cloud"]
+    let composer = app.textFields["Message spark"]
     XCTAssertTrue(mac.waitForExistence(timeout: 8))
     mac.tap()
-    let model = app.buttons["Model"]
-    XCTAssertTrue(model.waitForExistence(timeout: 8))
-    XCTAssertTrue(eventually("enabled == true", app.textFields["Message spark"], timeout: 5))
+    XCTAssertTrue(eventually("isSelected == true", mac, timeout: 5))
 
     try await setMacOnline(false)
-    XCTAssertTrue(app.staticTexts["Demo Mac is offline. Switch to Cloud or wake your Mac."].waitForExistence(timeout: 5))
-    XCTAssertTrue(mac.exists)
-    XCTAssertTrue(model.exists)
-    XCTAssertFalse(app.textFields["Message spark"].isEnabled)
+    XCTAssertTrue(mac.waitForNonExistence(timeout: 5))
+    XCTAssertTrue(cloudHeadline.waitForExistence(timeout: 5))
+    XCTAssertTrue(eventually("enabled == true", composer, timeout: 5))
 
-    app.buttons["Cloud"].firstMatch.tap()
-    XCTAssertTrue(eventually("enabled == true", app.textFields["Message spark"], timeout: 5))
+    // An automatic fallback doesn't replace the last deliberate choice.
     try await setMacOnline(true)
+    XCTAssertTrue(mac.waitForExistence(timeout: 5))
+    XCTAssertTrue(eventually("isSelected == true", mac, timeout: 5))
+
+    // An explicit choice does, and survives the next reconnect.
+    cloud.tap()
+    XCTAssertTrue(eventually("isSelected == true", cloud, timeout: 5))
+    try await setMacOnline(false)
+    XCTAssertTrue(mac.waitForNonExistence(timeout: 5))
+    try await setMacOnline(true)
+    XCTAssertTrue(mac.waitForExistence(timeout: 5))
+    XCTAssertTrue(eventually("isSelected == true", cloud, timeout: 5))
   }
 
   @MainActor
@@ -296,6 +412,13 @@ final class FlowTests: XCTestCase {
     shot(app, "04-sidebar-swiped")
 
     app.buttons["New chat"].firstMatch.tap()
+    let newChatHeadline = app.staticTexts["What should we build?"]
+    let chooseFolder = app.buttons["Choose a folder"]
+    let picker = app.navigationBars["Choose a folder"]
+    XCTAssertTrue(newChatHeadline.waitForExistence(timeout: 10))
+    XCTAssertFalse(picker.exists)
+    XCTAssertTrue(chooseFolder.isHittable)
+    chooseFolder.tap()
     let search = app.textFields.matching(NSPredicate(format: "placeholderValue BEGINSWITH 'Search in'")).firstMatch
     XCTAssertTrue(search.waitForExistence(timeout: 10))
     sleep(1)
@@ -429,6 +552,11 @@ final class FlowTests: XCTestCase {
     app.buttons["Done"].tap()
     sleep(1)
     app.buttons["New chat"].firstMatch.tap()
+    XCTAssertTrue(newChatHeadline.waitForExistence(timeout: 10))
+    XCTAssertFalse(picker.exists)
+    XCTAssertTrue(chooseFolder.isHittable)
+    chooseFolder.tap()
+    XCTAssertTrue(search.waitForExistence(timeout: 10))
     sleep(2)
     shot(app, "12-picker-recent")
 

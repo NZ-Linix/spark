@@ -5,7 +5,10 @@ struct ChatView: View {
   @Environment(Link.self) private var link
   @Environment(\.shell) private var shell
   let chat: Chat
-  @State private var draft = ""
+  private var draft: String {
+    get { link.draft(for: chat) }
+    nonmutating set { link.setDraft(newValue, for: chat) }
+  }
   @FocusState private var focused: Bool
   @State private var sent = 0
   /** following the newest text: on at the bottom, off once you scroll up, on again back down */
@@ -18,10 +21,11 @@ struct ChatView: View {
   @State private var follower = Follower()
   /** the thread has been laid out at its newest text, so the anchor that put it there can let go */
   @State private var settled = false
-  /** the message being edited: sending goes back to just before it and sends the new text */
-  @State private var editing: Entry?
-  /** the reply to go back to, once confirmed */
-  @State private var rewindTo: Entry?
+  /** an edit has its own text; it never replaces the unsent draft */
+  @State private var editing: MessageEdit?
+  @State private var historyAction: HistoryAction?
+  /** covers the entire rewind and replacement send, including the handoff between them */
+  @State private var historyBusy = false
   @State private var browsing = false
   /** kept while the chat is open, so a command keeps running with the terminal closed */
   @State private var terminal: Terminal?
@@ -49,12 +53,13 @@ struct ChatView: View {
     .toolbar { toolbar }
     .sheet(isPresented: $browsing) { FilesView(host: chat.host, root: chat.info.cwd) }
     .sheet(item: $typing) { TerminalView(terminal: $0) }
-    .confirmationDialog("Go back to this reply?", isPresented: Binding(get: { rewindTo != nil }, set: { if !$0 { rewindTo = nil } }), titleVisibility: .visible) {
-      Button("Go Back", role: .destructive) {
-        if let entry = rewindTo { rewind(to: entry) }
-      }
-    } message: {
-      Text("Everything after it leaves the chat.")
+    .confirmationDialog(historyAction?.title ?? "Change chat history?",
+      isPresented: Binding(get: { historyAction != nil }, set: { if !$0 { historyAction = nil } }),
+      titleVisibility: .visible, presenting: historyAction
+    ) { action in
+      Button(action.button, role: .destructive) { perform(action) }
+    } message: { action in
+      Text(action.message)
     }
     .sensoryFeedback(.impact(weight: .light), trigger: sent)
     .sensoryFeedback(.impact(flexibility: .soft, intensity: 0.6), trigger: chat.finished)
@@ -88,35 +93,54 @@ struct ChatView: View {
           .padding(.horizontal, 24)
           .transition(.opacity)
       }
-      if editing != nil {
-        EditingBar {
-          editing = nil
-          draft = ""
+      if !chat.queue.isEmpty {
+        QueuePanel(chat: chat, remove: { link.removeQueued($0, in: chat) }, resume: { link.resumeQueue(chat) })
+          .padding(.horizontal, 10)
+          .transition(Settle(distance: 16))
+      }
+      if let editing {
+        EditingBar(replacement: editing.target == nil) {
+          withAnimation(.smooth(duration: 0.3)) { self.editing = nil }
         }
-        .padding(.horizontal, 14)
-        .transition(Settle(distance: 12))
+          .disabled(historyBusy)
+          .padding(.horizontal, 14)
+          .transition(Settle(distance: 12))
       }
       Composer(
-        text: $draft, focused: $focused, running: chat.running && (!chat.elsewhere || chat.terminalOwner != nil),
-        enabled: chat.loaded && (!chat.elsewhere || chat.terminalOwner != nil) && !chat.rewinding && link.phase == .online,
+        text: composerText, focused: $focused, running: chat.running && (!chat.elsewhere || chat.terminalOwner != nil),
+        enabled: chat.loaded && (!chat.elsewhere || chat.terminalOwner != nil) && !chat.rewinding && !historyBusy && link.phase == .online,
         placeholder: editing == nil ? "Message spark" : "Edit your message",
-        working: chat.terminalOwner != nil ? "Message the Mac…" : "spark is working…",
+        working: chat.terminalOwner != nil ? "Message the Mac…" : "Queue a follow-up…",
         canSendWhileRunning: chat.terminalOwner != nil,
-        actionEnabled: !chat.sending && !chat.changingMcp
+        queuesMessages: editing == nil && chat.terminalOwner == nil,
+        actionEnabled: editing == nil ? chat.canSend || chat.canQueue : changeable,
+        stopEnabled: !chat.stopping
       ) {
-        send()
+        if editing != nil { sendEdit() } else { send() }
       } stop: {
         Task { await link.cancel(chat) }
       } trailing: {
-        ConfigChips(options: chat.config, set: { id, value in
+        ConfigChips(host: chat.host, options: chat.config, set: { id, value in
           if id == "effort" { UserDefaults.standard.set(value, forKey: "effort") }
           Task { await link.set(chat, id, to: value) }
-        }, prompts: link.prompts, prompt: promptBinding, mcpNames: link.mcpServers[chat.host] ?? [],
+        }, chooseModel: { choice in Task { await link.setModel(chat, to: choice) } },
+          prompts: link.prompts, prompt: promptBinding, mcpNames: link.mcpServers[chat.host] ?? [],
           mcpDisabled: Binding(get: { chat.mcpDisabled }, set: { disabled in Task { await link.setMcp(chat, disabled: disabled) } }),
-          mcpEditable: !chat.running && !chat.changingMcp, refreshMcp: { await link.loadMcpServers(chat.host) }, compact: true)
+          mcpEditable: !chat.running && !chat.changingMcp, refreshMcp: { await link.loadMcpServers(chat.host) },
+          compact: true, modelsEditable: changeable && !chat.sending)
+          .disabled(chat.changingModel)
       }
     }
+    .animation(.spring(duration: 0.35, bounce: 0.1), value: chat.queue.map(\.id))
+    .animation(.spring(duration: 0.35, bounce: 0.1), value: editing != nil)
     .readable()
+  }
+
+  private var composerText: Binding<String> {
+    if editing != nil {
+      return Binding(get: { editing?.text ?? "" }, set: { editing?.text = $0 })
+    }
+    return Binding(get: { draft }, set: { draft = $0 })
   }
 
   /** the chat's library prompt; a change starts its spark again with the new one */
@@ -136,7 +160,8 @@ struct ChatView: View {
 
   /** what a row's menu can do now: nothing changes the chat while spark works on it */
   private var changeable: Bool {
-    !chat.running && !chat.elsewhere && !chat.starting && !chat.rewinding && !chat.info.id.isEmpty && link.phase == .online
+    chat.loaded && !historyBusy && !chat.running && !chat.sending && !chat.elsewhere && !chat.starting &&
+      !chat.rewinding && !chat.changingMcp && !chat.changingModel && !chat.info.id.isEmpty && link.phase == .online
   }
 
   private var thread: some View {
@@ -144,9 +169,11 @@ struct ChatView: View {
     let liveID = chat.running ? chat.entries.last?.id : nil
     let first = chat.starting ? chat.entries.first?.id : nil
     let ends = turnEnds
-    // while a message is being edited, it and everything after it fade: sending replaces them
-    let cut = editing.flatMap { e in chat.entries.firstIndex { $0.id == e.id } }
-    let order = cut == nil ? [:] : Dictionary(uniqueKeysWithValues: chat.entries.enumerated().map { ($1.id, $0) })
+    let target = editing?.target?.id
+    // The edited message stays readable; the rows that a replacement removes fade behind it.
+    let cut = target.flatMap { id in chat.entries.firstIndex { $0.id == id } }
+    let after = cut.map { Set(chat.entries.dropFirst($0 + 1).map(\.id)) } ?? []
+    let editableRows = changeable && editing == nil
     return ScrollViewReader { reader in
       ScrollView {
         VStack(alignment: .leading, spacing: 0) {
@@ -154,13 +181,15 @@ struct ChatView: View {
             Group {
               switch unit.kind {
               case .one(let entry):
-                Row(entry: entry, live: entry.id == liveID, arriving: entry.id == first, ends: ends.contains(entry.id), changeable: changeable, disclose: pauseFollowing, act: act)
+                Row(entry: entry, live: entry.id == liveID, arriving: entry.id == first, ends: ends.contains(entry.id),
+                    changeable: editableRows, canRewind: editableRows && ends.contains(entry.id) && chat.hasTurn(after: entry),
+                    editing: entry.id == target, disclose: pauseFollowing, act: act)
               case .tools(let entries):
                 ToolGroup(entries: entries, live: entries.last?.id == liveID, disclose: pauseFollowing)
               }
             }
             .padding(.top, unit.gap)
-            .opacity(cut.map { (order[unit.id] ?? 0) >= $0 ? 0.3 : 1 } ?? 1)
+            .opacity(after.contains(unit.id) ? 0.35 : 1)
           }
           if chat.running {
             WorkingLine(chat: chat)
@@ -171,11 +200,11 @@ struct ChatView: View {
         .padding(.bottom, 24)
         .readable()
         Color.clear.frame(height: 1).id("chat-bottom").accessibilityHidden(true)
-          .background(ScrollFinder { follower.scrollView = $0 })
+          .background(ScrollFinder(found: { follower.scrollView = $0 }, tap: focused ? { focused = false } : nil))
       }
       // going back to an earlier message lays the thread out afresh, from the bottom
       .id(chat.epoch)
-      .transition(.opacity)
+      .transition(.asymmetric(insertion: .opacity.combined(with: .offset(y: 12)), removal: .opacity))
       // opens on the newest text; once laid out the anchor lets go, since while it holds, the bottom
       // edge sticks and growing text jumps the thread a line at a time instead of the follower gliding
       .defaultScrollAnchor(settled ? nil : .bottom, for: .initialOffset)
@@ -223,11 +252,17 @@ struct ChatView: View {
         }
       }
       .overlay {
-        if chat.rewinding {
-          ProgressView().tint(Color.dim).transition(.opacity)
+        if historyBusy || chat.rewinding {
+          ProgressView().tint(Color.dim)
+            .accessibilityLabel("Updating chat history")
+            .allowsHitTesting(false)
+            .transition(.opacity)
         }
       }
-      .animation(.smooth(duration: 0.2), value: chat.rewinding)
+      .animation(.smooth(duration: 0.2), value: historyBusy || chat.rewinding)
+      // the rows an edit would replace fade together, and come back together when it's dropped
+      .animation(.smooth(duration: 0.3), value: editing?.target?.id)
+      .animation(.smooth(duration: 0.35), value: chat.epoch)
     }
   }
 
@@ -295,60 +330,81 @@ struct ChatView: View {
     case .copy:
       UIPasteboard.general.string = entry.item.text
     case .edit:
-      guard changeable else { return }
-      editing = entry
-      draft = entry.item.text
+      guard changeable, editing == nil else { return }
+      withAnimation(.smooth(duration: 0.3)) { editing = MessageEdit(target: entry, text: entry.item.text) }
       focused = true
     case .retry:
-      guard changeable, let prompt = entry.role == .user ? entry : chat.prompt(before: entry) else { return }
-      resend(prompt, text: prompt.item.text)
+      guard changeable, editing == nil, let prompt = entry.role == .user ? entry : chat.prompt(before: entry) else { return }
+      if chat.hasTurn(after: prompt) {
+        historyAction = .retry(prompt)
+      } else {
+        perform(.retry(prompt))
+      }
     case .rewind:
-      guard changeable else { return }
-      rewindTo = entry
+      guard changeable, editing == nil, chat.hasTurn(after: entry) else { return }
+      historyAction = .rewind(entry)
     }
   }
 
-  /** goes back to just after `entry`, a reply: the turns after it leave the chat */
-  private func rewind(to entry: Entry) {
-    rewindTo = nil
-    editing = nil
-    pinned = true
+  private func perform(_ action: HistoryAction) {
+    historyAction = nil
+    guard changeable, editing == nil else { return }
+    switch action {
+    case .rewind(let reply):
+      guard chat.hasTurn(after: reply) else { return }
+      updateHistory(to: reply)
+    case .retry(let prompt):
+      guard chat.entries.contains(where: { $0.id == prompt.id }) else { return }
+      updateHistory(to: prompt, replacement: prompt.item.text)
+    }
+  }
+
+  private func sendEdit() {
+    guard changeable, let editing else { return }
+    let text = editing.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { return }
+    updateHistory(to: editing.target, replacement: text)
+  }
+
+  /** Rewind before a replacement, or keep the requested reply. A failed send can use the fork as-is. */
+  private func updateHistory(to target: Entry?, replacement: String? = nil) {
+    historyBusy = true
+    focused = false
+    chat.problem = nil
     Task {
+      defer { historyBusy = false }
       do {
-        try await link.rewind(chat, to: entry, keep: true)
+        if let target { try await link.rewind(chat, to: target, keep: replacement == nil) }
       } catch {
         chat.problem = error.localizedDescription
+        return
+      }
+      pinned = true
+      guard let replacement else { return }
+      // Once the original is gone, the next attempt should send to the fork without rewinding again.
+      editing = MessageEdit(target: nil, text: replacement)
+      if await link.send(replacement, in: chat) {
+        editing = nil
+        sent += 1
+      } else if chat.problem == nil {
+        chat.problem = "Couldn’t send the replacement. Try again."
       }
     }
   }
 
-  /** goes back to just before `prompt` and sends `text` in its place */
-  private func resend(_ prompt: Entry, text: String) {
-    sent += 1
-    pinned = true
-    Task {
-      do {
-        try await link.rewind(chat, to: prompt, keep: false)
-        await link.send(text, in: chat)
-      } catch {
-        chat.problem = error.localizedDescription
-        if draft.isEmpty { draft = text }
-      }
-    }
-  }
-
+  /** Straight to spark when it's idle; otherwise to the end of the queue, sent as each turn ends. */
   private func send() {
     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !text.isEmpty, chat.canSend, !chat.rewinding, !chat.changingMcp else { return }
-    draft = ""
-    pinned = true
-    if let target = editing {
-      editing = nil
-      resend(target, text: text)
-      return
+    guard !text.isEmpty else { return }
+    if chat.canSend {
+      draft = ""
+      pinned = true
+      sent += 1
+      Task { if !(await link.send(text, in: chat)), draft.isEmpty { draft = text } }
+    } else if chat.canQueue, link.enqueue(text, in: chat) {
+      draft = ""
+      sent += 1
     }
-    sent += 1
-    Task { if !(await link.send(text, in: chat)), draft.isEmpty { draft = text } }
   }
 }
 
@@ -414,47 +470,125 @@ private final class Follower {
   }
 }
 
-/** Hands over the UIScrollView a SwiftUI ScrollView is drawn in, once it's on screen. */
+/**
+ * Hands over the UIScrollView a SwiftUI ScrollView is drawn in, once it's on screen. With `tap`, a tap
+ * on the thread also puts the keyboard away; the tap still reaches buttons, menus and text under it.
+ */
 private struct ScrollFinder: UIViewRepresentable {
   let found: (UIScrollView) -> Void
+  var tap: (() -> Void)? = nil
 
   func makeUIView(context: Context) -> Probe {
     let probe = Probe()
     probe.found = found
+    probe.tap = tap
     return probe
   }
 
   func updateUIView(_ probe: Probe, context: Context) {
     probe.found = found
+    probe.tap = tap
   }
 
-  final class Probe: UIView {
+  static func dismantleUIView(_ probe: Probe, coordinator: ()) {
+    probe.detach()
+  }
+
+  final class Probe: UIView, UIGestureRecognizerDelegate {
     var found: ((UIScrollView) -> Void)?
+    var tap: (() -> Void)?
+    private lazy var recognizer: UITapGestureRecognizer = {
+      let r = UITapGestureRecognizer(target: self, action: #selector(tapped))
+      r.cancelsTouchesInView = false
+      r.delegate = self
+      return r
+    }()
 
     override func didMoveToWindow() {
       super.didMoveToWindow()
-      guard window != nil else { return }
+      guard window != nil else { return detach() }
       var view = superview
       while let v = view, !(v is UIScrollView) { view = v.superview }
-      if let scroll = view as? UIScrollView { found?(scroll) }
+      guard let scroll = view as? UIScrollView else { return }
+      found?(scroll)
+      if recognizer.view !== scroll {
+        detach()
+        scroll.addGestureRecognizer(recognizer)
+      }
+    }
+
+    func detach() {
+      recognizer.view?.removeGestureRecognizer(recognizer)
+    }
+
+    @objc private func tapped(_ r: UITapGestureRecognizer) {
+      if r.state == .ended { tap?() }
+    }
+
+    func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool { tap != nil }
+
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+      true
     }
   }
 }
 
 enum RowAction { case copy, edit, retry, rewind }
 
+/** A message being changed: the bubble it came from (gone once its turn was dropped) and the new text. */
+private struct MessageEdit {
+  var target: Entry?
+  var text: String
+}
+
+/** A change to the chat's history that drops turns, so it asks first. */
+private enum HistoryAction: Identifiable {
+  case rewind(Entry)
+  case retry(Entry)
+
+  var id: String {
+    switch self {
+    case .rewind(let e): "rewind-\(e.id)"
+    case .retry(let e): "retry-\(e.id)"
+    }
+  }
+  var title: String {
+    switch self {
+    case .rewind: "Go back to this reply?"
+    case .retry: "Send this message again?"
+    }
+  }
+  var button: String {
+    switch self {
+    case .rewind: "Go Back"
+    case .retry: "Send Again"
+    }
+  }
+  var message: String {
+    switch self {
+    case .rewind: "Everything after it leaves the chat."
+    case .retry: "The replies after it leave the chat, and spark answers it afresh."
+    }
+  }
+}
+
 /** Above the composer while a message is being edited: what sending will do, and a way out. */
 private struct EditingBar: View {
+  /** the original turn is already gone: sending only adds the edited message */
+  var replacement = false
   let cancel: () -> Void
 
   var body: some View {
     HStack(spacing: 8) {
-      Image(systemName: "pencil")
+      Image(systemName: replacement ? "arrow.clockwise" : "pencil")
         .font(.system(size: 12, weight: .semibold))
-      Text("Editing. Sending replaces it and what came after.")
+        .foregroundStyle(Effort.accent)
+        .contentTransition(.symbolEffect(.replace))
+      Text(replacement ? "Not sent yet. Send to try again." : "Editing. Sending replaces it and what came after.")
         .font(.geist(13, .medium))
         .lineLimit(1)
         .minimumScaleFactor(0.85)
+        .contentTransition(.opacity)
       Spacer(minLength: 4)
       Button(action: cancel) {
         Image(systemName: "xmark")
@@ -471,6 +605,77 @@ private struct EditingBar: View {
     .padding(.trailing, 6)
     .frame(height: 38)
     .glassEffect(.regular, in: .capsule)
+    .animation(.smooth(duration: 0.25), value: replacement)
+  }
+}
+
+/** Messages waiting for spark to finish, in the order they go out, with why they're held if they are. */
+private struct QueuePanel: View {
+  let chat: Chat
+  let remove: (String) -> Void
+  let resume: () -> Void
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      HStack(spacing: 6) {
+        Image(systemName: "text.append").font(.system(size: 11, weight: .semibold))
+        Text(status).font(.geist(12, .medium)).lineLimit(2)
+        Spacer(minLength: 4)
+        if chat.canResumeQueue {
+          Button("Resume", action: resume)
+            .font(.geist(12, .semibold))
+            .buttonStyle(.plain)
+            .foregroundStyle(Effort.accent)
+            .transition(.opacity)
+        }
+      }
+      .foregroundStyle(Color.dim)
+      .padding(.horizontal, 6)
+      ForEach(chat.queue) { item in
+        HStack(spacing: 10) {
+          Text(item.text)
+            .font(.geist(14))
+            .foregroundStyle(Color(white: 0.85))
+            .lineLimit(2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+          if chat.queueSending == item.id {
+            ProgressView().controlSize(.mini).accessibilityLabel("Sending")
+          } else {
+            Button { remove(item.id) } label: {
+              Image(systemName: "xmark")
+                .font(.system(size: 10, weight: .bold))
+                .frame(width: 24, height: 24)
+                .background(Color.white.opacity(0.1), in: .circle)
+                .contentShape(.circle)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove queued message")
+          }
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 6)
+        .padding(.vertical, 7)
+        .background(Color.white.opacity(0.06), in: .rect(cornerRadius: 14, style: .continuous))
+        .transition(.asymmetric(insertion: .move(edge: .bottom).combined(with: .opacity), removal: .opacity.combined(with: .scale(0.96))))
+      }
+    }
+    .padding(8)
+    .glassEffect(.regular, in: .rect(cornerRadius: 20, style: .continuous))
+    .animation(.spring(duration: 0.35, bounce: 0.1), value: chat.queue.map(\.id))
+    .animation(.smooth(duration: 0.2), value: chat.queueSending)
+    .accessibilityElement(children: .contain)
+    .accessibilityIdentifier("queue")
+  }
+
+  private var status: String {
+    let count = chat.queue.count == 1 ? "1 queued" : "\(chat.queue.count) queued"
+    switch chat.queuePause {
+    case .stopped?: return "\(count) · paused after Stop"
+    case .turnFailed?: return "\(count) · paused, the last turn failed"
+    case .rejected(let why)?: return "\(count) · not sent: \(why)"
+    case .unconfirmed?: return "\(count) · checking whether the last one arrived…"
+    case nil: return chat.queueSending != nil ? "Sending…" : "\(count) · sends when spark finishes"
+    }
   }
 }
 
@@ -576,6 +781,10 @@ private struct Row: View {
   var ends = false
   /** spark isn't working on the chat, so it can go back or try again */
   var changeable = false
+  /** a later turn exists, so going back to this reply would drop something */
+  var canRewind = false
+  /** this message is the one being edited in the composer */
+  var editing = false
   let disclose: () -> Void
   var act: (RowAction, Entry) -> Void = { _, _ in }
 
@@ -583,7 +792,7 @@ private struct Row: View {
     let item = entry.item
     switch entry.role {
     case .user:
-      UserBubble(text: item.text, arriving: arriving) {
+      UserBubble(text: item.text, arriving: arriving, editing: editing) {
         Button("Copy", systemImage: "doc.on.doc") { act(.copy, entry) }
         if changeable {
           Button("Edit", systemImage: "pencil") { act(.edit, entry) }
@@ -594,7 +803,7 @@ private struct Row: View {
       VStack(alignment: .leading, spacing: 6) {
         StreamingText(text: item.text, streaming: live).textSelection(.enabled)
         if ends, !live {
-          ReplyActions(changeable: changeable) { act($0, entry) }
+          ReplyActions(changeable: changeable, canRewind: canRewind) { act($0, entry) }
             .transition(.opacity)
         }
       }
@@ -613,6 +822,7 @@ private struct Row: View {
 /** Under the last answer of a turn: copy it, ask again, or take the chat back to it. */
 private struct ReplyActions: View {
   let changeable: Bool
+  var canRewind = false
   let act: (RowAction) -> Void
   @State private var copied = 0
 
@@ -629,13 +839,18 @@ private struct ReplyActions: View {
       .contentTransition(.symbolEffect(.replace))
       if changeable {
         button("arrow.clockwise", "Try again") { act(.retry) }
-        button("arrow.uturn.backward", "Go back to here") { act(.rewind) }
+          .transition(.opacity)
+        if canRewind {
+          button("arrow.uturn.backward", "Go back to here") { act(.rewind) }
+            .transition(.opacity)
+        }
       }
     }
     .padding(.leading, -8)
     .foregroundStyle(Color.faint)
     .sensoryFeedback(.success, trigger: copied) { _, new in new > 0 }
     .animation(.smooth(duration: 0.2), value: changeable)
+    .animation(.smooth(duration: 0.2), value: canRewind)
   }
 
   private func button(_ symbol: String, _ label: String, _ action: @escaping () -> Void) -> some View {
@@ -653,6 +868,7 @@ private struct ReplyActions: View {
 private struct UserBubble<Menu: View>: View {
   let text: String
   var arriving = false
+  var editing = false
   @ViewBuilder var menu: Menu
   @State private var landed = true
 
@@ -665,6 +881,13 @@ private struct UserBubble<Menu: View>: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 11)
         .background(Color.bubble, in: .rect(cornerRadius: 22, style: .continuous))
+        .overlay {
+          RoundedRectangle(cornerRadius: 22, style: .continuous)
+            .strokeBorder(Effort.accent.opacity(editing ? 0.85 : 0), lineWidth: 1.5)
+        }
+        .scaleEffect(editing ? 1.015 : 1, anchor: .trailing)
+        .animation(.spring(duration: 0.3, bounce: 0.15), value: editing)
+        .accessibilityValue(editing ? "Editing" : "")
         .contentShape(.contextMenuPreview, .rect(cornerRadius: 22, style: .continuous))
         .contextMenu { menu }
     }

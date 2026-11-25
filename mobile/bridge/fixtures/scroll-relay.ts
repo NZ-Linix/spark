@@ -18,13 +18,20 @@ const items = [
   { id: "tool", role: "tool", text: "", kind: "read", status: "completed", detail: "scroll-fixture.txt", output: "Expanded tool output.\n" + "line of output\n".repeat(20) },
   { id: "last", role: "assistant", text: "The last saved answer." },
 ];
-const config = [
-  { id: "model", name: "Model", currentValue: "local", options: [{ value: "local", name: "Local" }] },
-  { id: "context", name: "Context limit", currentValue: "auto", options: [
-    { value: "auto", name: "Model default" },
-    ...[32, 64, 100, 128, 200, 256, 300, 400, 500, 512, 1024].map(k => ({ value: String(k * 1024), name: k === 1024 ? "1M tokens" : `${k}k tokens` })),
-  ] },
-];
+const providers = [{ value: "local", name: "On-device" }, { value: "hosted", name: "Hosted" }];
+function configFor(provider = "local") {
+  const models = provider === "hosted"
+    ? [{ value: "hosted-default", name: "Hosted Default" }, { value: "fixture-pro", name: "Fixture Pro" }]
+    : [{ value: "local", name: "Local" }];
+  return [
+    { id: "provider", name: "Provider", currentValue: provider, options: providers },
+    { id: "model", name: "Model", currentValue: models[0].value, options: models },
+    { id: "context", name: "Context limit", currentValue: "auto", options: [
+      { value: "auto", name: "Model default" },
+      ...[32, 64, 100, 128, 200, 256, 300, 400, 500, 512, 1024].map(k => ({ value: String(k * 1024), name: k === 1024 ? "1M tokens" : `${k}k tokens` })),
+    ] },
+  ];
+}
 Bun.serve({
   hostname: "127.0.0.1", port: 18772,
   fetch(req, server) {
@@ -38,7 +45,7 @@ Bun.serve({
           return new Response(null, { status: 204 });
         }
         break;
-      case "/ws/device": if (server.upgrade(req)) return;
+      case "/ws/device": if (server.upgrade(req, { data: { config: configFor() } })) return;
     }
     return new Response(null, { status: 404 });
   },
@@ -81,12 +88,23 @@ Bun.serve({
         return;
       }
       if (req.op === "config") {
-        const option = config.find(o => o.id === req.option);
-        if (option?.options.some(o => o.value === req.value)) option.currentValue = req.value;
+        const option = ws.data.config.find(o => o.id === req.option);
+        if (!option?.options.some(o => o.value === req.value)) {
+          send({ t: "reply", id: req.id, ok: false, error: "Invalid fixture option" });
+          return;
+        }
+        if (req.option === "provider" && option.currentValue !== req.value) {
+          const context = ws.data.config.find(o => o.id === "context")?.currentValue;
+          ws.data.config = configFor(req.value);
+          if (context) ws.data.config.find(o => o.id === "context")!.currentValue = context;
+        } else {
+          option.currentValue = req.value;
+        }
       }
+      const config = ws.data.config;
       const results: Record<string, unknown> = {
         config,
-        sessions: target === mac.id ? [] : [session], open: { ...session, items, config, permission: null }, options: config,
+        sessions: target === mac.id ? [] : [session], open: { ...session, items, config, permission: null }, options: configFor(req.provider),
         prompts: [], mcpServers: ["fixture-mcp"], sessionMcp: req.disabled,
       };
       send({ t: "reply", id: req.id, ok: true, result: results[req.op] ?? null });

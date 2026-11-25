@@ -7,8 +7,8 @@ struct NewChatView: View {
   @Environment(Link.self) private var link
   @Environment(\.shell) private var shell
   @AppStorage("sidebarStyle") private var style: SidebarStyle = .sections
-  /** bumped by the shell when a new chat starts: show the folder picker */
-  let ask: Int
+  /** whether the shell is still showing this draft when a delayed send is ready */
+  let isCurrentDraft: () -> Bool
   @State private var folder: String?
   /** the folder as it reads, relative to the host's home */
   @State private var label = ""
@@ -24,8 +24,7 @@ struct NewChatView: View {
   @State private var problem: String?
   @State private var optionsProblem: String?
   @State private var optionsRetry = 0
-  @State private var providerOptions: [ConfigOption] = []
-  @State private var providerProblem: String?
+  @State private var modelOptions: [ConfigOption]?
   @State private var shown = false
   @State private var sent = 0
   /** sent: the headline dissolves before the chat takes the screen */
@@ -45,10 +44,16 @@ struct NewChatView: View {
 
   /** with every host in the sidebar, the chosen host is where new chats go: pick it here */
   private var wantsSwitch: Bool { style != .switcher && link.pickable.count > 1 }
-  private var reachable: Bool { link.phase == .online && link.host?.online == true }
-  private var providerLoading: Bool {
-    guard let provider = pending["provider"] else { return false }
-    return !providerOptions.contains { $0.id == "provider" && $0.currentValue == provider }
+  private var reachable: Bool { link.phase == .online && link.host != nil }
+
+  /** no online destination; the Mac names are still available for the offline hint */
+  private var offlineNotice: String? {
+    guard link.host == nil, !link.hosts.isEmpty else { return nil }
+    let macs = link.hosts.filter { $0.kind == .mac }
+    if macs.count == 1, let mac = macs.first {
+      return "\(mac.name) is offline. Wake your Mac to start a chat."
+    }
+    return macs.isEmpty ? "Cloud is offline. Try again in a moment." : "No Macs are online. Wake a Mac to start a chat."
   }
 
   var body: some View {
@@ -60,8 +65,9 @@ struct NewChatView: View {
         .textRenderer(DitherIn(progress: shown ? 1 : 0))
       // The switch and the line naming the one host trade places in a slot of fixed height, so the
       // headline holds still; then the slot takes its new height and the headline glides to its place
+      let switching = showsSwitch && wantsSwitch
       ZStack(alignment: .top) {
-        if showsSwitch {
+        if switching {
           HostSwitch()
             .frame(maxWidth: 280)
             .padding(.top, 6)
@@ -78,6 +84,7 @@ struct NewChatView: View {
       .frame(height: tall ? Self.switchHeight : lineHeight, alignment: .top)
       .opacity(shown ? 1 : 0)
       .animation(.smooth(duration: 0.3), value: link.host?.id)
+      .animation(.smooth(duration: 0.25), value: switching)
     }
     .padding(.horizontal, 32)
     // scoped to the words: animating the whole screen would slide the composer in as it's first laid out
@@ -92,23 +99,24 @@ struct NewChatView: View {
     .page()
     .safeAreaInset(edge: .bottom, spacing: 0) {
       VStack(alignment: .leading, spacing: 10) {
-        if let host = link.host, !host.online {
-          Text(link.hosts.contains(where: { $0.kind == .cloud }) ? "\(host.name) is offline. Switch to Cloud or wake your Mac." : "\(host.name) is offline. Wake your Mac to start a chat.")
-            .font(.geist(13)).foregroundStyle(Color.dim).padding(.horizontal, 24)
-        } else if let problem = problem ?? providerProblem {
+        if let offlineNotice {
+          Text(offlineNotice)
+            .font(.geist(13)).foregroundStyle(Color.dim).padding(.horizontal, 24).transition(.opacity)
+        } else if let problem = problem {
           Text(problem).font(.geist(13)).foregroundStyle(Color.dim).padding(.horizontal, 24).transition(.opacity)
         }
-        Composer(text: $draft, focused: $focused, running: false, enabled: reachable, send: { send() }, stop: {}, actionEnabled: !providerLoading) {
+        Composer(text: $draft, focused: $focused, running: false, enabled: reachable, send: { send() }, stop: {}) {
           ComposerOption(text: folder == nil ? "Choose folder" : (label.split(separator: "/").last.map(String.init) ?? label), mono: folder != nil, muted: folder == nil) { picking = true }
             .accessibilityLabel(folder == nil ? "Choose a folder" : "Folder \(label)")
             .disabled(!reachable)
-          if options.contains(where: { $0.id == "model" }) {
-            ConfigChips(options: options, set: chooseOption, prompts: link.prompts, prompt: $prompt, mcpNames: link.mcpServers[link.host?.id ?? ""] ?? [],
-              mcpDisabled: $mcpDisabled, refreshMcp: { if let host = link.host?.id, reachable { await link.loadMcpServers(host) } }, compact: true, modelsPending: providerLoading)
-              .id(link.host?.id)
+          if let host = link.host?.id, options.contains(where: { $0.id == "model" }) {
+            ConfigChips(host: host, options: options, set: chooseOption, chooseModel: chooseModel,
+              prompts: link.prompts, prompt: $prompt, mcpNames: link.mcpServers[host] ?? [],
+              mcpDisabled: $mcpDisabled, refreshMcp: { if reachable { await link.loadMcpServers(host) } }, compact: true)
+              .id(host)
           }
           if reachable {
-            if let failure = providerProblem ?? optionsProblem {
+            if let failure = optionsProblem {
               ComposerOption(text: "Retry models", muted: true) { optionsRetry += 1 }
                 .accessibilityHint(failure)
             } else if options.isEmpty {
@@ -119,6 +127,7 @@ struct NewChatView: View {
       }
       .animation(.ease, value: folder)
       .animation(.ease, value: problem)
+      .animation(.smooth(duration: 0.25), value: offlineNotice)
       .readable()
     }
     .navigationBarTitleDisplayMode(.inline)
@@ -168,29 +177,21 @@ struct NewChatView: View {
         if want {
           withAnimation(.spring(duration: 0.45, bounce: 0)) { tall = true }
         } else {
-          withAnimation(.smooth(duration: 0.25)) { showsSwitch = false }
+          showsSwitch = false
         }
         try? await Task.sleep(for: .milliseconds(want ? 220 : 320))
         guard mine == swap else { return }
         if want {
-          withAnimation(.smooth(duration: 0.25)) { showsSwitch = true }
+          showsSwitch = true
         } else {
           withAnimation(.spring(duration: 0.45, bounce: 0)) { tall = false }
         }
       }
     }
-    .onChange(of: ask, initial: true) { old, new in
-      guard new > 0, new != old || folder == nil else { return }
-      folder = nil
-      draft = ""
-      problem = nil
-      picking = reachable
-    }
     .onChange(of: link.hostID) {
       folder = nil
       pending = [:]
-      providerOptions = []
-      providerProblem = nil
+      modelOptions = nil
       optionsProblem = nil
       mcpDisabled = []
     }
@@ -203,27 +204,18 @@ struct NewChatView: View {
       _ = await list
       if link.hosts.contains(where: { $0.kind == .cloud }) { _ = try? await link.loadPrompts() }
     }
-    .task(id: "\(link.host?.id ?? "")-\(reachable)-\(pending["provider"] ?? "")-\(link.optionsRevision)-\(optionsRetry)") {
-      providerProblem = nil
-      guard reachable, let host = link.host?.id, let provider = pending["provider"] else { return }
-      do { providerOptions = try await link.loadOptions(host, provider: provider) }
-      catch {
-        if !Task.isCancelled {
-          providerOptions = []
-          providerProblem = error.localizedDescription
-        }
-      }
+  }
+
+  private func chooseModel(_ choice: ModelChoice) {
+    if choice.provider != options.first(where: { $0.id == "provider" })?.currentValue {
+      pending.removeValue(forKey: "effort")
     }
+    pending["provider"] = choice.provider
+    pending["model"] = choice.model.value
+    modelOptions = choice.config
   }
 
   private func chooseOption(_ id: String, _ value: String) {
-    if id == "provider", pending[id] != value {
-      pending.removeValue(forKey: "model")
-      pending.removeValue(forKey: "effort")
-      providerProblem = nil
-      pending[id] = link.configs[link.hostID ?? ""]?.first(where: { $0.id == "provider" })?.currentValue == value ? nil : value
-      return
-    }
     pending[id] = value
     if id == "effort" { lastEffort = value }
   }
@@ -231,7 +223,7 @@ struct NewChatView: View {
   /** the host's options with this chat's choices laid over them */
   private var options: [ConfigOption] {
     guard let host = link.host?.id else { return [] }
-    let base = pending["provider"] != nil && !providerLoading ? providerOptions : link.configs[host] ?? []
+    let base = modelOptions ?? link.configs[host] ?? []
     return base.map { o in
       var o = o
       if let v = pending[o.id] {
@@ -247,7 +239,7 @@ struct NewChatView: View {
 
   private func send() {
     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !text.isEmpty, reachable, !providerLoading, let host = link.host?.id else { return }
+    guard !text.isEmpty, reachable, let host = link.host?.id else { return }
     // no folder chosen: the chat runs in a new folder of its own on the host
     guard !leaving else { return }
     sent += 1
@@ -265,6 +257,7 @@ struct NewChatView: View {
       // the keyboard and the headline go first, so the chat opens onto a still screen instead of
       // landing while everything under it moves; the session starts behind the message
       try? await Task.sleep(for: .milliseconds(typing ? 300 : 180))
+      guard isCurrentDraft() else { return }
       link.begin(text, in: folder, on: host, options: options, prompt: chosen, mcpDisabled: mcpDisabled)
     }
   }

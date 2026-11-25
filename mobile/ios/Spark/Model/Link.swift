@@ -8,9 +8,11 @@ private struct Problem: Decodable { var error: String }
 struct LinkError: LocalizedError {
   let message: String
   var status = 0
-  init(_ message: String, status: Int = 0) {
+  var rejected: Bool
+  init(_ message: String, status: Int = 0, rejected: Bool = false) {
     self.message = message
     self.status = status
+    self.rejected = rejected
   }
   var errorDescription: String? { message }
 }
@@ -41,14 +43,14 @@ final class Link {
   private(set) var cloudAvailable = false
   private(set) var phase: Phase = .none
   private(set) var hosts: [HostEntry] = []
-  var hostID: String? = UserDefaults.standard.string(forKey: "host") {
+  private(set) var hostID: String? = UserDefaults.standard.string(forKey: "host") {
     didSet { UserDefaults.standard.set(hostID, forKey: "host") }
   }
-  /** the host last picked by hand */
+  /** the host last picked by hand, even while another host is used as a fallback */
   private var wanted: String? = UserDefaults.standard.string(forKey: "wantedHost") ?? UserDefaults.standard.string(forKey: "host") {
     didSet { UserDefaults.standard.set(wanted, forKey: "wantedHost") }
   }
-  var pickable: [HostEntry] { hosts }
+  var pickable: [HostEntry] { hosts.filter(\.online) }
   var sharedAccounts: Bool { hosts.contains { $0.kind == .cloud && $0.sharedAccounts == true } }
   private(set) var sessions: [String: [SessionInfo]] = [:]
   /** the options spark last offered on each host, so a new chat can pick a model before it exists */
@@ -56,6 +58,17 @@ final class Link {
   private(set) var configs = (try? JSONDecoder().decode([String: [ConfigOption]].self, from: UserDefaults.standard.data(forKey: "hostOptions") ?? Data())) ?? [:]
   private(set) var optionsRevision = 0
   var chat: Chat?
+  /** Unsent composer text belongs to a host/session, not the view currently showing it. */
+  private var drafts: [String: String] = [:]
+
+  func draft(for chat: Chat) -> String {
+    chat.info.id.isEmpty ? chat.provisionalDraft : drafts[chat.key] ?? ""
+  }
+
+  func setDraft(_ text: String, for chat: Chat) {
+    if chat.info.id.isEmpty { chat.provisionalDraft = text }
+    else { drafts[chat.key] = text.isEmpty ? nil : text }
+  }
 
   @ObservationIgnored private var token: String? = Keychain.read("token")
   @ObservationIgnored private var socket: URLSessionWebSocketTask?
@@ -68,8 +81,10 @@ final class Link {
   @ObservationIgnored private var active = true
   /** chats on their way out, as host/id */
   @ObservationIgnored private var deleting: Set<String> = []
+  /** Keep receiving events for chats with queued messages even when their view is gone. */
+  @ObservationIgnored private var queuedChats: [String: Chat] = [:]
 
-  var host: HostEntry? { hosts.first { $0.id == hostID } ?? hosts.first }
+  var host: HostEntry? { hosts.first { $0.id == hostID && $0.online } }
   var registered: Bool { relay != nil && token != nil }
 
   init() {
@@ -103,12 +118,15 @@ final class Link {
     req.timeoutInterval = 15
     let joined: Joined = try await Self.fetch(req)
     disconnect()
+    queuedChats.removeAll()
     relay = url
     token = joined.token
     UserDefaults.standard.set(url, forKey: "relay")
     Keychain.write("token", joined.token)
     hosts = joined.hosts
+    settleHost()
     sessions = [:]
+    drafts = [:]
     clearOptions()
     connect()
   }
@@ -124,7 +142,7 @@ final class Link {
   /** First launch without a Mac: just the cloud. */
   func useCloud() async throws {
     if token == nil || relay == nil { try await join(Self.defaultRelay.absoluteString) }
-    hostID = "cloud"
+    choose("cloud")
     ready = true
   }
 
@@ -150,7 +168,9 @@ final class Link {
     req.httpBody = try JSONEncoder().encode(["code": code])
     req.timeoutInterval = 15
     let paired: Paired = try await Self.fetch(req)
-    if !hosts.contains(where: { $0.id == paired.host.id }) {
+    if let i = hosts.firstIndex(where: { $0.id == paired.host.id }) {
+      hosts[i] = paired.host
+    } else {
       hosts.insert(paired.host, at: 0)
     }
     choose(paired.host.id)
@@ -172,31 +192,34 @@ final class Link {
     configs[host.id] = nil
     saveOptions()
     if wanted == host.id { wanted = nil }
-    if hostID == host.id { hostID = hosts.first?.id }
+    settleHost()
   }
 
   /** a host picked by hand */
   func choose(_ id: String) {
     wanted = id
-    hostID = id
+    settleHost()
   }
 
-  /** Keep the selected Mac visible even when it can't start a chat. */
+  /** restore the preferred host when possible without replacing the preference on fallback */
   private func settleHost() {
-    let open = pickable
-    if let wanted, open.contains(where: { $0.id == wanted }) {
-      if hostID != wanted { hostID = wanted }
-    } else if !open.contains(where: { $0.id == hostID }) {
-      hostID = open.first(where: \.online)?.id ?? open.first?.id
-    }
+    let online = pickable
+    let next = online.first { $0.id == wanted }
+      ?? online.first { $0.id == hostID }
+      ?? online.first { $0.kind == .cloud }
+      ?? online.first
+    if hostID != next?.id { hostID = next?.id }
   }
 
   func leave() {
     disconnect()
+    queuedChats.removeAll()
     relay = nil
     token = nil
     hosts = []
+    settleHost()
     sessions = [:]
+    drafts = [:]
     clearOptions()
     chat = nil
     UserDefaults.standard.removeObject(forKey: "relay")
@@ -233,6 +256,7 @@ final class Link {
   }
 
   private func disconnect() {
+    for chat in queuedChats.values { chat.queueNeedsSync = true }
     socket?.cancel(with: .goingAway, reason: nil)
     socket = nil
     for (_, c) in waiting { c.resume(throwing: LinkError("The connection dropped.")) }
@@ -305,6 +329,11 @@ final class Link {
       for h in hosts where h.online && !wasOnline.contains(h.id) && phase == .online {
         Task { await refresh(h.id) }
       }
+      let online = Set(hosts.filter(\.online).map(\.id))
+      for chat in Array(queuedChats.values) {
+        if online.contains(chat.host) { advanceQueue(chat) }
+        else { chat.queueNeedsSync = true }
+      }
       return
     }
     if env.relay == "library-changed" {
@@ -323,10 +352,23 @@ final class Link {
     }
     if e.t == "reply" {
       guard let n = e.id?.int, let c = waiting.removeValue(forKey: "\(host)#\(n)") else { return }
-      if e.ok == true { c.resume(returning: e.result ?? .null) } else { c.resume(throwing: LinkError(e.error ?? "Something went wrong.")) }
+      if e.ok == true { c.resume(returning: e.result ?? .null) } else { c.resume(throwing: LinkError(e.error ?? "Something went wrong.", rejected: true)) }
       return
     }
-    if let s = e.s, let chat, chat.host == host, chat.info.id == s { chat.apply(e) }
+    if let s = e.s {
+      let open = chat.flatMap { $0.host == host && $0.info.id == s ? $0 : nil }
+      if let receiving = queuedChats["\(host)/\(s)"] ?? open {
+        receiving.apply(e)
+        if e.t == "item" { reconcileQueue(receiving) }
+        if e.t == "state", e.running == false {
+          if !receiving.queue.isEmpty, receiving.queuePause == nil {
+            if e.reason == "cancelled" { receiving.queuePause = .stopped }
+            else if e.error != nil || e.reason == "error" { receiving.queuePause = .turnFailed }
+          }
+          advanceQueue(receiving)
+        }
+      }
+    }
     if let s = e.s, var list = sessions[host], let i = list.firstIndex(where: { $0.id == s }) {
       switch e.t {
       case "state": list[i].running = e.running ?? false
@@ -392,6 +434,11 @@ final class Link {
   }
 
   func open(_ info: SessionInfo, on host: String) async {
+    if let retained = queuedChats["\(host)/\(info.id)"] {
+      chat = retained
+      if retained.queueNeedsSync || retained.elsewhere { await reopen(retained) }
+      return
+    }
     let chat = Chat(host: host, info: info)
     self.chat = chat
     await reopen(chat)
@@ -422,6 +469,8 @@ final class Link {
         fields["mcpDisabled"] = .array(mcpDisabled.sorted().map(JSON.string))
         let snap = try await request(host, "new", fields, as: Snapshot.self)
         chat.adopt(snap)
+        setDraft(chat.provisionalDraft, for: chat)
+        chat.provisionalDraft = ""
         remember(chat)
         var list = sessions[host] ?? []
         list.insert(chat.info, at: 0)
@@ -451,12 +500,27 @@ final class Link {
   }
 
   private func reopen(_ chat: Chat) async {
+    guard !chat.reopening, !chat.info.id.isEmpty else { return }
+    chat.reopening = true
+    let gen = generation
+    let revision = chat.stateRevision
+    let id = chat.info.id
     do {
-      let snap = try await request(chat.host, "open", ["s": .string(chat.info.id)], as: Snapshot.self)
+      let snap = try await request(chat.host, "open", ["s": .string(id)], as: Snapshot.self)
+      chat.reopening = false
+      guard gen == generation, chat.info.id == id else { return }
+      let running = chat.running
       chat.load(snap)
+      // A live state received while open was in flight may be newer than the snapshot.
+      if chat.stateRevision != revision { chat.running = running; chat.info.running = running }
+      chat.queueNeedsSync = !hosts.contains { $0.id == chat.host && $0.online }
       remember(chat)
       chat.problem = nil
+      reconcileQueue(chat)
+      advanceQueue(chat)
     } catch {
+      chat.reopening = false
+      guard gen == generation else { return }
       chat.problem = error.localizedDescription
       chat.loaded = true
     }
@@ -483,11 +547,107 @@ final class Link {
     }
   }
 
+  func canReach(_ chat: Chat) -> Bool {
+    active && phase == .online && hosts.contains { $0.id == chat.host && $0.online }
+  }
+
+  /** The queue belongs to this session, not to the view or currently selected host. */
+  @discardableResult
+  func enqueue(_ text: String, in chat: Chat) -> Bool {
+    let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !body.isEmpty, canReach(chat), chat.canQueue, self.chat === chat, !deleting.contains(chat.key) else { return false }
+    queuedChats[chat.key] = chat
+    chat.queue.append(Chat.Queued(text: body))
+    advanceQueue(chat)
+    return true
+  }
+
+  func removeQueued(_ id: String, in chat: Chat) {
+    guard chat.queueSending != id, let i = chat.queue.firstIndex(where: { $0.id == id }) else { return }
+    chat.queue.remove(at: i)
+    if i == 0 {
+      switch chat.queuePause {
+      case .rejected?, .unconfirmed?: chat.queuePause = .stopped
+      default: break
+      }
+    }
+    releaseQueueIfEmpty(chat)
+    advanceQueue(chat)
+  }
+
+  func resumeQueue(_ chat: Chat) {
+    guard canReach(chat), chat.canResumeQueue else { return }
+    if case .rejected? = chat.queuePause { chat.queueNeedsSync = true }
+    chat.queuePause = nil
+    advanceQueue(chat)
+  }
+
+  private func releaseQueueIfEmpty(_ chat: Chat) {
+    guard chat.queue.isEmpty, chat.queueSending == nil else { return }
+    chat.queuePause = nil
+    chat.queueNeedsSync = false
+    if queuedChats[chat.key] === chat { queuedChats[chat.key] = nil }
+  }
+
+  /** The bridge echoes a client item id on acceptance. A lost reply alone must not cause a resend. */
+  private func reconcileQueue(_ chat: Chat) {
+    guard chat.queueSending == nil, case .unconfirmed? = chat.queuePause, let first = chat.queue.first,
+          chat.entries.contains(where: { $0.id == first.id && $0.role == .user }) else { return }
+    chat.queue.removeFirst()
+    chat.queuePause = nil
+    releaseQueueIfEmpty(chat)
+    advanceQueue(chat)
+  }
+
+  private func advanceQueue(_ chat: Chat) {
+    guard queuedChats[chat.key] === chat, !chat.queue.isEmpty, canReach(chat), !deleting.contains(chat.key),
+          !chat.reopening, !chat.sending, !chat.stopping, chat.queueSending == nil else { return }
+    if chat.queueNeedsSync {
+      Task {
+        guard queuedChats[chat.key] === chat, chat.queueNeedsSync, canReach(chat), !deleting.contains(chat.key) else { return }
+        await reopen(chat)
+      }
+    } else if chat.queuePause == nil, !chat.running, chat.canQueue {
+      Task { await sendNextQueued(in: chat) }
+    }
+  }
+
+  private func sendNextQueued(in chat: Chat) async {
+    guard queuedChats[chat.key] === chat, !deleting.contains(chat.key), canReach(chat), chat.canQueue,
+          !chat.queueNeedsSync, chat.queuePause == nil, !chat.running, !chat.sending,
+          chat.queueSending == nil, let item = chat.queue.first else { return }
+    // Acquire the slot before any suspension: idle notifications, reopen and taps can all reach this path.
+    chat.queueSending = item.id
+    let revision = chat.stateRevision
+    defer {
+      chat.queueSending = nil
+      releaseQueueIfEmpty(chat)
+      advanceQueue(chat)
+    }
+    do {
+      _ = try await request(chat.host, "prompt", ["s": .string(chat.info.id), "text": .string(item.text), "item": .string(item.id)])
+      if chat.stateRevision == revision { chat.running = true; chat.info.running = true }
+      chat.queue.removeFirst()
+    } catch {
+      if chat.entries.contains(where: { $0.id == item.id && $0.role == .user }) {
+        chat.queue.removeFirst()
+      } else if (error as? LinkError)?.rejected == true {
+        chat.queuePause = .rejected(error.localizedDescription)
+      } else {
+        chat.queuePause = .unconfirmed(error.localizedDescription)
+        chat.queueNeedsSync = true
+      }
+    }
+  }
+
   @discardableResult
   func send(_ text: String, in chat: Chat) async -> Bool {
-    guard chat.canSend else { return false }
+    guard canReach(chat), chat.canSend, !deleting.contains(chat.key) else { return false }
     chat.sending = true
-    defer { chat.sending = false }
+    defer {
+      chat.sending = false
+      advanceQueue(chat)
+    }
     let item = Item(id: UUID().uuidString, role: .user, text: text)
     let owner = chat.terminalOwner
     var fields: [String: JSON] = ["s": .string(chat.info.id), "text": .string(text), "item": .string(item.id)]
@@ -522,9 +682,8 @@ final class Link {
     chat.rewinding = true
     defer { chat.rewinding = false }
     let snap = try await request(chat.host, "rewind", ["s": .string(old), "item": .string(entry.id), "keep": .bool(keep)], as: Snapshot.self)
-    var t = Transaction()
-    t.disablesAnimations = true
-    withTransaction(t) { chat.rebase(snap) }
+    // the thread is rebuilt under a new epoch; ChatView crossfades the old layout into the new one
+    chat.rebase(snap)
     remember(chat)
     if var list = sessions[chat.host] {
       list.removeAll { $0.id == old || $0.id == chat.info.id }
@@ -553,6 +712,12 @@ final class Link {
     guard !chat.info.id.isEmpty else { return }
     var fields: [String: JSON] = ["s": .string(chat.info.id)]
     if let owner = chat.terminalOwner { fields["terminalOwner"] = .string(owner) }
+    // Queued messages wait for the cancelled turn's state, which pauses them, instead of racing it.
+    chat.stopping = true
+    defer {
+      chat.stopping = false
+      advanceQueue(chat)
+    }
     do {
       _ = try await request(chat.host, "cancel", fields)
     } catch {
@@ -579,6 +744,7 @@ final class Link {
     if let chat, chat.host == host, chat.info.id == session.id { self.chat = nil }
     do {
       _ = try await request(host, "sessionDelete", ["s": .string(session.id)])
+      drafts.removeValue(forKey: key)
     } catch {
       if let before, sessions[host]?.contains(where: { $0.id == session.id }) == false { sessions[host] = before }
       throw error
@@ -600,6 +766,27 @@ final class Link {
       if let previous, let i = chat.config.firstIndex(where: { $0.id == option && $0.currentValue == value }) {
         chat.config[i].currentValue = previous
       }
+      chat.problem = error.localizedDescription
+    }
+  }
+
+  /** Apply both parts of the route in order; the provider switch rebuilds the session's options. */
+  func setModel(_ chat: Chat, to choice: ModelChoice) async {
+    guard !chat.info.id.isEmpty, !chat.elsewhere, !chat.running, !chat.sending,
+          !chat.rewinding, !chat.changingModel else { return }
+    chat.changingModel = true
+    defer {
+      chat.changingModel = false
+      remember(chat)
+    }
+    var route = [("model", choice.model.value)]
+    if let provider = choice.provider { route.insert(("provider", provider), at: 0) }
+    do {
+      for (id, value) in route where chat.config.first(where: { $0.id == id })?.currentValue != value {
+        chat.config = try await request(chat.host, "config", ["s": .string(chat.info.id), "option": .string(id), "value": .string(value)], as: [ConfigOption].self)
+      }
+      chat.problem = nil
+    } catch {
       chat.problem = error.localizedDescription
     }
   }

@@ -33,6 +33,22 @@ nonisolated struct ConfigOption: Codable, Identifiable, Hashable, Sendable {
   var current: Choice? { options.first { $0.value == currentValue } }
 }
 
+/** A model id is only unique within a provider. Keep its route and configuration together. */
+nonisolated struct ModelChoice: Identifiable {
+  struct ID: Hashable {
+    let provider: String?
+    let model: String
+  }
+
+  let model: ConfigOption.Choice
+  let config: [ConfigOption]
+
+  private var providerOption: ConfigOption? { config.first { $0.id == "provider" } }
+  var provider: String? { providerOption?.currentValue }
+  var providerName: String? { providerOption?.current?.name ?? provider }
+  var id: ID { ID(provider: provider, model: model.value) }
+}
+
 nonisolated struct Permission: Codable, Identifiable, Hashable, Sendable {
   struct Option: Codable, Hashable, Sendable {
     var optionId: String

@@ -17,7 +17,9 @@ struct Composer<Accessories: View, Trailing: View>: View {
   /** a terminal's field: mono, and Return sends instead of making a new line */
   var command = false
   var canSendWhileRunning = false
+  var queuesMessages = false
   var actionEnabled = true
+  var stopEnabled: Bool? = nil
   @ViewBuilder var accessories: Accessories
   /** inside the box, beside the send button: how the chat runs, always on the glass so it reads */
   @ViewBuilder var trailing: Trailing
@@ -28,8 +30,10 @@ struct Composer<Accessories: View, Trailing: View>: View {
   private static var inset: CGFloat { max(12, Screen.cornerRadius - height / 2) }
 
   private var hasText: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-  private var live: Bool { enabled && actionEnabled && (running || hasText) }
-  private var isStop: Bool { running && !(hasText && canSendWhileRunning) }
+  /** while spark works, text goes to the queue (or straight to a terminal) instead of the button stopping */
+  private var queues: Bool { running && hasText && queuesMessages && !canSendWhileRunning }
+  private var isStop: Bool { running && !(hasText && (canSendWhileRunning || queuesMessages)) }
+  private var live: Bool { enabled && (isStop ? stopEnabled ?? actionEnabled : actionEnabled && hasText) }
   private var open: Bool { focused.wrappedValue || hasText }
 
   /** off until the screen has settled, so the bar doesn't animate into place when a screen opens */
@@ -121,8 +125,8 @@ struct Composer<Accessories: View, Trailing: View>: View {
     Button {
       isStop ? stop() : send()
     } label: {
-      Image(systemName: isStop ? "stop.fill" : "arrow.up")
-        .font(.system(size: isStop ? 12 : 15, weight: .bold))
+      Image(systemName: isStop ? "stop.fill" : queues ? "text.append" : "arrow.up")
+        .font(.system(size: isStop ? 12 : queues ? 14 : 15, weight: .bold))
         .foregroundStyle(live ? .black : Color.faint)
         .frame(width: 36, height: 36)
         .background(live ? Color.white : Color.white.opacity(0.08), in: .circle)
@@ -132,7 +136,7 @@ struct Composer<Accessories: View, Trailing: View>: View {
     .buttonStyle(.plain)
     // Return makes a new line; with a hardware keyboard, Command-Return sends (it never stops)
     .keyboardShortcut(isStop ? nil : KeyboardShortcut(.return, modifiers: .command))
-    .accessibilityLabel(isStop ? "Stop" : "Send")
+    .accessibilityLabel(isStop ? "Stop" : queues ? "Queue" : "Send")
     .disabled(!live)
   }
 }
@@ -151,9 +155,10 @@ extension Composer where Accessories == EmptyView {
   init(
     text: Binding<String>, focused: FocusState<Bool>.Binding, running: Bool, enabled: Bool,
     placeholder: String = "Message spark", working: String = "spark is working…", canSendWhileRunning: Bool = false,
-    actionEnabled: Bool = true, send: @escaping () -> Void, stop: @escaping () -> Void, @ViewBuilder trailing: () -> Trailing
+    queuesMessages: Bool = false, actionEnabled: Bool = true, stopEnabled: Bool? = nil,
+    send: @escaping () -> Void, stop: @escaping () -> Void, @ViewBuilder trailing: () -> Trailing
   ) {
-    self.init(text: text, focused: focused, running: running, enabled: enabled, send: send, stop: stop, placeholder: placeholder, working: working, command: false, canSendWhileRunning: canSendWhileRunning, actionEnabled: actionEnabled, accessories: { EmptyView() }, trailing: trailing)
+    self.init(text: text, focused: focused, running: running, enabled: enabled, send: send, stop: stop, placeholder: placeholder, working: working, command: false, canSendWhileRunning: canSendWhileRunning, queuesMessages: queuesMessages, actionEnabled: actionEnabled, stopEnabled: stopEnabled, accessories: { EmptyView() }, trailing: trailing)
   }
 }
 
@@ -194,8 +199,10 @@ struct ComposerOption: View {
  * row above the composer never has to fit four names.
  */
 struct ConfigChips: View {
+  let host: String
   let options: [ConfigOption]
   let set: (String, String) -> Void
+  let chooseModel: (ModelChoice) -> Void
   /** a new chat's library prompts and the one chosen; a running chat keeps its prompt */
   var prompts: [PromptSummary] = []
   var prompt: Binding<String>? = nil
@@ -205,7 +212,7 @@ struct ConfigChips: View {
   var refreshMcp: (() async -> Void)? = nil
   /** inside the composer: a small filled pill with a short name, so it reads over anything */
   var compact = false
-  var modelsPending = false
+  var modelsEditable = true
   @State private var open = false
 
   private var model: ConfigOption? { options.first { $0.id == "model" } }
@@ -213,7 +220,6 @@ struct ConfigChips: View {
     options.first { $0.id == "effort" && Effort.levels($0).count > 1 }
   }
   private var modelName: String {
-    if modelsPending { return "Model" }
     guard let model else { return "" }
     let name = model.current.map { $0.label(model.id) } ?? ConfigOption.Choice.pretty(model.currentValue)
     guard compact else { return name }
@@ -248,7 +254,7 @@ struct ConfigChips: View {
             .truncationMode(.tail)
             .frame(maxWidth: compact ? 200 : nil, alignment: .leading)
             .fixedSize(horizontal: !compact, vertical: false)
-          if !modelsPending, let effort, let level = Effort.current(effort) {
+          if let effort, let level = Effort.current(effort) {
             Text(Effort.name(level))
               .foregroundStyle(Effort.accent)
               .lineLimit(1)
@@ -272,7 +278,8 @@ struct ConfigChips: View {
       .accessibilityLabel("Model")
       .accessibilityValue([model.current?.label(model.id), effort.flatMap(Effort.current).map(Effort.name)].compactMap { $0 }.joined(separator: ", "))
       .sheet(isPresented: $open) {
-        ModelSheet(options: options, set: set, prompts: prompts, prompt: prompt, mcpNames: mcpNames, mcpDisabled: mcpDisabled, mcpEditable: mcpEditable, modelsPending: modelsPending)
+        ModelSheet(host: host, options: options, set: set, chooseModel: chooseModel, prompts: prompts, prompt: prompt,
+          mcpNames: mcpNames, mcpDisabled: mcpDisabled, mcpEditable: mcpEditable, modelsEditable: modelsEditable)
           .task { await refreshMcp?() }
       }
     }
@@ -472,50 +479,86 @@ struct StopSlider: View {
 
 // MARK: Models
 
-/**
- * How the chat runs. The effort slider sits up top and takes effect as you let go; provider, mode,
- * and a new chat's prompt are menus below it; then the models: tap one and you're done.
- */
+/** A searchable list of every model offered by the chat's host, with options for the active model. */
 struct ModelSheet: View {
+  let host: String
   let options: [ConfigOption]
   let set: (String, String) -> Void
+  let chooseModel: (ModelChoice) -> Void
   var prompts: [PromptSummary] = []
   var prompt: Binding<String>? = nil
   var mcpNames: [String] = []
   var mcpDisabled: Binding<Set<String>>? = nil
   var mcpEditable = true
-  var modelsPending = false
+  var modelsEditable = true
+  @Environment(Link.self) private var link
   @Environment(\.dismiss) private var dismiss
   @Environment(\.shell) private var shell
   @State private var query = ""
+  @State private var catalog: [String: [ConfigOption]] = [:]
+  @State private var loading = false
+  @State private var failed = false
+  @State private var retry = 0
 
   private var model: ConfigOption? { options.first { $0.id == "model" } }
-  private var effort: ConfigOption? {
-    modelsPending ? nil : options.first { $0.id == "effort" && Effort.levels($0).count > 1 }
-  }
-  private var context: ConfigOption? { modelsPending ? nil : options.first { $0.id == "context" } }
+  private var provider: ConfigOption? { options.first { $0.id == "provider" } }
+  private var otherProviders: [ConfigOption.Choice] { provider?.options.filter { $0.value != provider?.currentValue } ?? [] }
+  private var effort: ConfigOption? { options.first { $0.id == "effort" && Effort.levels($0).count > 1 } }
+  private var context: ConfigOption? { options.first { $0.id == "context" } }
   private var showsPrompt: Bool { prompt != nil && !prompts.isEmpty }
   private var menus: [ConfigOption] {
-    options.filter { option in ["provider", "mode"].contains(option.id) && option.options.contains { $0.value != option.currentValue } }
+    options.filter { option in option.id == "mode" && option.options.contains { $0.value != option.currentValue } }
   }
 
-  private var shown: [ConfigOption.Choice] {
-    guard !modelsPending, let model else { return [] }
-    let q = query.trimmingCharacters(in: .whitespaces).lowercased()
-    return model.options.filter { q.isEmpty || $0.value.lowercased().contains(q) || $0.label("model").lowercased().contains(q) }
+  private var terms: [String] { query.split(whereSeparator: \.isWhitespace).map(String.init) }
+  private var shown: [ModelChoice] {
+    let terms = terms
+    let configs = [options] + otherProviders.compactMap { catalog[$0.value] }
+    var seen: Set<ModelChoice.ID> = []
+    return configs.flatMap { config in
+      (config.first { $0.id == "model" }?.options ?? []).compactMap { model in
+        let choice = ModelChoice(model: model, config: config)
+        guard seen.insert(choice.id).inserted else { return nil }
+        let names = [model.label("model"), model.value, choice.providerName ?? "", choice.provider ?? ""]
+        return terms.allSatisfy { term in names.contains { $0.localizedStandardContains(term) } } ? choice : nil
+      }
+    }
   }
 
   /** a short list gets a sheet just its size */
-  private var fits: Bool { mcpNames.isEmpty && (model?.options.count ?? 0) <= 8 }
+  private var fits: Bool { otherProviders.isEmpty && mcpNames.isEmpty && (model?.options.count ?? 0) <= 8 }
   private var fitHeight: CGFloat {
-    64 + (effort == nil ? 0 : 138) + (menus.isEmpty && !showsPrompt ? 0 : 44)
+    112 + (effort == nil ? 0 : 138) + (menus.isEmpty && !showsPrompt ? 0 : 44)
       + (context == nil ? 0 : 138) + CGFloat(model?.options.count ?? 0) * 52 + 40
   }
 
-  private var makers: Set<String> { Set(shown.map { ConfigOption.Choice.maker($0.value) }) }
+  private var catalogKey: [String] {
+    [host, provider?.currentValue ?? "", String(link.optionsRevision), String(retry), String(link.phase == .online)]
+      + otherProviders.map(\.value)
+  }
+
+  private func loadCatalog() async {
+    catalog = [:]
+    failed = false
+    let providers = otherProviders.map(\.value)
+    loading = !providers.isEmpty && link.phase == .online
+    guard loading else { return }
+    await withTaskGroup(of: (String, [ConfigOption]?).self) { group in
+      for id in providers {
+        group.addTask { [link, host] in (id, try? await link.loadOptions(host, provider: id)) }
+      }
+      for await (id, config) in group {
+        guard !Task.isCancelled else { return }
+        if let config { catalog[id] = config } else { failed = true }
+      }
+    }
+    if !Task.isCancelled { loading = false }
+  }
 
   var body: some View {
-    VStack(spacing: 0) {
+    let choices = shown
+    let makers = Set(choices.map { ConfigOption.Choice.maker($0.model.value) })
+    return VStack(spacing: 0) {
       HStack {
         Text("Model").font(.geist(17, .semibold))
         Spacer()
@@ -533,51 +576,50 @@ struct ModelSheet: View {
       .padding(.top, 20)
       .padding(.bottom, 14)
 
-      if let effort {
-        EffortSlider(option: effort) { set(effort.id, $0) }
-          .padding(14)
-          .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 26, style: .continuous))
-          .padding(.horizontal, 12)
-          .padding(.bottom, 14)
+      HStack(spacing: 8) {
+        Image(systemName: "magnifyingglass").font(.system(size: 13, weight: .medium)).foregroundStyle(Color.dim)
+        TextField("Search models", text: $query)
+          .font(.geist(15))
+          .textInputAutocapitalization(.never)
+          .autocorrectionDisabled()
       }
-
-      if let context {
-        ContextSlider(option: context) { set(context.id, $0) }
-          .padding(14)
-          .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 26, style: .continuous))
-          .padding(.horizontal, 12)
-          .padding(.bottom, 14)
-      }
-
-      if !menus.isEmpty || showsPrompt {
-        ScrollView(.horizontal, showsIndicators: false) {
-          HStack(spacing: 8) {
-            if showsPrompt, let prompt { PromptMenu(prompts: prompts, selection: prompt) }
-            ForEach(menus) { o in OptionMenu(option: o) { set(o.id, $0) } }
-          }
-          .padding(.horizontal, 20)
-        }
-        .padding(.bottom, 12)
-      }
-
-      if !modelsPending, (model?.options.count ?? 0) > 8 {
-        HStack(spacing: 8) {
-          Image(systemName: "magnifyingglass").font(.system(size: 13, weight: .medium)).foregroundStyle(Color.dim)
-          TextField("Search models", text: $query)
-            .font(.geist(15))
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-        }
-        .padding(.horizontal, 14)
-        .frame(height: 40)
-        .background(Color.white.opacity(0.07), in: .capsule)
-        .padding(.horizontal, 16)
-        .padding(.bottom, 8)
-      }
+      .padding(.horizontal, 14)
+      .frame(height: 40)
+      .background(Color.white.opacity(0.07), in: .capsule)
+      .padding(.horizontal, 16)
+      .padding(.bottom, 8)
 
       ScrollView {
         LazyVStack(spacing: 2) {
-          if query.isEmpty, let mcpDisabled, !mcpNames.isEmpty {
+          if terms.isEmpty {
+            if let effort {
+              EffortSlider(option: effort) { set(effort.id, $0) }
+                .padding(14)
+                .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 26, style: .continuous))
+                .padding(.horizontal, 12)
+                .padding(.bottom, 14)
+            }
+
+            if let context {
+              ContextSlider(option: context) { set(context.id, $0) }
+                .padding(14)
+                .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 26, style: .continuous))
+                .padding(.horizontal, 12)
+                .padding(.bottom, 14)
+            }
+
+            if !menus.isEmpty || showsPrompt {
+              ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                  if showsPrompt, let prompt { PromptMenu(prompts: prompts, selection: prompt) }
+                  ForEach(menus) { o in OptionMenu(option: o) { set(o.id, $0) } }
+                }
+                .padding(.horizontal, 20)
+              }
+              .padding(.bottom, 12)
+            }
+          }
+          if terms.isEmpty, let mcpDisabled, !mcpNames.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
               Text("MCP Servers").font(.geist(13, .medium)).foregroundStyle(Color.dim)
               ForEach(mcpNames, id: \.self) { name in
@@ -606,18 +648,20 @@ struct ModelSheet: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 12)
           }
-          ForEach(shown, id: \.value) { c in
-            let on = c.value == model?.currentValue
+          ForEach(choices) { choice in
+            let on = choice.provider == provider?.currentValue && choice.model.value == model?.currentValue
+            let maker = ConfigOption.Choice.maker(choice.model.value)
+            let detail = otherProviders.isEmpty ? (makers.count > 1 ? maker : "") : (choice.providerName ?? maker)
             Button {
-              set("model", c.value)
+              chooseModel(choice)
               dismiss()
             } label: {
               HStack(spacing: 10) {
-                Text(c.label("model"))
+                Text(choice.model.label("model"))
                   .font(.geist(16, on ? .medium : .regular))
                   .foregroundStyle(.white)
-                if makers.count > 1 {
-                  Text(ConfigOption.Choice.maker(c.value)).font(.geist(13)).foregroundStyle(Color.faint)
+                if !detail.isEmpty {
+                  Text(detail).font(.geist(13)).foregroundStyle(Color.faint).lineLimit(1)
                 }
                 Spacer(minLength: 0)
                 if on {
@@ -630,20 +674,30 @@ struct ModelSheet: View {
               .contentShape(.rect)
             }
             .buttonStyle(.plain)
+            .disabled(!modelsEditable)
+            .accessibilityLabel(choice.model.label("model"))
+            .accessibilityValue(detail)
+            .accessibilityAddTraits(on ? .isSelected : [])
+          }
+          if loading {
+            ProgressView("Loading more models…").font(.geist(14)).padding(12)
+          } else {
+            if choices.isEmpty {
+              Text(terms.isEmpty ? "No models available" : "No models match “\(query)”")
+                .font(.geist(15)).foregroundStyle(Color.faint).padding(12)
+            }
+            if failed {
+              Button("Retry loading missing models") { retry += 1 }
+                .font(.geist(14)).padding(12)
+            }
           }
         }
         .padding(.horizontal, 8)
         .padding(.bottom, 16)
       }
-      .scrollDismissesKeyboard(.immediately)
-      .overlay {
-        if modelsPending {
-          Text("Models for this provider aren’t loaded yet.").font(.geist(15)).foregroundStyle(Color.dim)
-        } else if shown.isEmpty, !query.isEmpty {
-          Text("No models match “\(query)”").font(.geist(15)).foregroundStyle(Color.faint)
-        }
-      }
+      .scrollDismissesKeyboard(.interactively)
     }
+    .task(id: catalogKey) { await loadCatalog() }
     .onAppear { shell.modelSheetVisible(true) }
     .onDisappear { shell.modelSheetVisible(false) }
     .presentationDetents(fits ? [.height(fitHeight)] : [.medium, .large])
@@ -700,7 +754,7 @@ private struct OptionMenu: View {
       }
     } label: {
       HStack(spacing: 6) {
-        Image(systemName: option.id == "mode" ? "checkmark.shield" : "server.rack")
+        Image(systemName: "checkmark.shield")
           .font(.system(size: 11, weight: .semibold))
           .foregroundStyle(Color.dim)
         Text(current)
