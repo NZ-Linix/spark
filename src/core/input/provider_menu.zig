@@ -281,7 +281,7 @@ pub const State = struct {
     }
 
     pub fn planAction(index: usize) PlanAction {
-        return @enumFromInt(@min(index, @typeInfo(PlanAction).@"enum".field_names.len - 1));
+        return @fromBackingInt(@intCast(@min(index, @typeInfo(PlanAction).@"enum".field_names.len - 1)));
     }
 
     pub fn planSettingsRow(self: *const State, index: usize) PlanRow {
@@ -496,7 +496,7 @@ pub const State = struct {
             },
             .plan_settings => {
                 self.field = .plan_account;
-                self.selected = @intFromEnum(PlanAction.edit);
+                self.selected = @backingInt(PlanAction.edit);
             },
             .plan_model => {
                 self.field = .plan_settings;
@@ -1129,7 +1129,7 @@ test "a subscription account edits its name, largest window, and a model's defau
     };
     try state.beginEdit(alloc, &definition);
     try std.testing.expectEqual(Field.plan_account, state.field);
-    state.selected = @intFromEnum(PlanAction.edit);
+    state.selected = @backingInt(PlanAction.edit);
     try std.testing.expectEqual(Advance.next, try state.submit(alloc));
     try std.testing.expectEqual(Field.plan_settings, state.field);
     try std.testing.expectEqual(PlanRow{ .model = 0 }, state.planSettingsRow(plan_fields.len));
