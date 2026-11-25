@@ -220,6 +220,7 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
 }
 
 pub const StatuslineItems = struct {
+    model_name: ?[]const u8 = null,
     usage: ?types.SessionUsageCounters = null,
     ultrafast_indicator_active: bool = false,
     workspace_label: []const u8 = "",
@@ -233,8 +234,7 @@ pub const StatuslineItems = struct {
 /// upstream, so this only bounds pathological single-word titles.
 const max_session_title_cells: usize = 32;
 
-/// A model id as the status line names it: without its provider, and
-/// a Claude model as "opus 4-7". May use `out`.
+/// A short model label for tables with limited column space. May use `out`.
 pub fn compactModelLabel(model: []const u8, out: []u8) []const u8 {
     var start: usize = 0;
     for (model, 0..) |byte, i| {
@@ -259,6 +259,11 @@ pub fn compactModelLabel(model: []const u8, out: []u8) []const u8 {
     }
 
     return claude_name;
+}
+
+fn statusModelLabel(label: []const u8, out: []u8) []const u8 {
+    if (text_utils.isTerminalSafe(label)) return label;
+    return std.mem.print(out, "{f}", .{text_utils.terminalSafe(label)}) catch "";
 }
 
 /// spark always runs in full access, so the status line names no mode.
@@ -410,14 +415,13 @@ fn appendSessionStatusSegments(
     out: []u8,
     end: *usize,
     status_limit: usize,
-    model: []const u8,
+    model_label: []const u8,
     effort: types.ReasoningEffort,
     model_supports_effort: bool,
     fast_indicator_active: bool,
     statusline: StatuslineItems,
 ) void {
-    var model_buf: [96]u8 = undefined;
-    appendStatusSegment(out, end, compactModelLabel(model, &model_buf));
+    appendStatusSegment(out, end, model_label);
     if (model_supports_effort and !effort.isDefault()) {
         appendStatusSegment(out, end, effort.displayLabel());
     }
@@ -480,7 +484,9 @@ pub fn buildSessionStatusLine(
 ) []const u8 {
     var end: usize = 0;
     const status_limit = @min(@as(usize, width), out.len);
-    appendSessionStatusSegments(out, &end, status_limit, model, effort, model_supports_effort, false, statusline);
+    var model_buf: [512]u8 = undefined;
+    const model_label = statusModelLabel(statusline.model_name orelse model, &model_buf);
+    appendSessionStatusSegments(out, &end, status_limit, model_label, effort, model_supports_effort, false, statusline);
     if (width == 0) return "";
     return display_width.prefixByWidthIgnoringAnsi(out[0..end], width);
 }
@@ -497,9 +503,8 @@ pub fn buildHintLine(
     out: []u8,
 ) []const u8 {
     // With no connection there is no model yet; don't name the built-in default.
-    const shown_model = if (!has_api_key) "Select a model" else model;
-    var model_buf: [96]u8 = undefined;
-    const model_label = compactModelLabel(shown_model, &model_buf);
+    var model_buf: [512]u8 = undefined;
+    const model_label = if (has_api_key) statusModelLabel(statusline.model_name orelse model, &model_buf) else "Select a model";
     var permission_buf: [64]u8 = undefined;
     const permission_label = permissionModeStatusLabel(permission_mode, &permission_buf);
 
@@ -511,11 +516,22 @@ pub fn buildHintLine(
     if (leadingPermissionModeFits(status_limit, permission_label, model_label)) {
         appendStatusSegment(out, &end, permission_label);
     }
-    appendSessionStatusSegments(out, &end, status_limit, shown_model, effort, model_supports_effort and shown_model.ptr == model.ptr, fast_indicator_active, statusline);
+    appendSessionStatusSegments(out, &end, status_limit, model_label, effort, model_supports_effort and has_api_key, fast_indicator_active, statusline);
 
     const width_usize: usize = width;
     if (width_usize == 0) return "";
     return display_width.prefixByWidthIgnoringAnsi(out[0..end], width_usize);
+}
+
+test "status line uses the exact model ID or its display name" {
+    const id = "claude-opus-5-5";
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(id ++ " · medium", buildHintLine(true, id, .yolo, false, .medium, true, .{}, 80, &buf));
+    const name: StatuslineItems = .{ .model_name = "Claude Opus 5.5" };
+    try std.testing.expectEqualStrings("Claude Opus 5.5 · medium", buildHintLine(true, id, .yolo, false, .medium, true, name, 80, &buf));
+    try std.testing.expectEqualStrings("Claude Opus 5.5 · medium", buildSessionStatusLine(id, .medium, true, name, 80, &buf));
+    try std.testing.expectEqualStrings("anthropic/" ++ id, buildSessionStatusLine("anthropic/" ++ id, .auto, false, .{}, 80, &buf));
+    try std.testing.expectEqualStrings("run /provider · Select a model", buildHintLine(false, id, .yolo, false, .medium, true, name, 80, &buf));
 }
 
 pub fn buildInputLine(input: []const u8, cursor: usize, width: u16, out: []u8) InputLineView {

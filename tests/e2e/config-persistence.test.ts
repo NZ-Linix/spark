@@ -137,6 +137,42 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     secondSession = null;
   });
 
+  test("the footer shows the saved model name or exact model ID", async () => {
+    const root = mkdtempSync(join(tmpdir(), "spark-footer-model-"));
+    const home = join(root, "home");
+    const profile = join(home, ".spark");
+    const id = "claude-opus-5-5";
+    try {
+      mkdirSync(profile, { recursive: true, mode: 0o700 });
+      for (const [displayName, override, expected] of [
+        [undefined, undefined, id],
+        ["Claude Opus 5.5", undefined, "Claude Opus 5.5"],
+        ["Claude Opus 5.5", "My Opus", "My Opus"],
+      ] as const) {
+        writeFileSync(join(profile, "settings.json"), JSON.stringify({
+          provider: "local",
+          models: { local: id },
+          providers: { local: {
+            protocol: "openai-chat-completions",
+            base_url: "http://127.0.0.1:9/v1",
+            auth: { type: "none" },
+            model_metadata: { [id]: { display_name: displayName } },
+            model_overrides: override ? { [id]: { display_name: override } } : undefined,
+          } },
+        }), { mode: 0o600 });
+        session = await TmuxSession.create({ cwd: root, env: { ...NO_AUTH, HOME: home, SPARK_PROVIDER: undefined } });
+        const pane = await session.waitForText(expected, TIMEOUT);
+        expect(pane).not.toContain("opus 5-5");
+        await session.kill();
+        session = null;
+      }
+    } finally {
+      await session?.kill();
+      session = null;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
   serialTest("a profile folder other users can write is tightened, loaded, and noted once", async () => {
     const root = mkdtempSync(join(tmpdir(), "spark-loose-profile-"));
     const gateway = startFakeGateway([]);
@@ -493,10 +529,10 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           stderrPath: stderrBPath,
         });
         const startup = await session.waitForText(
-          "auto · opus 4.7 · ⚡︎",
+          "anthropic/claude-opus-4.7 · ⚡︎",
           TIMEOUT,
         );
-        expect(startup).toContain("auto · opus 4.7 · ⚡︎");
+        expect(startup).toContain("anthropic/claude-opus-4.7 · ⚡︎");
         expect(startup).not.toContain("adaptive");
         expect(startup).not.toContain("⚡︎ fast");
         await session.sendText("/settings");
@@ -1161,7 +1197,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.sendLiteral("fast");
         await session.waitForText("/model anthropic/claude-opus-4.8 xhigh fast", TIMEOUT);
         await session.sendKeys("Enter");
-        const selectedFastStatus = await session.waitForText("opus 4.8 · xhigh · ⚡︎", TIMEOUT);
+        const selectedFastStatus = await session.waitForText("anthropic/claude-opus-4.8 · xhigh · ⚡︎", TIMEOUT);
         expect(selectedFastStatus).not.toContain("⚡︎ fast");
         await session.sendText("Use fast.");
         await session.waitForText("Opus fast complete", TIMEOUT);
@@ -1195,7 +1231,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: gatewayEnv,
           stderrPath,
         });
-        const restoredFastStatus = await session.waitForText("opus 4.8 · xhigh · ⚡︎", TIMEOUT);
+        const restoredFastStatus = await session.waitForText("anthropic/claude-opus-4.8 · xhigh · ⚡︎", TIMEOUT);
         expect(restoredFastStatus).not.toContain("⚡︎ fast");
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);

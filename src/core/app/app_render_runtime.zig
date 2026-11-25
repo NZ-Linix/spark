@@ -842,7 +842,7 @@ pub fn Runtime(comptime App: type) type {
             agent: *AppAgent,
             visible_model: []const u8,
         ) ui_render.StatuslineItems {
-            var items: ui_render.StatuslineItems = .{};
+            var items: ui_render.StatuslineItems = .{ .model_name = provider_runtime.modelDisplayNameOf(app, agent, visible_model) };
             if (comptime @hasField(App, "workspace_identity") and
                 @hasField(App, "workspace_root"))
             {

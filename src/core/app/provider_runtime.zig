@@ -102,6 +102,13 @@ pub fn modelOf(app: anytype, agent: anytype) []const u8 {
     @compileError("app must own provider_selection");
 }
 
+pub fn modelDisplayNameOf(app: anytype, agent: anytype, model_id: []const u8) ?[]const u8 {
+    if (comptime !@hasField(@TypeOf(app.*), "provider_selection")) return null;
+    const definition = app.provider_selection.definitions.get(providerOf(app, agent).label()) orelse return null;
+    const metadata = definition.metadata_for(model_id) orelse return null;
+    return metadata.display_name;
+}
+
 /// Whether `agent` runs the model `--model`, `--provider`, or `SPARK_MODEL`
 /// chose for this run, not one picked since with `/model`.
 pub fn runsProcessModel(app: anytype, agent: anytype) bool {

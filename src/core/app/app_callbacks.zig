@@ -594,6 +594,7 @@ pub fn Bindings(comptime App: type) type {
             const show_context = if (comptime @hasField(App, "statusline_context")) app.statusline_context else false;
             const show_session = if (comptime @hasField(App, "statusline_session")) app.statusline_session else false;
             var items: ui_render.StatuslineItems = .{
+                .model_name = provider_runtime.modelDisplayNameOf(app, agent, status.model),
                 .context_used = if (show_context) status.input_tokens else 0,
                 .context_total = if (show_context) status.context_window else null,
                 .session_title = if (show_session) status.session_title else null,
