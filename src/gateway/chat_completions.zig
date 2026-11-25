@@ -16,11 +16,9 @@ const transport = @import("configured_transport.zig");
 const responses = @import("configured_responses.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const anthropic_messages = @import("anthropic_messages_protocol.zig");
+const gemini = @import("gemini_code_assist_protocol.zig");
+const plan_requests = @import("plan_requests.zig");
 const request_fragment = @import("../core/config/request_fragment.zig");
-const chatgpt_plan = @import("../core/auth/chatgpt_plan.zig");
-const chatgpt_catalog = @import("../core/config/chatgpt_catalog.zig");
-const oauth_http = @import("../builtins/oauth_http.zig");
-const secret = @import("../core/auth/secret.zig");
 const Allocator = std.mem.Allocator;
 
 /// Every callback borrows the immutable definition from the owning profile runtime.
@@ -47,7 +45,8 @@ pub fn model_catalog_provider(definition: *const definitions.Definition) catalog
         .fetch_fn = fetch_catalog,
         .lookup_capabilities_fn = lookup_capabilities,
         .provider_id = bound_identity(definition),
-        .refresh_interval_ms = if (definition.auth == .chatgpt_plan) 60_000 else null,
+        // A plan's catalog follows the account, which can change any time.
+        .refresh_interval_ms = if (definition.auth.plan() != null) 60_000 else null,
     };
 }
 
@@ -76,6 +75,11 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
         }
     };
     const metadata = definition.metadata_for(request.model);
+    switch (definition.auth) {
+        .claude_plan => return plan_requests.buildClaude(alloc, definition, &identity, request),
+        .antigravity_plan => return plan_requests.buildAntigravity(alloc, definition, &identity, request),
+        else => {},
+    }
     if (definition.auth == .chatgpt_plan) {
         // The catalog may have updated since the login snapshot was saved.
         // The selected account's live catalog supplies the picker choices;
@@ -123,6 +127,8 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             // Anthropic-compatible servers need not implement automatic caching.
             .automatic_cache = std.ascii.eqlIgnoreCase(definition.base_url, "https://api.anthropic.com/v1"),
         }),
+        // Only an Antigravity account speaks it, and it returned above.
+        .@"gemini-code-assist" => error.InvalidConfiguredProvider,
     };
 }
 
@@ -132,6 +138,7 @@ fn consumer(protocol: definitions.Protocol) transport.ConsumeFn {
         .@"openai-chat-completions" => consume,
         .@"openai-responses" => responses.consume,
         .@"anthropic-messages" => consume_messages,
+        .@"gemini-code-assist" => consume_gemini,
     };
 }
 
@@ -141,6 +148,7 @@ fn replay_projection(protocol: definitions.Protocol) *const fn (Allocator, ?type
         .@"openai-chat-completions" => project_replay,
         .@"openai-responses" => responses_protocol.selectReplayParts,
         .@"anthropic-messages" => anthropic_messages.project_replay,
+        .@"gemini-code-assist" => gemini.project_replay,
     };
 }
 
@@ -190,6 +198,13 @@ fn consume_messages(alloc: Allocator, reader: *std.Io.Reader, request: streams.M
     return anthropic_messages.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
 }
 
+/// The same for a Cloud Code reply.
+fn consume_gemini(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
+    var limits: gemini.Limits = .{};
+    if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
+    return gemini.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
+}
+
 /// The returned entry borrows its strings and lists no effort levels;
 /// fetch_catalog replaces the strings with owned copies and adds the levels.
 fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
@@ -230,7 +245,7 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
     if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
     const definition = definition_at(raw);
     var loaded = try load_models(definition, alloc, input.cancel_flag);
-    if (definition.auth == .chatgpt_plan and loaded.failure == .credential) {
+    if (definition.auth.plan() != null and loaded.failure == .credential) {
         catalog.freeModelCatalog(alloc, &loaded.entries);
         return .{ .failure = .{ .category = .authentication } };
     }
@@ -256,12 +271,13 @@ const LoadedModels = struct {
 fn load_models(definition: *const definitions.Definition, alloc: Allocator, cancel_flag: ?*std.atomic.Value(bool)) Allocator.Error!LoadedModels {
     var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
     errdefer catalog.freeModelCatalog(alloc, &entries);
-    if (definition.auth == .chatgpt_plan) {
-        var fresh = load_plan_models(alloc, definition, cancel_flag) catch |err| {
+    if (definition.auth.plan() != null) {
+        var fresh = plan_requests.liveCatalog(alloc, definition, cancel_flag) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             if (err == error.Cancelled) return .{ .entries = entries, .failure = .cancelled };
+            debug_trace.logf("gateway", "event=plan_models_unavailable connection={s} err={s}", .{ definition.id, @errorName(err) });
             for (definition.model_metadata) |declared| try append_entry(alloc, &entries, declared);
-            return .{ .entries = entries, .failure = if (err == error.ChatGPTSignInRequired) .credential else .transport };
+            return .{ .entries = entries, .failure = if (plan_requests.signInRequired(err)) .credential else .transport };
         };
         defer fresh.deinit(alloc);
         for (fresh.definitions[0].model_metadata) |declared| try append_entry(alloc, &entries, declared);
@@ -288,19 +304,6 @@ fn load_models(definition: *const definitions.Definition, alloc: Allocator, canc
     return .{ .entries = entries };
 }
 
-fn load_plan_models(alloc: Allocator, definition: *const definitions.Definition, cancel: ?*std.atomic.Value(bool)) !definitions.Registry {
-    const token = try chatgpt_plan.accessToken(alloc, oauth_http.provider, definition.id);
-    defer secret.zeroAndFree(alloc, token);
-    const body = try chatgpt_plan.fetchModels(alloc, oauth_http.provider, token, cancel);
-    defer alloc.free(body);
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var map: std.json.ObjectMap = .empty;
-    try map.put(a, definition.id, try chatgpt_catalog.connection(a, definition.display_name orelse definition.id, body));
-    return definitions.Registry.parse(alloc, .{ .object = map });
-}
-
 /// Adds `metadata` to `entries` as an entry that owns its strings and levels.
 fn append_entry(alloc: Allocator, entries: *std.ArrayList(catalog.ModelCatalogEntry), metadata: definitions.ModelMetadata) Allocator.Error!void {
     var entry = metadata_entry(metadata);
@@ -323,7 +326,7 @@ fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider
     var loaded = load_models(definition, alloc, input.cancel_flag) catch return exhausted;
     defer catalog.freeModelCatalog(alloc, &loaded.entries);
     if (loaded.failure == .cancelled) return .{ .failure = .{ .access = provenance.access, .failure = .{ .category = .cancellation } } };
-    if (definition.auth == .chatgpt_plan and loaded.failure == .credential) return .{ .failure = .{ .access = provenance.access, .failure = .{ .category = .authentication } } };
+    if (definition.auth.plan() != null and loaded.failure == .credential) return .{ .failure = .{ .access = provenance.access, .failure = .{ .category = .authentication } } };
     var ids = catalog.projectModelIds(alloc, loaded.entries.items) catch return exhausted;
     const notice = if (loaded.failure) |failure|
         alloc.print("could not get the model list of {s}: {s}; showing the models in settings", .{ definition.id, failure.text() }) catch {

@@ -27,7 +27,17 @@ export type ProfileOptions = {
 };
 
 export const isObject = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
-export const isLocalProvider = (name: string, value?: unknown) => name.startsWith("chatgpt-plan-") || (isObject(value) && value.auth?.type === "chatgpt-plan");
+/** the subscription plans a Mac can sign in to; their accounts never leave it */
+export const PLANS = {
+  chatgpt: { auth: "chatgpt-plan", command: "chatgpt-account", name: "ChatGPT" },
+  claude: { auth: "claude-plan", command: "claude-account", name: "Claude" },
+  antigravity: { auth: "antigravity-plan", command: "antigravity-account", name: "Antigravity" },
+} as const;
+export type Plan = keyof typeof PLANS;
+export const isPlan = (v: unknown): v is Plan => typeof v === "string" && Object.hasOwn(PLANS, v);
+const planOfAuth = (type: unknown) => (Object.keys(PLANS) as Plan[]).find(plan => PLANS[plan].auth === type);
+export const isLocalProvider = (name: string, value?: unknown) =>
+  Object.values(PLANS).some(plan => name.startsWith(`${plan.auth}-`)) || (isObject(value) && planOfAuth(value.auth?.type) !== undefined);
 
 /** the last 4 characters, and only when the key is long enough that they give little away */
 function mask(key: unknown): string | undefined {
@@ -76,28 +86,32 @@ export class Profile {
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  accounts(): ProviderSummary[] {
-    if (this.o.role !== "mac") throw new Error("ChatGPT plans are available only on your paired Mac.");
+  accounts(plan: unknown = "chatgpt"): ProviderSummary[] {
+    if (this.o.role !== "mac") throw new Error("Subscription accounts are available only on your paired Mac.");
+    if (!isPlan(plan)) throw new Error("Unknown subscription.");
     const s = this.read();
     const providers = isObject(s.providers) ? s.providers : {};
-    return Object.entries(providers).flatMap(([name, p]) => isObject(p) && p.auth?.type === "chatgpt-plan" ? [summarize(name, p, s)] : []);
+    return Object.entries(providers).flatMap(([name, p]) => isObject(p) && p.auth?.type === PLANS[plan].auth ? [summarize(name, p, s)] : []);
   }
 
-  async changeAccount(action: unknown, value: unknown): Promise<{ accounts: ProviderSummary[]; warning?: string }> {
-    if (this.o.role !== "mac") throw new Error("ChatGPT plans are available only on your paired Mac.");
-    if (this.accountJob) throw new Error("A ChatGPT account change is already in progress on this Mac.");
+  async changeAccount(plan: unknown, action: unknown, value: unknown): Promise<{ accounts: ProviderSummary[]; warning?: string }> {
+    if (this.o.role !== "mac") throw new Error("Subscription accounts are available only on your paired Mac.");
+    if (!isPlan(plan)) throw new Error("Unknown subscription.");
+    const { auth, command, name } = PLANS[plan];
+    if (this.accountJob) throw new Error("An account change is already in progress on this Mac.");
     if (action !== "connect" && action !== "reconnect" && action !== "remove") throw new Error("Unknown account action.");
-    if (typeof value !== "string" || (action === "connect" ? Buffer.byteLength(value) > 48 || /[\u0000-\u001f\u007f]/.test(value) : !/^chatgpt-plan-[0-9a-f]{32}$/.test(value))) throw new Error("Invalid ChatGPT account label or ID.");
+    const id = new RegExp(`^${auth}-[0-9a-f]{32}$`);
+    if (typeof value !== "string" || (action === "connect" ? Buffer.byteLength(value) > 48 || /[\u0000-\u001f\u007f]/.test(value) : !id.test(value))) throw new Error(`Invalid ${name} account label or ID.`);
     this.accountJob = true;
     try {
-      const child = Bun.spawn([this.o.spark, "provider", "chatgpt-account", action, value], {
+      const child = Bun.spawn([this.o.spark, "provider", command, action, value], {
         env: { ...process.env, SPARK_HOME: this.o.home }, stdin: "ignore", stdout: "ignore", stderr: "pipe",
         timeout: 330_000,
       });
       const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
       const detail = stderr.trim().replace(/^spark provider: /, "");
-      if (code !== 0) throw new Error(detail || "Could not update the ChatGPT account on this Mac.");
-      return { accounts: this.accounts(), warning: detail || undefined };
+      if (code !== 0) throw new Error(detail || `Could not update the ${name} account on this Mac.`);
+      return { accounts: this.accounts(plan), warning: detail || undefined };
     } finally {
       this.accountJob = false;
     }

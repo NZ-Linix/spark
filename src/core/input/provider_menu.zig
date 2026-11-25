@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const configured_provider = @import("../config/configured_provider.zig");
-const chatgpt = @import("../config/chatgpt_connection.zig");
+const plans = @import("../config/plan_connection.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -33,8 +33,10 @@ pub const Field = enum {
     model_name,
     model_context,
     model_efforts,
-    chatgpt_label,
-    chatgpt_account,
+    /// The label of a new subscription account (`State.plan` says which plan).
+    plan_label,
+    /// What to do with a saved subscription account.
+    plan_account,
 
     pub fn label(self: Field) []const u8 {
         return switch (self) {
@@ -49,13 +51,13 @@ pub const Field = enum {
             .model_name => "Display name",
             .model_context => "Context window",
             .model_efforts => "Reasoning levels",
-            .chatgpt_label => "Account label",
-            .chatgpt_account => "ChatGPT plan",
+            .plan_label => "Account label",
+            .plan_account => "Subscription",
         };
     }
 
     pub fn isList(self: Field) bool {
-        return self == .pick or self == .overview or self == .model or self == .chatgpt_account;
+        return self == .pick or self == .overview or self == .model or self == .plan_account;
     }
 };
 
@@ -101,11 +103,11 @@ pub const Advance = enum {
     /// A saved connection was picked: load its fields.
     edit,
     delete,
-    chatgpt_connect,
-    chatgpt_use,
-    chatgpt_reconnect,
-    chatgpt_remove,
-    chatgpt_usage,
+    plan_connect,
+    plan_use,
+    plan_reconnect,
+    plan_remove,
+    plan_usage,
     /// The form has nothing left to go back to.
     close,
 };
@@ -140,7 +142,9 @@ pub const State = struct {
     problem: ?[]const u8 = null,
     /// Set after a field was saved; cleared by the next key.
     saved: bool = false,
-    chatgpt_job: ?*chatgpt.Job = null,
+    /// The subscription plan the plan fields are about.
+    plan: plans.Kind = .chatgpt,
+    plan_job: ?*plans.Job = null,
 
     /// Opens on the list of available connections and connection types.
     pub fn open(self: *State, alloc: Allocator, names: []const []const u8) Allocator.Error!void {
@@ -171,7 +175,7 @@ pub const State = struct {
     }
 
     pub fn close(self: *State, alloc: Allocator) void {
-        if (self.chatgpt_job) |job| job.close();
+        if (self.plan_job) |job| job.close();
         self.clearInput();
         self.input.deinit(alloc);
         self.display_name.deinit(alloc);
@@ -195,11 +199,23 @@ pub const State = struct {
         self.models.clearRetainingCapacity();
     }
 
+    /// The plan whose "Continue with" row of the connection list is `row`.
+    pub fn planAt(self: *const State, row: usize) ?plans.Kind {
+        const first = self.connections.items.len + 1;
+        if (row < first or row - first >= plans.Kind.all.len) return null;
+        return plans.Kind.all[row - first];
+    }
+
+    pub fn planRow(self: *const State, kind: plans.Kind) usize {
+        return self.connections.items.len + 1 + @backingInt(kind);
+    }
+
     /// Rows of the current list.
     pub fn listLen(self: *const State) usize {
         return switch (self.field) {
-            .pick => self.connections.items.len + 2,
-            .chatgpt_account => 5,
+            // Connections, Add connection, then a row for each plan.
+            .pick => self.connections.items.len + 1 + plans.Kind.all.len,
+            .plan_account => 5,
             // Fields, models, Add model, Create or Delete, Back.
             .overview => connection_fields.len + self.models.items.len + 3,
             .model => model_fields.len + 2,
@@ -248,9 +264,10 @@ pub const State = struct {
         if (self.key_env) |env| alloc.free(env);
         self.key_env = null;
         switch (definition.auth) {
-            .chatgpt_plan => {
+            .chatgpt_plan, .claude_plan, .antigravity_plan => {
                 self.clearModels(alloc);
-                self.field = .chatgpt_account;
+                self.plan = definition.auth.plan().?;
+                self.field = .plan_account;
                 self.selected = 0;
                 self.clearInput();
                 self.problem = null;
@@ -358,8 +375,8 @@ pub const State = struct {
         self.saved = false;
         switch (self.field) {
             .pick => return false,
-            .chatgpt_label, .chatgpt_account => {
-                self.selected = self.connectionIndex() orelse self.connections.items.len + 1;
+            .plan_label, .plan_account => {
+                self.selected = self.connectionIndex() orelse self.planRow(self.plan);
                 self.field = .pick;
             },
             .overview => {
@@ -442,12 +459,13 @@ pub const State = struct {
         self.saved = false;
         switch (self.field) {
             .pick => {
-                if (self.selected == self.connections.items.len + 1) {
+                if (self.planAt(self.selected)) |kind| {
                     if (self.editing) |old| alloc.free(old);
                     self.editing = null;
                     self.name.clearRetainingCapacity();
                     self.display_name.clearRetainingCapacity();
-                    try self.focus(alloc, .chatgpt_label);
+                    self.plan = kind;
+                    try self.focus(alloc, .plan_label);
                     return .next;
                 }
                 if (self.selected == self.connections.items.len) {
@@ -468,12 +486,12 @@ pub const State = struct {
                 self.editing = try alloc.dupe(u8, self.connections.items[self.selected]);
                 return .edit;
             },
-            .chatgpt_label => return .chatgpt_connect,
-            .chatgpt_account => switch (self.selected) {
-                0 => return .chatgpt_use,
-                1 => return .chatgpt_reconnect,
-                2 => return .chatgpt_usage,
-                3 => return .chatgpt_remove,
+            .plan_label => return .plan_connect,
+            .plan_account => switch (self.selected) {
+                0 => return .plan_use,
+                1 => return .plan_reconnect,
+                2 => return .plan_usage,
+                3 => return .plan_remove,
                 else => return if (try self.back(alloc)) .next else .close,
             },
             .overview => switch (self.overviewRow(self.selected)) {
@@ -671,8 +689,8 @@ pub const State = struct {
     /// The field's hint, shown as a placeholder while it is empty.
     pub fn hint(self: *const State) []const u8 {
         return switch (self.field) {
-            .pick, .overview, .model, .chatgpt_account => "",
-            .chatgpt_label => "optional, e.g. Work or Personal",
+            .pick, .overview, .model, .plan_account => "",
+            .plan_label => "optional, e.g. Work or Personal",
             .display_name => "optional, e.g. OpenCode Go",
             .name => "letters, digits, - and _, e.g. openrouter",
             .base_url => "e.g. https://openrouter.ai/api/v1",

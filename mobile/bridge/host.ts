@@ -239,12 +239,15 @@ export class Host {
         return this.deleteSession(req.s);
       case "providers":
         return this.o.library ? this.o.library.providers() : this.profile().list();
+      // `chatgptAccount(s)` are what app builds before Claude and Antigravity send.
+      case "planAccounts":
       case "chatgptAccounts":
-        if (this.o.info.kind !== "mac") throw new Error("ChatGPT plans are available only on your paired Mac.");
-        return this.profile().accounts();
+        if (this.o.info.kind !== "mac") throw new Error("Subscription accounts are available only on your paired Mac.");
+        return this.profile().accounts(req.op === "planAccounts" ? req.plan : "chatgpt");
+      case "planAccount":
       case "chatgptAccount": {
-        if (this.o.info.kind !== "mac") throw new Error("ChatGPT plans are available only on your paired Mac.");
-        const result = await this.profile().changeAccount(req.action, req.value);
+        if (this.o.info.kind !== "mac") throw new Error("Subscription accounts are available only on your paired Mac.");
+        const result = await this.profile().changeAccount(req.op === "planAccount" ? req.plan : "chatgpt", req.action, req.value);
         this.invalidate();
         return result;
       }

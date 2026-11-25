@@ -136,7 +136,7 @@ final class FlowTests: XCTestCase {
   }
 
   @MainActor
-  func testChatGPTPlanAccounts() throws {
+  func testSubscriptionAccounts() throws {
     let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"])
     let app = XCUIApplication()
     app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
@@ -148,27 +148,32 @@ final class FlowTests: XCTestCase {
     }
     XCTAssertTrue(settings.waitForExistence(timeout: 8))
     settings.tap()
-    let plans = app.buttons["chatGPTPlans-demo-mac"]
-    XCTAssertTrue(plans.waitForExistence(timeout: 8))
-    plans.tap()
-    let start = app.buttons["chatGPTContinue"]
-    XCTAssertTrue(eventually("enabled == true", start, timeout: 6))
-    shot(app, "chatgpt-plans-empty")
-    for label in ["Work", "Personal"] {
-      start.tap()
-      let field = app.alerts.textFields["Account label (optional)"]
-      XCTAssertTrue(field.waitForExistence(timeout: 4))
-      field.tap()
-      field.typeText(label)
-      app.alerts.buttons["Continue with ChatGPT"].tap()
-      XCTAssertTrue(app.staticTexts["Codex (\(label))"].waitForExistence(timeout: 5))
+    for (plan, product, button) in [("chatgpt", "Codex", "Continue with ChatGPT"), ("claude", "Claude", "Continue with Claude"), ("antigravity", "Antigravity", "Continue with Google")] {
+      let row = app.buttons["plan-\(plan)-demo-mac"]
+      XCTAssertTrue(row.waitForExistence(timeout: 8))
+      row.tap()
+      let start = app.buttons["planContinue"]
+      XCTAssertTrue(eventually("enabled == true", start, timeout: 6))
+      shot(app, "\(plan)-accounts-empty")
+      // The plan's only account goes by the plan's name; a second brings labels.
+      for (label, shown) in [("Work", product), ("Personal", "\(product) (Personal)")] {
+        start.tap()
+        let field = app.alerts.textFields["Account label (optional)"]
+        XCTAssertTrue(field.waitForExistence(timeout: 4))
+        field.tap()
+        field.typeText(label)
+        app.alerts.buttons[button].tap()
+        XCTAssertTrue(app.staticTexts[shown].waitForExistence(timeout: 5))
+      }
+      XCTAssertTrue(app.staticTexts["\(product) (Work)"].exists)
+      shot(app, "\(plan)-accounts-connected")
+      app.buttons["Manage \(product) (Work)"].tap()
+      app.buttons["Disconnect"].firstMatch.tap()
+      app.buttons["Disconnect"].firstMatch.tap()
+      XCTAssertTrue(eventually("exists == false", app.staticTexts["\(product) (Work)"], timeout: 5))
+      XCTAssertTrue(app.staticTexts[product].exists)
+      app.navigationBars.buttons.element(boundBy: 0).tap()
     }
-    shot(app, "chatgpt-plans-connected")
-    app.buttons["Manage Codex (Work)"].tap()
-    app.buttons["Disconnect"].firstMatch.tap()
-    app.buttons["Disconnect"].firstMatch.tap()
-    XCTAssertTrue(eventually("exists == false", app.staticTexts["Codex (Work)"], timeout: 5))
-    XCTAssertTrue(app.staticTexts["Codex (Personal)"].exists)
   }
 
   @MainActor

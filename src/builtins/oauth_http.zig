@@ -62,13 +62,14 @@ const OAuthHttpOperation = struct {
                     .post_form => .{ .override = "application/x-www-form-urlencoded" },
                     .post_json => .{ .override = "application/json" },
                 },
-                .user_agent = .{ .override = gateway_client.user_agent },
+                .user_agent = .{ .override = self.request.user_agent orelse gateway_client.user_agent },
                 .accept_encoding = .omit,
                 .authorization = if (self.request.authorization) |value|
                     .{ .override = value }
                 else
                     .default,
             },
+            .extra_headers = self.request.extra_headers,
             .redirect_behavior = .unhandled,
             .response_writer = &response_writer,
         }) catch |err| switch (err) {

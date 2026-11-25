@@ -29,8 +29,16 @@ pub const list_hint_variants = [_][]const u8{
 fn subtitle(state: *const State, buf: []u8) []const u8 {
     return switch (state.field) {
         .pick => "saved connections",
-        .chatgpt_account => "uses a ChatGPT plan",
-        .chatgpt_label => "uses a ChatGPT plan, no API key",
+        .plan_account => switch (state.plan) {
+            .chatgpt => "uses a ChatGPT plan",
+            .claude => "uses a Claude subscription",
+            .antigravity => "uses an Antigravity (Google AI) subscription",
+        },
+        .plan_label => switch (state.plan) {
+            .chatgpt => "uses a ChatGPT plan, no API key",
+            .claude => "uses a Claude Pro or Max subscription, no API key",
+            .antigravity => "uses an Antigravity (Google AI) subscription, no API key",
+        },
         .overview => if (state.saved) "saved" else if (state.editing == null) "new · choose a field" else "choose a field",
         .model => blk: {
             const id = if (state.model_index < state.models.items.len) state.models.items[state.model_index].id else "";
@@ -75,8 +83,8 @@ pub fn composeProviderMenuRow(
             "Model connections"
         else if (state.editing) |_|
             (std.mem.print(&title_buf, "{s}", .{if (state.display_name.items.len > 0) state.display_name.items else state.name.items}) catch "Edit connection")
-        else if (state.field == .chatgpt_label)
-            "Continue with ChatGPT"
+        else if (state.field == .plan_label)
+            continueLabel(state.plan)
         else if (state.name.items.len > 0)
             (std.mem.print(&title_buf, "New connection {s}", .{state.name.items}) catch "New connection")
         else
@@ -130,16 +138,20 @@ fn appendListRow(alloc: Allocator, row: *std.ArrayList(u8), state: *const State,
         .pick => {
             const label = if (item < state.connections.items.len)
                 (state.connectionLabel(item) orelse state.connections.items[item])
-            else if (item == state.connections.items.len)
-                "+ Add connection"
+            else if (state.planAt(item)) |kind|
+                continueLabel(kind)
             else
-                "Continue with ChatGPT";
+                "+ Add connection";
             try appendAction(alloc, row, label, selected, false, width);
         },
-        .chatgpt_account => try appendAction(alloc, row, switch (item) {
+        .plan_account => try appendAction(alloc, row, switch (item) {
             0 => "Use this account",
-            1 => "Continue with ChatGPT",
-            2 => "Manage ChatGPT usage",
+            1 => "Sign in again",
+            2 => switch (state.plan) {
+                .chatgpt => "Manage ChatGPT usage",
+                .claude => "Manage Claude usage",
+                .antigravity => "Open Antigravity",
+            },
             3 => "Disconnect account",
             else => "Back",
         }, selected, item == 3, width),
@@ -261,4 +273,13 @@ fn appendFocused(alloc: Allocator, row: *std.ArrayList(u8), state: *const State,
     } else {
         try row.appendSlice(alloc, "\x1b[7m \x1b[27m");
     }
+}
+
+/// The connection list's row that signs in to a plan.
+fn continueLabel(kind: @import("../../core/auth/plan_kind.zig").Kind) []const u8 {
+    return switch (kind) {
+        .chatgpt => "Continue with ChatGPT",
+        .claude => "Continue with Claude",
+        .antigravity => "Continue with Antigravity (Google)",
+    };
 }

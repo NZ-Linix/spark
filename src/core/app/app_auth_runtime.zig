@@ -145,9 +145,22 @@ pub fn Runtime(comptime App: type) type {
             app.auth.clearCredential(app.alloc);
             app.provider_selection.adoptOwned(target, &owned_model);
             app.model_cache.resetForProviderChange();
+            // Load the new connection's credential now: a session that started
+            // without one refuses a prompt until it has one. One that can't be
+            // loaded yet is reported when a prompt needs it.
+            switch (try app.auth.selectForProvider(app.alloc, target)) {
+                .selected, .unchanged => app.auth.loaded_for = target,
+                .missing, .failed => {},
+            }
             if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
 
-            const body = try app.alloc.print("Switched to {s} with {s}.", .{ target.label(), provider_runtime.modelOf(app, agent) });
+            // A subscription account's ID is opaque: name it and its model as pickers do.
+            const plan = definition.auth.plan() != null;
+            const model_name = if (plan) if (definition.model(provider_runtime.modelOf(app, agent))) |known| known.display_name else null else null;
+            const body = try app.alloc.print("Switched to {s} with {s}.", .{
+                if (plan) definition.display_name orelse target.label() else target.label(),
+                model_name orelse provider_runtime.modelOf(app, agent),
+            });
             defer app.alloc.free(body);
             var persistence = app.persistRuntimePreferences(agent, .{
                 .provider = target,

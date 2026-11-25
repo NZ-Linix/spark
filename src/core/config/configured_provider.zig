@@ -1,6 +1,6 @@
 const std = @import("std");
 const request_fragment = @import("request_fragment.zig");
-const chatgpt_plan = @import("../auth/chatgpt_plan.zig");
+const plan_kind = @import("../auth/plan_kind.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
@@ -53,6 +53,9 @@ pub const Protocol = enum {
     @"openai-chat-completions",
     @"openai-responses",
     @"anthropic-messages",
+    /// Google's Cloud Code Assist wrapper around Gemini `generateContent`,
+    /// spoken only by Antigravity plan accounts.
+    @"gemini-code-assist",
 
     /// Where a model request goes, after the connection's base URL.
     pub fn request_path(self: Protocol) []const u8 {
@@ -60,6 +63,7 @@ pub const Protocol = enum {
             .@"openai-chat-completions" => "/chat/completions",
             .@"openai-responses" => "/responses",
             .@"anthropic-messages" => "/messages",
+            .@"gemini-code-assist" => "/v1internal:streamGenerateContent?alt=sse",
         };
     }
 
@@ -73,6 +77,8 @@ pub const Protocol = enum {
             .@"openai-chat-completions" => &.{ "model", "messages", "stream", "stream_options", "tools", "tool_choice", "parallel_tool_calls", "max_tokens", "max_completion_tokens", "response_format" },
             .@"openai-responses" => &.{ "model", "input", "instructions", "stream", "store", "tools", "tool_choice", "parallel_tool_calls", "max_output_tokens", "include", "text" },
             .@"anthropic-messages" => &.{ "model", "messages", "system", "stream", "tools", "tool_choice", "max_tokens" },
+            // An effort level may name the model of its tier (`gemini-3-pro-high`).
+            .@"gemini-code-assist" => &.{ "project", "request", "requestType", "userAgent", "requestId" },
         };
     }
 };
@@ -90,7 +96,28 @@ pub const Auth = union(enum) {
     bearer: []const u8,
     /// A key saved by `/provider` in the profile settings file itself.
     key: []const u8,
+    /// A subscription account signed in with `/provider`; its OAuth
+    /// credentials stay in the plan's private folder in the profile.
     chatgpt_plan,
+    claude_plan,
+    antigravity_plan,
+
+    pub fn plan(self: Auth) ?plan_kind.Kind {
+        return switch (self) {
+            .chatgpt_plan => .chatgpt,
+            .claude_plan => .claude,
+            .antigravity_plan => .antigravity,
+            .none, .bearer, .key => null,
+        };
+    }
+
+    pub fn of_plan(kind: plan_kind.Kind) Auth {
+        return switch (kind) {
+            .chatgpt => .chatgpt_plan,
+            .claude => .claude_plan,
+            .antigravity => .antigravity_plan,
+        };
+    }
 };
 
 /// A request header whose value is read from the environment variable `env`
@@ -151,6 +178,9 @@ pub const Definition = struct {
     id: []const u8,
     /// The name menus show in place of `id`, such as "OpenCode Go" for `oc-go`.
     display_name: ?[]const u8 = null,
+    /// A subscription account's own label, such as `Work`. Its names carry
+    /// the label only while its plan has more than one account.
+    account_label: ?[]const u8 = null,
     protocol: Protocol,
     base_url: []const u8,
     auth: Auth,
@@ -225,7 +255,7 @@ pub const Definition = struct {
         hash_part(&hash, self.base_url);
         hash_part(&hash, @tagName(self.auth));
         switch (self.auth) {
-            .none, .chatgpt_plan => {},
+            .none, .chatgpt_plan, .claude_plan, .antigravity_plan => {},
             .bearer => |env| hash_part(&hash, env),
             .key => {},
         }
@@ -418,7 +448,7 @@ pub const Registry = struct {
 /// `owned` is the registry's arena: a failure frees nothing here.
 fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at: ?*FailurePath) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "display_name", "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata" }, at);
+    try check_fields(value, &.{ "display_name", "account_label", "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata" }, at);
     enter(at, "protocol");
     const protocol_name = try required(value, "protocol");
     if (protocol_name != .string) return error.InvalidProtocol;
@@ -431,9 +461,13 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
     leave(at);
     enter(at, "auth");
     const auth = try parse_auth(try required(value, "auth"), at);
-    if (auth == .chatgpt_plan) {
-        if (!chatgpt_plan.isId(id) or protocol != .@"openai-responses" or !std.mem.eql(u8, normalized, chatgpt_plan.resource) or value.object.contains("headers")) return error.InvalidAuth;
-    } else if (std.mem.startsWith(u8, id, chatgpt_plan.id_prefix)) return error.ReservedProviderId;
+    if (auth.plan()) |kind| {
+        if (!kind.isId(id) or !std.mem.eql(u8, @tagName(protocol), kind.protocolName()) or !std.mem.eql(u8, normalized, kind.baseUrl()) or value.object.contains("headers")) return error.InvalidAuth;
+    } else {
+        if (plan_kind.Kind.reserving(id) != null) return error.ReservedProviderId;
+        // Only an Antigravity account speaks Google's internal protocol.
+        if (protocol == .@"gemini-code-assist") return error.InvalidProtocol;
+    }
     leave(at);
     var mode: ToolChoiceMode = .omit;
     if (value.object.get("tool_choice_mode")) |choice| {
@@ -468,14 +502,25 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         display_name = try owned.dupe(u8, name.string);
         leave(at);
     }
+    var account_label: ?[]const u8 = null;
+    if (value.object.get("account_label")) |label| {
+        enter(at, "account_label");
+        if (auth.plan() == null or label != .string or label.string.len == 0 or label.string.len > 48) return error.InvalidDisplayName;
+        for (label.string) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidDisplayName;
+        account_label = try owned.dupe(u8, label.string);
+        leave(at);
+    }
     return .{
         .id = try owned.dupe(u8, id),
         .display_name = display_name,
+        .account_label = account_label,
         .protocol = protocol,
         .base_url = try owned.dupe(u8, normalized),
         .auth = switch (auth) {
             .none => .none,
             .chatgpt_plan => .chatgpt_plan,
+            .claude_plan => .claude_plan,
+            .antigravity_plan => .antigravity_plan,
             .bearer => |env| .{ .bearer = try owned.dupe(u8, env) },
             .key => |key| .{ .key = try owned.dupe(u8, key) },
         },
@@ -507,9 +552,9 @@ fn parse_auth(value: std.json.Value, at: ?*FailurePath) ParseError!Auth {
         if (value.object.contains("env") or value.object.contains("key")) return error.InvalidAuth;
         return .none;
     }
-    if (std.mem.eql(u8, kind.string, "chatgpt-plan")) {
+    if (plan_kind.Kind.fromAuthType(kind.string)) |plan| {
         if (value.object.count() != 1) return error.InvalidAuth;
-        return .chatgpt_plan;
+        return Auth.of_plan(plan);
     }
     if (std.mem.eql(u8, kind.string, "key")) {
         if (value.object.contains("env")) return error.InvalidAuth;

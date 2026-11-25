@@ -77,7 +77,7 @@ pub fn resolveForProvider(alloc: std.mem.Allocator, provider: model_provider.Pro
     const definition = registry.get(bound.label()).?;
     return switch (definition.auth) {
         // The HTTP adapter reads/renews this account at send time; never cache its OAuth token in an agent.
-        .none, .chatgpt_plan => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
+        .none, .chatgpt_plan, .claude_plan, .antigravity_plan => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
         .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env) },
         .key => |key| .{ .credential = .{ .token = try alloc.dupe(u8, key), .source = .configured } },
     };

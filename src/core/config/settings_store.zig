@@ -102,6 +102,10 @@ pub const UserSettingsPatch = struct {
     /// Adds or replaces one `providers.<id>` custom connection, as `/provider`
     /// writes it. The value must outlive the patch's application.
     connection: ?ConnectionPatch = null,
+    /// Replaces other saved connections in the same commit, such as the
+    /// accounts of a subscription plan whose names change when it gains or
+    /// loses an account. A connection no longer saved is left out.
+    other_connections: []const ConnectionPatch = &.{},
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model_preference == null and
@@ -132,6 +136,7 @@ pub const UserSettingsPatch = struct {
             self.cache_warming == null and
             self.tool_placement == null and
             self.connection == null and
+            self.other_connections.len == 0 and
             self.remove == null;
     }
 };
@@ -1164,6 +1169,14 @@ fn applyUserPatchToRoot(
         const list = root.object.getPtr("providers").?;
         if (connection.value) |value| try list.object.put(arena, id, value);
         if (list.object.count() == 0) _ = root.object.orderedRemove("providers");
+        application.changed = true;
+    }
+    for (patch.other_connections) |other| {
+        const value = other.value orelse continue;
+        const list = root.object.getPtr("providers") orelse break;
+        if (list.* != .object) return error.InvalidSettingsFormat;
+        const saved = list.object.getPtr(other.id) orelse continue;
+        saved.* = value;
         application.changed = true;
     }
     if (patch.remove) |path| application.changed = removePath(&root.object, path) or application.changed;

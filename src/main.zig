@@ -899,11 +899,11 @@ const App = struct {
 
     /// Full teardown for hosts that keep running after the shell ends. Native
     /// interactive exit uses `shutdownForProcessExit`.
-    pub fn chatgptBrowser(_: *App) host.UrlOpener {
+    pub fn planBrowser(_: *App) host.UrlOpener {
         return url_opener.native_opener;
     }
 
-    pub fn chatgptTransport(_: *App) oauth_transport.Provider {
+    pub fn planTransport(_: *App) oauth_transport.Provider {
         return builtin_oauth_http.provider;
     }
 
@@ -2062,7 +2062,7 @@ const App = struct {
         // declared levels and window come from the current definitions, not
         // the catalog fetched at startup.
         if (provider == .configured) if (self.provider_selection.definitions.get(provider.label())) |definition| {
-            if (definition.auth == .chatgpt_plan) return capabilities; // its live catalog takes precedence over the sign-in snapshot
+            if (definition.auth.plan() != null) return capabilities; // its live catalog takes precedence over the sign-in snapshot
             if (definition.metadata_for(model)) |metadata| {
                 capabilities.reasoning_efforts = .{};
                 for (metadata.reasoning_efforts orelse &.{}) |level| {
@@ -3017,7 +3017,7 @@ const App = struct {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
         try app_commands.Handlers(App).collectMcpHostFacts(self, self.screenAgent());
-        try app_provider_menu_runtime.Runtime(App).collectChatGPT(self, self.screenAgent());
+        try app_provider_menu_runtime.Runtime(App).collectPlan(self, self.screenAgent());
         if (self.launch_completion.refresh(self.alloc, self.input_runtime.edit_state.input.items, io_mod.homeDir(), self.workspace_root, self.instances.seed.launchDefaults())) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }

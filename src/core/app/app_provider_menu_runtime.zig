@@ -11,8 +11,7 @@ const model_provider = @import("../config/model_provider.zig");
 const settings_store = @import("../config/settings_store.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
-const chatgpt = @import("../config/chatgpt_connection.zig");
-const plan = @import("../auth/chatgpt_plan.zig");
+const plans = @import("../config/plan_connection.zig");
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -26,7 +25,7 @@ pub fn Runtime(comptime App: type) type {
             // Escape starts an arrow key, a paste, or Esc itself; the input
             // decoder turns it into an action for `routeAction`.
             if (byte == 0x1b) return false;
-            if (form.chatgpt_job) |job| {
+            if (form.plan_job) |job| {
                 if (byte == 3) job.cancel.store(true, .release);
                 return true;
             }
@@ -50,7 +49,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn routeAction(app: *App, agent: *AppAgent, action: anytype) !bool {
             const form = &app.input_runtime.provider_menu;
             if (!form.active) return false;
-            if (form.chatgpt_job) |job| {
+            if (form.plan_job) |job| {
                 if (action == .escape) job.cancel.store(true, .release);
                 return true;
             }
@@ -93,58 +92,63 @@ pub fn Runtime(comptime App: type) type {
                     try form.beginEdit(app.alloc, definition);
                 },
                 .delete => try deleteConnection(app, agent),
-                .chatgpt_connect => try startChatGPT(app, agent, .connect),
-                .chatgpt_use => {
+                .plan_connect => try startPlan(app, agent, .connect),
+                .plan_use => {
                     const target = model_provider.parse(form.editing orelse return) orelse return;
                     form.close(app.alloc);
                     try app_auth_runtime.Runtime(App).switchToConnection(app, agent, try target.bind(app.provider_selection.definitions));
                 },
-                .chatgpt_reconnect => try startChatGPT(app, agent, .reconnect),
-                .chatgpt_remove => try startChatGPT(app, agent, .remove),
-                .chatgpt_usage => if (comptime @hasDecl(App, "chatgptBrowser")) {
-                    if (!try app.chatgptBrowser().open(app.alloc, "https://chatgpt.com/settings/usage")) form.problem = "Open https://chatgpt.com/settings/usage to review your plan.";
+                .plan_reconnect => try startPlan(app, agent, .reconnect),
+                .plan_remove => try startPlan(app, agent, .remove),
+                .plan_usage => if (comptime @hasDecl(App, "planBrowser")) {
+                    if (!try app.planBrowser().open(app.alloc, form.plan.usageUrl())) form.problem = switch (form.plan) {
+                        .chatgpt => "Open https://chatgpt.com/settings/usage to review your plan.",
+                        .claude => "Open https://claude.ai/settings/usage to review your plan.",
+                        .antigravity => "Open https://antigravity.google/ to review your plan.",
+                    };
                 },
             }
         }
 
-        fn startChatGPT(app: *App, agent: *AppAgent, operation: chatgpt.Operation) !void {
+        fn startPlan(app: *App, agent: *AppAgent, operation: plans.Operation) !void {
             const form = &app.input_runtime.provider_menu;
-            if (comptime !@hasDecl(App, "chatgptBrowser")) {
-                form.problem = "ChatGPT sign-in is only available in the local terminal app.";
+            if (comptime !@hasDecl(App, "planBrowser")) {
+                form.problem = "Subscription sign-in is only available in the local terminal app.";
                 return;
             } else {
                 if (agent.stream.active or agent.worker.queuedPromptCount() > 0) {
                     form.problem = "Wait for the active and queued work to finish.";
                     return;
                 }
-                const id = if (operation == .connect) try plan.newId(app.alloc) else try app.alloc.dupe(u8, form.editing orelse return);
+                const kind = form.plan;
+                const id = if (operation == .connect) try plans.newId(app.alloc, kind) else try app.alloc.dupe(u8, form.editing orelse return);
                 defer app.alloc.free(id);
                 if (operation == .connect and form.connections.items.len >= 32) {
                     form.problem = "The profile already has 32 connections.";
                     return;
                 }
-                const display_name = if (operation == .connect)
-                    chatgpt.displayName(app.alloc, app.provider_selection.definitions, form.input.items) catch |err| {
-                        form.problem = chatgpt.errorText(err);
+                const label = if (operation == .connect)
+                    plans.chooseLabel(app.alloc, kind, app.provider_selection.definitions, form.input.items) catch |err| {
+                        form.problem = plans.errorText(kind, err);
                         return;
                     }
                 else
-                    try app.alloc.dupe(u8, form.display_name.items);
-                defer app.alloc.free(display_name);
-                form.chatgpt_job = try chatgpt.Job.start(app.chatgptTransport(), app.chatgptBrowser(), operation, id, display_name);
-                form.problem = if (operation == .remove) "Disconnecting from ChatGPT…" else "Finish sign-in in your browser. Esc cancels.";
+                    try plans.labelOfAccount(app.alloc, (app.provider_selection.definitions.get(id) orelse return).*);
+                defer app.alloc.free(label);
+                form.plan_job = try plans.Job.start(kind, app.planTransport(), app.planBrowser(), operation, id, label);
+                form.problem = if (operation == .remove) "Disconnecting…" else "Finish sign-in in your browser. Esc cancels.";
             }
         }
 
-        pub fn collectChatGPT(app: *App, agent: *AppAgent) !void {
+        pub fn collectPlan(app: *App, agent: *AppAgent) !void {
             const form = &app.input_runtime.provider_menu;
-            const job = form.chatgpt_job orelse return;
+            const job = form.plan_job orelse return;
             if (!job.done.load(.acquire)) return;
-            form.chatgpt_job = null;
+            form.plan_job = null;
             defer job.close();
             app.shell.render_requests.request(.footer);
             const confirmed = job.result catch |err| {
-                form.problem = chatgpt.errorText(err);
+                form.problem = plans.errorText(job.kind, err);
                 return;
             };
             form.close(app.alloc);
@@ -161,14 +165,14 @@ pub fn Runtime(comptime App: type) type {
                         app.model_cache.resetForProviderChange();
                     }
                 }
-                try app.writeDomainNotice(.{ .topic = "connect", .tone = if (confirmed) .neutral else .warning, .body = if (confirmed) "Disconnected from ChatGPT." else "Removed the local account. Remote revocation could not be confirmed; disconnect Spark in ChatGPT settings." }, true);
+                try app.writeDomainNotice(.{ .topic = "connect", .tone = if (confirmed) .neutral else .warning, .body = plans.removedText(job.kind, confirmed) }, true);
                 return;
             }
             const target = try model_provider.parse(job.id).?.bind(app.provider_selection.definitions);
             if (!provider_runtime.providerOf(app, agent).same_authority(target)) {
                 try app_auth_runtime.Runtime(App).switchToConnection(app, agent, target);
             } else app.model_cache.resetForProviderChange();
-            try app.writeDomainNotice(.{ .topic = "connect", .tone = .neutral, .body = "Using your ChatGPT plan. Manage usage at https://chatgpt.com/settings/usage." }, true);
+            try app.writeDomainNotice(.{ .topic = "connect", .tone = .neutral, .body = plans.connectedText(job.kind) }, true);
         }
 
         /// Opens the form on the saved connections.

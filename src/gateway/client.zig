@@ -2347,6 +2347,8 @@ pub const PostTarget = struct {
     uri: std.Uri,
     authorization: ?[]const u8,
     extra_headers: []const std.http.Header = &.{},
+    /// Replaces spark's own User-Agent for a service that requires its own.
+    user_agent: ?[]const u8 = null,
 };
 
 /// Opens a POST on a client of its own, on an open job (`OpenJob`), so Esc
@@ -2376,7 +2378,7 @@ fn openBoundedPostWith(
     var headers: std.http.Client.Request.Headers = .{
         .content_type = .{ .override = "application/json" },
         .accept_encoding = .omit,
-        .user_agent = .{ .override = user_agent },
+        .user_agent = .{ .override = target.user_agent orelse user_agent },
     };
     if (target.authorization) |value| headers.authorization = .{ .override = value };
     const options: std.http.Client.RequestOptions = .{

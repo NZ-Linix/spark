@@ -38,19 +38,24 @@ Bun.serve({
       const { host: target, msg: req } = JSON.parse(String(data));
       if (!req) return;
       const send = (msg: object) => ws.send(JSON.stringify({ host: target, msg }));
-      if (target === mac.id && req.op === "chatgptAccounts") {
-        send({ t: "reply", id: req.id, ok: true, result: accounts });
+      const plan: string = req.op === "planAccounts" || req.op === "planAccount" ? req.plan : "chatgpt";
+      const product = ({ chatgpt: "Codex", claude: "Claude", antigravity: "Antigravity" } as Record<string, string>)[plan];
+      const ofPlan = () => accounts.filter(account => account.auth === `${plan}-plan`);
+      if (target === mac.id && (req.op === "chatgptAccounts" || req.op === "planAccounts")) {
+        send({ t: "reply", id: req.id, ok: true, result: ofPlan() });
         return;
       }
-      if (target === mac.id && req.op === "chatgptAccount") {
+      if (target === mac.id && (req.op === "chatgptAccount" || req.op === "planAccount")) {
         if (req.action === "connect") {
-          accounts.push({ name: `chatgpt-plan-${crypto.randomUUID().replaceAll("-", "")}`, displayName: `Codex (${req.value || accounts.length + 1})`, baseUrl: "https://api.openai.com/v1", protocol: "openai-responses", auth: "chatgpt-plan", models: ["example-model"], active: accounts.length === 0, headerEnv: [], provider: {} });
+          accounts.push({ name: `${plan}-plan-${crypto.randomUUID().replaceAll("-", "")}`, label: req.value || String(ofPlan().length + 1), baseUrl: "https://example.com", protocol: "openai-responses", auth: `${plan}-plan`, models: ["example-model"], active: accounts.length === 0, headerEnv: [], provider: {} });
         }
         if (req.action === "remove") {
           const index = accounts.findIndex(account => account.name === req.value);
           if (index >= 0) accounts.splice(index, 1);
         }
-        send({ t: "reply", id: req.id, ok: true, result: { accounts } });
+        // As spark names them: the plan's only account without its label.
+        for (const account of ofPlan()) account.displayName = ofPlan().length > 1 ? `${product} (${account.label})` : product;
+        send({ t: "reply", id: req.id, ok: true, result: { accounts: ofPlan() } });
         return;
       }
       if (typeof req.op === "string" && req.op.startsWith("mcp") && req.op !== "mcpServers") {

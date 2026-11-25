@@ -19,6 +19,10 @@ pub const Request = struct {
     payload: ?[]const u8 = null,
     /// Optional preformatted Authorization value, borrowed for this request.
     authorization: ?[]const u8 = null,
+    /// Replaces spark's own User-Agent for a service that requires its own.
+    user_agent: ?[]const u8 = null,
+    /// Further headers, borrowed for this request.
+    extra_headers: []const std.http.Header = &.{},
     cancel_flag: ?*std.atomic.Value(bool) = null,
     deadline: ?std.Io.Clock.Timestamp = null,
     /// Overrides the transport's response size limit for a request whose

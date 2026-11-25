@@ -12,6 +12,9 @@ const streams = @import("../core/agent/stream_provider.zig");
 const io = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
 const chatgpt_plan = @import("../core/auth/chatgpt_plan.zig");
+const claude_plan = @import("../core/auth/claude_plan.zig");
+const antigravity_plan = @import("../core/auth/antigravity_plan.zig");
+const plan_requests = @import("plan_requests.zig");
 const oauth_http = @import("../builtins/oauth_http.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const request_deadlines = @import("request_deadlines.zig");
@@ -163,7 +166,7 @@ pub fn tokenOf(definition: *const definitions.Definition, request: streams.Model
         for (value) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidConfiguredProviderCredential;
     }
     switch (definition.auth) {
-        .none, .chatgpt_plan => if (token != null) return error.UnexpectedConfiguredProviderCredential,
+        .none, .chatgpt_plan, .claude_plan, .antigravity_plan => if (token != null) return error.UnexpectedConfiguredProviderCredential,
         .bearer, .key => if (token == null) return error.MissingConfiguredProviderCredential,
     }
     return token;
@@ -176,18 +179,19 @@ pub fn tokenOf(definition: *const definitions.Definition, request: streams.Model
 pub fn send(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, payload: []const u8, consume: ConsumeFn) !streams.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const configured_token = try tokenOf(definition, request);
-    const plan_token = if (definition.auth == .chatgpt_plan) blk: {
-        if (!std.mem.eql(u8, definition.base_url, chatgpt_plan.resource) or definition.protocol != .@"openai-responses") return error.InvalidChatGPTAccount;
-        break :blk try chatgpt_plan.accessToken(alloc, oauth_http.provider, definition.id);
-    } else null;
-    defer if (plan_token) |value| secret.zeroAndFree(alloc, value);
-    const token = if (plan_token) |value| value else configured_token;
+    var plan = try PlanAccess.open(alloc, definition);
+    defer plan.deinit(alloc);
+    const token = plan.token orelse configured_token;
+    // An Antigravity body names the account's own Cloud Code project, and a
+    // plan's body the session's prompt-cache key.
+    const body = if (definition.auth.plan()) |kind| try plan_requests.sendBody(alloc, kind, payload, plan.project, request.session_id) else null;
+    defer if (body) |owned| alloc.free(owned);
     // Before anything is sent: a header that cannot be filled in fails here.
     var headers = try Headers.resolve(alloc, definition, request.session_id);
     defer headers.deinit(alloc);
     // The wait the request is in, so a bound that runs out can name itself.
     var wait: request_deadlines.Wait = .connecting;
-    return post(alloc, definition, request, token, &headers, payload, consume, &wait) catch |err| {
+    return post(alloc, definition, request, token, &headers, &plan, body orelse payload, consume, &wait) catch |err| {
         request.attempt_evidence.network_failure = client_mod.networkFailureEvidence(err, request.delivery.load());
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (request.deadline) |deadline| if (expired(deadline)) return error.Timeout;
@@ -198,12 +202,50 @@ pub fn send(alloc: Allocator, definition: *const definitions.Definition, request
     };
 }
 
+/// What a subscription plan's request carries besides the connection's own
+/// headers: the account's current token, the client identity the plan
+/// requires, and an Antigravity account's project. Empty for any other
+/// connection. Free with `deinit`, which wipes the token.
+const PlanAccess = struct {
+    token: ?[]u8 = null,
+    user_agent: ?[]u8 = null,
+    project: ?[]u8 = null,
+    headers: []const std.http.Header = &.{},
+
+    fn open(alloc: Allocator, definition: *const definitions.Definition) !PlanAccess {
+        const kind = definition.auth.plan() orelse return .{};
+        if (!std.mem.eql(u8, definition.base_url, kind.baseUrl()) or !std.mem.eql(u8, @tagName(definition.protocol), kind.protocolName())) return error.InvalidPlanAccount;
+        const transport = oauth_http.provider;
+        return switch (kind) {
+            .chatgpt => .{ .token = try chatgpt_plan.accessToken(alloc, transport, definition.id) },
+            .claude => .{
+                .token = try claude_plan.accessToken(alloc, transport, definition.id),
+                .user_agent = try alloc.dupe(u8, claude_plan.user_agent),
+                // `Headers.resolve` adds `anthropic-version` for this protocol.
+                .headers = claude_plan.api_headers[1..],
+            },
+            .antigravity => blk: {
+                const session = try antigravity_plan.open(alloc, transport, definition.id);
+                break :blk .{ .token = session.token, .user_agent = session.user_agent, .project = session.project };
+            },
+        };
+    }
+
+    fn deinit(self: *PlanAccess, alloc: Allocator) void {
+        if (self.token) |value| secret.zeroAndFree(alloc, value);
+        if (self.user_agent) |value| alloc.free(value);
+        if (self.project) |value| alloc.free(value);
+        self.* = .{};
+    }
+};
+
 fn post(
     alloc: Allocator,
     definition: *const definitions.Definition,
     request: streams.ModelRequest,
     token: ?[]const u8,
     headers: *const Headers,
+    plan: *const PlanAccess,
     payload: []const u8,
     consume: ConsumeFn,
     wait: *request_deadlines.Wait,
@@ -214,7 +256,7 @@ fn post(
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
-    const extra = try std.mem.concat(alloc, std.http.Header, &.{ &.{.{ .name = "accept", .value = "text/event-stream" }}, headers.list });
+    const extra = try std.mem.concat(alloc, std.http.Header, &.{ &.{.{ .name = "accept", .value = "text/event-stream" }}, headers.list, plan.headers });
     defer alloc.free(extra);
     try request.admission.admit();
     const timeouts = definition.timeouts;
@@ -222,6 +264,7 @@ fn post(
         .uri = uri,
         .authorization = authorization,
         .extra_headers = extra,
+        .user_agent = plan.user_agent,
     });
     defer opened.deinit();
     wait.* = .awaiting_head;
@@ -262,7 +305,11 @@ fn post(
     var transfer: [64 * 1024]u8 = undefined;
     const reader = response.reader(&transfer);
     if (response.head.status != .ok) {
-        if (definition.auth == .chatgpt_plan and response.head.status == .unauthorized) return error.ChatGPTSignInRequired;
+        if (response.head.status == .unauthorized) switch (definition.auth) {
+            .chatgpt_plan => return error.ChatGPTSignInRequired,
+            .claude_plan, .antigravity_plan => return error.PlanSignInRequired,
+            else => {},
+        };
         var detail = reader.allocRemaining(alloc, .limited(max_error_bytes)) catch |err| switch (err) {
             error.StreamTooLong => try alloc.dupe(u8, "Provider error response exceeded the local limit"),
             else => return err,
@@ -388,7 +435,7 @@ pub fn fetchModelIds(alloc: Allocator, definition: *const definitions.Definition
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
     switch (definition.auth) {
         .none => {},
-        .chatgpt_plan => return .{ .failure = .credential }, // uses the account-specific catalog shape
+        .chatgpt_plan, .claude_plan, .antigravity_plan => return .{ .failure = .credential }, // uses the account-specific catalog shape
         .bearer => |env| {
             const token = io.getenv(env) orelse return .{ .failure = .credential };
             if (token.len == 0 or token.len > max_secret_bytes) return .{ .failure = .credential };

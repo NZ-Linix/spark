@@ -31,6 +31,11 @@ pub const Options = struct {
     /// Fields of the effort level the request carries; null when the model does not declare it.
     effort_fields: ?request_fragment.Fragment = null,
     automatic_cache: bool = false,
+    /// Text blocks the `system` array starts with, before the instructions;
+    /// a Claude subscription's token requires its client identity there.
+    system_prefix: []const []const u8 = &.{},
+    /// The output limit when the request sets none.
+    default_max_tokens: ?u32 = null,
 };
 
 pub const Error = error{
@@ -233,8 +238,10 @@ pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, optio
 fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const function_tools.Function, projection: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
-    try writer.print(",\"max_tokens\":{d},\"stream\":true", .{request.max_output_tokens orelse default_max_tokens});
-    try write_system(writer, alloc, request.instructions);
+    try writer.print(",\"max_tokens\":{d},\"stream\":true", .{request.max_output_tokens orelse options.default_max_tokens orelse default_max_tokens});
+    if (options.system_prefix.len != 0) {
+        try write_system_blocks(writer, alloc, options.system_prefix, request.instructions);
+    } else try write_system(writer, alloc, request.instructions);
     try write_messages(writer, alloc, request, projection);
     if (request.response_format) |format| {
         try writer.writeAll(",\"tools\":[{\"name\":");
@@ -305,6 +312,28 @@ fn write_system(writer: *std.Io.Writer, alloc: Allocator, instructions: []const 
     if (joined.items.len == 0) return;
     try writer.writeAll(",\"system\":");
     try std.json.Stringify.value(joined.items, .{}, writer);
+}
+
+/// `system` as text blocks: `prefix`, then the instructions joined.
+fn write_system_blocks(writer: *std.Io.Writer, alloc: Allocator, prefix: []const []const u8, instructions: []const types.ChatMessage) !void {
+    try writer.writeAll(",\"system\":[");
+    for (prefix, 0..) |text, index| {
+        if (index != 0) try writer.writeByte(',');
+        try write_text_block(writer, text);
+    }
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(alloc);
+    for (instructions) |instruction| {
+        const text = instruction.content orelse continue;
+        if (text.len == 0) continue;
+        if (joined.items.len != 0) try joined.appendSlice(alloc, "\n\n");
+        try joined.appendSlice(alloc, text);
+    }
+    if (joined.items.len != 0) {
+        try writer.writeByte(',');
+        try write_text_block(writer, joined.items);
+    }
+    try writer.writeByte(']');
 }
 
 test "automatic Anthropic caching marks only eligible session requests" {

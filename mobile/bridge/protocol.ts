@@ -185,6 +185,10 @@ export type Request =
   | { id: number; op: "run"; run: string; cwd: string; command: string }
   | { id: number; op: "runStop"; run: string }
   | { id: number; op: "providers" }
+  /** Mac only: the subscription accounts of a plan, and signing in to or removing one */
+  | { id: number; op: "planAccounts"; plan: "chatgpt" | "claude" | "antigravity" }
+  | { id: number; op: "planAccount"; plan: "chatgpt" | "claude" | "antigravity"; action: "connect" | "reconnect" | "remove"; value: string }
+  /** the ChatGPT-only forms older app builds send */
   | { id: number; op: "chatgptAccounts" }
   | { id: number; op: "chatgptAccount"; action: "connect" | "reconnect" | "remove"; value: string }
   /** Mac only */

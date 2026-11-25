@@ -313,7 +313,7 @@ final class Link {
     let data = try JSONEncoder().encode(["host": JSON.string(host), "msg": .object(msg)])
     let key = "\(host)#\(n)"
     let timeout = Task {
-      do { try await Task.sleep(for: .seconds(op == "chatgptAccount" ? 340 : op == "watchTerminal" ? 15 : 90)) }
+      do { try await Task.sleep(for: .seconds(op == "planAccount" ? 340 : op == "watchTerminal" ? 15 : 90)) }
       catch { return }
       waiting.removeValue(forKey: key)?.resume(throwing: LinkError("The host took too long to answer."))
     }
@@ -604,17 +604,19 @@ final class Link {
     try await request(host, "providers", as: [ProviderSummary].self)
   }
 
-  func chatGPTAccounts(_ host: String) async throws -> [ProviderSummary] {
-    try await request(host, "chatgptAccounts", as: [ProviderSummary].self)
+  /** the subscription accounts of `plan` on a paired Mac */
+  func planAccounts(_ host: String, plan: SubscriptionPlan) async throws -> [ProviderSummary] {
+    try await request(host, "planAccounts", ["plan": .string(plan.rawValue)], as: [ProviderSummary].self)
   }
 
-  struct ChatGPTAccountUpdate: Decodable {
+  struct PlanAccountUpdate: Decodable {
     let accounts: [ProviderSummary]
     let warning: String?
   }
 
-  func changeChatGPTAccount(_ host: String, action: String, value: String) async throws -> ChatGPTAccountUpdate {
-    let result = try await request(host, "chatgptAccount", ["action": .string(action), "value": .string(value)], as: ChatGPTAccountUpdate.self)
+  /** signs in to (`connect`, `reconnect`) or removes an account; sign-in opens in the Mac's browser */
+  func changePlanAccount(_ host: String, plan: SubscriptionPlan, action: String, value: String) async throws -> PlanAccountUpdate {
+    let result = try await request(host, "planAccount", ["plan": .string(plan.rawValue), "action": .string(action), "value": .string(value)], as: PlanAccountUpdate.self)
     configs[host] = nil
     return result
   }

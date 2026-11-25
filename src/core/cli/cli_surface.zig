@@ -24,8 +24,7 @@ const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
-const chatgpt_connection = @import("../config/chatgpt_connection.zig");
-const chatgpt_plan = @import("../auth/chatgpt_plan.zig");
+const plan_connection = @import("../config/plan_connection.zig");
 const profiles = @import("../profiles/profiles.zig");
 const app_profile_runtime = @import("../app/app_profile_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -1139,7 +1138,7 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .provider => |rest| {
-            if (rest.len >= 2 and std.mem.eql(u8, rest[0], "chatgpt-account")) return runChatGPTAccount(alloc, rest[1..], cfg, deps);
+            if (rest.len >= 2) if (plan_connection.Kind.fromAccountCommand(rest[0])) |kind| return runPlanAccount(alloc, kind, rest[1..], cfg, deps);
             if (cli_provider_edit.handles(rest)) {
                 const result = try cli_provider_edit.run(alloc, rest);
                 defer alloc.free(result.text);
@@ -1795,41 +1794,59 @@ fn writeHostManagedAuthResult(deps: RunDeps) !void {
     try writeStdout(deps, "\n");
 }
 
-fn runChatGPTAccount(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
-    const operation = std.meta.stringToEnum(chatgpt_connection.Operation, args[0]);
+/// `spark provider claude-account connect [label] | reconnect <id> | remove <id>`,
+/// and the same for `chatgpt-account` and `antigravity-account`.
+fn runPlanAccount(alloc: Allocator, kind: plan_connection.Kind, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
+    const operation = std.meta.stringToEnum(plan_connection.Operation, args[0]);
     if (operation == null or args.len > 2 or (operation != .connect and args.len != 2)) {
-        try writeStderr(deps, "spark provider chatgpt-account connect [label] | reconnect <id> | remove <id>\n");
+        const usage = try std.fmt.allocPrint(alloc, "spark provider {s} connect [label] | reconnect <id> | remove <id>\n", .{kind.accountCommand()});
+        defer alloc.free(usage);
+        try writeStderr(deps, usage);
         return usage_failure;
     }
     var registry = try config_runtime.loadConfiguredProviders(alloc);
     defer registry.deinit(alloc);
-    const id = if (operation == .connect) try chatgpt_plan.newId(alloc) else try alloc.dupe(u8, args[1]);
+    const id = if (operation == .connect) try plan_connection.newId(alloc, kind) else try alloc.dupe(u8, args[1]);
     defer alloc.free(id);
     const label = if (operation == .connect) blk: {
         if (registry.definitions.len >= 32) {
             try writeProviderActivationError(alloc, deps, "the profile already has 32 connections");
             return .handled_failure;
         }
-        break :blk chatgpt_connection.displayName(alloc, registry, if (args.len == 2) args[1] else "") catch |err| {
-            try writeProviderActivationError(alloc, deps, chatgpt_connection.errorText(err));
+        break :blk plan_connection.chooseLabel(alloc, kind, registry, if (args.len == 2) args[1] else "") catch |err| {
+            try writeProviderActivationError(alloc, deps, plan_connection.errorText(kind, err));
             return .handled_failure;
         };
     } else blk: {
         const definition = registry.get(id);
-        if (definition == null or definition.?.auth != .chatgpt_plan) {
-            try writeProviderActivationError(alloc, deps, "that ChatGPT account is not saved here");
+        if (definition == null or definition.?.auth.plan() != kind) {
+            try writeProviderActivationError(alloc, deps, "that account is not saved here");
             return .handled_failure;
         }
-        break :blk try alloc.dupe(u8, definition.?.display_name orelse id);
+        break :blk try plan_connection.labelOfAccount(alloc, definition.?.*);
     };
     defer alloc.free(label);
+    // What the account is called before the change, for a removal's message.
+    const before = try alloc.dupe(u8, if (registry.get(id)) |definition| definition.display_name orelse id else id);
+    defer alloc.free(before);
     var cancel: std.atomic.Value(bool) = .init(false);
-    const confirmed = chatgpt_connection.change(alloc, cfg.oauth_transport, cfg.url_opener, operation.?, id, label, &cancel) catch |err| {
-        try writeProviderActivationError(alloc, deps, chatgpt_connection.errorText(err));
+    const confirmed = plan_connection.change(alloc, kind, cfg.oauth_transport, cfg.url_opener, operation.?, id, label, &cancel) catch |err| {
+        try writeProviderActivationError(alloc, deps, plan_connection.errorText(kind, err));
         return .handled_failure;
     };
-    if (!confirmed) try writeStderr(deps, "Removed the local account. Remote revocation could not be confirmed; disconnect Spark in ChatGPT settings.\n");
-    try writeStdout(deps, if (operation == .remove) "ChatGPT account removed.\n" else "ChatGPT plan connected.\n");
+    if (operation == .remove and !confirmed) {
+        const warning = try std.fmt.allocPrint(alloc, "{s}\n", .{plan_connection.removedText(kind, false)});
+        defer alloc.free(warning);
+        try writeStderr(deps, warning);
+    }
+    // A connected account's name as its plan now shows it: `Claude` alone,
+    // `Claude (Work)` beside another.
+    var after = try config_runtime.loadConfiguredProviders(alloc);
+    defer after.deinit(alloc);
+    const shown = if (operation == .remove) before else if (after.get(id)) |definition| definition.display_name orelse id else id;
+    const done = try std.fmt.allocPrint(alloc, "{s} {s}.\n", .{ shown, if (operation == .remove) "removed" else "connected" });
+    defer alloc.free(done);
+    try writeStdout(deps, done);
     return .handled_success;
 }
 

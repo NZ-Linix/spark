@@ -1090,6 +1090,7 @@ pub fn userSettingsPath(alloc: Allocator) !?[]u8 {
 
 pub const StatuslineItem = settings_store.StatuslineItem;
 pub const UserSettingsPatch = settings_store.UserSettingsPatch;
+pub const ConnectionPatch = settings_store.ConnectionPatch;
 pub const WorkspaceDirectoryMutation = settings_store.WorkspaceDirectoryMutation;
 pub const CommitOutcome = settings_store.CommitOutcome;
 pub const LegacyCleanup = settings_store.LegacyCleanup;

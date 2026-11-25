@@ -635,7 +635,7 @@ pub const slash_specs = [_]SlashSpec{
 
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .requires_args = true, .accepts_payload = true },
     .{ .kind = .fork_session, .command = "/fork", .aliases = &.{"/rewind"}, .help_entry = "/fork (/rewind)", .completion_description = "rewind to a prompt in a fork and edit it", .presentation_category = .session },
-    .{ .kind = .provider, .command = "/provider", .help_entry = "/provider", .completion_description = "manage model connections and ChatGPT plan accounts", .presentation_category = .account },
+    .{ .kind = .provider, .command = "/provider", .help_entry = "/provider", .completion_description = "manage model connections and ChatGPT, Claude and Antigravity subscription accounts", .presentation_category = .account },
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration and the session ID", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .requires_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },

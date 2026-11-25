@@ -338,6 +338,40 @@ describe("library", () => {
     }
   });
 
+  test("keeps Claude and Antigravity accounts on their own Mac and checks each plan's IDs", async () => {
+    const base = mkdtempSync(join(tmpdir(), "spark-plan-library-"));
+    try {
+      const mac = join(base, "mac");
+      mkdirSync(mac);
+      const claude = "claude-plan-00000000000000000000000000000001";
+      const google = "antigravity-plan-00000000000000000000000000000002";
+      const providers = {
+        [claude]: { display_name: "Claude (Work)", protocol: "anthropic-messages", base_url: "https://api.anthropic.com/v1", auth: { type: "claude-plan" } },
+        [google]: { display_name: "Antigravity (Personal)", protocol: "gemini-code-assist", base_url: "https://daily-cloudcode-pa.googleapis.com", auth: { type: "antigravity-plan" } },
+        shared: { protocol: "openai-chat-completions", base_url: "https://example.com/v1", auth: { type: "none" } },
+      };
+      writeFileSync(join(mac, "settings.json"), JSON.stringify({ provider: claude, providers }));
+      const local = new Profile({ role: "mac", home: mac, spark: "spark" });
+      expect(local.list().map(p => p.name)).toEqual(["shared"]);
+      expect(local.accounts("claude").map(p => p.displayName)).toEqual(["Claude (Work)"]);
+      expect(local.accounts("antigravity").map(p => p.displayName)).toEqual(["Antigravity (Personal)"]);
+      expect(local.accounts("chatgpt")).toEqual([]);
+      expect(() => local.accounts("other")).toThrow("Unknown subscription");
+      await expect(local.export(claude)).rejects.toThrow("stay on this Mac");
+      await expect(local.changeAccount("claude", "remove", google)).rejects.toThrow("Invalid Claude account");
+      await expect(local.changeAccount("antigravity", "connect", "x".repeat(49))).rejects.toThrow("Invalid Antigravity account");
+      const library = new Library({ dir: join(base, "library"), spark: "spark" });
+      await expect(library.putProvider({ name: google, provider: providers[google] })).rejects.toThrow("aren't part of the provider library");
+      const snapshot: LibrarySnapshot = { providers: { shared: providers.shared }, models: {}, provider: "shared", env: {}, prompts: {} };
+      applySnapshot(mac, snapshot, true);
+      const saved = JSON.parse(readFileSync(join(mac, "settings.json"), "utf8"));
+      expect(Object.keys(saved.providers).sort()).toEqual([google, claude, "shared"].sort());
+      expect(saved.provider).toBe(claude);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   test("mirrors cloud MCP definitions without copying OAuth state", () => {
     const lib = new Library({ dir: join(dir, "lib"), spark: SPARK });
     const home = join(dir, "home");
