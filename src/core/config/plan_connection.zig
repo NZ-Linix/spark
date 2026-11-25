@@ -70,6 +70,31 @@ pub fn chooseLabel(alloc: Allocator, kind: Kind, registry: configured.Registry, 
     unreachable;
 }
 
+/// Whether `text` can be an account's label.
+pub fn usableLabel(text: []const u8) bool {
+    return plan_catalog.usableLabel(text, 48);
+}
+
+/// Gives the saved account `id` the label `input`, which no other account
+/// of its plan may use, and names it and its models for it.
+pub fn relabel(alloc: Allocator, kind: Kind, registry: configured.Registry, id: []const u8, input: []const u8) !void {
+    if (!kind.isId(id)) return error.InvalidPlanAccount;
+    const label = std.mem.trim(u8, input, " \t");
+    if (!usableLabel(label)) return error.InvalidPlanLabel;
+    var labels = try labelsOf(alloc, kind, registry, id);
+    defer labels.deinit(alloc);
+    for (labels.items) |used| if (std.ascii.eqlIgnoreCase(used, label)) return error.PlanLabelTaken;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = try config.loadUserSettingsJson(a);
+    const providers = if (settings) |root| root.object.get("providers") else null;
+    const saved = (if (providers) |all| (if (all == .object) all.object.get(id) else null) else null) orelse return error.InvalidPlanAccount;
+    const value = try plan_catalog.presented(a, kind, saved, label, countOthers(kind, providers, id) >= 1);
+    var result = try config.setUserPreferences(alloc, .{ .connection = .{ .id = id, .value = value } });
+    result.deinit(alloc);
+}
+
 /// The saved label of the account `id`, for signing in to it again.
 /// Caller owns it.
 pub fn labelOfAccount(alloc: Allocator, definition: configured.Definition) ![]u8 {
@@ -96,6 +121,10 @@ fn removeAccount(alloc: Allocator, kind: Kind, transport: oauth.Provider, id: []
         .antigravity => antigravity_plan.remove(alloc, transport, id),
     };
 }
+
+/// The fields of an account's settings that the person sets in `/provider`,
+/// which signing in again keeps.
+pub const personal_fields = [_][]const u8{ "custom_name", "context_limit", "model_overrides" };
 
 pub fn catalogOf(arena: Allocator, kind: Kind, display_name: []const u8, models: []const u8) !std.json.Value {
     return switch (kind) {
@@ -162,6 +191,10 @@ pub fn change(alloc: Allocator, kind: Kind, transport: oauth.Provider, opener: h
     const name = try plan_catalog.accountName(a, kind, label, labeled);
     var value = try catalogOf(a, kind, name, models);
     try value.object.put(a, "account_label", .{ .string = label });
+    // Signing in again refreshes the catalog but keeps what the person set.
+    if (providers) |saved| if (saved == .object) if (saved.object.get(id)) |previous| if (previous == .object) {
+        for (personal_fields) |field| if (previous.object.get(field)) |kept| try value.object.put(a, field, kept);
+    };
     var providers_map: std.json.ObjectMap = .empty;
     try providers_map.put(a, id, value);
     var definition = try configured.Registry.parse(alloc, .{ .object = providers_map });

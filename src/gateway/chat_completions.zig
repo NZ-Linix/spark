@@ -220,6 +220,7 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
         .has_file_input = vision,
         .context_window = metadata.context_window orelse 0,
         .max_tokens = metadata.max_output_tokens orelse 0,
+        .default_effort = default_effort_of(metadata),
     };
 }
 
@@ -236,9 +237,24 @@ fn effort_options(metadata: definitions.ModelMetadata) model_capabilities.Reason
 
 fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
     const metadata = definition_at(raw).metadata_for(model) orelse return .{};
+    return capabilities_of(metadata);
+}
+
+/// What `metadata` says the model can do, its default level included.
+pub fn capabilities_of(metadata: definitions.ModelMetadata) model_capabilities.Capabilities {
+    return model_capabilities.mergeCapabilities(.{}, gateway_metadata_of(metadata));
+}
+
+/// What `metadata` says, as a catalog would say it, with its levels.
+pub fn gateway_metadata_of(metadata: definitions.ModelMetadata) model_capabilities.GatewayMetadata {
     var listed = model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata));
     listed.reasoning_efforts = effort_options(metadata);
-    return model_capabilities.mergeCapabilities(.{}, listed);
+    return listed;
+}
+
+/// The model's default level, when its settings name one.
+pub fn default_effort_of(metadata: definitions.ModelMetadata) ?types.ReasoningEffort {
+    return types.ReasoningEffort.parse(metadata.default_effort orelse return null);
 }
 
 fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
@@ -276,11 +292,11 @@ fn load_models(definition: *const definitions.Definition, alloc: Allocator, canc
             if (err == error.OutOfMemory) return error.OutOfMemory;
             if (err == error.Cancelled) return .{ .entries = entries, .failure = .cancelled };
             debug_trace.logf("gateway", "event=plan_models_unavailable connection={s} err={s}", .{ definition.id, @errorName(err) });
-            for (definition.model_metadata) |declared| try append_entry(alloc, &entries, declared);
+            for (definition.model_metadata) |declared| try append_entry(alloc, &entries, definition.with_overrides(declared));
             return .{ .entries = entries, .failure = if (plan_requests.signInRequired(err)) .credential else .transport };
         };
         defer fresh.deinit(alloc);
-        for (fresh.definitions[0].model_metadata) |declared| try append_entry(alloc, &entries, declared);
+        for (fresh.definitions[0].model_metadata) |served| try append_entry(alloc, &entries, definition.with_overrides(served));
         return .{ .entries = entries };
     }
     for (definition.model_metadata) |declared| {

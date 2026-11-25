@@ -1061,7 +1061,9 @@ pub fn Commands(comptime App: type) type {
                 "fast"
             else
                 "normal";
-            const line = try app.alloc.print("{s}{s} (effort: {s}, speed: {s})", .{ prefix, selected, agent.effort.displayLabel(), speed });
+            const effective = model_capabilities.resolveForApp(App, app, selected).effectiveEffort(agent.effort);
+            const default_note: []const u8 = if (agent.effort.isDefault() and !effective.isDefault()) " (model default)" else "";
+            const line = try app.alloc.print("{s}{s} (effort: {s}{s}, speed: {s})", .{ prefix, selected, effective.displayLabel(), default_note, speed });
             defer app.alloc.free(line);
             try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
             if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();

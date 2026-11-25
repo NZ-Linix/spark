@@ -99,6 +99,8 @@ pub fn Runtime(comptime App: type) type {
                     try app_auth_runtime.Runtime(App).switchToConnection(app, agent, try target.bind(app.provider_selection.definitions));
                 },
                 .plan_reconnect => try startPlan(app, agent, .reconnect),
+                .plan_save => try savePlanAccount(app, agent),
+                .plan_relabel => try relabelPlanAccount(app, agent),
                 .plan_remove => try startPlan(app, agent, .remove),
                 .plan_usage => if (comptime @hasDecl(App, "planBrowser")) {
                     if (!try app.planBrowser().open(app.alloc, form.plan.usageUrl())) form.problem = switch (form.plan) {
@@ -183,10 +185,77 @@ pub fn Runtime(comptime App: type) type {
             defer labels.deinit(app.alloc);
             for (app.provider_selection.definitions.definitions) |definition| {
                 try names.append(app.alloc, definition.id);
-                try labels.append(app.alloc, definition.display_name);
+                try labels.append(app.alloc, listName(definition));
             }
             try app.input_runtime.provider_menu.open(app.alloc, names.items);
             try app.input_runtime.provider_menu.setLabels(app.alloc, labels.items);
+        }
+
+        /// The name the connection list shows for `definition`.
+        fn listName(definition: configured_provider.Definition) ?[]const u8 {
+            return definition.custom_name orelse definition.display_name;
+        }
+
+        fn refreshLabels(app: *App) !void {
+            const form = &app.input_runtime.provider_menu;
+            var labels: std.ArrayList(?[]const u8) = .empty;
+            defer labels.deinit(app.alloc);
+            for (form.connections.items) |entry| {
+                const definition = app.provider_selection.definitions.get(entry);
+                try labels.append(app.alloc, if (definition) |d| listName(d.*) else null);
+            }
+            try form.setLabels(app.alloc, labels.items);
+        }
+
+        /// Saves the subscription account's name, largest window, and model
+        /// overrides, and keeps the form open on them.
+        fn savePlanAccount(app: *App, agent: *AppAgent) !void {
+            const form = &app.input_runtime.provider_menu;
+            const id = form.editing orelse return;
+            if (agent.stream.active) {
+                form.problem = "wait for the current turn to finish; the change is not saved yet";
+                return;
+            }
+            var arena: std.heap.ArenaAllocator = .init(app.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const owned = try a.dupe(u8, id);
+            const base = (config_runtime.loadConnectionJson(a, owned) catch null) orelse {
+                form.problem = "that account is no longer in the settings";
+                return;
+            };
+            const value = try form.planToJson(a, base);
+            var check: std.json.ObjectMap = .empty;
+            try check.put(a, owned, value);
+            var checked = configured_provider.Registry.parse(app.alloc, .{ .object = check }) catch |err| {
+                form.problem = configured_provider.failure_advice(err) orelse "the account could not be saved";
+                return;
+            };
+            checked.deinit(app.alloc);
+            var outcome = config_runtime.setUserPreferences(app.alloc, .{
+                .connection = .{ .id = owned, .value = value },
+            }) catch |err| return writeError(form, err);
+            outcome.deinit(app.alloc);
+            if (!try reloadConnections(app)) return;
+            try refreshLabels(app);
+            form.saved = true;
+        }
+
+        /// Gives the subscription account the label typed, which renames it
+        /// and its models, and shows the account's fields again.
+        fn relabelPlanAccount(app: *App, agent: *AppAgent) !void {
+            const form = &app.input_runtime.provider_menu;
+            const id = try app.alloc.dupe(u8, form.editing orelse return);
+            defer app.alloc.free(id);
+            if (agent.stream.active) {
+                form.problem = "wait for the current turn to finish; the change is not saved yet";
+            } else if (plans.relabel(app.alloc, form.plan, app.provider_selection.definitions, id, form.account_label.items)) |_| {
+                if (!try reloadConnections(app)) return;
+                try refreshLabels(app);
+                form.saved = true;
+            } else |err| form.problem = plans.errorText(form.plan, err);
+            // The saved label and names, whether or not the change took.
+            if (app.provider_selection.definitions.get(id)) |definition| try form.reloadPlanAccount(app.alloc, definition);
         }
 
         /// Closes the form without saving. Returns whether it was open.
@@ -307,7 +376,7 @@ pub fn Runtime(comptime App: type) type {
             defer labels.deinit(app.alloc);
             for (form.connections.items) |entry| {
                 const definition = app.provider_selection.definitions.get(entry);
-                try labels.append(app.alloc, if (definition) |d| d.display_name else null);
+                try labels.append(app.alloc, if (definition) |d| listName(d.*) else null);
             }
             try form.setLabels(app.alloc, labels.items);
             if (was_active and renamed) {

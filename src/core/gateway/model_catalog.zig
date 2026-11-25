@@ -180,6 +180,7 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
         .context_window = entry.context_window,
         .max_tokens = entry.max_tokens,
         .web_search_price = null,
+        .default_effort = entry.default_effort,
     };
     errdefer if (cloned.web_search_price) |price| alloc.free(price);
     if (entry.web_search_price) |price| {
@@ -280,6 +281,9 @@ pub const ModelCatalogEntry = struct {
     /// The id of the model whose Fast mode runs this one; null when the
     /// catalog names none.
     fast_variant_of: ?[]u8 = null,
+    /// The level a request uses while the session's effort is `default`,
+    /// as a connection's settings choose it for the model.
+    default_effort: ?types.ReasoningEffort = null,
 };
 
 pub fn freeModelCatalog(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelCatalogEntry)) void {

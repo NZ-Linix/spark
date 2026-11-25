@@ -702,7 +702,8 @@ pub fn Runtime(comptime App: type) type {
                 .steering_messages = steering.messages,
                 .steering_waits_for_boundary = steering.waits_for_boundary,
                 .fast_indicator_active = fast_indicator_active,
-                .effort = visible_effort,
+                // `default` reads as the model's own default level, when it has one.
+                .effort = visible_capabilities.effectiveEffort(visible_effort),
                 .model_supports_effort = model_supports_effort,
                 .ctrl_c_pending = app.input_runtime.gestures.ctrlCExitArmed(),
                 .shimmer_pos = shimmer_pos,

@@ -116,28 +116,34 @@ pub fn Runtime(comptime App: type) type {
         /// session's provider. The model is the one saved for it, else its
         /// first declared model, else the one in use.
         pub fn switchToConnection(app: *App, agent: *AppAgent, target: model_provider.ProviderId) !void {
+            _ = try switchToConnectionWithModel(app, agent, target, null);
+        }
+
+        /// Like `switchToConnection`, but with `model` in place of the saved
+        /// one when it is set. Returns whether the connection changed.
+        pub fn switchToConnectionWithModel(app: *App, agent: *AppAgent, target: model_provider.ProviderId, chosen: ?[]const u8) !bool {
             if (agent.stream.active or agent.worker.queuedPromptCount() > 0) {
                 try writeNotice(app, .warning, provider_busy_message);
-                return;
+                return false;
             }
             const current = provider_runtime.providerOf(app, agent);
             if (current.same_authority(target)) {
                 const body = try app.alloc.print("Already using {s}.", .{target.label()});
                 defer app.alloc.free(body);
                 try writeNotice(app, .neutral, body);
-                return;
+                return false;
             }
             var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
                 debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
                 try writeNotice(app, .@"error", "Could not load the saved provider selection. The current provider is unchanged.");
-                return;
+                return false;
             };
             defer settings.deinit(app.alloc);
             const definition = app.provider_selection.definitions.get(target.label()) orelse {
                 try writeNotice(app, .@"error", "That provider is not configured. Run /provider to add it.");
-                return;
+                return false;
             };
-            const model = settings.models.get(target) orelse
+            const model = chosen orelse settings.models.get(target) orelse
                 (if (definition.model_metadata.len > 0) definition.model_metadata[0].id else provider_runtime.modelOf(app, agent));
             var owned_model = try app.alloc.dupe(u8, model);
             defer app.alloc.free(owned_model);
@@ -156,9 +162,10 @@ pub fn Runtime(comptime App: type) type {
 
             // A subscription account's ID is opaque: name it and its model as pickers do.
             const plan = definition.auth.plan() != null;
-            const model_name = if (plan) if (definition.model(provider_runtime.modelOf(app, agent))) |known| known.display_name else null else null;
+            const known = definition.metadata_for(provider_runtime.modelOf(app, agent));
+            const model_name = if (plan or definition.override(provider_runtime.modelOf(app, agent)) != null) if (known) |metadata| metadata.display_name else null else null;
             const body = try app.alloc.print("Switched to {s} with {s}.", .{
-                if (plan) definition.display_name orelse target.label() else target.label(),
+                definition.custom_name orelse if (plan) definition.display_name orelse target.label() else target.label(),
                 model_name orelse provider_runtime.modelOf(app, agent),
             });
             defer app.alloc.free(body);
@@ -172,6 +179,7 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 try writeNotice(app, .neutral, body);
             }
+            return true;
         }
 
         fn writeNotice(app: *App, tone: types.NoticeTone, body: []const u8) !void {

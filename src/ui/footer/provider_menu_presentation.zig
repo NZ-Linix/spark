@@ -34,6 +34,11 @@ fn subtitle(state: *const State, buf: []u8) []const u8 {
             .claude => "uses a Claude subscription",
             .antigravity => "uses an Antigravity (Google AI) subscription",
         },
+        .plan_settings => if (state.saved) "account settings · saved" else "account settings",
+        .plan_model => blk: {
+            const id = if (state.model_index < state.models.items.len) state.models.items[state.model_index].id else "";
+            break :blk std.mem.print(buf, "model {s}{s}", .{ id, if (state.saved) " · saved" else "" }) catch id;
+        },
         .plan_label => switch (state.plan) {
             .chatgpt => "uses a ChatGPT plan, no API key",
             .claude => "uses a Claude Pro or Max subscription, no API key",
@@ -82,7 +87,12 @@ pub fn composeProviderMenuRow(
         const title: []const u8 = if (state.field == .pick)
             "Model connections"
         else if (state.editing) |_|
-            (std.mem.print(&title_buf, "{s}", .{if (state.display_name.items.len > 0) state.display_name.items else state.name.items}) catch "Edit connection")
+            (std.mem.print(&title_buf, "{s}", .{if (state.custom_name.items.len > 0 and state.isPlanAccount())
+                state.custom_name.items
+            else if (state.display_name.items.len > 0)
+                state.display_name.items
+            else
+                state.name.items}) catch "Edit connection")
         else if (state.field == .plan_label)
             continueLabel(state.plan)
         else if (state.name.items.len > 0)
@@ -144,17 +154,44 @@ fn appendListRow(alloc: Allocator, row: *std.ArrayList(u8), state: *const State,
                 "+ Add connection";
             try appendAction(alloc, row, label, selected, false, width);
         },
-        .plan_account => try appendAction(alloc, row, switch (item) {
-            0 => "Use this account",
-            1 => "Sign in again",
-            2 => switch (state.plan) {
+        .plan_account => try appendAction(alloc, row, switch (State.planAction(item)) {
+            .use => "Use this account",
+            .edit => "Edit account",
+            .reconnect => "Sign in again",
+            .usage => switch (state.plan) {
                 .chatgpt => "Manage ChatGPT usage",
                 .claude => "Manage Claude usage",
                 .antigravity => "Open Antigravity",
             },
-            3 => "Disconnect account",
-            else => "Back",
-        }, selected, item == 3, width),
+            .remove => "Disconnect account",
+            .back => "Back",
+        }, selected, State.planAction(item) == .remove, width),
+        .plan_settings => switch (state.planSettingsRow(item)) {
+            .field => |field| {
+                var tokens_buf: [16]u8 = undefined;
+                const value: []const u8 = switch (field) {
+                    .account_label => state.account_label.items,
+                    .account_name => state.custom_name.items,
+                    else => if (state.context_limit) |tokens| std.mem.print(&tokens_buf, "{d}", .{tokens}) catch "" else "",
+                };
+                try appendValueRow(alloc, row, field.label(), value, selected, width);
+            },
+            .model => |index| try appendValueRow(alloc, row, "Model", planModelSummary(state.models.items[index], state.context_limit, &buf), selected, width),
+            .back => try appendAction(alloc, row, "Back", selected, false, width),
+        },
+        .plan_model => switch (State.planModelRow(item)) {
+            .field => |field| {
+                const model = state.models.items[state.model_index];
+                var tokens_buf: [32]u8 = undefined;
+                const value: []const u8 = switch (field) {
+                    .model_name => model.name orelse model.served_name orelse "",
+                    .model_context => if (model.context orelse model.served_context) |tokens| std.mem.print(&tokens_buf, "{d}{s}", .{ tokens, if (model.context == null) " (plan)" else "" }) catch "" else "",
+                    else => model.default_effort orelse "",
+                };
+                try appendValueRow(alloc, row, field.label(), value, selected, width);
+            },
+            else => try appendAction(alloc, row, "Back", selected, false, width),
+        },
         .overview => switch (state.overviewRow(item)) {
             .field => |field| try appendValueRow(alloc, row, field.label(), fieldValue(state, field), selected, width),
             .model => |index| try appendValueRow(alloc, row, "Model", modelSummary(state.models.items[index], &buf), selected, width),
@@ -171,6 +208,7 @@ fn appendListRow(alloc: Allocator, row: *std.ArrayList(u8), state: *const State,
                     .model_id => model.id,
                     .model_name => model.name orelse "",
                     .model_context => if (model.context) |tokens| std.mem.print(&tokens_buf, "{d}", .{tokens}) catch "" else "",
+                    .model_default_effort => model.default_effort orelse "",
                     else => model.efforts orelse "",
                 };
                 try appendValueRow(alloc, row, field.label(), value, selected, width);
@@ -198,6 +236,17 @@ fn modelSummary(model: provider_menu.Model, buf: []u8) []const u8 {
     if (model.name != null) writer.print(" ({s})", .{model.id}) catch {};
     if (model.context) |tokens| writer.print(" · {d} tokens", .{tokens}) catch {};
     if (model.efforts) |levels| writer.print(" · {s}", .{levels}) catch {};
+    if (model.default_effort) |level| writer.print(" · default {s}", .{level}) catch {};
+    return writer.buffered();
+}
+
+/// A subscription model's row: its name with what the person set.
+fn planModelSummary(model: provider_menu.Model, limit: ?u32, buf: []u8) []const u8 {
+    var writer: std.Io.Writer = .fixed(buf);
+    writer.writeAll(model.name orelse model.served_name orelse model.id) catch {};
+    const window = model.context orelse model.served_context;
+    if (if (limit) |cap| @min(window orelse cap, cap) else window) |tokens| writer.print(" · {d} tokens", .{tokens}) catch {};
+    if (model.default_effort) |level| writer.print(" · default {s}", .{level}) catch {};
     return writer.buffered();
 }
 

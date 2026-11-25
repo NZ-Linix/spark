@@ -41,6 +41,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidRequestFields,
     ReservedRequestField,
     InvalidEffortLevel,
+    InvalidDefaultEffort,
     InvalidHeader,
     InvalidHeaderName,
     ReservedHeader,
@@ -162,6 +163,8 @@ pub const ModelMetadata = struct {
     /// The levels spark offers for the model, in the settings' order. Null means
     /// the settings do not say; an empty list says the model has none.
     reasoning_efforts: ?[]const EffortLevel = null,
+    /// The level a request uses while the session's effort is `default`.
+    default_effort: ?[]const u8 = null,
 
     pub fn effort(self: *const ModelMetadata, name: []const u8) ?*const EffortLevel {
         const levels = self.reasoning_efforts orelse return null;
@@ -201,6 +204,41 @@ pub const Definition = struct {
     /// itself, including one the settings do not declare. Its `id` is empty.
     model_defaults: ?ModelMetadata = null,
     model_metadata: []const ModelMetadata = &.{},
+    /// The name the person gave the connection, shown in place of
+    /// `display_name`. A subscription account keeps its own `display_name`
+    /// for how its plan names it.
+    custom_name: ?[]const u8 = null,
+    /// The largest context window any model of the connection gets.
+    context_limit: ?u32 = null,
+    /// What the person set for a model over what the connection or its
+    /// service says: its name, context window, and default level. Only
+    /// `display_name`, `context_window`, and `default_effort` are set.
+    model_overrides: []const ModelMetadata = &.{},
+
+    /// The name menus show for the connection.
+    pub fn shown_name(self: *const Definition) []const u8 {
+        return self.custom_name orelse self.display_name orelse self.id;
+    }
+
+    pub fn override(self: *const Definition, id: []const u8) ?*const ModelMetadata {
+        for (self.model_overrides) |*entry| {
+            if (std.mem.eql(u8, entry.id, id)) return entry;
+        }
+        return null;
+    }
+
+    /// `metadata` with what the person set for the model on top, and the
+    /// window held to `context_limit`. The result borrows both.
+    pub fn with_overrides(self: *const Definition, metadata: ModelMetadata) ModelMetadata {
+        var merged = metadata;
+        if (self.override(metadata.id)) |set| {
+            if (set.display_name) |name| merged.display_name = name;
+            if (set.context_window) |window| merged.context_window = window;
+            if (set.default_effort) |level| merged.default_effort = level;
+        }
+        if (self.context_limit) |limit| merged.context_window = @min(merged.context_window orelse limit, limit);
+        return merged;
+    }
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
@@ -229,17 +267,21 @@ pub const Definition = struct {
     /// What the connection knows about `id`: the model's own metadata, with
     /// `model_defaults` for each field it leaves out. Null when the settings
     /// say nothing about the model. The result borrows `id` and the registry.
-    pub fn metadata_for(self: Definition, id: []const u8) ?ModelMetadata {
+    pub fn metadata_for(self: *const Definition, id: []const u8) ?ModelMetadata {
         if (id.len > max_model_bytes) return null;
         const declared = self.model(id);
-        const defaults = self.model_defaults orelse return if (declared) |metadata| metadata.* else null;
+        const defaults = self.model_defaults orelse {
+            if (declared) |metadata| return self.with_overrides(metadata.*);
+            if (self.override(id) != null or self.context_limit != null) return self.with_overrides(.{ .id = id });
+            return null;
+        };
         var merged: ModelMetadata = if (declared) |metadata| metadata.* else .{ .id = id };
         inline for (@typeInfo(ModelMetadata).@"struct".field_names) |name| {
             if (comptime !std.mem.eql(u8, name, "id")) {
                 if (@field(merged, name) == null) @field(merged, name) = @field(defaults, name);
             }
         }
-        return merged;
+        return self.with_overrides(merged);
     }
 
     /// Non-secret route provenance, stable across credential rotation in the
@@ -332,6 +374,7 @@ pub fn failure_advice(err: anyerror) ?[]const u8 {
         error.DuplicateField => "another key here names the same thing, perhaps in other letter case; keep one",
         error.InvalidTimeout => "a timeout is a whole number of milliseconds from 1 to 86400000",
         error.InvalidEffortLevel => "an effort level's name uses letters, digits, -, _, and ., and is not auto, adaptive, or default",
+        error.InvalidDefaultEffort => "a model's default_effort names one of its reasoning levels",
         error.UnknownField => "spark doesn't know this field; check its spelling or remove it",
         error.MissingField => "this field is required; add it",
         error.InvalidObject => "this must be a JSON object",
@@ -448,7 +491,7 @@ pub const Registry = struct {
 /// `owned` is the registry's arena: a failure frees nothing here.
 fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at: ?*FailurePath) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "display_name", "account_label", "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata" }, at);
+    try check_fields(value, &.{ "display_name", "account_label", "custom_name", "context_limit", "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata", "model_overrides" }, at);
     enter(at, "protocol");
     const protocol_name = try required(value, "protocol");
     if (protocol_name != .string) return error.InvalidProtocol;
@@ -495,6 +538,16 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         leave(at);
     }
     const model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(owned, protocol, metadata, at) else &.{};
+    const model_overrides = if (value.object.get("model_overrides")) |overrides| try parse_overrides(owned, overrides, at) else &.{};
+    const context_limit = try positive_limit(value, "context_limit", at);
+    var custom_name: ?[]const u8 = null;
+    if (value.object.get("custom_name")) |name| {
+        enter(at, "custom_name");
+        if (name != .string or name.string.len == 0 or name.string.len > 80) return error.InvalidDisplayName;
+        for (name.string) |byte| if (byte < 0x20 or byte == 0x7f) return error.InvalidDisplayName;
+        custom_name = try owned.dupe(u8, name.string);
+        leave(at);
+    }
     var display_name: ?[]const u8 = null;
     if (value.object.get("display_name")) |name| {
         enter(at, "display_name");
@@ -532,7 +585,58 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         .fetch_models = fetch_models,
         .model_defaults = model_defaults,
         .model_metadata = model_metadata,
+        .custom_name = custom_name,
+        .context_limit = context_limit,
+        .model_overrides = model_overrides,
     };
+}
+
+/// What the person set for each model, keyed by model id.
+fn parse_overrides(owned: Allocator, value: std.json.Value, at: ?*FailurePath) ParseError![]const ModelMetadata {
+    enter(at, "model_overrides");
+    if (value != .object) return error.InvalidObject;
+    if (value.object.count() > max_models) return error.LimitExceeded;
+    const models = try owned.alloc(ModelMetadata, value.object.count());
+    var iterator = value.object.iterator();
+    var index: usize = 0;
+    while (iterator.next()) |entry| : (index += 1) {
+        enter(at, entry.key_ptr.*);
+        try validate_model_id(entry.key_ptr.*);
+        const fields = entry.value_ptr.*;
+        try check_fields(fields, &.{ "display_name", "context_window", "default_effort" }, at);
+        var display_name: ?[]const u8 = null;
+        if (fields.object.get("display_name")) |name| {
+            enter(at, "display_name");
+            if (name != .string or name.string.len == 0 or name.string.len > max_model_bytes) return error.InvalidModelMetadata;
+            display_name = try owned.dupe(u8, name.string);
+            leave(at);
+        }
+        models[index] = .{
+            .id = try owned.dupe(u8, entry.key_ptr.*),
+            .display_name = display_name,
+            .context_window = try positive_limit(fields, "context_window", at),
+            .default_effort = try default_effort(owned, fields, null, at),
+        };
+        leave(at);
+    }
+    leave(at);
+    return models;
+}
+
+/// A model's `default_effort`: a level name, and one of `levels` when the
+/// model lists them.
+fn default_effort(owned: Allocator, fields: std.json.Value, levels: ?[]const EffortLevel, at: ?*FailurePath) ParseError!?[]const u8 {
+    const present = fields.object.get("default_effort") orelse return null;
+    enter(at, "default_effort");
+    if (present != .string) return error.InvalidDefaultEffort;
+    validate_effort_name(present.string) catch return error.InvalidDefaultEffort;
+    if (levels) |known| {
+        for (known) |level| {
+            if (std.mem.eql(u8, level.name, present.string)) break;
+        } else return error.InvalidDefaultEffort;
+    }
+    leave(at);
+    return try owned.dupe(u8, present.string);
 }
 
 fn optional_model(owned: Allocator, parent: std.json.Value, key: []const u8, at: ?*FailurePath) ParseError!?[]const u8 {
@@ -673,7 +777,7 @@ fn parse_metadata(owned: Allocator, protocol: Protocol, value: std.json.Value, a
 }
 
 fn parse_model(owned: Allocator, protocol: Protocol, id: []const u8, metadata: std.json.Value, at: ?*FailurePath) ParseError!ModelMetadata {
-    try check_fields(metadata, &.{ "display_name", "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "output_limit_field", "request", "reasoning_efforts" }, at);
+    try check_fields(metadata, &.{ "display_name", "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "output_limit_field", "request", "reasoning_efforts", "default_effort" }, at);
     var display_name: ?[]const u8 = null;
     if (metadata.object.get("display_name")) |name| {
         enter(at, "display_name");
@@ -718,6 +822,7 @@ fn parse_model(owned: Allocator, protocol: Protocol, id: []const u8, metadata: s
         .output_limit_field = limit_field,
         .request = request,
         .reasoning_efforts = efforts,
+        .default_effort = try default_effort(owned, metadata, efforts, at),
     };
 }
 
@@ -909,6 +1014,38 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expect(unknown.supports_tool_use == null and unknown.supports_vision == null);
     try std.testing.expect(router.model("missing") == null);
     try std.testing.expect(registry.get("Router") == null);
+}
+
+test "a connection's name, largest window, and model overrides sit over what it serves" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc,
+        \\{"claude-plan-00000000000000000000000000000001":{"auth":{"type":"claude-plan"},"protocol":"anthropic-messages","base_url":"https://api.anthropic.com/v1",
+        \\ "display_name":"Claude","custom_name":"Main","context_limit":200000,
+        \\ "model_metadata":{"m1":{"display_name":"M1","context_window":1000000,"reasoning_efforts":{"low":{},"high":{}}},"m2":{"context_window":100000}},
+        \\ "model_overrides":{"m1":{"display_name":"Mine","default_effort":"high"},"m2":{"context_window":150000}}},
+        \\ "local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1/v1","auth":{"type":"none"},
+        \\ "model_metadata":{"x":{"reasoning_efforts":{"low":{},"max":{}},"default_effort":"max"}}}}
+    );
+    defer registry.deinit(alloc);
+    const plan = registry.get("claude-plan-00000000000000000000000000000001").?;
+    try std.testing.expectEqualStrings("Main", plan.shown_name());
+    const first = plan.metadata_for("m1").?;
+    try std.testing.expectEqualStrings("Mine", first.display_name.?);
+    try std.testing.expectEqual(@as(?u32, 200000), first.context_window);
+    try std.testing.expectEqualStrings("high", first.default_effort.?);
+    // The override raises the window, and the limit still holds it.
+    try std.testing.expectEqual(@as(?u32, 150000), plan.metadata_for("m2").?.context_window);
+    const local = registry.get("local").?;
+    try std.testing.expectEqualStrings("local", local.shown_name());
+    try std.testing.expectEqualStrings("max", local.metadata_for("x").?.default_effort.?);
+    try std.testing.expect(local.metadata_for("y") == null);
+}
+
+test "a model's default effort is one of its levels" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidDefaultEffort, Registry.parse_json(alloc, "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"x\":{\"reasoning_efforts\":{\"low\":{}},\"default_effort\":\"high\"}}}}"));
+    try std.testing.expectError(error.InvalidDefaultEffort, Registry.parse_json(alloc, "{\"local\":{" ++ test_required_fields ++ ",\"model_overrides\":{\"x\":{\"default_effort\":\"bad level\"}}}}"));
+    try std.testing.expectError(error.UnknownField, Registry.parse_json(alloc, "{\"local\":{" ++ test_required_fields ++ ",\"model_overrides\":{\"x\":{\"max_output_tokens\":5}}}}"));
 }
 
 fn test_allocations(alloc: Allocator) !void {

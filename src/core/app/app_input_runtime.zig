@@ -2202,7 +2202,16 @@ pub fn Runtime(comptime App: type) type {
         /// the background, so models released mid-session appear once it lands.
         fn openModelMenu(app: *App) !void {
             if (comptime @hasDecl(App, "revalidateModelCache")) app.revalidateModelCache();
+            if (comptime @hasDecl(App, "refreshOtherConnectionModels")) try app.refreshOtherConnectionModels();
             try app.model_cache.openMenu();
+        }
+
+        /// Switches to the connection that serves the model picked from the
+        /// menu, when it is not the one in use. False when it could not.
+        fn switchToPickedConnection(app: *App, agent: *AppAgent, connection: ?[]const u8, model: []const u8) !bool {
+            const id = connection orelse return true;
+            if (comptime !@hasDecl(App, "switchConnectionForModel")) return false;
+            return app.switchConnectionForModel(agent, id, model);
         }
 
         fn openModelBrowseCatalog(app: *App) !void {
@@ -2397,6 +2406,13 @@ pub fn Runtime(comptime App: type) type {
         fn applyInlineSettingsModelSelection(app: *App, agent: *AppAgent) !void {
             const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse return;
             defer app.alloc.free(selected);
+            const connection = try app.model_cache.menu.selectedConnectionAlloc(app.alloc);
+            defer if (connection) |id| app.alloc.free(id);
+            if (!try switchToPickedConnection(app, agent, connection, selected)) {
+                app.model_cache.closeMenu();
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             try session_commands.Commands(App).selectModelFromPicker(
                 app,
                 agent,
@@ -2583,6 +2599,8 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             };
             defer app.alloc.free(selected);
+            const connection = try app.model_cache.menu.selectedConnectionAlloc(app.alloc);
+            defer if (connection) |id| app.alloc.free(id);
 
             // Ctrl+P and `/model` both continue into the inline effort and
             // fast stages. A Ctrl+P draft stays stashed while those stages
@@ -2592,6 +2610,12 @@ pub fn Runtime(comptime App: type) type {
             app.model_cache.closeMenu();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            // A model of another connection switches to that connection first.
+            if (!try switchToPickedConnection(app, agent, connection, selected)) {
+                restoreModelPickerDraft(app);
+                app.shell.render_requests.request(.footer);
+                return true;
+            }
             try completion_rt.beginExactModelSelection(app, agent, selected);
             return true;
         }

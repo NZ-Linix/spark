@@ -57,6 +57,7 @@ pub const GatewayMetadata = struct {
     supports_implicit_caching: bool = false,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
+    default_effort: ?types.ReasoningEffort = null,
 };
 
 pub const Capabilities = struct {
@@ -75,6 +76,17 @@ pub const Capabilities = struct {
     parallel_tool_calls: ?bool = null,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
+    /// The level a request uses while the session's effort is `default`, as a
+    /// connection's settings choose it for the model.
+    default_effort: ?types.ReasoningEffort = null,
+
+    /// The level a request sends for `effort`: the model's default level
+    /// in place of `default`.
+    pub fn effectiveEffort(self: Capabilities, effort: types.ReasoningEffort) types.ReasoningEffort {
+        if (!effort.isDefault()) return effort;
+        const level = self.default_effort orelse return effort;
+        return if (reasoningEffortSupported(self, level)) level else effort;
+    }
 };
 
 /// Compares two capabilities in a test. `reasoning_efforts.values` is
@@ -123,6 +135,7 @@ pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?Ga
         capabilities.supports_implicit_caching = metadata.supports_implicit_caching;
         if (metadata.context_window) |window| capabilities.context_window = window;
         if (metadata.max_output_tokens) |tokens| capabilities.max_output_tokens = tokens;
+        if (metadata.default_effort) |level| capabilities.default_effort = level;
     }
     return capabilities;
 }
@@ -235,12 +248,13 @@ pub fn nextReasoningEffort(capabilities: Capabilities, current: types.ReasoningE
 
 pub fn resolveProviderOptionsForCapabilities(
     capabilities: Capabilities,
-    effort: types.ReasoningEffort,
+    requested_effort: types.ReasoningEffort,
     fast_mode: bool,
 ) ResolvedProviderOptions {
     var resolved: ResolvedProviderOptions = .{
         .parallel_tool_calls = capabilities.parallel_tool_calls,
     };
+    const effort = capabilities.effectiveEffort(requested_effort);
     if (!effort.isDefault() and reasoningEffortSupported(capabilities, effort)) {
         resolved.reasoning = effort;
     }
@@ -268,4 +282,18 @@ pub fn resolveUltrafastProviderOptions(
     options.fast = false;
     options.ultrafast = true;
     return options;
+}
+
+test "a model's default level stands in for the default effort" {
+    var capabilities: Capabilities = .{ .default_effort = types.ReasoningEffort.literal("high") };
+    capabilities.reasoning_efforts.values[0] = types.ReasoningEffort.literal("low");
+    capabilities.reasoning_efforts.values[1] = types.ReasoningEffort.literal("high");
+    capabilities.reasoning_efforts.len = 2;
+    try std.testing.expectEqualStrings("high", capabilities.effectiveEffort(.auto).label());
+    try std.testing.expectEqualStrings("low", capabilities.effectiveEffort(types.ReasoningEffort.literal("low")).label());
+    const options = resolveProviderOptionsForCapabilities(capabilities, .auto, false);
+    try std.testing.expectEqualStrings("high", options.reasoning.?.label());
+    // A default the model does not offer is not sent.
+    capabilities.default_effort = types.ReasoningEffort.literal("max");
+    try std.testing.expect(capabilities.effectiveEffort(.auto).isDefault());
 }

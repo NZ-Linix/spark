@@ -77,7 +77,7 @@ Start spark in a project and add a model provider:
 /provider
 ```
 
-Choose **Add connection** to set an OpenAI-compatible base URL, API key (empty for a local server), and models. Spark saves the provider in `~/.spark/settings.json` and switches to it.
+Choose **Add connection** to set an OpenAI-compatible base URL, API key (empty for a local server), and models. Spark saves the provider in `~/.spark/settings.json` and switches to it. Each model can have a **Default effort**, one of its reasoning levels, which requests use while the session's effort is `default`.
 
 Or use a subscription instead of an API key:
 
@@ -85,7 +85,7 @@ Or use a subscription instead of an API key:
 - **Continue with Claude** connects a Claude Pro or Max subscription.
 - **Continue with Antigravity (Google)** connects an Antigravity (Google AI) subscription through Google's Cloud Code Assist service.
 
-No Codex, Claude Code or Antigravity installation is needed: Spark signs in in your browser and sends its own prompt and tools. Claude and Antigravity requests start with the one-line client identity each service requires before Spark's prompt. Give accounts labels such as `Work` and `Personal`, or leave the label blank for a numbered account. A service's only account is just `Claude`, `Codex` or `Antigravity`, with plain model names; once it has a second, each shows its label, as in `Claude (Work)` and `Sonnet 5.5 (Work)` beside `Claude (Personal)` and `Sonnet 5.5 (Personal)`. Requests keep a stable prompt prefix and a per-session cache key, so each service's prompt cache applies. Each account's models and reasoning levels come from the service and stay current. Choose an account under `/provider`, then pick from its models. OAuth credentials stay in the private `chatgpt-plan`, `claude-plan` and `antigravity-plan` folders in your Spark profile. To disconnect, open the account in `/provider` and choose **Disconnect account**. Without the form, run `spark provider claude-account connect [label]`, `reconnect <id>` or `remove <id>`, and the same with `chatgpt-account` or `antigravity-account`.
+No Codex, Claude Code or Antigravity installation is needed: Spark signs in in your browser and sends its own prompt and tools. Claude and Antigravity requests start with the one-line client identity each service requires before Spark's prompt. Give accounts labels such as `Work` and `Personal`, or leave the label blank for a numbered account. A service's only account is just `Claude`, `Codex` or `Antigravity`, with plain model names; once it has a second, each shows its label, as in `Claude (Work)` and `Sonnet 5.5 (Work)` beside `Claude (Personal)` and `Sonnet 5.5 (Personal)`. Requests keep a stable prompt prefix and a per-session cache key, so each service's prompt cache applies. Each account's models and reasoning levels come from the service and stay current. Choose an account under `/provider`, then pick from its models. OAuth credentials stay in the private `chatgpt-plan`, `claude-plan` and `antigravity-plan` folders in your Spark profile. To disconnect, open the account in `/provider` and choose **Disconnect account**. **Edit account** changes its label, gives it a display name of your own, caps every model's context window with **Max context**, and sets a model's display name, context window, and default reasoning effort over what the service serves. Signing in again keeps these. Without the form, run `spark provider claude-account connect [label]`, `reconnect <id>` or `remove <id>`, and the same with `chatgpt-account` or `antigravity-account`.
 
 Then just type what you want done.
 
@@ -101,7 +101,7 @@ spark ask --json "summarize the failing tests" | jq -r .final_output
 | Command    | What it does                                                         |
 | ---------- | -------------------------------------------------------------------- |
 | `/provider` | Add, edit, rename, or delete model providers                        |
-| `/model`   | Switch models                                                        |
+| `/model`   | Switch models; lists every connection's models and switches to the one that serves the pick |
 | `/prompt`  | Pick a custom system prompt from your prompt folders; Tab stars one  |
 | `/mcp`     | Manage MCP servers                                                   |
 | `/help`    | List every command                                                   |

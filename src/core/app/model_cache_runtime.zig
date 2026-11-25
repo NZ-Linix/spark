@@ -116,14 +116,48 @@ pub const ModelMenuItem = struct {
     name: ?[]u8 = null,
     provider: []const u8,
     capabilities: model_capabilities.Capabilities,
+    /// The saved connection that serves the model when it is not the one in
+    /// use; picking the model switches to it.
+    connection: ?[]u8 = null,
+    /// The name of the connection that serves the model, shown beside it
+    /// while the menu lists more than one connection.
+    connection_label: ?[]u8 = null,
 
     pub fn label(self: ModelMenuItem) []const u8 {
         return self.name orelse self.id;
     }
 
-    fn deinit(self: ModelMenuItem, alloc: Allocator) void {
+    pub fn deinit(self: ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.name) |name| alloc.free(name);
+        if (self.connection) |id| alloc.free(id);
+        if (self.connection_label) |text| alloc.free(text);
+    }
+
+    /// A copy that owns its strings, the provider a slice of its own id.
+    pub fn clone(self: ModelMenuItem, alloc: Allocator) Allocator.Error!ModelMenuItem {
+        var copy: ModelMenuItem = .{ .id = try alloc.dupe(u8, self.id), .provider = "", .capabilities = self.capabilities };
+        errdefer copy.deinit(alloc);
+        copy.provider = modelProvider(copy.id);
+        if (self.name) |name| copy.name = try alloc.dupe(u8, name);
+        if (self.connection) |id| copy.connection = try alloc.dupe(u8, id);
+        if (self.connection_label) |text| copy.connection_label = try alloc.dupe(u8, text);
+        return copy;
+    }
+};
+
+/// Models of the saved connections other than the one in use, which the
+/// model menu lists after the current connection's catalog.
+pub const OtherConnections = struct {
+    items: std.ArrayList(ModelMenuItem) = .empty,
+    /// The name of the connection in use, shown beside its models.
+    current_label: ?[]u8 = null,
+
+    pub fn deinit(self: *OtherConnections, alloc: Allocator) void {
+        for (self.items.items) |item| item.deinit(alloc);
+        self.items.deinit(alloc);
+        if (self.current_label) |text| alloc.free(text);
+        self.* = .{};
     }
 };
 
@@ -214,6 +248,14 @@ pub const ModelMenu = struct {
         return try alloc.dupe(u8, item.id);
     }
 
+    /// The other connection that serves the highlighted model, or null when
+    /// the connection in use serves it.
+    pub fn selectedConnectionAlloc(self: *const ModelMenu, alloc: Allocator) !?[]u8 {
+        if (!self.active or self.load_state != .ready) return null;
+        const item = self.itemAt(self.selected_index) orelse return null;
+        return if (item.connection) |id| try alloc.dupe(u8, id) else null;
+    }
+
     fn clearSnapshot(self: *ModelMenu, alloc: Allocator) void {
         for (self.items.items) |item| item.deinit(alloc);
         self.items.deinit(alloc);
@@ -276,7 +318,9 @@ const ModelMenuMatches = struct {
     pub fn matchAt(self: ModelMenuMatches, position: usize) ?fuzzy_match.Match {
         const item = self.items[position];
         if (!providerMatchesFilter(item.provider, self.provider_filter)) return null;
-        return modelIdMatch(self.query, item.id) orelse if (item.name) |name| modelIdMatch(self.query, name) else null;
+        return modelIdMatch(self.query, item.id) orelse
+            (if (item.name) |name| modelIdMatch(self.query, name) else null) orelse
+            if (item.connection_label) |connection| fuzzy_match.match(self.query, &.{.{ .text = connection }}) else null;
     }
 };
 
@@ -362,6 +406,8 @@ pub const Runtime = struct {
     outcome: CatalogOutcome = .{},
     from_profile_settings: bool = false,
     menu: ModelMenu = .{},
+    /// The other saved connections' models, listed after the catalog.
+    others: OtherConnections = .{},
 
     pub fn init(alloc: Allocator) Self {
         return .{
@@ -373,7 +419,19 @@ pub const Runtime = struct {
         self.cancelAndJoin();
         self.discardStagedLocked();
         self.menu.deinit(self.alloc);
+        self.others.deinit(self.alloc);
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+    }
+
+    /// Replaces the other connections' models the menu lists, taking
+    /// ownership of `others`, and refreshes an open menu.
+    pub fn adoptOtherConnections(self: *Self, others: *OtherConnections) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.others.deinit(self.alloc);
+        self.others = others.*;
+        others.* = .{};
+        if (self.menu.active) try self.refreshMenuLocked(&self.menu);
     }
 
     /// Starts a background fetch of `provider`'s catalog for `access`.
@@ -860,17 +918,27 @@ pub const Runtime = struct {
 
     fn refreshMenuLocked(self: *Self, menu: *ModelMenu) !void {
         if (!menu.active) return;
+        const others = self.others.items.items.len > 0;
         switch (self.state) {
-            .idle, .loading => {
+            .loading => {
                 menu.clearSnapshot(self.alloc);
                 menu.load_state = .loading;
             },
-            .failed => {
+            // The connection in use lists nothing, but the others do.
+            .idle => if (others and !self.fetch_in_flight)
+                try hydrateMenuSnapshot(self.alloc, menu, &.{}, &self.others)
+            else {
+                menu.clearSnapshot(self.alloc);
+                menu.load_state = .loading;
+            },
+            .failed => if (others and !self.fetch_in_flight)
+                try hydrateMenuSnapshot(self.alloc, menu, &.{}, &self.others)
+            else {
                 menu.clearSnapshot(self.alloc);
                 // A retry runs behind the failed state; the picker shows it.
                 menu.load_state = if (self.fetch_in_flight) .loading else .failed;
             },
-            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
+            .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items, &self.others),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
@@ -898,25 +966,18 @@ fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) M
     };
 }
 
-fn appendMenuItem(alloc: Allocator, items: *std.ArrayList(ModelMenuItem), entry: model_catalog.ModelCatalogEntry) !void {
-    const id = try alloc.dupe(u8, entry.id);
-    const name: ?[]u8 = if (entry.name) |n| alloc.dupe(u8, n) catch |err| {
-        alloc.free(id);
-        return err;
-    } else null;
-    const item: ModelMenuItem = .{
-        .id = id,
-        .name = name,
-        .provider = modelProvider(id),
-        .capabilities = model_capabilities.resolveCapabilities(
-            id,
-            model_catalog_metadata.fromCatalogEntry(entry),
-        ),
+fn appendMenuItem(alloc: Allocator, items: *std.ArrayList(ModelMenuItem), entry: model_catalog.ModelCatalogEntry, connection_label: ?[]const u8) !void {
+    var item: ModelMenuItem = .{
+        .id = try alloc.dupe(u8, entry.id),
+        .provider = "",
+        .capabilities = undefined,
     };
-    items.append(alloc, item) catch |err| {
-        item.deinit(alloc);
-        return err;
-    };
+    errdefer item.deinit(alloc);
+    item.provider = modelProvider(item.id);
+    item.capabilities = model_capabilities.resolveCapabilities(item.id, model_catalog_metadata.fromCatalogEntry(entry));
+    if (entry.name) |n| item.name = try alloc.dupe(u8, n);
+    if (connection_label) |text| item.connection_label = try alloc.dupe(u8, text);
+    try items.append(alloc, item);
 }
 
 /// Fills `menu` from `catalog`, in catalog order. A model that Fast mode on
@@ -925,18 +986,28 @@ fn hydrateMenuSnapshot(
     alloc: Allocator,
     menu: *ModelMenu,
     catalog: []const model_catalog.ModelCatalogEntry,
+    others: *const OtherConnections,
 ) !void {
     var items: std.ArrayList(ModelMenuItem) = .empty;
     errdefer {
         for (items.items) |item| item.deinit(alloc);
         items.deinit(alloc);
     }
-    try items.ensureTotalCapacity(alloc, catalog.len);
+    try items.ensureTotalCapacity(alloc, catalog.len + others.items.items.len);
 
+    // The connection in use is named beside its models once others list too.
+    const current_label = if (others.items.items.len > 0) others.current_label else null;
     for (catalog) |entry| {
         // Fast mode on the base model's row already selects this model.
         if (model_catalog.foldsIntoFastMode(entry, catalog)) continue;
-        try appendMenuItem(alloc, &items, entry);
+        try appendMenuItem(alloc, &items, entry, current_label);
+    }
+    for (others.items.items) |other| {
+        var copy = try other.clone(alloc);
+        items.append(alloc, copy) catch |err| {
+            copy.deinit(alloc);
+            return err;
+        };
     }
 
     // A revalidated catalog replaces rows under an open menu; keep the
@@ -1137,3 +1208,35 @@ const GatedCatalog = struct {
         return .{ .context = self, .fetch_fn = fetch, .refresh_interval_ms = self.refresh_interval_ms };
     }
 };
+
+test "the model menu lists the other connections' models after the catalog" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var source = AuthChangeCatalog{ .model_id = "current-model" };
+    runtime.loadCooperative(source.provider(), .public_only);
+    var others: OtherConnections = .{ .current_label = try alloc.dupe(u8, "Here") };
+    defer others.deinit(alloc);
+    const borrowed: ModelMenuItem = .{
+        .id = @constCast("other-model"),
+        .provider = "",
+        .capabilities = .{},
+        .connection = @constCast("elsewhere"),
+        .connection_label = @constCast("Elsewhere"),
+    };
+    try others.items.append(alloc, try borrowed.clone(alloc));
+    try runtime.adoptOtherConnections(&others);
+    try runtime.openMenu();
+
+    const menu = &runtime.menu;
+    try std.testing.expectEqual(@as(usize, 2), menu.filteredItemCount());
+    try std.testing.expectEqualStrings("Here", menu.itemAt(0).?.connection_label.?);
+    try std.testing.expect(try menu.selectedConnectionAlloc(alloc) == null);
+    try std.testing.expect(menu.moveVisibleItems(1, 8));
+    const connection = (try menu.selectedConnectionAlloc(alloc)).?;
+    defer alloc.free(connection);
+    try std.testing.expectEqualStrings("elsewhere", connection);
+    // The connection's name finds its models.
+    menu.setQuery("Elsewhere");
+    try std.testing.expectEqual(@as(usize, 1), menu.filteredItemCount());
+}

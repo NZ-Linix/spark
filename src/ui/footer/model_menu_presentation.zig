@@ -294,8 +294,11 @@ fn providerRangeWidth(
 const fact_gap: usize = 3;
 /// A model id keeps at least this many cells before facts take the rest.
 const min_id_width: usize = 20;
+/// The widest a connection's name gets beside its models.
+const max_connection_width: usize = 24;
 
 /// The facts beside each model, in columns that line up down the list: the
+/// connection that serves it while the menu lists more than one, the
 /// context window, the output limit, and the speed options. The widths come
 /// from every model in the open tab, so the columns stay put while the user
 /// scrolls or types a search. A row that is too narrow drops whole columns
@@ -303,6 +306,7 @@ const min_id_width: usize = 20;
 const FactColumns = struct {
     /// The cell where the first column starts.
     start: usize = 0,
+    connection: usize = 0,
     context_digits: usize = 0,
     output_digits: usize = 0,
     speed: usize = 0,
@@ -318,6 +322,7 @@ const FactColumns = struct {
         for (projection.items) |item| {
             if (!model_cache_runtime.modelProviderFilterKeeps(item, filter)) continue;
             longest_id = @max(longest_id, display_width.visibleWidth(item.label()));
+            if (item.connection_label) |label| columns.connection = @min(max_connection_width, @max(columns.connection, display_width.visibleWidth(label)));
             var buf: [32]u8 = undefined;
             if (item.capabilities.context_window) |tokens| {
                 const text: []const u8 = formatTokenCount(&buf, tokens) catch "";
@@ -340,6 +345,10 @@ const FactColumns = struct {
     fn width(self: FactColumns) usize {
         var total: usize = 0;
         var count: usize = 0;
+        if (self.connection > 0) {
+            total += self.connection;
+            count += 1;
+        }
         if (self.context_digits > 0) {
             total += self.context_digits + context_label.len;
             count += 1;
@@ -362,6 +371,8 @@ const FactColumns = struct {
             self.output_digits = 0;
         } else if (self.context_digits > 0) {
             self.context_digits = 0;
+        } else if (self.connection > 0) {
+            self.connection = 0;
         }
     }
 
@@ -370,6 +381,12 @@ const FactColumns = struct {
     fn appendCells(self: FactColumns, alloc: Allocator, out: *std.ArrayList(u8), item: model_cache_runtime.ModelMenuItem) !void {
         var cells: CellWriter = .{ .alloc = alloc, .out = out };
         var buf: [32]u8 = undefined;
+        if (self.connection > 0) {
+            var label: std.ArrayList(u8) = .empty;
+            defer label.deinit(alloc);
+            if (item.connection_label) |text| try row_text.appendSingleLineEllipsized(alloc, &label, text, self.connection);
+            try cells.cell(label.items, self.connection);
+        }
         if (self.context_digits > 0) {
             try cells.cell(try tokenCell(&buf, item.capabilities.context_window, self.context_digits, context_label), self.context_digits + context_label.len);
         }
@@ -395,7 +412,7 @@ const CellWriter = struct {
             try self.out.appendSlice(self.alloc, text);
             self.pending = 0;
         }
-        self.pending += cell_width -| text.len;
+        self.pending += cell_width -| display_width.visibleWidth(text);
     }
 };
 

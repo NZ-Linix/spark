@@ -857,6 +857,26 @@ describe("custom connection options", () => {
     } finally { f.close(); }
   }, 45000);
 
+  test("effort: a model's default_effort is sent while the effort is default, and a chosen level wins", async () => {
+    const f = fixture();
+    try {
+      Object.assign(metadata(f), {
+        reasoning_efforts: { low: { reasoning_effort: "low" }, high: { reasoning_effort: "high" } },
+        default_effort: "low",
+      });
+      f.save();
+      const defaulted = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (defaulted.code !== 0) throw new Error(defaulted.stdout + defaulted.stderr);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].body.reasoning_effort).toBe("low");
+
+      const chosen = await runFx(["ask", "--json", "--no-save", "--effort", "high", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (chosen.code !== 0) throw new Error(chosen.stdout + chosen.stderr);
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests[1].body.reasoning_effort).toBe("high");
+    } finally { f.close(); }
+  }, 45000);
+
   test("effort: a configured level the model does not declare is not sent, and one line says so", async () => {
     let calls = 0;
     const f = fixture(body => ++calls === 1 ? toolCompletion(body.model, "read_file", { path: "note.txt" }) : completion(body.model, "read complete"));
@@ -1409,6 +1429,8 @@ describe("custom connection errors name the setting", () => {
       "providers.local.headers.X-Org", "a header's value is {\"env\": \"VARIABLE\"}, the environment variable that holds it"],
     ["an effort level spark can't name", (f: ReturnType<typeof fixture>) => { metadata(f).reasoning_efforts = { "High Effort!": {} }; },
       "providers.local.model_metadata.local-model.reasoning_efforts.\"High Effort!\"", "an effort level's name uses letters, digits, -, _, and ., and is not auto, adaptive, or default"],
+    ["a default effort the model does not offer", (f: ReturnType<typeof fixture>) => { Object.assign(metadata(f), { reasoning_efforts: { low: {} }, default_effort: "max" }); },
+      "providers.local.model_metadata.local-model.default_effort", "a model's default_effort names one of its reasoning levels"],
     ["a timeout of 0", (f: ReturnType<typeof fixture>) => { connection(f).timeouts = { stall_ms: 0 }; },
       "providers.local.timeouts.stall_ms", "a timeout is a whole number of milliseconds from 1 to 86400000"],
     ["a field spark does not know", (f: ReturnType<typeof fixture>) => { metadata(f).bogus = 1; },

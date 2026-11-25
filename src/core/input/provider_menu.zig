@@ -5,7 +5,10 @@
 //! and returns to the list; a model opens on its own fields the same way.
 //! A new connection takes its ID first, then the same list with "Create
 //! connection". The focused field's text lives here, not in the composer, so
-//! the API key never reaches composer history.
+//! the API key never reaches composer history. A subscription account opens
+//! on what to do with it; "Edit account" lists its label, name, largest
+//! context window, and models, whose name, window, and default reasoning
+//! level the person can set over what the plan serves.
 
 const std = @import("std");
 const configured_provider = @import("../config/configured_provider.zig");
@@ -33,10 +36,22 @@ pub const Field = enum {
     model_name,
     model_context,
     model_efforts,
+    /// The level a request uses while the session's effort is `default`.
+    model_default_effort,
     /// The label of a new subscription account (`State.plan` says which plan).
     plan_label,
     /// What to do with a saved subscription account.
     plan_account,
+    /// The fields of a saved subscription account.
+    plan_settings,
+    /// The fields of one model of a subscription account.
+    plan_model,
+    /// A saved subscription account's label, as `Work` in `Claude (Work)`.
+    account_label,
+    /// The name a subscription account shows in place of its plan's.
+    account_name,
+    /// The largest context window any model of the account gets.
+    context_limit,
 
     pub fn label(self: Field) []const u8 {
         return switch (self) {
@@ -51,13 +66,21 @@ pub const Field = enum {
             .model_name => "Display name",
             .model_context => "Context window",
             .model_efforts => "Reasoning levels",
-            .plan_label => "Account label",
+            .model_default_effort => "Default effort",
+            .plan_label, .account_label => "Account label",
             .plan_account => "Subscription",
+            .plan_settings => "Account",
+            .plan_model => "Model",
+            .account_name => "Display name",
+            .context_limit => "Max context",
         };
     }
 
     pub fn isList(self: Field) bool {
-        return self == .pick or self == .overview or self == .model or self == .plan_account;
+        return switch (self) {
+            .pick, .overview, .model, .plan_account, .plan_settings, .plan_model => true,
+            else => false,
+        };
     }
 };
 
@@ -78,8 +101,20 @@ pub const ModelRow = union(enum) {
     back,
 };
 
+/// A row of a subscription account's field list.
+pub const PlanRow = union(enum) {
+    field: Field,
+    model: usize,
+    back,
+};
+
+/// A row of the action list of a saved subscription account.
+pub const PlanAction = enum { use, edit, reconnect, usage, remove, back };
+
 const connection_fields = [_]Field{ .display_name, .name, .base_url, .api_key };
-const model_fields = [_]Field{ .model_id, .model_name, .model_context, .model_efforts };
+const model_fields = [_]Field{ .model_id, .model_name, .model_context, .model_efforts, .model_default_effort };
+const plan_fields = [_]Field{ .account_label, .account_name, .context_limit };
+const plan_model_fields = [_]Field{ .model_name, .model_context, .model_default_effort };
 
 pub const Model = struct {
     id: []u8,
@@ -90,6 +125,13 @@ pub const Model = struct {
     /// `efforts` when the edit began, so unchanged levels keep the request
     /// fields the settings give them.
     original_efforts: ?[]u8 = null,
+    /// The level a request uses while the session's effort is `default`.
+    default_effort: ?[]u8 = null,
+    /// A subscription model's name and window as its plan serves them. For
+    /// such a model `name` and `context` hold only what the person set, and
+    /// `efforts` the plan's levels, which the form does not change.
+    served_name: ?[]u8 = null,
+    served_context: ?u32 = null,
 };
 
 /// What Enter did.
@@ -106,6 +148,10 @@ pub const Advance = enum {
     plan_connect,
     plan_use,
     plan_reconnect,
+    /// A subscription account's label changed: rename it and its models.
+    plan_relabel,
+    /// Another field of a subscription account changed: save it.
+    plan_save,
     plan_remove,
     plan_usage,
     /// The form has nothing left to go back to.
@@ -142,6 +188,13 @@ pub const State = struct {
     problem: ?[]const u8 = null,
     /// Set after a field was saved; cleared by the next key.
     saved: bool = false,
+    /// A subscription account's own name, empty for none.
+    custom_name: std.ArrayList(u8) = .empty,
+    /// A subscription account's label; the typed one waits here for
+    /// `plan_relabel` while the saved one stays in the settings.
+    account_label: std.ArrayList(u8) = .empty,
+    /// The largest context window any of the account's models gets.
+    context_limit: ?u32 = null,
     /// The subscription plan the plan fields are about.
     plan: plans.Kind = .chatgpt,
     plan_job: ?*plans.Job = null,
@@ -179,6 +232,8 @@ pub const State = struct {
         self.clearInput();
         self.input.deinit(alloc);
         self.display_name.deinit(alloc);
+        self.custom_name.deinit(alloc);
+        self.account_label.deinit(alloc);
         self.name.deinit(alloc);
         std.crypto.secureZero(u8, self.api_key.items);
         self.api_key.deinit(alloc);
@@ -215,12 +270,28 @@ pub const State = struct {
         return switch (self.field) {
             // Connections, Add connection, then a row for each plan.
             .pick => self.connections.items.len + 1 + plans.Kind.all.len,
-            .plan_account => 5,
+            .plan_account => @typeInfo(PlanAction).@"enum".field_names.len,
             // Fields, models, Add model, Create or Delete, Back.
             .overview => connection_fields.len + self.models.items.len + 3,
             .model => model_fields.len + 2,
+            .plan_settings => plan_fields.len + self.models.items.len + 1,
+            .plan_model => plan_model_fields.len + 1,
             else => 0,
         };
+    }
+
+    pub fn planAction(index: usize) PlanAction {
+        return @enumFromInt(@min(index, @typeInfo(PlanAction).@"enum".field_names.len - 1));
+    }
+
+    pub fn planSettingsRow(self: *const State, index: usize) PlanRow {
+        if (index < plan_fields.len) return .{ .field = plan_fields[index] };
+        const at = index - plan_fields.len;
+        return if (at < self.models.items.len) .{ .model = at } else .back;
+    }
+
+    pub fn planModelRow(index: usize) PlanRow {
+        return if (index < plan_model_fields.len) .{ .field = plan_model_fields[index] } else .back;
     }
 
     pub fn overviewRow(self: *const State, index: usize) OverviewRow {
@@ -265,7 +336,7 @@ pub const State = struct {
         self.key_env = null;
         switch (definition.auth) {
             .chatgpt_plan, .claude_plan, .antigravity_plan => {
-                self.clearModels(alloc);
+                try self.loadPlanAccount(alloc, definition);
                 self.plan = definition.auth.plan().?;
                 self.field = .plan_account;
                 self.selected = 0;
@@ -293,6 +364,7 @@ pub const State = struct {
                 model.efforts = try alloc.dupe(u8, text.items);
                 model.original_efforts = try alloc.dupe(u8, text.items);
             }
+            if (metadata.default_effort) |level| model.default_effort = try alloc.dupe(u8, level);
             try self.models.append(alloc, model);
         }
         self.field = .overview;
@@ -301,6 +373,49 @@ pub const State = struct {
         self.problem = null;
     }
 
+    /// Fills the account fields and its models, with what the person set
+    /// apart from what the plan serves.
+    fn loadPlanAccount(self: *State, alloc: Allocator, definition: *const configured_provider.Definition) Allocator.Error!void {
+        self.clearModels(alloc);
+        try replace(alloc, &self.custom_name, definition.custom_name orelse "");
+        try replace(alloc, &self.account_label, definition.account_label orelse "");
+        self.context_limit = definition.context_limit;
+        for (definition.model_metadata[0..@min(definition.model_metadata.len, max_models)]) |metadata| {
+            var model: Model = .{ .id = try alloc.dupe(u8, metadata.id) };
+            errdefer freeModel(alloc, model);
+            if (metadata.display_name) |name| model.served_name = try alloc.dupe(u8, name);
+            model.served_context = metadata.context_window;
+            if (metadata.reasoning_efforts) |levels| {
+                var text: std.ArrayList(u8) = .empty;
+                defer text.deinit(alloc);
+                for (levels, 0..) |level, index| {
+                    if (index > 0) try text.appendSlice(alloc, ", ");
+                    try text.appendSlice(alloc, level.name);
+                }
+                model.efforts = try alloc.dupe(u8, text.items);
+            }
+            if (definition.override(metadata.id)) |set| {
+                if (set.display_name) |name| model.name = try alloc.dupe(u8, name);
+                model.context = set.context_window;
+                if (set.default_effort) |level| model.default_effort = try alloc.dupe(u8, level);
+            }
+            try self.models.append(alloc, model);
+        }
+    }
+
+    /// Refills the account's fields from its saved settings, staying on the
+    /// same row.
+    pub fn reloadPlanAccount(self: *State, alloc: Allocator, definition: *const configured_provider.Definition) Allocator.Error!void {
+        try self.loadPlanAccount(alloc, definition);
+        if (self.model_index >= self.models.items.len) self.model_index = 0;
+    }
+
+    /// Whether the connection being edited is a subscription account.
+    pub fn isPlanAccount(self: *const State) bool {
+        const name = self.editing orelse return false;
+        for (plans.Kind.all) |kind| if (kind.isId(name)) return true;
+        return false;
+    }
     /// Records that the connection was saved under its current name.
     pub fn markSaved(self: *State, alloc: Allocator) Allocator.Error!void {
         const name = try alloc.dupe(u8, self.name.items);
@@ -379,6 +494,15 @@ pub const State = struct {
                 self.selected = self.connectionIndex() orelse self.planRow(self.plan);
                 self.field = .pick;
             },
+            .plan_settings => {
+                self.field = .plan_account;
+                self.selected = @intFromEnum(PlanAction.edit);
+            },
+            .plan_model => {
+                self.field = .plan_settings;
+                self.selected = plan_fields.len + self.model_index;
+            },
+            .account_label, .account_name, .context_limit => self.returnToPlan(self.field),
             .overview => {
                 if (self.connections.items.len == 0) return false;
                 self.field = .pick;
@@ -400,10 +524,30 @@ pub const State = struct {
                 self.field = .overview;
                 self.selected = connection_fields.len + self.models.items.len;
             } else self.returnToModel(.model_id),
-            .model_name, .model_context, .model_efforts => self.returnToModel(self.field),
+            .model_name, .model_context, .model_default_effort => if (self.isPlanAccount()) self.returnToPlanModel(self.field) else self.returnToModel(self.field),
+            .model_efforts => self.returnToModel(self.field),
         }
         self.clearInput();
         return true;
+    }
+
+    fn returnToPlan(self: *State, from: Field) void {
+        self.field = .plan_settings;
+        self.selected = for (plan_fields, 0..) |field, index| {
+            if (field == from) break index;
+        } else 0;
+    }
+
+    fn returnToPlanModel(self: *State, from: Field) void {
+        self.field = .plan_model;
+        self.selected = for (plan_model_fields, 0..) |field, index| {
+            if (field == from) break index;
+        } else 0;
+    }
+
+    /// Returns to the list the model field `from` belongs to.
+    fn returnFromModelField(self: *State, from: Field) void {
+        if (self.isPlanAccount()) self.returnToPlanModel(from) else self.returnToModel(from);
     }
 
     fn connectionIndex(self: *const State) ?usize {
@@ -442,6 +586,10 @@ pub const State = struct {
             .model_name => if (model) |m| m.name orelse "" else "",
             .model_context => if (model) |m| (if (m.context) |tokens| std.mem.print(&buf, "{d}", .{tokens}) catch "" else "") else "",
             .model_efforts => if (model) |m| m.efforts orelse "" else "",
+            .model_default_effort => if (model) |m| m.default_effort orelse "" else "",
+            .account_label => self.account_label.items,
+            .account_name => self.custom_name.items,
+            .context_limit => if (self.context_limit) |tokens| std.mem.print(&buf, "{d}", .{tokens}) catch "" else "",
             else => "",
         };
         try self.load(alloc, value);
@@ -487,12 +635,65 @@ pub const State = struct {
                 return .edit;
             },
             .plan_label => return .plan_connect,
-            .plan_account => switch (self.selected) {
-                0 => return .plan_use,
-                1 => return .plan_reconnect,
-                2 => return .plan_usage,
-                3 => return .plan_remove,
-                else => return if (try self.back(alloc)) .next else .close,
+            .plan_account => switch (planAction(self.selected)) {
+                .use => return .plan_use,
+                .edit => {
+                    self.field = .plan_settings;
+                    self.selected = 0;
+                    return .next;
+                },
+                .reconnect => return .plan_reconnect,
+                .usage => return .plan_usage,
+                .remove => return .plan_remove,
+                .back => return if (try self.back(alloc)) .next else .close,
+            },
+            .plan_settings => switch (self.planSettingsRow(self.selected)) {
+                .field => |field| {
+                    try self.focus(alloc, field);
+                    return .next;
+                },
+                .model => |index| {
+                    self.model_index = index;
+                    self.field = .plan_model;
+                    self.selected = 0;
+                    return .next;
+                },
+                .back => {
+                    _ = try self.back(alloc);
+                    return .next;
+                },
+            },
+            .plan_model => switch (planModelRow(self.selected)) {
+                .field => |field| {
+                    try self.focus(alloc, field);
+                    return .next;
+                },
+                else => {
+                    _ = try self.back(alloc);
+                    return .next;
+                },
+            },
+            .account_label => {
+                if (!plans.usableLabel(text)) return self.refuse("a label is 1 to 48 characters, like Work or Personal");
+                try replace(alloc, &self.account_label, text);
+                self.returnToPlan(.account_label);
+                self.clearInput();
+                return .plan_relabel;
+            },
+            .account_name => {
+                if (text.len > max_display_name_bytes) return self.refuse("a display name is at most 80 bytes");
+                try replace(alloc, &self.custom_name, text);
+                self.returnToPlan(.account_name);
+                self.clearInput();
+                return .plan_save;
+            },
+            .context_limit => {
+                if (text.len > 0) {
+                    self.context_limit = parseTokens(text) orelse return self.refuse("enter a number of tokens, like 200000 or 200k");
+                } else self.context_limit = null;
+                self.returnToPlan(.context_limit);
+                self.clearInput();
+                return .plan_save;
             },
             .overview => switch (self.overviewRow(self.selected)) {
                 .field => |field| {
@@ -600,14 +801,25 @@ pub const State = struct {
                 const name: ?[]u8 = if (text.len > 0) try alloc.dupe(u8, text) else null;
                 if (model.name) |old| alloc.free(old);
                 model.name = name;
-                self.returnToModel(.model_name);
+                self.returnFromModelField(.model_name);
             },
             .model_context => {
                 const model = &self.models.items[self.model_index];
                 if (text.len > 0) {
                     model.context = parseTokens(text) orelse return self.refuse("enter a number of tokens, like 128000 or 128k");
                 } else model.context = null;
-                self.returnToModel(.model_context);
+                self.returnFromModelField(.model_context);
+            },
+            .model_default_effort => {
+                const model = &self.models.items[self.model_index];
+                if (text.len > 0) {
+                    configured_provider.validate_effort_name(text) catch return self.refuse("a level uses letters, digits, - _ and ., like high");
+                    if (model.efforts) |levels| if (!listsLevel(levels, text)) return self.refuse("pick one of the model's reasoning levels");
+                }
+                const level: ?[]u8 = if (text.len > 0) try alloc.dupe(u8, text) else null;
+                if (model.default_effort) |old| alloc.free(old);
+                model.default_effort = level;
+                self.returnFromModelField(.model_default_effort);
             },
             .model_efforts => {
                 var names = std.mem.tokenizeAny(u8, text, ", ");
@@ -620,11 +832,49 @@ pub const State = struct {
                 const efforts: ?[]u8 = if (count > 0) try alloc.dupe(u8, text) else null;
                 if (model.efforts) |old| alloc.free(old);
                 model.efforts = efforts;
+                // A default the new levels no longer list goes with them.
+                if (model.default_effort) |level| if (efforts != null and !listsLevel(efforts.?, level)) {
+                    alloc.free(level);
+                    model.default_effort = null;
+                };
                 self.returnToModel(.model_efforts);
             },
         }
+        const plan_field = self.isPlanAccount();
         self.clearInput();
-        return self.committed();
+        return if (plan_field) .plan_save else self.committed();
+    }
+
+    /// The subscription account's settings value with what the form sets:
+    /// its name, largest window, and each model's overrides. `base` is the
+    /// saved value; everything else in it is kept. Allocated in `arena`.
+    pub fn planToJson(self: *const State, arena: Allocator, base: std.json.Value) Allocator.Error!std.json.Value {
+        var root: std.json.ObjectMap = if (base == .object) try base.object.clone(arena) else .empty;
+        if (self.custom_name.items.len > 0)
+            try root.put(arena, "custom_name", .{ .string = try arena.dupe(u8, self.custom_name.items) })
+        else
+            _ = root.orderedRemove("custom_name");
+        if (self.context_limit) |tokens|
+            try root.put(arena, "context_limit", .{ .integer = tokens })
+        else
+            _ = root.orderedRemove("context_limit");
+        // Overrides of models the form does not list stay as they were.
+        var overrides: std.json.ObjectMap = if (root.get("model_overrides")) |value| (if (value == .object) try value.object.clone(arena) else .empty) else .empty;
+        for (self.models.items) |model| {
+            var entry: std.json.ObjectMap = .empty;
+            if (model.name) |name| try entry.put(arena, "display_name", .{ .string = try arena.dupe(u8, name) });
+            if (model.context) |tokens| try entry.put(arena, "context_window", .{ .integer = tokens });
+            if (model.default_effort) |level| try entry.put(arena, "default_effort", .{ .string = try arena.dupe(u8, level) });
+            if (entry.count() > 0)
+                try overrides.put(arena, try arena.dupe(u8, model.id), .{ .object = entry })
+            else
+                _ = overrides.orderedRemove(model.id);
+        }
+        if (overrides.count() > 0)
+            try root.put(arena, "model_overrides", .{ .object = overrides })
+        else
+            _ = root.orderedRemove("model_overrides");
+        return .{ .object = root };
     }
 
     /// The connection as a `providers.<name>` settings value, allocated in
@@ -666,6 +916,10 @@ pub const State = struct {
             else
                 _ = entry.orderedRemove("context_window");
             if (!entry.contains("supports_tool_use")) try entry.put(arena, "supports_tool_use", .{ .bool = true });
+            if (model.default_effort) |level|
+                try entry.put(arena, "default_effort", .{ .string = try arena.dupe(u8, level) })
+            else
+                _ = entry.orderedRemove("default_effort");
             const unchanged = if (model.efforts) |now| (if (model.original_efforts) |was| std.mem.eql(u8, now, was) else false) else model.original_efforts == null;
             if (!unchanged or !entry.contains("reasoning_efforts")) {
                 _ = entry.orderedRemove("reasoning_efforts");
@@ -689,15 +943,19 @@ pub const State = struct {
     /// The field's hint, shown as a placeholder while it is empty.
     pub fn hint(self: *const State) []const u8 {
         return switch (self.field) {
-            .pick, .overview, .model, .plan_account => "",
+            .pick, .overview, .model, .plan_account, .plan_settings, .plan_model => "",
             .plan_label => "optional, e.g. Work or Personal",
+            .account_label => "e.g. Work or Personal",
+            .account_name => "optional, shown in place of the plan's name",
+            .context_limit => "optional, e.g. 200k; caps every model",
+            .model_default_effort => if (self.model_index < self.models.items.len) (self.models.items[self.model_index].efforts orelse "optional, e.g. high") else "optional, e.g. high",
             .display_name => "optional, e.g. OpenCode Go",
             .name => "letters, digits, - and _, e.g. openrouter",
             .base_url => "e.g. https://openrouter.ai/api/v1",
             .api_key => if (self.key_env != null) "empty keeps the environment variable" else "leave empty for none",
             .model_id => "the id the server expects",
-            .model_name => "optional",
-            .model_context => "optional, e.g. 128k",
+            .model_name => if (self.isPlanAccount()) "empty keeps the plan's name" else "optional",
+            .model_context => if (self.isPlanAccount()) "empty keeps the plan's window, e.g. 200k" else "optional, e.g. 128k",
             .model_efforts => "optional, e.g. low, medium, high",
         };
     }
@@ -760,6 +1018,15 @@ fn freeModelDetails(alloc: Allocator, model: Model) void {
     if (model.name) |name| alloc.free(name);
     if (model.efforts) |text| alloc.free(text);
     if (model.original_efforts) |text| alloc.free(text);
+    if (model.default_effort) |text| alloc.free(text);
+    if (model.served_name) |text| alloc.free(text);
+}
+
+/// Whether the typed levels `levels`, like `low, high`, include `level`.
+fn listsLevel(levels: []const u8, level: []const u8) bool {
+    var names = std.mem.tokenizeAny(u8, levels, ", ");
+    while (names.next()) |name| if (std.mem.eql(u8, name, level)) return true;
+    return false;
 }
 
 /// `128000`, `128k`, or `1m`.
@@ -838,7 +1105,107 @@ test "editing a saved connection changes one field and saves" {
     state.selected = 4;
     _ = try state.submit(alloc);
     try std.testing.expectEqual(Field.model, state.field);
-    state.selected = 4;
+    state.selected = 5;
     try std.testing.expectEqual(ModelRow.delete, State.modelRow(state.selected));
     try std.testing.expectEqual(Advance.invalid, try state.submit(alloc));
+}
+
+test "a subscription account edits its name, largest window, and a model's default effort" {
+    const alloc = std.testing.allocator;
+    const id = "claude-plan-00000000000000000000000000000001";
+    var state: State = .{};
+    defer state.close(alloc);
+    try state.open(alloc, &.{id});
+    try std.testing.expectEqual(Advance.edit, try state.submit(alloc));
+    const levels = [_]configured_provider.EffortLevel{ .{ .name = "low", .fields = .{} }, .{ .name = "high", .fields = .{} } };
+    const definition: configured_provider.Definition = .{
+        .id = id,
+        .protocol = .@"anthropic-messages",
+        .base_url = "https://api.anthropic.com/v1",
+        .auth = .claude_plan,
+        .display_name = "Claude",
+        .account_label = "1",
+        .model_metadata = &.{.{ .id = "m1", .display_name = "M1", .context_window = 1_000_000, .reasoning_efforts = &levels }},
+    };
+    try state.beginEdit(alloc, &definition);
+    try std.testing.expectEqual(Field.plan_account, state.field);
+    state.selected = @intFromEnum(PlanAction.edit);
+    try std.testing.expectEqual(Advance.next, try state.submit(alloc));
+    try std.testing.expectEqual(Field.plan_settings, state.field);
+    try std.testing.expectEqual(PlanRow{ .model = 0 }, state.planSettingsRow(plan_fields.len));
+
+    state.selected = 1;
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Field.account_name, state.field);
+    try std.testing.expectEqual(Advance.plan_save, try typeAndSubmit(&state, alloc, "Main"));
+    state.selected = 2;
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Advance.invalid, try typeAndSubmit(&state, alloc, "lots"));
+    try std.testing.expectEqual(Advance.plan_save, try typeAndSubmit(&state, alloc, "200k"));
+    try std.testing.expectEqual(Field.plan_settings, state.field);
+
+    state.selected = plan_fields.len;
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Field.plan_model, state.field);
+    state.selected = 2;
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Field.model_default_effort, state.field);
+    try std.testing.expectEqual(Advance.invalid, try typeAndSubmit(&state, alloc, "max"));
+    try std.testing.expectEqual(Advance.plan_save, try typeAndSubmit(&state, alloc, "high"));
+    try std.testing.expectEqual(Field.plan_model, state.field);
+    try std.testing.expect(try state.back(alloc));
+    try std.testing.expectEqual(Field.plan_settings, state.field);
+
+    state.selected = 0;
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Advance.plan_relabel, try typeAndSubmit(&state, alloc, "Work"));
+    try std.testing.expectEqualStrings("Work", state.account_label.items);
+
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    var base: std.json.ObjectMap = .empty;
+    try base.put(arena.allocator(), "display_name", .{ .string = "Claude" });
+    const value = try state.planToJson(arena.allocator(), .{ .object = base });
+    try std.testing.expectEqualStrings("Claude", value.object.get("display_name").?.string);
+    try std.testing.expectEqualStrings("Main", value.object.get("custom_name").?.string);
+    try std.testing.expectEqual(@as(i64, 200_000), value.object.get("context_limit").?.integer);
+    const override = value.object.get("model_overrides").?.object.get("m1").?.object;
+    try std.testing.expectEqualStrings("high", override.get("default_effort").?.string);
+    try std.testing.expect(override.get("display_name") == null);
+}
+
+test "a custom model's default effort follows its levels" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.close(alloc);
+    try state.open(alloc, &.{"oc"});
+    _ = try state.submit(alloc);
+    const levels = [_]configured_provider.EffortLevel{ .{ .name = "low", .fields = .{} }, .{ .name = "high", .fields = .{} } };
+    const definition: configured_provider.Definition = .{
+        .id = "oc",
+        .protocol = .@"openai-chat-completions",
+        .base_url = "https://example.com/v1",
+        .auth = .none,
+        .model_metadata = &.{.{ .id = "m1", .reasoning_efforts = &levels, .default_effort = "high" }},
+    };
+    try state.beginEdit(alloc, &definition);
+    try std.testing.expectEqualStrings("high", state.models.items[0].default_effort.?);
+    state.selected = connection_fields.len;
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Field.model, state.field);
+    state.selected = 3;
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Field.model_efforts, state.field);
+    // Levels without the default drop it.
+    try std.testing.expectEqual(Advance.save, try typeAndSubmit(&state, alloc, "low, medium"));
+    try std.testing.expect(state.models.items[0].default_effort == null);
+    state.selected = 4;
+    _ = try state.submit(alloc);
+    try std.testing.expectEqual(Field.model_default_effort, state.field);
+    try std.testing.expectEqual(Advance.save, try typeAndSubmit(&state, alloc, "medium"));
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const value = try state.toJson(arena.allocator(), null);
+    const model = value.object.get("model_metadata").?.object.get("m1").?.object;
+    try std.testing.expectEqualStrings("medium", model.get("default_effort").?.string);
 }

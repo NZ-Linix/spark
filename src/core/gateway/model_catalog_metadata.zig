@@ -21,5 +21,6 @@ pub fn fromCatalogEntry(entry: model_catalog.ModelCatalogEntry) model_capabiliti
         .supports_implicit_caching = entry.has_implicit_caching,
         .context_window = optionalPositiveU32(entry.context_window),
         .max_output_tokens = optionalPositiveU32(entry.max_tokens),
+        .default_effort = entry.default_effort,
     };
 }

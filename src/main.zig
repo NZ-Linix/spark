@@ -7,7 +7,7 @@ const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
 
-pub const version = "26.11.25";
+pub const version = "26.11.25.1";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -65,6 +65,7 @@ const builtin_providers = @import("builtins/providers.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
+const chat_completions = @import("gateway/chat_completions.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
@@ -2024,6 +2025,49 @@ const App = struct {
         self.model_cache.startWarmup(provider, self.auth.modelCatalogAccess(), trigger);
     }
 
+    /// Lists the models every other saved connection declares in the model
+    /// menu, after the catalog of the one in use.
+    pub fn refreshOtherConnectionModels(self: *App) !void {
+        var others: model_cache_runtime.OtherConnections = .{};
+        defer others.deinit(self.alloc);
+        if (!self.provider_selection.model_requests_blocked) {
+            const current = provider_runtime.provider(self);
+            for (self.provider_selection.definitions.definitions) |*definition| {
+                if (current == .configured and std.mem.eql(u8, definition.id, current.label())) {
+                    if (others.current_label == null) others.current_label = try self.alloc.dupe(u8, definition.shown_name());
+                    continue;
+                }
+                for (definition.model_metadata) |declared| {
+                    const metadata = definition.metadata_for(declared.id) orelse declared;
+                    var capabilities = chat_completions.capabilities_of(metadata);
+                    capabilities.intrinsic_fast = model_capabilities.capabilitiesForModel(metadata.id).intrinsic_fast;
+                    const borrowed: model_cache_runtime.ModelMenuItem = .{
+                        .id = @constCast(metadata.id),
+                        .name = if (metadata.display_name) |name| @constCast(name) else null,
+                        .provider = "",
+                        .capabilities = capabilities,
+                        .connection = @constCast(definition.id),
+                        .connection_label = @constCast(definition.shown_name()),
+                    };
+                    var item = try borrowed.clone(self.alloc);
+                    others.items.append(self.alloc, item) catch |err| {
+                        item.deinit(self.alloc);
+                        return err;
+                    };
+                }
+            }
+        }
+        try self.model_cache.adoptOtherConnections(&others);
+    }
+
+    /// Makes the saved connection `id` the one in use with `model`, for a
+    /// model the menu listed under it. Returns whether it switched.
+    pub fn switchConnectionForModel(self: *App, agent: *agents.Agent, id: []const u8, model: []const u8) !bool {
+        const target = model_provider.parse(id) orelse return false;
+        const bound = target.bind(self.provider_selection.definitions) catch return false;
+        return app_auth_runtime.Runtime(App).switchToConnectionWithModel(self, agent, bound, model);
+    }
+
     pub fn ensureModelCache(self: *App) void {
         self.startModelCacheWarmup();
     }
@@ -2062,8 +2106,17 @@ const App = struct {
         // declared levels and window come from the current definitions, not
         // the catalog fetched at startup.
         if (provider == .configured) if (self.provider_selection.definitions.get(provider.label())) |definition| {
-            if (definition.auth.plan() != null) return capabilities; // its live catalog takes precedence over the sign-in snapshot
-            if (definition.metadata_for(model)) |metadata| {
+            const declared = definition.metadata_for(model);
+            capabilities.default_effort = if (declared) |metadata| chat_completions.default_effort_of(metadata) else null;
+            if (definition.auth.plan() != null) {
+                // Its live catalog takes precedence over the sign-in snapshot,
+                // which stands in until the catalog loads, as after a switch.
+                if (self.model_cache.metadataForModel(model) == null) if (declared) |metadata| {
+                    capabilities = model_capabilities.mergeCapabilities(capabilities, chat_completions.gateway_metadata_of(metadata));
+                };
+                return capabilities;
+            }
+            if (declared) |metadata| {
                 capabilities.reasoning_efforts = .{};
                 for (metadata.reasoning_efforts orelse &.{}) |level| {
                     const effort = types.ReasoningEffort.parse(level.name) orelse continue;
