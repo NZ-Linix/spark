@@ -239,7 +239,19 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
     try writer.print(",\"max_tokens\":{d},\"stream\":true", .{request.max_output_tokens orelse options.default_max_tokens orelse default_max_tokens});
-    if (options.system_prefix.len != 0) {
+    const effort_fields = if (request.provider_options.reasoning != null) options.effort_fields orelse request_fragment.Fragment{} else request_fragment.Fragment{};
+    // When the agent marks its prompt cacheable, let Anthropic advance the
+    // breakpoint with the conversation. Leave stateless helpers and custom
+    // cache settings alone.
+    const cacheable = for (request.instructions) |instruction| {
+        if (instruction.cache_breakpoint) break true;
+    } else false;
+    const cached = options.automatic_cache and cacheable and request.messages.len != 0 and
+        !request.provider_options.skip_cache_writes and
+        !options.request_fields.has("cache_control") and !effort_fields.has("cache_control");
+    if (cached) {
+        try write_cached_system(writer, alloc, options.system_prefix, request.instructions);
+    } else if (options.system_prefix.len != 0) {
         try write_system_blocks(writer, alloc, options.system_prefix, request.instructions);
     } else try write_system(writer, alloc, request.instructions);
     try write_messages(writer, alloc, request, projection);
@@ -270,6 +282,9 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
                 .builtin => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema),
                 .dynamic => |schema| try std.json.Stringify.value(schema, .{}, writer),
             }
+            // The tools come first in what Anthropic caches, and they are the
+            // same in every session, so a new session reads them from the cache.
+            if (cached and index + 1 == functions.len) try writer.writeAll(cache_marker);
             try writer.writeByte('}');
         }
         try writer.writeByte(']');
@@ -282,21 +297,52 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             });
         }
     }
-    const effort_fields = if (request.provider_options.reasoning != null) options.effort_fields orelse request_fragment.Fragment{} else request_fragment.Fragment{};
-    // When the agent marks its prompt cacheable, let Anthropic advance the
-    // breakpoint with the conversation. Leave stateless helpers and custom
-    // cache settings alone.
-    const cacheable = for (request.instructions) |instruction| {
-        if (instruction.cache_breakpoint) break true;
-    } else false;
-    if (options.automatic_cache and cacheable and request.messages.len != 0 and
-        !request.provider_options.skip_cache_writes and
-        !options.request_fields.has("cache_control") and !effort_fields.has("cache_control"))
-    {
-        try writer.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
-    }
+    if (cached) try writer.writeAll(cache_marker);
     try request_fragment.write(writer, options.request_fields, effort_fields);
     try writer.writeByte('}');
+}
+
+const cache_marker = ",\"cache_control\":{\"type\":\"ephemeral\"}";
+
+/// Anthropic takes four breakpoints: the tools, the conversation's end, and
+/// these in `system`.
+const max_system_breakpoints = 2;
+
+/// `system` as text blocks: `prefix`, then the instructions joined up to
+/// each one the agent marks as the end of a stable part, which carries a
+/// breakpoint so the next session or step reads it from the cache.
+fn write_cached_system(writer: *std.Io.Writer, alloc: Allocator, prefix: []const []const u8, instructions: []const types.ChatMessage) !void {
+    var marks: usize = 0;
+    for (instructions) |instruction| marks += @intFromBool(instruction.cache_breakpoint);
+    // Keep the last ones; they cover the most.
+    var skip = marks -| max_system_breakpoints;
+    try writer.writeAll(",\"system\":[");
+    var blocks: usize = 0;
+    for (prefix) |text| {
+        if (blocks != 0) try writer.writeByte(',');
+        try write_text_block(writer, text);
+        blocks += 1;
+    }
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(alloc);
+    for (instructions, 0..) |instruction, index| {
+        if (instruction.content) |text| if (text.len != 0) {
+            if (joined.items.len != 0) try joined.appendSlice(alloc, "\n\n");
+            try joined.appendSlice(alloc, text);
+        };
+        const last = index + 1 == instructions.len;
+        const mark = instruction.cache_breakpoint and skip == 0;
+        if (instruction.cache_breakpoint and skip != 0) skip -= 1;
+        if (!(mark or last) or joined.items.len == 0) continue;
+        if (blocks != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(joined.items, .{}, writer);
+        if (mark) try writer.writeAll(cache_marker);
+        try writer.writeByte('}');
+        blocks += 1;
+        joined.clearRetainingCapacity();
+    }
+    try writer.writeByte(']');
 }
 
 /// The instructions, joined, as the one `system` string this API takes.
@@ -359,6 +405,16 @@ test "automatic Anthropic caching marks only eligible session requests" {
     defer alloc.free(custom);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, custom, "cache_control"));
     try std.testing.expect(std.mem.find(u8, custom, "\"ttl\":\"1h\"") != null);
+    request.instructions = &.{
+        .{ .role = .system, .content = "Prompt", .cache_breakpoint = true },
+        .{ .role = .system, .content = "Rules", .cache_breakpoint = true },
+        .{ .role = .system, .content = "Turn" },
+    };
+    const split = try build_request(alloc, request, .{ .automatic_cache = true, .system_prefix = &.{"Identity"} });
+    defer alloc.free(split);
+    try std.testing.expect(std.mem.find(u8, split, "\"system\":[{\"type\":\"text\",\"text\":\"Identity\"},{\"type\":\"text\",\"text\":\"Prompt\"" ++ cache_marker ++
+        "},{\"type\":\"text\",\"text\":\"Rules\"" ++ cache_marker ++ "},{\"type\":\"text\",\"text\":\"Turn\"}]") != null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, split, "cache_control"));
     request.instructions = &.{.{ .role = .system, .content = "Helper instructions" }};
     const stateless = try build_request(alloc, request, .{ .automatic_cache = true });
     defer alloc.free(stateless);
