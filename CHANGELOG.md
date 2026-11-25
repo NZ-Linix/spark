@@ -1,8 +1,24 @@
 # spark
 
-## 26.11.25.1
+## 26.11.25.2
 
 <!-- release:start -->
+
+**New sessions on a Claude connection read Spark's prompt from the cache.**
+
+### Improvements
+
+- Claude requests mark the tools and the stable parts of Spark's prompt for caching, so a new session's first request reads about 95% of its input from the cache instead of none, and the cache hit rate in the footer starts high.
+
+### Bug Fixes
+
+- A reply written without thinking no longer streams in directly under your message and then drops a row when it finishes.
+- An ACP client such as the iPhone app no longer gets an empty thought, or blank lines before the reply, when the model answers without thinking.
+
+<!-- release:end -->
+
+## 26.11.25.1
+
 
 **Pick any connection's model from `/model`, and edit subscription accounts.**
 
@@ -12,7 +28,6 @@
 - **Edit account** in `/provider` changes a ChatGPT, Claude, or Antigravity account's label and display name, caps its models' context window with **Max context**, and sets each model's display name, context window, and default reasoning effort. Signing in again keeps these.
 - A model of a custom connection or subscription account can have a **Default effort**. Requests use it while the session's effort is `default`, and the footer shows it.
 
-<!-- release:end -->
 
 ## 26.11.25
 
