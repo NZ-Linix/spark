@@ -9,7 +9,6 @@ extension Color {
   static let hairline = Color.white.opacity(0.08)
   static let dim = Color(white: 0.55)
   static let faint = Color(white: 0.34)
-  static let live = Color(red: 0.36, green: 0.86, blue: 0.55)
 }
 
 /** The wordmark: the name, set in mono like the terminal it comes from. */
@@ -20,31 +19,6 @@ struct Wordmark: View {
     Text("spark")
       .font(.geistMono(size, .medium))
       .kerning(-size * 0.02)
-  }
-}
-
-/** A small dot that breathes while spark is working. */
-struct LiveDot: View {
-  var on = true
-  @State private var pulse = false
-
-  var body: some View {
-    Circle()
-      .fill(on ? Color.live : Color.faint)
-      .frame(width: 7, height: 7)
-      .background {
-        if on {
-          Circle()
-            .fill(Color.live.opacity(0.35))
-            .scaleEffect(pulse ? 2.4 : 1)
-            .opacity(pulse ? 0 : 1)
-        }
-      }
-      .onAppear {
-        guard on else { return }
-        withAnimation(.easeOut(duration: 1.4).repeatForever(autoreverses: false)) { pulse = true }
-      }
-      .accessibilityHidden(true)
   }
 }
 

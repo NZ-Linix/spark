@@ -359,6 +359,8 @@ private struct Sidebar: View {
       Button(action: settings) {
         HStack(spacing: 12) {
           Image(systemName: link.host?.symbol ?? "antenna.radiowaves.left.and.right")
+            .contentTransition(.symbolEffect(.replace))
+            .animation(.smooth(duration: 0.3), value: link.host?.id)
             .font(.system(size: 14, weight: .medium))
             .frame(width: 36, height: 36)
             .background(Color.white.opacity(0.08), in: .circle)
@@ -366,10 +368,14 @@ private struct Sidebar: View {
             Text(link.host.map { $0.kind == .cloud ? "Cloud" : $0.name } ?? "spark")
               .font(.geist(15, .medium))
               .lineLimit(1)
+              .contentTransition(.opacity)
             if let status {
               Text(status).font(.geist(12)).foregroundStyle(Color.dim)
+                .transition(Settle(distance: -4))
             }
           }
+          .animation(.smooth(duration: 0.3), value: status)
+          .animation(.smooth(duration: 0.3), value: link.host?.id)
           Spacer(minLength: 0)
           Image(systemName: "gearshape")
             .font(.system(size: 15, weight: .medium))
@@ -448,6 +454,8 @@ private struct Sidebar: View {
       .id(style)
       .padding(.horizontal, 6)
       .animation(.smooth(duration: 0.32), value: link.listed.map(\.id))
+      // a Mac going offline or coming back: its note, its rows and its dimming all ease over together
+      .animation(.smooth(duration: 0.4), value: link.hosts.map { "\($0.id)-\($0.online)" })
     }
     .scrollIndicators(.hidden)
     .refreshable { await link.refreshAll() }
@@ -470,16 +478,21 @@ private struct Sidebar: View {
       let shown = (link.sessions[h.id] ?? []).filter(matches).map { Listed(host: h, session: $0) }
       VStack(alignment: .leading, spacing: 2) {
         if headed { heading(h) }
-        if !h.online { offline(h) }
-        ForEach(shown) { row($0, badge: false) }
-        // said only once the host has answered, so a refresh never flashes it
-        if h.online, shown.isEmpty, link.sessions[h.id] != nil {
-          Text(query.isEmpty ? "No chats yet" : "No chats match")
-            .font(.geist(13))
-            .foregroundStyle(Color.faint)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+        // the offline note and "No chats yet" trade places in one spot, so the section eases from one
+        // height to the other instead of holding both for a moment
+        ZStack(alignment: .topLeading) {
+          if !h.online { offline(h) }
+          // said only once the host has answered, so a refresh never flashes it
+          if h.online, shown.isEmpty, link.sessions[h.id] != nil {
+            Text(query.isEmpty ? "No chats yet" : "No chats match")
+              .font(.geist(13))
+              .foregroundStyle(Color.faint)
+              .padding(.horizontal, 12)
+              .padding(.vertical, 6)
+              .transition(Settle(distance: -4))
+          }
         }
+        ForEach(shown) { row($0, badge: false) }
       }
       .opacity(h.online ? 1 : 0.55)
       .padding(.bottom, 10)
@@ -510,10 +523,10 @@ private struct Sidebar: View {
     HStack(spacing: 6) {
       Image(systemName: h.symbol).font(.system(size: 11, weight: .semibold))
       Text(h.kind == .cloud ? "Cloud" : h.name).lineLimit(1)
-      if h.kind == .mac { LiveDot(on: h.online && link.phase == .online) }
     }
     .font(.geist(12, .medium))
-    .foregroundStyle(Color.dim)
+    .foregroundStyle(h.online && link.phase == .online ? Color.dim : Color.faint)
+    .animation(.smooth(duration: 0.3), value: h.online && link.phase == .online)
     .padding(.horizontal, 12)
     .padding(.top, 10)
     .padding(.bottom, 4)
@@ -552,6 +565,7 @@ private struct Sidebar: View {
       .foregroundStyle(Color.dim)
       .padding(.horizontal, style == .sections ? 12 : 18)
       .padding(.vertical, 6)
+      .transition(Settle(distance: -4))
   }
 
   @ViewBuilder private func empty(_ none: Bool) -> some View {
@@ -561,6 +575,7 @@ private struct Sidebar: View {
         .foregroundStyle(Color.faint)
         .frame(maxWidth: .infinity)
         .padding(.top, 40)
+        .transition(.opacity)
     }
   }
 
@@ -620,23 +635,32 @@ private struct Sidebar: View {
   }
 }
 
-/** Mac or cloud: one glass track with the chosen host lit, sliding between them. */
+/**
+ * Mac or cloud: one glass track with the chosen host lit, sliding between them. A Mac that goes
+ * offline leaves the track, and the others close up over its place.
+ */
 struct HostSwitch: View {
   @Environment(Link.self) private var link
   @Namespace private var ns
 
   var body: some View {
-    if link.hosts.count > 1 {
-      HStack(spacing: 0) {
-        ForEach(link.hosts) { h in
+    let hosts = link.pickable
+    VStack(spacing: 0) {
+      if hosts.count > 1 { track(hosts).transition(Settle(distance: 6)) }
+    }
+    .animation(.spring(duration: 0.4, bounce: 0), value: hosts.map(\.id))
+  }
+
+  private func track(_ hosts: [HostEntry]) -> some View {
+    HStack(spacing: 0) {
+        ForEach(hosts) { h in
           let on = h.id == link.host?.id
           Button {
-            withAnimation(.spring(duration: 0.35, bounce: 0.15)) { link.hostID = h.id }
+            withAnimation(.spring(duration: 0.35, bounce: 0.15)) { link.choose(h.id) }
           } label: {
             HStack(spacing: 6) {
               Image(systemName: h.symbol).font(.system(size: 13, weight: .medium))
               Text(h.kind == .cloud ? "Cloud" : h.name).lineLimit(1)
-              if !h.online { Circle().fill(Color.faint).frame(width: 5, height: 5) }
             }
             .font(.geist(14, .medium))
             .foregroundStyle(on ? .white : Color.dim)
@@ -650,11 +674,11 @@ struct HostSwitch: View {
             .contentShape(.capsule)
           }
           .buttonStyle(.plain)
+          .transition(.opacity.combined(with: .scale(0.92)))
         }
       }
       .padding(3)
       .glassEffect(.regular, in: .capsule)
       .sensoryFeedback(.selection, trigger: link.hostID)
-    }
   }
 }

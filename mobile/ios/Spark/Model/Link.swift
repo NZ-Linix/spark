@@ -44,6 +44,12 @@ final class Link {
   var hostID: String? = UserDefaults.standard.string(forKey: "host") {
     didSet { UserDefaults.standard.set(hostID, forKey: "host") }
   }
+  /** the host last picked by hand: it's chosen again whenever it comes back online */
+  private var wanted: String? = UserDefaults.standard.string(forKey: "wantedHost") ?? UserDefaults.standard.string(forKey: "host") {
+    didSet { UserDefaults.standard.set(wanted, forKey: "wantedHost") }
+  }
+  /** where a new chat can go: the cloud, and each Mac while it's online */
+  var pickable: [HostEntry] { hosts.filter { $0.kind == .cloud || $0.online } }
   private(set) var sessions: [String: [SessionInfo]] = [:]
   /** the options spark last offered on each host, so a new chat can pick a model before it exists */
   private(set) var mcpServers: [String: [String]] = [:]
@@ -145,7 +151,7 @@ final class Link {
     if !hosts.contains(where: { $0.id == paired.host.id }) {
       hosts.insert(paired.host, at: 0)
     }
-    hostID = paired.host.id
+    choose(paired.host.id)
     return paired.host
   }
 
@@ -161,7 +167,27 @@ final class Link {
     req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     struct Left: Decodable { var hosts: [HostEntry] }
     if let left: Left = try? await Self.fetch(req) { hosts = left.hosts }
+    if wanted == host.id { wanted = nil }
     if hostID == host.id { hostID = hosts.first?.id }
+  }
+
+  /** a host picked by hand */
+  func choose(_ id: String) {
+    wanted = id
+    hostID = id
+  }
+
+  /**
+   * A Mac that goes offline leaves the picker, so the chosen host moves to one still there; the
+   * one picked by hand comes back once it's online again.
+   */
+  private func settleHost() {
+    let open = pickable
+    if let wanted, open.contains(where: { $0.id == wanted }) {
+      if hostID != wanted { hostID = wanted }
+    } else if !open.contains(where: { $0.id == hostID }) {
+      hostID = open.first?.id ?? hosts.first?.id
+    }
   }
 
   func leave() {
@@ -270,7 +296,7 @@ final class Link {
     if env.relay == "hosts", let hosts = env.hosts {
       let wasOnline = Set(self.hosts.filter(\.online).map(\.id))
       self.hosts = hosts
-      if hostID == nil || !hosts.contains(where: { $0.id == hostID }) { hostID = hosts.first?.id }
+      settleHost()
       // a Mac that just came online has a list the sidebar hasn't seen
       for h in hosts where h.online && !wasOnline.contains(h.id) && phase == .online {
         Task { await refresh(h.id) }

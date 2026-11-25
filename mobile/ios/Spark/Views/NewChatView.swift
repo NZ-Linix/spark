@@ -2,6 +2,8 @@ import SwiftUI
 
 /** A new chat: pick where it runs, then say what to do. Nothing is remembered between chats. */
 struct NewChatView: View {
+  /** the switch's 36-point track, its 3-point rim, and the 6 points above it */
+  private static let switchHeight: CGFloat = 48
   @Environment(Link.self) private var link
   @Environment(\.shell) private var shell
   @AppStorage("sidebarStyle") private var style: SidebarStyle = .sections
@@ -29,6 +31,16 @@ struct NewChatView: View {
   @State private var terminal: Terminal?
   @State private var typing: Terminal?
   @FocusState private var focused: Bool
+  /** the host switch is drawn under the headline; lags `wantsSwitch` so the swap happens in place first */
+  @State private var showsSwitch = false
+  /** the room under the headline is the switch's; follows the swap a beat later, so the headline moves last */
+  @State private var tall = false
+  @State private var lineHeight: CGFloat = 20
+  /** bumped each time Macs come or go, so an older swap still in flight stands down */
+  @State private var swap = 0
+
+  /** with every host in the sidebar, the chosen host is where new chats go: pick it here */
+  private var wantsSwitch: Bool { style != .switcher && link.pickable.count > 1 }
 
   var body: some View {
     VStack(spacing: 12) {
@@ -37,19 +49,26 @@ struct NewChatView: View {
         .kerning(-0.8)
         .multilineTextAlignment(.center)
         .textRenderer(DitherIn(progress: shown ? 1 : 0))
-      // with every host in the sidebar, the chosen host is where new chats go: pick it here
-      if style != .switcher, link.hosts.count > 1 {
-        HostSwitch()
-          .frame(maxWidth: 280)
-          .padding(.top, 6)
-          .opacity(shown ? 1 : 0)
-      } else if let host = link.host {
-        Text(host.kind == .cloud ? "in the cloud" : "on \(host.name)")
-          .font(.geist(15))
-          .foregroundStyle(Color.dim)
-          .opacity(shown ? 1 : 0)
-          .contentTransition(.opacity)
+      // The switch and the line naming the one host trade places in a slot of fixed height, so the
+      // headline holds still; then the slot takes its new height and the headline glides to its place
+      ZStack(alignment: .top) {
+        if showsSwitch {
+          HostSwitch()
+            .frame(maxWidth: 280)
+            .padding(.top, 6)
+            .transition(Settle(distance: 6))
+        } else if let host = link.host {
+          Text(host.kind == .cloud ? "in the cloud" : "on \(host.name)")
+            .font(.geist(15))
+            .foregroundStyle(Color.dim)
+            .contentTransition(.opacity)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { lineHeight = $0 }
+            .transition(Settle(distance: 6))
+        }
       }
+      .frame(height: tall ? Self.switchHeight : lineHeight, alignment: .top)
+      .opacity(shown ? 1 : 0)
+      .animation(.smooth(duration: 0.3), value: link.host?.id)
     }
     .padding(.horizontal, 32)
     // scoped to the words: animating the whole screen would slide the composer in as it's first laid out
@@ -120,7 +139,30 @@ struct NewChatView: View {
       }
     }
     .sensoryFeedback(.impact(weight: .light), trigger: sent)
-    .onAppear { shown = true }
+    .onAppear {
+      shown = true
+      showsSwitch = wantsSwitch
+      tall = wantsSwitch
+    }
+    .onChange(of: wantsSwitch) { _, want in
+      swap += 1
+      let mine = swap
+      Task {
+        // appearing: make room first, then the switch fades into it; leaving: the reverse
+        if want {
+          withAnimation(.spring(duration: 0.45, bounce: 0)) { tall = true }
+        } else {
+          withAnimation(.smooth(duration: 0.25)) { showsSwitch = false }
+        }
+        try? await Task.sleep(for: .milliseconds(want ? 220 : 320))
+        guard mine == swap else { return }
+        if want {
+          withAnimation(.smooth(duration: 0.25)) { showsSwitch = true }
+        } else {
+          withAnimation(.spring(duration: 0.45, bounce: 0)) { tall = false }
+        }
+      }
+    }
     .onChange(of: ask, initial: true) { old, new in
       guard new > 0, new != old || folder == nil else { return }
       folder = nil
