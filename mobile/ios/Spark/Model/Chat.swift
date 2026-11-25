@@ -11,6 +11,10 @@ final class Entry: Identifiable {
   /** fixed for the row's life: the thread lays rows out by role without watching their text */
   let role: Item.Role
   var item: Item
+  /** when it came in live while spark works; nil for rows loaded with the chat */
+  @ObservationIgnored var arrived: Date?
+  /** just came in, so it animates in the first time it's drawn */
+  var fresh: Bool { arrived.map { $0.timeIntervalSinceNow > -1 } ?? false }
 
   init(_ item: Item) {
     id = item.id
@@ -143,6 +147,7 @@ final class Chat {
         if entries[i].item != item { entries[i].item = item }
       } else {
         add(item)
+        entries.last?.arrived = .now
       }
     case "append":
       guard let id = e.id.flatMap(Self.string), let text = e.text, let i = index[id] else { return }

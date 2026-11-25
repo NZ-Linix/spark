@@ -129,9 +129,8 @@ struct ChatView: View {
 
   /** why the composer is off while another spark process has the chat open */
   private var elsewhereNote: String? {
-    guard chat.elsewhere else { return nil }
+    guard chat.elsewhere, chat.terminalOwner == nil else { return nil }
     let name = link.hosts.first { $0.id == chat.host }?.name ?? "the Mac"
-    if chat.terminalOwner != nil { return "Live on \(name)" }
     return "Open in spark on \(name). Close it there to write here."
   }
 
@@ -745,13 +744,16 @@ private struct ToolGroup: View {
   let entries: [Entry]
   let live: Bool
   let disclose: () -> Void
+  @Environment(\.accessibilityReduceMotion) private var reduce
   @State private var open = false
+  /** the summary line settles in when a lone call becomes a run of them */
+  @State private var header = true
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       Button {
         disclose()
-        open.toggle()
+        withAnimation(.toolDisclose) { open.toggle() }
       } label: {
         HStack(spacing: 9) {
           Image(systemName: "square.stack.3d.up")
@@ -760,9 +762,12 @@ private struct ToolGroup: View {
           Text(summary)
             .font(.geist(14, .medium))
             .lineLimit(1)
+            // the count ticks over as each call joins the run
+            .contentTransition(.numericText())
             .modifier(MaybeShimmer(on: live))
           if failed > 0 {
             Text("\(failed) failed").font(.geist(12)).foregroundStyle(.red.opacity(0.8))
+              .transition(.scale(0.8, anchor: .leading).combined(with: .opacity))
           }
           Spacer(minLength: 4)
           Image(systemName: "chevron.right")
@@ -775,6 +780,9 @@ private struct ToolGroup: View {
         .contentShape(.rect)
       }
       .buttonStyle(.plain)
+      .offset(y: header || reduce ? 0 : 6)
+      .blur(radius: header || reduce ? 0 : 4)
+      .opacity(header ? 1 : 0)
       .accessibilityLabel(summary)
       .accessibilityHint(open ? "Hides the steps" : "Shows each step")
 
@@ -784,14 +792,28 @@ private struct ToolGroup: View {
         }
         .padding(.leading, 8)
         .overlay(alignment: .leading) { Capsule().fill(Color.hairline).frame(width: 1.5).padding(.vertical, 6) }
+        .transition(Settle(distance: reduce ? 0 : -6))
       } else if live, let last = entries.last {
-        ToolRow(entry: last, disclose: disclose)
-          .id(last.id)
-          .transition(.opacity)
+        // the newest call rises into the line as the one before lifts away, both in the same spot
+        ZStack(alignment: .topLeading) {
+          ToolRow(entry: last, disclose: disclose)
+            .id(last.id)
+            .transition(.asymmetric(insertion: AnyTransition.identity, removal: AnyTransition(Settle(distance: reduce ? 0 : -10))))
+        }
+        .transition(Settle(distance: reduce ? 0 : 8))
       }
     }
+    .animation(.toolArrive, value: entries.count)
+    .animation(.toolArrive, value: failed)
+    .animation(.toolArrive, value: live)
     .clipped()
     .sensoryFeedback(.selection, trigger: open)
+    .onAppear {
+      // only a run that just formed: a chat opened on a long one shows it as it is
+      guard live, entries.count == 2, entries.last?.fresh == true else { return }
+      header = false
+      withAnimation(.toolArrive) { header = true }
+    }
   }
 
   private var failed: Int { entries.filter { $0.item.status == .failed }.count }
@@ -825,7 +847,12 @@ private struct ToolGroup: View {
 private struct ToolRow: View {
   let entry: Entry
   let disclose: () -> Void
+  @Environment(\.accessibilityReduceMotion) private var reduce
   @State private var open = false
+  /** where the row is in its arrival: the icon lands first, the words follow it in from the left */
+  @State private var row = true
+  @State private var icon = true
+  @State private var words = true
 
   var body: some View {
     let item = entry.item
@@ -833,25 +860,33 @@ private struct ToolRow: View {
       Button {
         guard hasOutput(item) else { return }
         disclose()
-        open.toggle()
+        withAnimation(.toolDisclose) { open.toggle() }
       } label: {
         HStack(alignment: .center, spacing: 9) {
           Image(systemName: symbol(item))
             .font(.system(size: 12, weight: .medium))
             .frame(width: 16)
             .foregroundStyle(Color.dim)
-          Text(verb(item))
-            .font(.geist(14, .medium))
-            .foregroundStyle(Color.dim)
-            .modifier(MaybeShimmer(on: !done(item)))
-            .layoutPriority(1)
-          if let detail = shown(item) {
-            Text(detail)
-              .font(.geistMono(12.5))
-              .foregroundStyle(Color(white: 0.74))
-              .lineLimit(1)
-              .truncationMode(.middle)
+            .scaleEffect(icon || reduce ? 1 : 0.4)
+            .opacity(icon ? 1 : 0)
+          HStack(spacing: 9) {
+            Text(verb(item))
+              .font(.geist(14, .medium))
+              .foregroundStyle(Color.dim)
+              .contentTransition(.opacity)
+              .modifier(MaybeShimmer(on: !done(item)))
+              .layoutPriority(1)
+            if let detail = shown(item) {
+              Text(detail)
+                .font(.geistMono(12.5))
+                .foregroundStyle(Color(white: 0.74))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            }
           }
+          .offset(x: words || reduce ? 0 : -8)
+          .blur(radius: words || reduce ? 0 : 3)
+          .opacity(words ? 1 : 0)
           Spacer(minLength: 4)
           status(item)
         }
@@ -864,10 +899,26 @@ private struct ToolRow: View {
         OutputBlock(text: output)
           .padding(.top, 4)
           .padding(.bottom, 6)
+          .transition(Settle(distance: reduce ? 0 : -6))
       }
     }
+    .offset(y: row || reduce ? 0 : 8)
+    .opacity(row ? 1 : 0)
+    .animation(.toolArrive, value: item.status)
     .clipped()
     .sensoryFeedback(.selection, trigger: open)
+    .onAppear(perform: arrive)
+  }
+
+  /** a call that just came in settles into its line in three quick beats instead of popping in */
+  private func arrive() {
+    guard entry.fresh else { return }
+    row = false
+    icon = false
+    words = false
+    withAnimation(.toolArrive) { row = true }
+    withAnimation(.spring(duration: 0.45, bounce: 0.3).delay(0.04)) { icon = true }
+    withAnimation(.toolArrive.delay(0.08)) { words = true }
   }
 
   private func hasOutput(_ item: Item) -> Bool { !(item.output ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -876,12 +927,14 @@ private struct ToolRow: View {
     switch item.status {
     case .failed:
       Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.red.opacity(0.85))
+        .transition(.scale(0.5).combined(with: .opacity))
     case .completed:
       if hasOutput(item) {
         Image(systemName: "chevron.right")
           .font(.system(size: 9, weight: .bold))
           .foregroundStyle(Color.faint)
           .rotationEffect(.degrees(open ? 90 : 0))
+          .transition(.scale(0.5).combined(with: .opacity))
       }
     default:
       EmptyView()
@@ -951,13 +1004,6 @@ private struct OutputBlock: View {
     .fixedSize(horizontal: false, vertical: true)
     .background(Color.well, in: .rect(cornerRadius: 14, style: .continuous))
     .overlay { RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.hairline) }
-    .overlay(alignment: .topTrailing) {
-      CopyButton(text: text)
-        .labelStyle(.iconOnly)
-        .font(.system(size: 12))
-        .foregroundStyle(Color.dim)
-        .padding(10)
-    }
     .padding(.leading, 25)
   }
 }

@@ -141,4 +141,8 @@ struct Settle: Transition {
 
 extension Animation {
   static let ease = Animation.spring(duration: 0.45, bounce: 0.12)
+  /** a tool call settling into the thread: quick, and without overshoot so the line doesn't wobble */
+  static let toolArrive = Animation.spring(duration: 0.38, bounce: 0)
+  /** a tool call's steps or output opening and closing */
+  static let toolDisclose = Animation.spring(duration: 0.32, bounce: 0)
 }
