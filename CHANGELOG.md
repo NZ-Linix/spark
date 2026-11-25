@@ -1,8 +1,21 @@
 # spark
 
-## 26.11.25
+## 26.11.25.1
 
 <!-- release:start -->
+
+**Pick any connection's model from `/model`, and edit subscription accounts.**
+
+### New Features
+
+- `/model` lists the models of every saved connection, each beside its connection's name. Picking one from another connection switches to it.
+- **Edit account** in `/provider` changes a ChatGPT, Claude, or Antigravity account's label and display name, caps its models' context window with **Max context**, and sets each model's display name, context window, and default reasoning effort. Signing in again keeps these.
+- A model of a custom connection or subscription account can have a **Default effort**. Requests use it while the session's effort is `default`, and the footer shows it.
+
+<!-- release:end -->
+
+## 26.11.25
+
 
 **Use a ChatGPT, Claude, or Antigravity subscription instead of an API key.**
 
@@ -20,7 +33,6 @@
 
 - A session started without a provider can send a prompt after `/provider` switches it to a connection.
 
-<!-- release:end -->
 
 ## 26.11.24.1
 
