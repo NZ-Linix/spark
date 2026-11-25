@@ -93,6 +93,8 @@ xcodegen generate
 open Spark.xcodeproj
 ```
 
+`./testflight.sh` archives the app and uploads it for internal TestFlight testing. Its build number is the UTC date and time, such as `20261125.1442`, so each upload is newer than the last.
+
 ### UI test
 
 `SparkUITests` walks pair, start, send, reply, and renaming a chat against a live relay and bridge. `testSidebarLayoutsAndLibrary` switches through the sidebar layouts, opens a provider named `local` from the library, and writes, renames, and deletes a prompt:
