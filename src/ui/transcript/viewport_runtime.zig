@@ -181,6 +181,25 @@ pub fn rowForEntryIdInSelection(
     });
 }
 
+/// Whether the reply being written follows the prompt directly, with no
+/// thinking block or other output between them. Only then does the
+/// transcript's gap above the reply lie under the preview's top.
+pub fn replyFollowsPrompt(self: anytype) bool {
+    var index = self.notebook.entries.items.len;
+    while (index > 0) {
+        index -= 1;
+        const entry = self.notebook.entries.items[index];
+        if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
+        switch (entry) {
+            .raw_bytes => |e| if (trimBlockTail(e.bytes).len == 0) continue else return false,
+            .assistant_turn => |e| if (e.segments.text.items.len == 0) continue else return false,
+            .user_turn => return true,
+            else => return false,
+        }
+    }
+    return false;
+}
+
 pub fn transientAssistantGapRows(self: anytype) u16 {
     var index = self.notebook.entries.items.len;
     while (index > 0) {

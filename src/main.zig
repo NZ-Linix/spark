@@ -2354,16 +2354,20 @@ const App = struct {
 
     pub fn livePreview(self: *App, agent: *agents.Agent) ?live_preview_mod.Preview {
         const preview = self.live_pacer.preview(self.liveSource(agent), self.shell.layout.cols) orelse return null;
-        // The transcript puts a gap above the thinking block when it writes
-        // it; the preview leaves the same one.
+        // The transcript puts a gap above the thinking block, and above a
+        // reply under the prompt, when it writes them; the preview leaves
+        // the same one, so the text doesn't drop a row when it lands.
+        const gap = @min(1, self.shell.transientAssistantGapRows());
         if (preview.kind == .reasoning) {
-            var shown = preview.withGapAbove(@min(1, self.shell.transientAssistantGapRows()));
+            var shown = preview.withGapAbove(gap);
             const now_ms = io_mod.milliTimestamp();
             if (agent.reasoning_started_ms > 0 and now_ms > agent.reasoning_started_ms)
                 shown.thinking_ms = @intCast(now_ms - agent.reasoning_started_ms);
             return shown;
         }
-        return preview;
+        // Under a thinking block or an earlier paragraph the gap row is
+        // already on screen.
+        return if (self.shell.replyFollowsPrompt()) preview.withGapAbove(gap) else preview;
     }
 
     /// Ends the launch splash: writes the version line it held back to the

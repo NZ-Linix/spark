@@ -3524,6 +3524,10 @@ pub const TranscriptRuntime = struct {
         return transcript_store.toolStatusEntryLabel(self, entry_id);
     }
 
+    pub fn replyFollowsPrompt(self: *const TranscriptRuntime) bool {
+        return transcript_viewport_runtime.replyFollowsPrompt(self);
+    }
+
     pub fn transientAssistantGapRows(self: *const TranscriptRuntime) u16 {
         return transcript_viewport_runtime.transientAssistantGapRows(self);
     }

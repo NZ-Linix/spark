@@ -234,6 +234,12 @@ const AcpContext = struct {
     published_tool_calls: std.StringHashMapUnmanaged(ToolCallCard) = .empty,
     message_id: acp_types.MessageIdBuffer = undefined,
     message_kind: ?AgentMessageKind = null,
+    /// Whether the current message has shown any text, so its leading blank
+    /// lines can be left out.
+    message_shown: bool = false,
+    /// Whether the model's thinking since its reply began has shown any
+    /// text. A thought of only whitespace leaves the client nothing to show.
+    thought_shown: bool = false,
     stop_reason: acp_types.StopReason = .end_turn,
     /// Mode and permission policy captured at prompt dispatch so mid-turn
     /// session/set_mode changes never mutate a running turn.
@@ -311,6 +317,7 @@ const AcpContext = struct {
         if (self.message_kind != kind) {
             _ = acp_types.generateMessageId(&self.message_id);
             self.message_kind = kind;
+            self.message_shown = false;
         }
         return &self.message_id;
     }
@@ -2359,6 +2366,7 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const text, const message_id = switch (emission) {
         .assistant_started => {
             ctx.message_kind = null;
+            ctx.thought_shown = false;
             return;
         },
         .assistant_source => |text| .{ text, ctx.assistantMessageId() },
@@ -2366,12 +2374,20 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
         .assistant_restarted => |text| .{ text, ctx.operationalMessageId() },
         .operational => |text| .{ text, ctx.operationalMessageId() },
     };
-    if (text.len == 0) return;
-    ctx.sendAgentText(message_id, text) catch {};
+    // The reply starts at its first word, as the client lays it out.
+    const shown = if (ctx.message_shown) text else std.mem.trimStart(u8, text, "\r\n");
+    if (shown.len == 0) return;
+    ctx.message_shown = true;
+    ctx.sendAgentText(message_id, shown) catch {};
 }
 
-fn pushReasoningDelta(raw_ctx: *anyopaque, delta: []const u8) !void {
+fn pushReasoningDelta(raw_ctx: *anyopaque, raw_delta: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    // A model that answers without thinking can still open an empty thought;
+    // the client shows a thought only once it has words.
+    const delta = if (ctx.thought_shown) raw_delta else std.mem.trimStart(u8, raw_delta, " \t\r\n");
+    if (delta.len == 0) return;
+    ctx.thought_shown = true;
     var update: std.Io.Writer.Allocating = .init(ctx.alloc);
     defer update.deinit();
     try acp_types.writeAgentThoughtChunk(&update.writer, delta);
