@@ -27,6 +27,7 @@ export type ProfileOptions = {
 };
 
 export const isObject = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
+export const isLocalProvider = (name: string, value?: unknown) => name.startsWith("chatgpt-plan-") || (isObject(value) && value.auth?.type === "chatgpt-plan");
 
 /** the last 4 characters, and only when the key is long enough that they give little away */
 function mask(key: unknown): string | undefined {
@@ -53,6 +54,7 @@ function headerVariables(p: Json): string[] {
  */
 export class Profile {
   private queue: Promise<unknown> = Promise.resolve();
+  private accountJob = false;
 
   constructor(private o: ProfileOptions) {}
 
@@ -69,9 +71,36 @@ export class Profile {
     const s = this.read();
     const providers = isObject(s.providers) ? s.providers : {};
     return Object.entries(providers)
-      .filter(([, p]) => isObject(p))
+      .filter(([name, p]) => isObject(p) && !isLocalProvider(name, p))
       .map(([name, p]) => summarize(name, p as Json, s))
       .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  accounts(): ProviderSummary[] {
+    if (this.o.role !== "mac") throw new Error("ChatGPT plans are available only on your paired Mac.");
+    const s = this.read();
+    const providers = isObject(s.providers) ? s.providers : {};
+    return Object.entries(providers).flatMap(([name, p]) => isObject(p) && p.auth?.type === "chatgpt-plan" ? [summarize(name, p, s)] : []);
+  }
+
+  async changeAccount(action: unknown, value: unknown): Promise<{ accounts: ProviderSummary[]; warning?: string }> {
+    if (this.o.role !== "mac") throw new Error("ChatGPT plans are available only on your paired Mac.");
+    if (this.accountJob) throw new Error("A ChatGPT account change is already in progress on this Mac.");
+    if (action !== "connect" && action !== "reconnect" && action !== "remove") throw new Error("Unknown account action.");
+    if (typeof value !== "string" || (action === "connect" ? Buffer.byteLength(value) > 48 || /[\u0000-\u001f\u007f]/.test(value) : !/^chatgpt-plan-[0-9a-f]{32}$/.test(value))) throw new Error("Invalid ChatGPT account label or ID.");
+    this.accountJob = true;
+    try {
+      const child = Bun.spawn([this.o.spark, "provider", "chatgpt-account", action, value], {
+        env: { ...process.env, SPARK_HOME: this.o.home }, stdin: "ignore", stdout: "ignore", stderr: "pipe",
+        timeout: 330_000,
+      });
+      const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+      const detail = stderr.trim().replace(/^spark provider: /, "");
+      if (code !== 0) throw new Error(detail || "Could not update the ChatGPT account on this Mac.");
+      return { accounts: this.accounts(), warning: detail || undefined };
+    } finally {
+      this.accountJob = false;
+    }
   }
 
   /** the variables the cloud's spark runs with */
@@ -96,6 +125,7 @@ export class Profile {
     const s = this.read();
     const found = isObject(s.providers) ? s.providers[name] : undefined;
     if (!isObject(found)) throw new Error(`There's no provider named ${name} on this Mac.`);
+    if (isLocalProvider(name, found)) throw new Error("Subscription accounts stay on this Mac.");
     const provider: Json = structuredClone(found);
     const env: Record<string, string> = {};
     const missing: string[] = [];
@@ -136,6 +166,7 @@ export class Profile {
     if (previous !== undefined && previous !== null && (typeof previous !== "string" || !NAME.test(previous))) return Promise.reject(new Error("That old name isn't valid."));
     if (typeof name !== "string" || !NAME.test(name)) return Promise.reject(new Error("A provider's name starts with a letter and uses letters, digits, _ and -."));
     if (!isObject(provider)) return Promise.reject(new Error("That provider isn't an object."));
+    if (isLocalProvider(name, provider) || (typeof previous === "string" && isLocalProvider(previous))) return Promise.reject(new Error("Subscription accounts aren't part of the provider library."));
     if (model !== undefined && model !== null && (typeof model !== "string" || model.length > MAX_MODEL_BYTES)) return Promise.reject(new Error("That model name isn't valid."));
     let values: Record<string, string>;
     try {
@@ -177,6 +208,7 @@ export class Profile {
     return this.serial(async () => {
       const s = this.read();
       if (typeof name !== "string" || !isObject(s.providers) || !isObject(s.providers[name])) throw new Error("That provider is already gone.");
+      if (isLocalProvider(name, s.providers[name])) throw new Error("Disconnect this account on your Mac instead.");
       delete s.providers[name];
       if (isObject(s.models)) delete s.models[name];
       if (s.provider === name) {

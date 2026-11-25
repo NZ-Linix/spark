@@ -58,6 +58,18 @@ pub fn writeInput(
     limits: ReplayLimits,
     budget: image_attachments.CaptureBudget,
 ) !void {
+    return writeInputWithNamespace(writer, scratch_alloc, messages, verified_images, limits, budget, null);
+}
+
+pub fn writeInputWithNamespace(
+    writer: *std.Io.Writer,
+    scratch_alloc: std.mem.Allocator,
+    messages: []const types.ChatMessage,
+    verified_images: ?[]const image_attachments.VerifiedSnapshot,
+    limits: ReplayLimits,
+    budget: image_attachments.CaptureBudget,
+    namespace: ?[]const u8,
+) !void {
     try budget.check();
     if (verified_images != null and (messages.len != 1 or
         messages[0].role != .user or messages[0].images.len != 0))
@@ -152,6 +164,10 @@ pub fn writeInput(
                     try std.json.Stringify.value(ids.resolve(call.id), .{}, writer);
                     try writer.writeAll(",\"name\":");
                     try std.json.Stringify.value(call.name, .{}, writer);
+                    if (namespace) |name| {
+                        try writer.writeAll(",\"namespace\":");
+                        try std.json.Stringify.value(name, .{}, writer);
+                    }
                     try writer.writeAll(",\"arguments\":");
                     try std.json.Stringify.value(call.arguments_json, .{}, writer);
                     try writer.writeByte('}');
@@ -331,10 +347,24 @@ pub fn writeTools(
     alloc: std.mem.Allocator,
     tools: stream_provider.ToolSelection,
 ) !usize {
+    return writeToolsWithNamespace(writer, alloc, tools, null);
+}
+
+pub fn writeToolsWithNamespace(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    tools: stream_provider.ToolSelection,
+    namespace: ?[]const u8,
+) !usize {
     var count: usize = 0;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll(",\"tools\":[");
+    if (namespace) |name| {
+        try out.writer.writeAll("{\"type\":\"namespace\",\"name\":");
+        try std.json.Stringify.value(name, .{}, &out.writer);
+        try out.writer.writeAll(",\"description\":\"Spark's locally executed tools\",\"tools\":[");
+    }
 
     for (tools.advertised_names) |name| {
         const tool = tools.advertisedFunction(name) orelse continue;
@@ -372,6 +402,7 @@ pub fn writeTools(
         );
         count += 1;
     }
+    if (namespace != null) try out.writer.writeAll("]}");
     try out.writer.writeByte(']');
     if (count > 0) try writer.writeAll(out.written());
     return count;

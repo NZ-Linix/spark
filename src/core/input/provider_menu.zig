@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const configured_provider = @import("../config/configured_provider.zig");
+const chatgpt = @import("../config/chatgpt_connection.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -32,6 +33,8 @@ pub const Field = enum {
     model_name,
     model_context,
     model_efforts,
+    chatgpt_label,
+    chatgpt_account,
 
     pub fn label(self: Field) []const u8 {
         return switch (self) {
@@ -46,11 +49,13 @@ pub const Field = enum {
             .model_name => "Display name",
             .model_context => "Context window",
             .model_efforts => "Reasoning levels",
+            .chatgpt_label => "Account label",
+            .chatgpt_account => "ChatGPT plan",
         };
     }
 
     pub fn isList(self: Field) bool {
-        return self == .pick or self == .overview or self == .model;
+        return self == .pick or self == .overview or self == .model or self == .chatgpt_account;
     }
 };
 
@@ -96,6 +101,11 @@ pub const Advance = enum {
     /// A saved connection was picked: load its fields.
     edit,
     delete,
+    chatgpt_connect,
+    chatgpt_use,
+    chatgpt_reconnect,
+    chatgpt_remove,
+    chatgpt_usage,
     /// The form has nothing left to go back to.
     close,
 };
@@ -130,8 +140,9 @@ pub const State = struct {
     problem: ?[]const u8 = null,
     /// Set after a field was saved; cleared by the next key.
     saved: bool = false,
+    chatgpt_job: ?*chatgpt.Job = null,
 
-    /// Opens on the list when `names` has connections, else on a new one.
+    /// Opens on the list of available connections and connection types.
     pub fn open(self: *State, alloc: Allocator, names: []const []const u8) Allocator.Error!void {
         self.close(alloc);
         self.active = true;
@@ -140,7 +151,7 @@ pub const State = struct {
             errdefer alloc.free(copy);
             try self.connections.append(alloc, copy);
         }
-        self.field = if (self.connections.items.len > 0) .pick else .name;
+        self.field = .pick;
     }
 
     /// Sets the display names shown beside the connections `open` listed.
@@ -160,6 +171,8 @@ pub const State = struct {
     }
 
     pub fn close(self: *State, alloc: Allocator) void {
+        if (self.chatgpt_job) |job| job.close();
+        self.clearInput();
         self.input.deinit(alloc);
         self.display_name.deinit(alloc);
         self.name.deinit(alloc);
@@ -185,7 +198,8 @@ pub const State = struct {
     /// Rows of the current list.
     pub fn listLen(self: *const State) usize {
         return switch (self.field) {
-            .pick => self.connections.items.len + 1,
+            .pick => self.connections.items.len + 2,
+            .chatgpt_account => 5,
             // Fields, models, Add model, Create or Delete, Back.
             .overview => connection_fields.len + self.models.items.len + 3,
             .model => model_fields.len + 2,
@@ -234,6 +248,14 @@ pub const State = struct {
         if (self.key_env) |env| alloc.free(env);
         self.key_env = null;
         switch (definition.auth) {
+            .chatgpt_plan => {
+                self.clearModels(alloc);
+                self.field = .chatgpt_account;
+                self.selected = 0;
+                self.clearInput();
+                self.problem = null;
+                return;
+            },
             .none => {},
             .key => |key| try replace(alloc, &self.api_key, key),
             .bearer => |env| self.key_env = try alloc.dupe(u8, env),
@@ -336,6 +358,10 @@ pub const State = struct {
         self.saved = false;
         switch (self.field) {
             .pick => return false,
+            .chatgpt_label, .chatgpt_account => {
+                self.selected = self.connectionIndex() orelse self.connections.items.len + 1;
+                self.field = .pick;
+            },
             .overview => {
                 if (self.connections.items.len == 0) return false;
                 self.field = .pick;
@@ -348,7 +374,6 @@ pub const State = struct {
             .name => {
                 // A new connection's first step.
                 if (self.editing == null and self.models.items.len == 0 and self.base_url.items.len == 0) {
-                    if (self.connections.items.len == 0) return false;
                     self.field = .pick;
                     self.selected = self.connections.items.len;
                 } else self.returnToOverview(.name);
@@ -417,7 +442,15 @@ pub const State = struct {
         self.saved = false;
         switch (self.field) {
             .pick => {
-                if (self.selected >= self.connections.items.len) {
+                if (self.selected == self.connections.items.len + 1) {
+                    if (self.editing) |old| alloc.free(old);
+                    self.editing = null;
+                    self.name.clearRetainingCapacity();
+                    self.display_name.clearRetainingCapacity();
+                    try self.focus(alloc, .chatgpt_label);
+                    return .next;
+                }
+                if (self.selected == self.connections.items.len) {
                     self.clearModels(alloc);
                     self.display_name.clearRetainingCapacity();
                     self.base_url.clearRetainingCapacity();
@@ -434,6 +467,14 @@ pub const State = struct {
                 if (self.editing) |old| alloc.free(old);
                 self.editing = try alloc.dupe(u8, self.connections.items[self.selected]);
                 return .edit;
+            },
+            .chatgpt_label => return .chatgpt_connect,
+            .chatgpt_account => switch (self.selected) {
+                0 => return .chatgpt_use,
+                1 => return .chatgpt_reconnect,
+                2 => return .chatgpt_usage,
+                3 => return .chatgpt_remove,
+                else => return if (try self.back(alloc)) .next else .close,
             },
             .overview => switch (self.overviewRow(self.selected)) {
                 .field => |field| {
@@ -630,7 +671,8 @@ pub const State = struct {
     /// The field's hint, shown as a placeholder while it is empty.
     pub fn hint(self: *const State) []const u8 {
         return switch (self.field) {
-            .pick, .overview, .model => "",
+            .pick, .overview, .model, .chatgpt_account => "",
+            .chatgpt_label => "optional, e.g. Work or Personal",
             .display_name => "optional, e.g. OpenCode Go",
             .name => "letters, digits, - and _, e.g. openrouter",
             .base_url => "e.g. https://openrouter.ai/api/v1",
@@ -729,6 +771,8 @@ test "a new connection takes its ID, then each field from the list" {
     var state: State = .{};
     defer state.close(alloc);
     try state.open(alloc, &.{});
+    try std.testing.expectEqual(Field.pick, state.field);
+    try std.testing.expectEqual(Advance.next, try state.submit(alloc));
     try std.testing.expectEqual(Field.name, state.field);
     try std.testing.expectEqual(Advance.next, try typeAndSubmit(&state, alloc, "oc-go"));
     try std.testing.expectEqual(Field.overview, state.field);

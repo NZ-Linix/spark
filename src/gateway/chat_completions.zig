@@ -17,6 +17,10 @@ const responses = @import("configured_responses.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const anthropic_messages = @import("anthropic_messages_protocol.zig");
 const request_fragment = @import("../core/config/request_fragment.zig");
+const chatgpt_plan = @import("../core/auth/chatgpt_plan.zig");
+const chatgpt_catalog = @import("../core/config/chatgpt_catalog.zig");
+const oauth_http = @import("../builtins/oauth_http.zig");
+const secret = @import("../core/auth/secret.zig");
 const Allocator = std.mem.Allocator;
 
 /// Every callback borrows the immutable definition from the owning profile runtime.
@@ -38,7 +42,13 @@ pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
 /// outlive the provider.
 pub fn model_catalog_provider(definition: *const definitions.Definition) catalog.Provider {
     const context: *anyopaque = @ptrCast(@constCast(definition));
-    return .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = bound_identity(definition) };
+    return .{
+        .context = context,
+        .fetch_fn = fetch_catalog,
+        .lookup_capabilities_fn = lookup_capabilities,
+        .provider_id = bound_identity(definition),
+        .refresh_interval_ms = if (definition.auth == .chatgpt_plan) 60_000 else null,
+    };
 }
 
 fn definition_at(raw: ?*anyopaque) *const definitions.Definition {
@@ -66,6 +76,28 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
         }
     };
     const metadata = definition.metadata_for(request.model);
+    if (definition.auth == .chatgpt_plan) {
+        // The catalog may have updated since the login snapshot was saved.
+        // The selected account's live catalog supplies the picker choices;
+        // OpenAI validates the effort again when it receives the request.
+        const effort = request.provider_options.reasoning;
+        var buffer: [256]u8 = undefined;
+        var json = std.Io.Writer.fixed(&buffer);
+        var fields: [1]request_fragment.Field = undefined;
+        if (effort) |value| {
+            try json.writeAll("{\"effort\":");
+            try std.json.Stringify.value(value.label(), .{}, &json);
+            if (!std.mem.eql(u8, value.label(), "none")) try json.writeAll(",\"summary\":\"auto\"");
+            try json.writeByte('}');
+            fields[0] = .{ .key = "reasoning", .value_json = json.buffered() };
+        }
+        return responses.build_request(alloc, request, .{
+            .provider = &identity,
+            .chatgpt_plan = true,
+            .effort_fields = if (effort != null) .{ .fields = &fields } else null,
+            .include_reasoning = if (effort) |value| !std.mem.eql(u8, value.label(), "none") else declares_efforts(metadata),
+        });
+    }
     const request_fields: request_fragment.Fragment = if (metadata) |known| known.request orelse .{} else .{};
     const level = effort_fields(metadata, request.provider_options.reasoning);
     return switch (definition.protocol) {
@@ -196,7 +228,12 @@ fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.C
 
 fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
     if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
-    var loaded = try load_models(definition_at(raw), alloc, input.cancel_flag);
+    const definition = definition_at(raw);
+    var loaded = try load_models(definition, alloc, input.cancel_flag);
+    if (definition.auth == .chatgpt_plan and loaded.failure == .credential) {
+        catalog.freeModelCatalog(alloc, &loaded.entries);
+        return .{ .failure = .{ .category = .authentication } };
+    }
     if (loaded.failure == .cancelled) {
         catalog.freeModelCatalog(alloc, &loaded.entries);
         return .{ .failure = .{ .category = .cancellation } };
@@ -219,6 +256,17 @@ const LoadedModels = struct {
 fn load_models(definition: *const definitions.Definition, alloc: Allocator, cancel_flag: ?*std.atomic.Value(bool)) Allocator.Error!LoadedModels {
     var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
     errdefer catalog.freeModelCatalog(alloc, &entries);
+    if (definition.auth == .chatgpt_plan) {
+        var fresh = load_plan_models(alloc, definition, cancel_flag) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            if (err == error.Cancelled) return .{ .entries = entries, .failure = .cancelled };
+            for (definition.model_metadata) |declared| try append_entry(alloc, &entries, declared);
+            return .{ .entries = entries, .failure = if (err == error.ChatGPTSignInRequired) .credential else .transport };
+        };
+        defer fresh.deinit(alloc);
+        for (fresh.definitions[0].model_metadata) |declared| try append_entry(alloc, &entries, declared);
+        return .{ .entries = entries };
+    }
     for (definition.model_metadata) |declared| {
         try append_entry(alloc, &entries, definition.metadata_for(declared.id).?);
     }
@@ -238,6 +286,19 @@ fn load_models(definition: *const definitions.Definition, alloc: Allocator, canc
         },
     }
     return .{ .entries = entries };
+}
+
+fn load_plan_models(alloc: Allocator, definition: *const definitions.Definition, cancel: ?*std.atomic.Value(bool)) !definitions.Registry {
+    const token = try chatgpt_plan.accessToken(alloc, oauth_http.provider, definition.id);
+    defer secret.zeroAndFree(alloc, token);
+    const body = try chatgpt_plan.fetchModels(alloc, oauth_http.provider, token, cancel);
+    defer alloc.free(body);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map: std.json.ObjectMap = .empty;
+    try map.put(a, definition.id, try chatgpt_catalog.connection(a, definition.display_name orelse definition.id, body));
+    return definitions.Registry.parse(alloc, .{ .object = map });
 }
 
 /// Adds `metadata` to `entries` as an entry that owns its strings and levels.
@@ -262,6 +323,7 @@ fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider
     var loaded = load_models(definition, alloc, input.cancel_flag) catch return exhausted;
     defer catalog.freeModelCatalog(alloc, &loaded.entries);
     if (loaded.failure == .cancelled) return .{ .failure = .{ .access = provenance.access, .failure = .{ .category = .cancellation } } };
+    if (definition.auth == .chatgpt_plan and loaded.failure == .credential) return .{ .failure = .{ .access = provenance.access, .failure = .{ .category = .authentication } } };
     var ids = catalog.projectModelIds(alloc, loaded.entries.items) catch return exhausted;
     const notice = if (loaded.failure) |failure|
         alloc.print("could not get the model list of {s}: {s}; showing the models in settings", .{ definition.id, failure.text() }) catch {

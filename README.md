@@ -77,7 +77,9 @@ Start spark in a project and add a model provider:
 /provider
 ```
 
-The form asks for a name, a base URL such as `https://openrouter.ai/api/v1`, an API key (leave it empty for a local server), and one or more models with their context window. spark saves the provider in `~/.spark/settings.json` and switches to it.
+Choose **Add connection** to set an OpenAI-compatible base URL, API key (empty for a local server), and models. Spark saves the provider in `~/.spark/settings.json` and switches to it.
+
+Choose **Continue with ChatGPT** to connect an eligible ChatGPT plan instead. No API key or Codex installation is needed: Spark sends its own prompts and tools using OpenAI's [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source). Give accounts labels such as `Work` and `Personal`, or leave the label blank for a numbered account. Choose an account under `/provider`, then pick from that account's models and reasoning levels. OAuth credentials stay in the private `chatgpt-plan` folder in your Spark profile. To disconnect, open the account in `/provider` and choose **Disconnect account**.
 
 Then just type what you want done.
 

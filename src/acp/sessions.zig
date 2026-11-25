@@ -1843,10 +1843,10 @@ pub fn writeProviderConfigOption(
     const lists_definitions = true;
     var first = true;
     if (current == .configured and (!lists_definitions or !definitionOffered(definitions, current.label()))) {
-        try writeProviderOption(w, current.label(), &first);
+        try writeProviderOption(w, current.label(), current.label(), &first);
     }
     if (lists_definitions) {
-        for (definitions) |definition| try writeProviderOption(w, definition.id, &first);
+        for (definitions) |definition| try writeProviderOption(w, definition.id, definition.display_name orelse definition.id, &first);
     }
     try w.writeAll("]}");
 }
@@ -1856,13 +1856,13 @@ fn definitionOffered(definitions: []const @import("../core/config/configured_pro
     return false;
 }
 
-fn writeProviderOption(w: *std.Io.Writer, id: []const u8, first: *bool) !void {
+fn writeProviderOption(w: *std.Io.Writer, id: []const u8, name: []const u8, first: *bool) !void {
     if (!first.*) try w.writeAll(",");
     first.* = false;
     try w.writeAll("{\"value\":");
     try writeJsonStr(id, w);
     try w.writeAll(",\"name\":");
-    try writeJsonStr(id, w);
+    try writeJsonStr(name, w);
     try w.writeAll("}");
 }
 

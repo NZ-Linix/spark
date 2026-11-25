@@ -136,6 +136,42 @@ final class FlowTests: XCTestCase {
   }
 
   @MainActor
+  func testChatGPTPlanAccounts() throws {
+    let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"])
+    let app = XCUIApplication()
+    app.launchEnvironment["SPARK_SCROLL_FIXTURE"] = relay
+    app.launch()
+    let settings = app.buttons["Settings"]
+    if !settings.waitForExistence(timeout: 3) {
+      let show = app.buttons["Show Chats"]
+      if show.exists, show.isHittable { show.tap() } else { app.buttons["Chats"].tap() }
+    }
+    XCTAssertTrue(settings.waitForExistence(timeout: 8))
+    settings.tap()
+    let plans = app.buttons["chatGPTPlans-demo-mac"]
+    XCTAssertTrue(plans.waitForExistence(timeout: 8))
+    plans.tap()
+    let start = app.buttons["chatGPTContinue"]
+    XCTAssertTrue(eventually("enabled == true", start, timeout: 6))
+    shot(app, "chatgpt-plans-empty")
+    for label in ["Work", "Personal"] {
+      start.tap()
+      let field = app.alerts.textFields["Account label (optional)"]
+      XCTAssertTrue(field.waitForExistence(timeout: 4))
+      field.tap()
+      field.typeText(label)
+      app.alerts.buttons["Continue with ChatGPT"].tap()
+      XCTAssertTrue(app.staticTexts["Codex (\(label))"].waitForExistence(timeout: 5))
+    }
+    shot(app, "chatgpt-plans-connected")
+    app.buttons["Manage Codex (Work)"].tap()
+    app.buttons["Disconnect"].firstMatch.tap()
+    app.buttons["Disconnect"].firstMatch.tap()
+    XCTAssertTrue(eventually("exists == false", app.staticTexts["Codex (Work)"], timeout: 5))
+    XCTAssertTrue(app.staticTexts["Codex (Personal)"].exists)
+  }
+
+  @MainActor
   func testMcpServers() throws {
     let relay = try XCTUnwrap(env["SPARK_SCROLL_FIXTURE"], "Run mobile/bridge/fixtures/scroll-relay.ts on a test simulator")
     let app = XCUIApplication()

@@ -11,6 +11,8 @@ const model_provider = @import("../config/model_provider.zig");
 const settings_store = @import("../config/settings_store.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const chatgpt = @import("../config/chatgpt_connection.zig");
+const plan = @import("../auth/chatgpt_plan.zig");
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -24,6 +26,10 @@ pub fn Runtime(comptime App: type) type {
             // Escape starts an arrow key, a paste, or Esc itself; the input
             // decoder turns it into an action for `routeAction`.
             if (byte == 0x1b) return false;
+            if (form.chatgpt_job) |job| {
+                if (byte == 3) job.cancel.store(true, .release);
+                return true;
+            }
             switch (byte) {
                 3 => form.close(app.alloc),
                 '\r', '\n' => try submit(app, agent),
@@ -44,6 +50,10 @@ pub fn Runtime(comptime App: type) type {
         pub fn routeAction(app: *App, agent: *AppAgent, action: anytype) !bool {
             const form = &app.input_runtime.provider_menu;
             if (!form.active) return false;
+            if (form.chatgpt_job) |job| {
+                if (action == .escape) job.cancel.store(true, .release);
+                return true;
+            }
             switch (action) {
                 .paste_start, .paste_end, .remapped_byte => return false,
                 // Esc leaves a field or a list; on the connection list it
@@ -83,7 +93,82 @@ pub fn Runtime(comptime App: type) type {
                     try form.beginEdit(app.alloc, definition);
                 },
                 .delete => try deleteConnection(app, agent),
+                .chatgpt_connect => try startChatGPT(app, agent, .connect),
+                .chatgpt_use => {
+                    const target = model_provider.parse(form.editing orelse return) orelse return;
+                    form.close(app.alloc);
+                    try app_auth_runtime.Runtime(App).switchToConnection(app, agent, try target.bind(app.provider_selection.definitions));
+                },
+                .chatgpt_reconnect => try startChatGPT(app, agent, .reconnect),
+                .chatgpt_remove => try startChatGPT(app, agent, .remove),
+                .chatgpt_usage => if (comptime @hasDecl(App, "chatgptBrowser")) {
+                    if (!try app.chatgptBrowser().open(app.alloc, "https://chatgpt.com/settings/usage")) form.problem = "Open https://chatgpt.com/settings/usage to review your plan.";
+                },
             }
+        }
+
+        fn startChatGPT(app: *App, agent: *AppAgent, operation: chatgpt.Operation) !void {
+            const form = &app.input_runtime.provider_menu;
+            if (comptime !@hasDecl(App, "chatgptBrowser")) {
+                form.problem = "ChatGPT sign-in is only available in the local terminal app.";
+                return;
+            } else {
+                if (agent.stream.active or agent.worker.queuedPromptCount() > 0) {
+                    form.problem = "Wait for the active and queued work to finish.";
+                    return;
+                }
+                const id = if (operation == .connect) try plan.newId(app.alloc) else try app.alloc.dupe(u8, form.editing orelse return);
+                defer app.alloc.free(id);
+                if (operation == .connect and form.connections.items.len >= 32) {
+                    form.problem = "The profile already has 32 connections.";
+                    return;
+                }
+                const display_name = if (operation == .connect)
+                    chatgpt.displayName(app.alloc, app.provider_selection.definitions, form.input.items) catch |err| {
+                        form.problem = chatgpt.errorText(err);
+                        return;
+                    }
+                else
+                    try app.alloc.dupe(u8, form.display_name.items);
+                defer app.alloc.free(display_name);
+                form.chatgpt_job = try chatgpt.Job.start(app.chatgptTransport(), app.chatgptBrowser(), operation, id, display_name);
+                form.problem = if (operation == .remove) "Disconnecting from ChatGPT…" else "Finish sign-in in your browser. Esc cancels.";
+            }
+        }
+
+        pub fn collectChatGPT(app: *App, agent: *AppAgent) !void {
+            const form = &app.input_runtime.provider_menu;
+            const job = form.chatgpt_job orelse return;
+            if (!job.done.load(.acquire)) return;
+            form.chatgpt_job = null;
+            defer job.close();
+            app.shell.render_requests.request(.footer);
+            const confirmed = job.result catch |err| {
+                form.problem = chatgpt.errorText(err);
+                return;
+            };
+            form.close(app.alloc);
+            if (!try reloadConnections(app)) return;
+            if (job.operation == .remove) {
+                if (std.mem.eql(u8, provider_runtime.providerOf(app, agent).label(), job.id)) {
+                    const definitions = app.provider_selection.definitions.definitions;
+                    if (definitions.len > 0) {
+                        const target = model_provider.parse(definitions[0].id).?;
+                        try app_auth_runtime.Runtime(App).switchToConnection(app, agent, try target.bind(app.provider_selection.definitions));
+                    } else {
+                        try app.provider_selection.replaceSelection(.none, provider_runtime.modelOf(app, agent));
+                        app.auth.clearCredential(app.alloc);
+                        app.model_cache.resetForProviderChange();
+                    }
+                }
+                try app.writeDomainNotice(.{ .topic = "connect", .tone = if (confirmed) .neutral else .warning, .body = if (confirmed) "Disconnected from ChatGPT." else "Removed the local account. Remote revocation could not be confirmed; disconnect Spark in ChatGPT settings." }, true);
+                return;
+            }
+            const target = try model_provider.parse(job.id).?.bind(app.provider_selection.definitions);
+            if (!provider_runtime.providerOf(app, agent).same_authority(target)) {
+                try app_auth_runtime.Runtime(App).switchToConnection(app, agent, target);
+            } else app.model_cache.resetForProviderChange();
+            try app.writeDomainNotice(.{ .topic = "connect", .tone = .neutral, .body = "Using your ChatGPT plan. Manage usage at https://chatgpt.com/settings/usage." }, true);
         }
 
         /// Opens the form on the saved connections.
@@ -126,6 +211,8 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return false;
             };
+            // The in-flight catalog callback borrows the current definition.
+            app.model_cache.resetForProviderChange();
             app.provider_selection.definitions.deinit(app.provider_selection.alloc);
             app.provider_selection.definitions = registry;
             return true;

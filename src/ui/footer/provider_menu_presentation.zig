@@ -29,6 +29,8 @@ pub const list_hint_variants = [_][]const u8{
 fn subtitle(state: *const State, buf: []u8) []const u8 {
     return switch (state.field) {
         .pick => "saved connections",
+        .chatgpt_account => "uses a ChatGPT plan",
+        .chatgpt_label => "uses a ChatGPT plan, no API key",
         .overview => if (state.saved) "saved" else if (state.editing == null) "new · choose a field" else "choose a field",
         .model => blk: {
             const id = if (state.model_index < state.models.items.len) state.models.items[state.model_index].id else "";
@@ -73,6 +75,8 @@ pub fn composeProviderMenuRow(
             "Model connections"
         else if (state.editing) |_|
             (std.mem.print(&title_buf, "{s}", .{if (state.display_name.items.len > 0) state.display_name.items else state.name.items}) catch "Edit connection")
+        else if (state.field == .chatgpt_label)
+            "Continue with ChatGPT"
         else if (state.name.items.len > 0)
             (std.mem.print(&title_buf, "New connection {s}", .{state.name.items}) catch "New connection")
         else
@@ -124,9 +128,21 @@ fn appendListRow(alloc: Allocator, row: *std.ArrayList(u8), state: *const State,
     var buf: [512]u8 = undefined;
     switch (state.field) {
         .pick => {
-            const label = if (item < state.connections.items.len) (state.connectionLabel(item) orelse state.connections.items[item]) else "+ Add connection";
+            const label = if (item < state.connections.items.len)
+                (state.connectionLabel(item) orelse state.connections.items[item])
+            else if (item == state.connections.items.len)
+                "+ Add connection"
+            else
+                "Continue with ChatGPT";
             try appendAction(alloc, row, label, selected, false, width);
         },
+        .chatgpt_account => try appendAction(alloc, row, switch (item) {
+            0 => "Use this account",
+            1 => "Continue with ChatGPT",
+            2 => "Manage ChatGPT usage",
+            3 => "Disconnect account",
+            else => "Back",
+        }, selected, item == 3, width),
         .overview => switch (state.overviewRow(item)) {
             .field => |field| try appendValueRow(alloc, row, field.label(), fieldValue(state, field), selected, width),
             .model => |index| try appendValueRow(alloc, row, "Model", modelSummary(state.models.items[index], &buf), selected, width),

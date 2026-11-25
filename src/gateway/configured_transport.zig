@@ -11,6 +11,8 @@ const definitions = @import("../core/config/configured_provider.zig");
 const streams = @import("../core/agent/stream_provider.zig");
 const io = @import("../core/shared/io.zig");
 const secret = @import("../core/auth/secret.zig");
+const chatgpt_plan = @import("../core/auth/chatgpt_plan.zig");
+const oauth_http = @import("../builtins/oauth_http.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const request_deadlines = @import("request_deadlines.zig");
 const sse = @import("sse.zig");
@@ -161,7 +163,7 @@ pub fn tokenOf(definition: *const definitions.Definition, request: streams.Model
         for (value) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidConfiguredProviderCredential;
     }
     switch (definition.auth) {
-        .none => if (token != null) return error.UnexpectedConfiguredProviderCredential,
+        .none, .chatgpt_plan => if (token != null) return error.UnexpectedConfiguredProviderCredential,
         .bearer, .key => if (token == null) return error.MissingConfiguredProviderCredential,
     }
     return token;
@@ -173,7 +175,13 @@ pub fn tokenOf(definition: *const definitions.Definition, request: streams.Model
 /// decides whether to send again.
 pub fn send(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, payload: []const u8, consume: ConsumeFn) !streams.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    const token = try tokenOf(definition, request);
+    const configured_token = try tokenOf(definition, request);
+    const plan_token = if (definition.auth == .chatgpt_plan) blk: {
+        if (!std.mem.eql(u8, definition.base_url, chatgpt_plan.resource) or definition.protocol != .@"openai-responses") return error.InvalidChatGPTAccount;
+        break :blk try chatgpt_plan.accessToken(alloc, oauth_http.provider, definition.id);
+    } else null;
+    defer if (plan_token) |value| secret.zeroAndFree(alloc, value);
+    const token = if (plan_token) |value| value else configured_token;
     // Before anything is sent: a header that cannot be filled in fails here.
     var headers = try Headers.resolve(alloc, definition, request.session_id);
     defer headers.deinit(alloc);
@@ -254,11 +262,16 @@ fn post(
     var transfer: [64 * 1024]u8 = undefined;
     const reader = response.reader(&transfer);
     if (response.head.status != .ok) {
+        if (definition.auth == .chatgpt_plan and response.head.status == .unauthorized) return error.ChatGPTSignInRequired;
         var detail = reader.allocRemaining(alloc, .limited(max_error_bytes)) catch |err| switch (err) {
             error.StreamTooLong => try alloc.dupe(u8, "Provider error response exceeded the local limit"),
             else => return err,
         };
         detail = try headers.mask(alloc, detail, token);
+        if (definition.auth == .chatgpt_plan and std.mem.find(u8, detail, "subscription_sharing_usage_limit_exceeded") != null) {
+            alloc.free(detail);
+            return error.ChatGPTPlanUsageLimit;
+        }
         return .{ .failed = .{ .kind = client_mod.httpFailureKind(alloc, .fromHttpStatus(response.head.status), detail), .http_status = response.head.status, .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
     var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
@@ -375,6 +388,7 @@ pub fn fetchModelIds(alloc: Allocator, definition: *const definitions.Definition
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
     switch (definition.auth) {
         .none => {},
+        .chatgpt_plan => return .{ .failure = .credential }, // uses the account-specific catalog shape
         .bearer => |env| {
             const token = io.getenv(env) orelse return .{ .failure = .credential };
             if (token.len == 0 or token.len > max_secret_bytes) return .{ .failure = .credential };

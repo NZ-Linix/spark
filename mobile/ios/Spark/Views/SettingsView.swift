@@ -41,6 +41,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 28) {
           connection
           hosts
+          chatGPTPlans
           sidebar
           if link.hosts.contains(where: { $0.kind == .cloud }) { library }
           about
@@ -150,6 +151,26 @@ struct SettingsView: View {
       }
       .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 22, style: .continuous))
       Text("Run spark pair on a Mac to add it. The cloud keeps working while your Mac sleeps.")
+        .font(.geist(13))
+        .foregroundStyle(Color.faint)
+        .padding(.horizontal, 6)
+    }
+  }
+
+  private var chatGPTPlans: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Caption("Subscription accounts")
+      VStack(spacing: 0) {
+        ForEach(link.hosts.filter { $0.kind == .mac }) { mac in
+          providersLink("ChatGPT plans on \(mac.name)", symbol: "person.crop.circle", id: "chatGPTPlans-\(mac.id)") {
+            ChatGPTAccountsView(mac: mac)
+          }
+          .disabled(!mac.online)
+          .opacity(mac.online ? 1 : 0.5)
+        }
+      }
+      .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 22, style: .continuous))
+      Text("ChatGPT plans work in chats on your paired Mac. Sign-in opens in its browser. Accounts are not shared with Cloud.")
         .font(.geist(13))
         .foregroundStyle(Color.faint)
         .padding(.horizontal, 6)

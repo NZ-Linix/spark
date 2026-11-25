@@ -313,7 +313,7 @@ final class Link {
     let data = try JSONEncoder().encode(["host": JSON.string(host), "msg": .object(msg)])
     let key = "\(host)#\(n)"
     let timeout = Task {
-      do { try await Task.sleep(for: .seconds(op == "watchTerminal" ? 15 : 90)) }
+      do { try await Task.sleep(for: .seconds(op == "chatgptAccount" ? 340 : op == "watchTerminal" ? 15 : 90)) }
       catch { return }
       waiting.removeValue(forKey: key)?.resume(throwing: LinkError("The host took too long to answer."))
     }
@@ -602,6 +602,21 @@ final class Link {
 
   func providers(_ host: String = "cloud") async throws -> [ProviderSummary] {
     try await request(host, "providers", as: [ProviderSummary].self)
+  }
+
+  func chatGPTAccounts(_ host: String) async throws -> [ProviderSummary] {
+    try await request(host, "chatgptAccounts", as: [ProviderSummary].self)
+  }
+
+  struct ChatGPTAccountUpdate: Decodable {
+    let accounts: [ProviderSummary]
+    let warning: String?
+  }
+
+  func changeChatGPTAccount(_ host: String, action: String, value: String) async throws -> ChatGPTAccountUpdate {
+    let result = try await request(host, "chatgptAccount", ["action": .string(action), "value": .string(value)], as: ChatGPTAccountUpdate.self)
+    configs[host] = nil
+    return result
   }
 
   /** the shared prompts; the cloud keeps them */

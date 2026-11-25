@@ -397,6 +397,8 @@ pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
         .{ "ConnectionTimedOut", "connection timed out" },
         .{ "ConnectionSetupTimedOut", "connection took too long to open" },
         .{ "TlsInitializationFailed", "couldn't make a secure connection" },
+        .{ "ChatGPTSignInRequired", "sign in to this ChatGPT plan again in provider settings" },
+        .{ "ChatGPTPlanUsageLimit", "ChatGPT plan usage limit reached; manage usage at https://chatgpt.com/settings/usage" },
         .{ "CertificateBundleLoadFailure", "couldn't load trusted certificates" },
         .{ "Timeout", "timed out" },
         .{ "StreamStalled", "stream stalled" },

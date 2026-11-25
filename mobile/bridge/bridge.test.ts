@@ -310,6 +310,34 @@ describe("library", () => {
     expect(readdirSync(join(home, PROMPT_DIR))).toEqual([]);
   });
 
+  test("keeps ChatGPT plan accounts on their own Mac and out of the library", async () => {
+    const base = mkdtempSync(join(tmpdir(), "spark-chatgpt-library-"));
+    try {
+      const mac = join(base, "mac");
+      const cloud = join(base, "cloud");
+      mkdirSync(mac);
+      const id = "chatgpt-plan-00000000000000000000000000000001";
+      const plan = { display_name: "Codex (Work)", protocol: "openai-responses", base_url: "https://api.openai.com/v1", auth: { type: "chatgpt-plan" } };
+      writeFileSync(join(mac, "settings.json"), JSON.stringify({ provider: id, providers: { [id]: plan }, models: { [id]: "fresh-model" } }));
+      const local = new Profile({ role: "mac", home: mac, spark: "spark" });
+      const library = new Library({ dir: join(base, "library"), spark: "spark" });
+      await expect(local.export(id)).rejects.toThrow("stay on this Mac");
+      await expect(library.putProvider({ name: id, provider: plan })).rejects.toThrow("aren't part of the provider library");
+      expect(local.list()).toEqual([]);
+      expect(local.accounts().map(p => p.displayName)).toEqual(["Codex (Work)"]);
+      const snapshot: LibrarySnapshot = { providers: { [id]: { ...plan, display_name: "Override" } }, models: { [id]: "wrong" }, provider: id, env: {}, prompts: {} };
+      expect(applySnapshot(mac, snapshot, true)).toEqual({});
+      expect(applySnapshot(cloud, snapshot)).toEqual({});
+      const saved = JSON.parse(readFileSync(join(mac, "settings.json"), "utf8"));
+      expect(saved.provider).toBe(id);
+      expect(saved.models[id]).toBe("fresh-model");
+      expect(saved.providers[id].display_name).toBe("Codex (Work)");
+      expect(JSON.parse(readFileSync(join(cloud, "settings.json"), "utf8")).providers).toEqual({});
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   test("mirrors cloud MCP definitions without copying OAuth state", () => {
     const lib = new Library({ dir: join(dir, "lib"), spark: SPARK });
     const home = join(dir, "home");

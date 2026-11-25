@@ -1,5 +1,6 @@
 const std = @import("std");
 const request_fragment = @import("request_fragment.zig");
+const chatgpt_plan = @import("../auth/chatgpt_plan.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
@@ -89,6 +90,7 @@ pub const Auth = union(enum) {
     bearer: []const u8,
     /// A key saved by `/provider` in the profile settings file itself.
     key: []const u8,
+    chatgpt_plan,
 };
 
 /// A request header whose value is read from the environment variable `env`
@@ -223,7 +225,7 @@ pub const Definition = struct {
         hash_part(&hash, self.base_url);
         hash_part(&hash, @tagName(self.auth));
         switch (self.auth) {
-            .none => {},
+            .none, .chatgpt_plan => {},
             .bearer => |env| hash_part(&hash, env),
             .key => {},
         }
@@ -429,6 +431,9 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
     leave(at);
     enter(at, "auth");
     const auth = try parse_auth(try required(value, "auth"), at);
+    if (auth == .chatgpt_plan) {
+        if (!chatgpt_plan.isId(id) or protocol != .@"openai-responses" or !std.mem.eql(u8, normalized, chatgpt_plan.resource) or value.object.contains("headers")) return error.InvalidAuth;
+    } else if (std.mem.startsWith(u8, id, chatgpt_plan.id_prefix)) return error.ReservedProviderId;
     leave(at);
     var mode: ToolChoiceMode = .omit;
     if (value.object.get("tool_choice_mode")) |choice| {
@@ -470,6 +475,7 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         .base_url = try owned.dupe(u8, normalized),
         .auth = switch (auth) {
             .none => .none,
+            .chatgpt_plan => .chatgpt_plan,
             .bearer => |env| .{ .bearer = try owned.dupe(u8, env) },
             .key => |key| .{ .key = try owned.dupe(u8, key) },
         },
@@ -500,6 +506,10 @@ fn parse_auth(value: std.json.Value, at: ?*FailurePath) ParseError!Auth {
     if (std.mem.eql(u8, kind.string, "none")) {
         if (value.object.contains("env") or value.object.contains("key")) return error.InvalidAuth;
         return .none;
+    }
+    if (std.mem.eql(u8, kind.string, "chatgpt-plan")) {
+        if (value.object.count() != 1) return error.InvalidAuth;
+        return .chatgpt_plan;
     }
     if (std.mem.eql(u8, kind.string, "key")) {
         if (value.object.contains("env")) return error.InvalidAuth;

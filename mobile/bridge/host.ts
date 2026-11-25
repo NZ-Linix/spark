@@ -239,6 +239,15 @@ export class Host {
         return this.deleteSession(req.s);
       case "providers":
         return this.o.library ? this.o.library.providers() : this.profile().list();
+      case "chatgptAccounts":
+        if (this.o.info.kind !== "mac") throw new Error("ChatGPT plans are available only on your paired Mac.");
+        return this.profile().accounts();
+      case "chatgptAccount": {
+        if (this.o.info.kind !== "mac") throw new Error("ChatGPT plans are available only on your paired Mac.");
+        const result = await this.profile().changeAccount(req.action, req.value);
+        this.invalidate();
+        return result;
+      }
       case "providerExport":
         return this.profile().export(req.name);
       case "providerPut": {

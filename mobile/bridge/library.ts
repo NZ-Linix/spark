@@ -5,7 +5,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { chooseModel, isObject, type Json, Profile, writeAtomic } from "./providers";
+import { chooseModel, isLocalProvider, isObject, type Json, Profile, writeAtomic } from "./providers";
 import type { McpSummary, PromptSummary, ProviderSummary } from "./protocol";
 
 /** a prompt is a file named after it, so its name can't hold a path or start with a dot */
@@ -186,11 +186,11 @@ export class Library {
 
   snapshot(): LibrarySnapshot {
     const s = readJson(join(this.o.dir, "settings.json"));
-    const providers = isObject(s.providers) ? (s.providers as Record<string, Json>) : {};
+    const providers = isObject(s.providers) ? Object.fromEntries(Object.entries(s.providers).filter(([name, p]) => !isLocalProvider(name, p))) : {};
     const models = isObject(s.models) ? Object.fromEntries(Object.entries(s.models).filter(([k, v]) => typeof v === "string" && k in providers)) : {};
     const prompts = Object.fromEntries(Object.entries(this.readPrompts()).map(([k, v]) => [k, v.text]));
     const mcp = readMcp(this.o.dir);
-    return { providers, models: models as Record<string, string>, provider: typeof s.provider === "string" ? s.provider : undefined, env: this.profile.env(), prompts, mcp };
+    return { providers, models: models as Record<string, string>, provider: typeof s.provider === "string" && Object.hasOwn(providers, s.provider) ? s.provider : undefined, env: this.profile.env(), prompts, mcp };
   }
 
   /**
@@ -209,11 +209,11 @@ export class Library {
       const s = readJson(join(home, "settings.json"));
       if (!isObject(s.providers)) continue;
       for (const [name, p] of Object.entries(s.providers)) {
-        if (!isObject(p) || out.providers[name]) continue;
+        if (!isObject(p) || isLocalProvider(name, p) || out.providers[name]) continue;
         out.providers[name] = p;
         if (isObject(s.models) && typeof s.models[name] === "string") out.models[name] = s.models[name];
       }
-      if (out.provider === undefined && typeof s.provider === "string" && isObject(s.providers[s.provider])) out.provider = s.provider;
+      if (out.provider === undefined && typeof s.provider === "string" && Object.hasOwn(out.providers, s.provider)) out.provider = s.provider;
       const e = readJson(join(home, "cloud-env.json"));
       for (const [k, v] of Object.entries(e)) if (typeof v === "string" && !(k in env)) env[k] = v;
     }
@@ -327,21 +327,24 @@ function stable(v: unknown): string {
  * the provider and models it chose while they still exist, and the prompts land in PROMPT_DIR,
  * which the profile's prompts.json lists. Returns each provider's fingerprint as written.
  */
-export function applySnapshot(home: string, snap: LibrarySnapshot): Record<string, string> {
+export function applySnapshot(home: string, snap: LibrarySnapshot, keepLocal = false): Record<string, string> {
   mkdirSync(home, { recursive: true, mode: 0o700 });
   const file = join(home, "settings.json");
   const s = readJson(file);
-  s.providers = structuredClone(snap.providers);
+  const shared = Object.fromEntries(Object.entries(snap.providers).filter(([name, p]) => !isLocalProvider(name, p)));
+  const local = keepLocal && isObject(s.providers) ? Object.entries(s.providers).filter(([name, p]) => isLocalProvider(name, p)) : [];
+  const providers = Object.assign(structuredClone(shared), Object.fromEntries(local));
+  s.providers = providers;
   const models: Json = isObject(s.models) ? s.models : {};
   for (const name of Object.keys(models)) {
-    const p = snap.providers[name];
+    const p = Object.hasOwn(providers, name) ? providers[name] : undefined;
     const meta = isObject(p) && isObject(p.model_metadata) ? p.model_metadata : null;
-    if (!p || typeof models[name] !== "string" || (meta && Object.keys(meta).length && !(models[name] in meta))) delete models[name];
+    if (!p || typeof models[name] !== "string" || (!isLocalProvider(name, p) && meta && Object.keys(meta).length && !(models[name] in meta))) delete models[name];
   }
-  for (const [name, m] of Object.entries(snap.models)) if (!(name in models) && name in snap.providers) models[name] = m;
+  for (const [name, m] of Object.entries(snap.models)) if (!(name in models) && Object.hasOwn(shared, name)) models[name] = m;
   s.models = models;
-  if (typeof s.provider !== "string" || !snap.providers[s.provider]) {
-    const next = snap.provider && snap.providers[snap.provider] ? snap.provider : Object.keys(snap.providers).sort()[0];
+  if (typeof s.provider !== "string" || !Object.hasOwn(providers, s.provider)) {
+    const next = snap.provider && Object.hasOwn(shared, snap.provider) ? snap.provider : Object.keys(providers).sort()[0];
     if (next) s.provider = next;
     else delete s.provider;
   }
@@ -355,7 +358,7 @@ export function applySnapshot(home: string, snap: LibrarySnapshot): Record<strin
       writeAtomic(path, { ...current, mcpServers: snap.mcp });
     }
   }
-  return Object.fromEntries(Object.entries(snap.providers).map(([k, p]) => [k, fingerprint(p)]));
+  return Object.fromEntries(Object.entries(shared).map(([k, p]) => [k, fingerprint(p)]));
 }
 
 function writePrompts(home: string, prompts: Record<string, string>) {

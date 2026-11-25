@@ -24,6 +24,8 @@ const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
+const chatgpt_connection = @import("../config/chatgpt_connection.zig");
+const chatgpt_plan = @import("../auth/chatgpt_plan.zig");
 const profiles = @import("../profiles/profiles.zig");
 const app_profile_runtime = @import("../app/app_profile_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -1137,6 +1139,7 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .provider => |rest| {
+            if (rest.len >= 2 and std.mem.eql(u8, rest[0], "chatgpt-account")) return runChatGPTAccount(alloc, rest[1..], cfg, deps);
             if (cli_provider_edit.handles(rest)) {
                 const result = try cli_provider_edit.run(alloc, rest);
                 defer alloc.free(result.text);
@@ -1790,6 +1793,44 @@ fn writeProviderActivationError(alloc: Allocator, deps: RunDeps, detail: []const
 fn writeHostManagedAuthResult(deps: RunDeps) !void {
     try writeStdout(deps, credentials.host_managed_auth_message);
     try writeStdout(deps, "\n");
+}
+
+fn runChatGPTAccount(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
+    const operation = std.meta.stringToEnum(chatgpt_connection.Operation, args[0]);
+    if (operation == null or args.len > 2 or (operation != .connect and args.len != 2)) {
+        try writeStderr(deps, "spark provider chatgpt-account connect [label] | reconnect <id> | remove <id>\n");
+        return usage_failure;
+    }
+    var registry = try config_runtime.loadConfiguredProviders(alloc);
+    defer registry.deinit(alloc);
+    const id = if (operation == .connect) try chatgpt_plan.newId(alloc) else try alloc.dupe(u8, args[1]);
+    defer alloc.free(id);
+    const label = if (operation == .connect) blk: {
+        if (registry.definitions.len >= 32) {
+            try writeProviderActivationError(alloc, deps, "the profile already has 32 connections");
+            return .handled_failure;
+        }
+        break :blk chatgpt_connection.displayName(alloc, registry, if (args.len == 2) args[1] else "") catch |err| {
+            try writeProviderActivationError(alloc, deps, chatgpt_connection.errorText(err));
+            return .handled_failure;
+        };
+    } else blk: {
+        const definition = registry.get(id);
+        if (definition == null or definition.?.auth != .chatgpt_plan) {
+            try writeProviderActivationError(alloc, deps, "that ChatGPT account is not saved here");
+            return .handled_failure;
+        }
+        break :blk try alloc.dupe(u8, definition.?.display_name orelse id);
+    };
+    defer alloc.free(label);
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const confirmed = chatgpt_connection.change(alloc, cfg.oauth_transport, cfg.url_opener, operation.?, id, label, &cancel) catch |err| {
+        try writeProviderActivationError(alloc, deps, chatgpt_connection.errorText(err));
+        return .handled_failure;
+    };
+    if (!confirmed) try writeStderr(deps, "Removed the local account. Remote revocation could not be confirmed; disconnect Spark in ChatGPT settings.\n");
+    try writeStdout(deps, if (operation == .remove) "ChatGPT account removed.\n" else "ChatGPT plan connected.\n");
+    return .handled_success;
 }
 
 /// Makes the configured provider `target` the saved selection, with the model

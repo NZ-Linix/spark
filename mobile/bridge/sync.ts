@@ -7,7 +7,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { applySnapshot, fingerprint, type LibrarySnapshot, readMcp } from "./library";
-import { isObject, type Profile, writeAtomic } from "./providers";
+import { isLocalProvider, isObject, type Profile, writeAtomic } from "./providers";
 
 const POLL_MS = 1000;
 
@@ -112,7 +112,7 @@ export class Mirror {
 
   private apply(snap: LibrarySnapshot) {
     try {
-      this.written = applySnapshot(this.o.home, snap);
+      this.written = applySnapshot(this.o.home, snap, true);
       this.writtenMcp = Object.fromEntries(Object.entries(readMcp(this.o.home) ?? {}).map(([k, v]) => [k, fingerprint(v)]));
       this.mtime = this.stamp();
       this.mcpMtime = this.stamp(this.mcpFile);
@@ -134,7 +134,7 @@ export class Mirror {
     if (!existsSync(this.settingsFile)) return {};
     try {
       const s = JSON.parse(readFileSync(this.settingsFile, "utf8"));
-      return isObject(s) && isObject(s.providers) ? s.providers : {};
+      return isObject(s) && isObject(s.providers) ? Object.fromEntries(Object.entries(s.providers).filter(([name, p]) => !isLocalProvider(name, p))) : {};
     } catch {
       return {};
     }

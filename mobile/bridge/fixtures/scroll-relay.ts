@@ -6,6 +6,9 @@ import { Library } from "../library";
 
 const library = new Library({ dir: mkdtempSync(join(tmpdir(), "spark-fixture-library-")), spark: "spark" });
 const host = { id: "cloud", name: "Cloud", kind: "cloud", online: true };
+const mac = { id: "demo-mac", name: "Demo Mac", kind: "mac", online: true };
+const hosts = process.env.SPARK_CHATGPT_FIXTURE ? [host, mac] : [host];
+const accounts: Record<string, unknown>[] = [];
 const session = { id: "scroll", cwd: "/tmp", title: "Scroll regression", updatedAt: new Date().toISOString(), live: true, running: false };
 const items = [
   ...Array.from({ length: 18 }, (_, i) => ({ id: `message-${i}`, role: i % 2 ? "assistant" : "user", text: `Earlier message ${i}\n\n${"A paragraph in the scroll fixture. ".repeat(8)}` })),
@@ -24,17 +27,32 @@ Bun.serve({
   fetch(req, server) {
     switch (new URL(req.url).pathname) {
       case "/api/info": return Response.json({ cloud: true });
-      case "/api/devices": return Response.json({ token: "fixture", hosts: [host] });
+      case "/api/devices": return Response.json({ token: "fixture", hosts });
       case "/ws/device": if (server.upgrade(req)) return;
     }
     return new Response(null, { status: 404 });
   },
   websocket: {
-    open(ws) { ws.send(JSON.stringify({ relay: "hosts", hosts: [host] })); },
+    open(ws) { ws.send(JSON.stringify({ relay: "hosts", hosts })); },
     message(ws, data) {
-      const { msg: req } = JSON.parse(String(data));
+      const { host: target, msg: req } = JSON.parse(String(data));
       if (!req) return;
-      const send = (msg: object) => ws.send(JSON.stringify({ host: host.id, msg }));
+      const send = (msg: object) => ws.send(JSON.stringify({ host: target, msg }));
+      if (target === mac.id && req.op === "chatgptAccounts") {
+        send({ t: "reply", id: req.id, ok: true, result: accounts });
+        return;
+      }
+      if (target === mac.id && req.op === "chatgptAccount") {
+        if (req.action === "connect") {
+          accounts.push({ name: `chatgpt-plan-${crypto.randomUUID().replaceAll("-", "")}`, displayName: `Codex (${req.value || accounts.length + 1})`, baseUrl: "https://api.openai.com/v1", protocol: "openai-responses", auth: "chatgpt-plan", models: ["example-model"], active: accounts.length === 0, headerEnv: [], provider: {} });
+        }
+        if (req.action === "remove") {
+          const index = accounts.findIndex(account => account.name === req.value);
+          if (index >= 0) accounts.splice(index, 1);
+        }
+        send({ t: "reply", id: req.id, ok: true, result: { accounts } });
+        return;
+      }
       if (typeof req.op === "string" && req.op.startsWith("mcp") && req.op !== "mcpServers") {
         try {
           const result = req.op === "mcpList" ? library.mcp() : req.op === "mcpPut" ? library.putMcp(req) : req.op === "mcpDelete" ? library.deleteMcp(req.name) : library.setMcpEnabled(req.name, req.enabled);
@@ -50,7 +68,7 @@ Bun.serve({
       }
       const results: Record<string, unknown> = {
         config,
-        sessions: [session], open: { ...session, items, config, permission: null }, options: config,
+        sessions: target === mac.id ? [] : [session], open: { ...session, items, config, permission: null }, options: config,
         prompts: [], mcpServers: ["fixture-mcp"], sessionMcp: req.disabled,
       };
       send({ t: "reply", id: req.id, ok: true, result: results[req.op] ?? null });

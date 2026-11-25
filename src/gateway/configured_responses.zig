@@ -32,6 +32,7 @@ pub const Options = struct {
     /// settings declare effort levels: OpenAI refuses the request for a model
     /// that does not reason, and settings cannot take the field out.
     include_reasoning: bool = false,
+    chatgpt_plan: bool = false,
 };
 
 const max_event_bytes: usize = 1024 * 1024;
@@ -97,14 +98,15 @@ pub fn build_request(alloc: Allocator, request: stream_provider.RequestData, opt
     try writer.writeAll(",\"input\":[");
     // Replay and image scratch must not grow the body's own buffer, as the
     // ChatGPT and Grok adapters keep it apart.
-    try responses_protocol.writeInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, .{
+    const namespace: ?[]const u8 = if (options.chatgpt_plan) "spark" else null;
+    try responses_protocol.writeInputWithNamespace(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, .{
         .tool_calls = max_tool_calls,
         .tool_identity_bytes = max_tool_identity_bytes,
         .tool_arguments_bytes = max_tool_arguments_bytes,
         .provider_state_bytes = max_provider_state_bytes,
-    }, budget);
+    }, budget, namespace);
     try writer.writeByte(']');
-    const tool_count = if (request.tool_choice == .none) 0 else try responses_protocol.writeTools(writer, alloc, tools.selection);
+    const tool_count = if (request.tool_choice == .none) 0 else try responses_protocol.writeToolsWithNamespace(writer, alloc, tools.selection, namespace);
     if (tool_count > 0) {
         if (options.tool_choice_mode == .send) {
             const choice: types.ToolChoice = if (request.vision_mode == .required) .required else request.tool_choice;
@@ -130,7 +132,7 @@ pub fn build_request(alloc: Allocator, request: stream_provider.RequestData, opt
         try std.json.Stringify.value(format.schema, .{}, writer);
         try writer.writeAll(",\"strict\":true}}");
     }
-    if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
+    if (!options.chatgpt_plan) if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
     const effort_fields = if (provider_options.reasoning != null) options.effort_fields orelse request_fragment.Fragment{} else request_fragment.Fragment{};
     try request_fragment.write(writer, options.request_fields, effort_fields);
     try writer.writeByte('}');
@@ -264,11 +266,15 @@ test "configured responses body has spark's fields, then the model's, with a dec
 
 const RecordedEvents = struct {
     content: std.ArrayList(u8) = .empty,
+    reasoning: std.ArrayList(u8) = .empty,
+    started_tools: usize = 0,
 
     fn emit(raw: *anyopaque, event: stream_provider.Event) void {
         const self: *RecordedEvents = @ptrCast(@alignCast(raw));
         switch (event) {
             .content_delta => |text| self.content.appendSlice(std.testing.allocator, text) catch {},
+            .reasoning_delta => |text| self.reasoning.appendSlice(std.testing.allocator, text) catch {},
+            .tool_started => self.started_tools += 1,
             else => {},
         }
     }
@@ -293,4 +299,60 @@ fn test_consume(alloc: Allocator, bytes: []const u8, recorded: *RecordedEvents) 
         .events = .{ .context = recorded, .emit_fn = RecordedEvents.emit },
         .cancel_flag = &cancel,
     }, null);
+}
+
+test "ChatGPT plan streams reasoning, text and a tool call and builds its next Spark turn" {
+    const a = std.testing.allocator;
+    const plan = @import("../core/auth/chatgpt_plan.zig");
+    const id = plan.id_prefix ++ "00000000000000000000000000000001";
+    const definition: configured_provider.Definition = .{ .id = id, .base_url = plan.resource, .protocol = .@"openai-responses", .auth = .chatgpt_plan };
+    const event =
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"summary_index\":0,\"delta\":\"Checking.\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"encrypted\"}}\n\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"content_index\":0,\"delta\":\"Let's check.\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"namespace\":\"spark\",\"name\":\"lookup_color\",\"arguments\":\"\"}}\n\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"{}\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"namespace\":\"spark\",\"name\":\"lookup_color\",\"arguments\":\"{}\"}}\n\n" ++
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n";
+    var recorded: RecordedEvents = .{};
+    defer recorded.content.deinit(a);
+    defer recorded.reasoning.deinit(a);
+    var got = try test_consume(a, event, &recorded);
+    defer got.deinit(a);
+    const completion = got.completed.completion;
+    try std.testing.expectEqualStrings("Let's check.", recorded.content.items);
+    try std.testing.expectEqualStrings("Checking.", recorded.reasoning.items);
+    try std.testing.expectEqual(@as(usize, 1), recorded.started_tools);
+    try std.testing.expectEqualStrings("lookup_color", completion.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{}", completion.tool_calls[0].arguments_json);
+    var identity = model_provider.parse(id).?;
+    identity.configured.binding = definition.binding_identity();
+    var request = test_request();
+    request.messages = &.{
+        .{ .role = .user, .content = "Look up a color" },
+        .{ .role = .assistant, .content = "Let's check.", .tool_calls = completion.tool_calls, .provider_replay = .{ .source = .{ .provider = identity, .model = request.model }, .parts_json = completion.provider_state_json.? } },
+        .{ .role = .tool, .tool_call_id = completion.tool_calls[0].id, .content = "blue" },
+    };
+    request.tools.additional_functions = &.{.{ .name = "lookup_color", .description = "Look up a color" }};
+    request.provider_options.reasoning = .literal("high");
+    const body = try @import("chat_completions.zig").build_for(&definition, a, request);
+    defer a.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const fields = parsed.value.object;
+    try std.testing.expectEqualStrings("first\n\nsecond", fields.get("instructions").?.string);
+    try std.testing.expect(!fields.get("store").?.bool);
+    try std.testing.expect(fields.get("stream").?.bool);
+    try std.testing.expect(fields.get("max_output_tokens") == null);
+    try std.testing.expectEqualStrings("high", fields.get("reasoning").?.object.get("effort").?.string);
+    try std.testing.expectEqualStrings("reasoning.encrypted_content", fields.get("include").?.array.items[0].string);
+    const namespace = fields.get("tools").?.array.items[0].object;
+    try std.testing.expectEqualStrings("namespace", namespace.get("type").?.string);
+    try std.testing.expectEqualStrings("spark", namespace.get("name").?.string);
+    try std.testing.expectEqualStrings("lookup_color", namespace.get("tools").?.array.items[0].object.get("name").?.string);
+    const input = fields.get("input").?.array.items;
+    try std.testing.expectEqualStrings("spark", input[input.len - 2].object.get("namespace").?.string);
+    try std.testing.expectEqualStrings("blue", input[input.len - 1].object.get("output").?.string);
+    try std.testing.expect(std.mem.find(u8, body, "encrypted_content\":\"encrypted") != null);
+    try std.testing.expectError(error.ResponsesStreamIncomplete, test_consume(a, "data: {\"type\":\"response.created\"}\n\n", &recorded));
 }

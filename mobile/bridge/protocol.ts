@@ -185,6 +185,8 @@ export type Request =
   | { id: number; op: "run"; run: string; cwd: string; command: string }
   | { id: number; op: "runStop"; run: string }
   | { id: number; op: "providers" }
+  | { id: number; op: "chatgptAccounts" }
+  | { id: number; op: "chatgptAccount"; action: "connect" | "reconnect" | "remove"; value: string }
   /** Mac only */
   | { id: number; op: "providerExport"; name: string }
   /** a key left out keeps the saved one; `env` is cloud only; `previous` renames */
