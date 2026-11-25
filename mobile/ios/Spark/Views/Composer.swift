@@ -229,7 +229,12 @@ struct ConfigChips: View {
 
   var body: some View {
     if let model {
-      Button { open = true } label: {
+      Button {
+        // a menu in the sheet gives focus back to the last field when it closes; with the composer
+        // still holding it, that would raise the keyboard over the sheet
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        open = true
+      } label: {
         HStack(spacing: 5) {
           if promptChosen {
             Image(systemName: "text.quote")
@@ -314,14 +319,73 @@ enum Effort {
   }
 }
 
-/**
- * Reasoning effort as a track with a stop for each level. Tap a stop or drag the knob: it snaps to
- * the nearest level as the finger moves, and the level is set the moment the finger lifts.
- */
+/** Reasoning effort on the stop slider, one stop per level the model offers. */
 struct EffortSlider: View {
   let option: ConfigOption
   let set: (String) -> Void
-  /** the level under the finger while it's down */
+
+  var body: some View {
+    StopSlider(
+      stops: Effort.levels(option).map { .init(value: $0.value, name: Effort.name($0)) },
+      current: option.currentValue, placeholder: "Effort", label: "Reasoning effort", set: set)
+  }
+}
+
+/** The chat's context limit on the same slider as effort, with a way back to the model's own window. */
+struct ContextSlider: View {
+  let option: ConfigOption
+  let set: (String) -> Void
+
+  /** k is 1024 tokens, as in `/context 64k` */
+  static let stops: [StopSlider.Stop] = [32, 64, 100, 128, 200, 256, 300, 400, 500, 512, 1024].map { k in
+    .init(value: String(k * 1024), name: k == 1024 ? "1M" : "\(k)k")
+  }
+
+  private var auto: Bool { option.currentValue == "auto" }
+
+  var body: some View {
+    StopSlider(
+      stops: Self.stops, current: option.currentValue,
+      placeholder: auto ? "Model default" : (option.current?.name ?? "\(option.currentValue) tokens"),
+      suffix: " context", label: "Context limit", set: set)
+      .overlay(alignment: .topTrailing) {
+        if !auto {
+          Button { set("auto") } label: {
+            Image(systemName: "arrow.counterclockwise")
+              .font(.system(size: 11, weight: .bold))
+              .foregroundStyle(Color.dim)
+              .frame(width: 28, height: 28)
+              .background(Color.white.opacity(0.08), in: .circle)
+              .contentShape(.circle)
+          }
+          .buttonStyle(QuietPress())
+          .accessibilityLabel("Use the model default")
+          .transition(.scale(0.8).combined(with: .opacity))
+        }
+      }
+      .animation(.spring(duration: 0.22, bounce: 0.15), value: auto)
+  }
+}
+
+/**
+ * A track with a stop for each value. Tap a stop or drag the knob: it snaps to the nearest stop as
+ * the finger moves, and the value is set the moment the finger lifts.
+ */
+struct StopSlider: View {
+  struct Stop {
+    let value: String
+    let name: String
+  }
+
+  let stops: [Stop]
+  let current: String
+  /** the title while no stop is chosen */
+  let placeholder: String
+  /** after a chosen stop's name in the title */
+  var suffix = ""
+  let label: String
+  let set: (String) -> Void
+  /** the stop under the finger while it's down */
   @State private var dragging: Int?
   @State private var width: CGFloat = 0
 
@@ -329,19 +393,19 @@ struct EffortSlider: View {
   private static let knob: CGFloat = 36
   private static let pad: CGFloat = 4
 
-  private var levels: [ConfigOption.Choice] { Effort.levels(option) }
-  /** nil while spark picks the effort itself: no stop is lit and there's no knob until one is tapped */
-  private var chosen: Int? { levels.firstIndex { $0.value == option.currentValue } }
+  /** nil while none is chosen: no stop is lit and there's no knob until one is tapped */
+  private var chosen: Int? { stops.firstIndex { $0.value == current } }
   private var shown: Int? { dragging ?? chosen }
   private var picked: Bool { shown != nil }
 
   var body: some View {
     VStack(spacing: 14) {
-      Text(shown.map { Effort.name(levels[$0]) } ?? "Effort")
+      Text(shown.map { stops[$0].name + suffix } ?? placeholder)
         .font(.geist(17, .semibold))
         .foregroundStyle(picked ? Effort.accent : Color.dim)
         .contentTransition(.numericText())
         .frame(maxWidth: .infinity)
+        .frame(height: 28)
       ZStack(alignment: .leading) {
         Capsule().fill(Color.white.opacity(0.09))
         if let i = shown, picked {
@@ -349,7 +413,7 @@ struct EffortSlider: View {
             .fill(Effort.accent)
             .frame(width: x(i) + Self.knob / 2 + Self.pad)
         }
-        ForEach(levels.indices, id: \.self) { i in
+        ForEach(stops.indices, id: \.self) { i in
           Circle()
             .fill(Color.white.opacity(i <= (shown ?? -1) ? 0.55 : 0.28))
             .frame(width: 6, height: 6)
@@ -372,7 +436,7 @@ struct EffortSlider: View {
           .onEnded { g in
             let i = index(g.location.x)
             dragging = nil
-            if levels[i].value != option.currentValue { set(levels[i].value) }
+            if stops[i].value != current { set(stops[i].value) }
           }
       )
     }
@@ -380,28 +444,27 @@ struct EffortSlider: View {
     .animation(.spring(duration: 0.22, bounce: 0.15), value: dragging == nil)
     .sensoryFeedback(.selection, trigger: shown)
     .accessibilityElement()
-    .accessibilityLabel("Reasoning effort")
-    .accessibilityValue(shown.map { Effort.name(levels[$0]) } ?? "Not set")
+    .accessibilityLabel(label)
+    .accessibilityValue(shown.map { stops[$0].name + suffix } ?? placeholder)
     .accessibilityAdjustableAction { direction in
-      let i = chosen ?? 0
-      let next = direction == .increment ? min(i + 1, levels.count - 1) : max(i - 1, 0)
-      set(levels[next].value)
+      let i = chosen.map { direction == .increment ? min($0 + 1, stops.count - 1) : max($0 - 1, 0) } ?? 0
+      set(stops[i].value)
     }
   }
 
-  /** the center of level `i`'s stop */
+  /** the center of stop `i` */
   private func x(_ i: Int) -> CGFloat {
     let start = Self.pad + Self.knob / 2
-    guard levels.count > 1, width > 0 else { return start }
-    return start + CGFloat(i) * (width - 2 * start) / CGFloat(levels.count - 1)
+    guard stops.count > 1, width > 0 else { return start }
+    return start + CGFloat(i) * (width - 2 * start) / CGFloat(stops.count - 1)
   }
 
-  /** the level whose stop is nearest `x` */
+  /** the stop nearest `x` */
   private func index(_ x: CGFloat) -> Int {
-    guard levels.count > 1, width > 0 else { return 0 }
+    guard stops.count > 1, width > 0 else { return 0 }
     let start = Self.pad + Self.knob / 2
-    let step = (width - 2 * start) / CGFloat(levels.count - 1)
-    return min(max(Int(((x - start) / step).rounded()), 0), levels.count - 1)
+    let step = (width - 2 * start) / CGFloat(stops.count - 1)
+    return min(max(Int(((x - start) / step).rounded()), 0), stops.count - 1)
   }
 }
 
@@ -442,7 +505,7 @@ struct ModelSheet: View {
   private var fits: Bool { mcpNames.isEmpty && (model?.options.count ?? 0) <= 8 }
   private var fitHeight: CGFloat {
     64 + (effort == nil ? 0 : 138) + (menus.isEmpty && !showsPrompt ? 0 : 44)
-      + (context == nil ? 0 : 64) + CGFloat(model?.options.count ?? 0) * 52 + 40
+      + (context == nil ? 0 : 138) + CGFloat(model?.options.count ?? 0) * 52 + 40
   }
 
   private var makers: Set<String> { Set(shown.map { ConfigOption.Choice.maker($0.value) }) }
@@ -468,6 +531,14 @@ struct ModelSheet: View {
 
       if let effort {
         EffortSlider(option: effort) { set(effort.id, $0) }
+          .padding(14)
+          .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 26, style: .continuous))
+          .padding(.horizontal, 12)
+          .padding(.bottom, 14)
+      }
+
+      if let context {
+        ContextSlider(option: context) { set(context.id, $0) }
           .padding(14)
           .background(Color.white.opacity(0.05), in: .rect(cornerRadius: 26, style: .continuous))
           .padding(.horizontal, 12)
@@ -502,36 +573,6 @@ struct ModelSheet: View {
 
       ScrollView {
         LazyVStack(spacing: 2) {
-          if query.isEmpty, let context {
-            Menu {
-              Picker(context.name, selection: Binding(get: { context.currentValue }, set: { set(context.id, $0) })) {
-                ForEach(context.options, id: \.value) { Text($0.name).tag($0.value) }
-              }
-            } label: {
-              HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 3) {
-                  Text("Context limit").font(.geist(15, .medium))
-                  Text("This chat only").font(.geist(12)).foregroundStyle(Color.dim)
-                }
-                Spacer()
-                Text(context.current?.name ?? context.currentValue)
-                  .font(.geist(13, .medium)).monospacedDigit()
-                  .foregroundStyle(Color.dim)
-                Image(systemName: "chevron.up.chevron.down")
-                  .font(.system(size: 9, weight: .bold))
-                  .foregroundStyle(Color.dim)
-              }
-              .foregroundStyle(Color(white: 0.9))
-              .frame(minHeight: 48)
-              .contentShape(.rect)
-            }
-            .menuOrder(.fixed)
-            .accessibilityLabel("Context limit")
-            .accessibilityValue(context.current?.name ?? context.currentValue)
-            .accessibilityHint("Sets the token limit for this chat, up to the model maximum")
-            .padding(.horizontal, 16)
-            .padding(.bottom, 12)
-          }
           if query.isEmpty, let mcpDisabled, !mcpNames.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
               Text("MCP Servers").font(.geist(13, .medium)).foregroundStyle(Color.dim)

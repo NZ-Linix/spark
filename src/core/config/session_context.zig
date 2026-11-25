@@ -2,7 +2,8 @@ const std = @import("std");
 const model_capabilities = @import("model_capabilities.zig");
 
 pub const min_tokens = 8_192;
-pub const presets = [_]u32{ 16_384, 32_768, 65_536, 131_072, 262_144, 524_288, 1_048_576 };
+/// The limits the mobile app's slider offers, in the same 1024-token k as `/context 64k`.
+pub const presets = [_]u32{ 32 * 1024, 64 * 1024, 100 * 1024, 128 * 1024, 200 * 1024, 256 * 1024, 300 * 1024, 400 * 1024, 500 * 1024, 512 * 1024, 1024 * 1024 };
 pub const usage = "Use /context <tokens> (e.g. 64k), or /context auto to use the model default.";
 
 pub fn parse(text: []const u8) error{InvalidContextWindow}!?u32 {

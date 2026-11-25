@@ -19,7 +19,8 @@ const items = [
 const config = [
   { id: "model", name: "Model", currentValue: "local", options: [{ value: "local", name: "Local" }] },
   { id: "context", name: "Context limit", currentValue: "auto", options: [
-    { value: "auto", name: "Model default" }, { value: "65536", name: "64k tokens" },
+    { value: "auto", name: "Model default" },
+    ...[32, 64, 100, 128, 200, 256, 300, 400, 500, 512, 1024].map(k => ({ value: String(k * 1024), name: k === 1024 ? "1M tokens" : `${k}k tokens` })),
   ] },
 ];
 Bun.serve({

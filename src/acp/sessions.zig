@@ -1971,7 +1971,11 @@ pub fn writeContextConfigOption(w: *std.Io.Writer, current: ?u32) !void {
     var listed = false;
     for (session_context.presets) |tokens| {
         if (current == tokens) listed = true;
-        try w.print(",{{\"value\":\"{d}\",\"name\":\"{d}k tokens\"}}", .{ tokens, tokens / 1024 });
+        if (tokens == 1024 * 1024) {
+            try w.print(",{{\"value\":\"{d}\",\"name\":\"1M tokens\"}}", .{tokens});
+        } else {
+            try w.print(",{{\"value\":\"{d}\",\"name\":\"{d}k tokens\"}}", .{ tokens, tokens / 1024 });
+        }
     }
     if (!listed) if (current) |tokens| {
         try w.print(",{{\"value\":\"{d}\",\"name\":\"{d} tokens\"}}", .{ tokens, tokens });

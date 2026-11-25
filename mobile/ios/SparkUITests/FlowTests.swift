@@ -83,15 +83,21 @@ final class FlowTests: XCTestCase {
     let keyboardTip = app.buttons["Continue"]
     if keyboardTip.waitForExistence(timeout: 2) { keyboardTip.tap() }
     app.buttons["Model"].tap()
-    let context = app.buttons["Context limit"]
+    let context = app.descendants(matching: .any)["Context limit"]
     XCTAssertTrue(context.waitForExistence(timeout: 5))
-    context.tap()
-    app.buttons["64k tokens"].tap()
-    XCTAssertTrue(eventually("value == '64k tokens'", context, timeout: 5))
+    // the second of eleven stops along the track, which runs under the title at the bottom
+    let frame = context.frame
+    let inset: CGFloat = 22
+    context.coordinate(withNormalizedOffset: .zero)
+      .withOffset(CGVector(dx: inset + (frame.width - 2 * inset) / 10, dy: frame.height - inset))
+      .tap()
+    XCTAssertTrue(eventually("value == '64k context'", context, timeout: 5))
+    // nothing in the sheet hands focus back to the composer behind it
+    XCTAssertFalse(app.keyboards.firstMatch.exists)
     shot(app, "context-limit-64k")
-    context.tap()
-    app.buttons["Model default"].tap()
+    app.buttons["Use the model default"].tap()
     XCTAssertTrue(eventually("value == 'Model default'", context, timeout: 5))
+    XCTAssertFalse(app.keyboards.firstMatch.exists)
   }
 
   @MainActor
