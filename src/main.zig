@@ -7,7 +7,7 @@ const profile_paths = @import("core/shared/profile_paths.zig");
 const terminal_env = @import("core/shared/terminal_env.zig");
 const env_settings = @import("core/config/env_settings.zig");
 
-pub const version = "26.11.24.1";
+pub const version = "26.11.25";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");

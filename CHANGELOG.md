@@ -1,8 +1,29 @@
 # spark
 
-## 26.11.24.1
+## 26.11.25
 
 <!-- release:start -->
+
+**Use a ChatGPT, Claude, or Antigravity subscription instead of an API key.**
+
+### New Features
+
+- `/provider` can connect a subscription with **Continue with ChatGPT**, **Continue with Claude** (Pro or Max), or **Continue with Antigravity (Google)**. Spark signs in through your browser and sends its own prompt and tools, so Codex, Claude Code, and Antigravity don't need to be installed. Each account's models and reasoning levels come from the service.
+- Label accounts, such as `Work` and `Personal`, to keep several for one service. Manage them without the form using `spark provider chatgpt-account`, `claude-account`, or `antigravity-account` with `connect [label]`, `reconnect <id>`, or `remove <id>`.
+- On iPhone and iPad, **Settings → Subscription accounts** lists the accounts on each paired Mac and signs in new ones in that Mac's browser. Accounts and credentials stay on the Mac. Update both Spark and `spark-bridge` on the Mac to use this.
+
+### Improvements
+
+- Subscription requests keep a stable prompt prefix and a per-session cache key, so each service's prompt cache applies.
+
+### Bug Fixes
+
+- A session started without a provider can send a prompt after `/provider` switches it to a connection.
+
+<!-- release:end -->
+
+## 26.11.24.1
+
 
 **Set a context limit for each chat, in the terminal or on iPhone and iPad.**
 
@@ -15,8 +36,6 @@
 
 - Direct Anthropic connections use automatic prompt caching. When a session has a lower context ceiling, compaction can still reuse the cached conversation for its summary if it fits the model's native window.
 - The iPhone chat follows new text smoothly. The button to jump to the newest reply also works while the chat is still scrolling.
-
-<!-- release:end -->
 
 ## 26.11.24
 
