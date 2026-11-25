@@ -526,12 +526,12 @@ pub fn buildHintLine(
 test "status line uses the exact model ID or its display name" {
     const id = "claude-opus-5-5";
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings(id ++ " · medium", buildHintLine(true, id, .yolo, false, .medium, true, .{}, 80, &buf));
+    try std.testing.expectEqualStrings(id ++ " · medium", buildHintLine(true, id, .yolo, false, types.ReasoningEffort.literal("medium"), true, .{}, 80, &buf));
     const name: StatuslineItems = .{ .model_name = "Claude Opus 5.5" };
-    try std.testing.expectEqualStrings("Claude Opus 5.5 · medium", buildHintLine(true, id, .yolo, false, .medium, true, name, 80, &buf));
-    try std.testing.expectEqualStrings("Claude Opus 5.5 · medium", buildSessionStatusLine(id, .medium, true, name, 80, &buf));
+    try std.testing.expectEqualStrings("Claude Opus 5.5 · medium", buildHintLine(true, id, .yolo, false, types.ReasoningEffort.literal("medium"), true, name, 80, &buf));
+    try std.testing.expectEqualStrings("Claude Opus 5.5 · medium", buildSessionStatusLine(id, types.ReasoningEffort.literal("medium"), true, name, 80, &buf));
     try std.testing.expectEqualStrings("anthropic/" ++ id, buildSessionStatusLine("anthropic/" ++ id, .auto, false, .{}, 80, &buf));
-    try std.testing.expectEqualStrings("run /provider · Select a model", buildHintLine(false, id, .yolo, false, .medium, true, name, 80, &buf));
+    try std.testing.expectEqualStrings("run /provider · Select a model", buildHintLine(false, id, .yolo, false, types.ReasoningEffort.literal("medium"), true, name, 80, &buf));
 }
 
 pub fn buildInputLine(input: []const u8, cursor: usize, width: u16, out: []u8) InputLineView {

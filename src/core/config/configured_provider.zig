@@ -1,5 +1,6 @@
 const std = @import("std");
 const request_fragment = @import("request_fragment.zig");
+const antigravity_catalog = @import("antigravity_catalog.zig");
 const plan_kind = @import("../auth/plan_kind.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -204,6 +205,8 @@ pub const Definition = struct {
     /// itself, including one the settings do not declare. Its `id` is empty.
     model_defaults: ?ModelMetadata = null,
     model_metadata: []const ModelMetadata = &.{},
+    /// Older Antigravity IDs that can still be used but are no longer listed.
+    model_aliases: []const ModelMetadata = &.{},
     /// The name the person gave the connection, shown in place of
     /// `display_name`. A subscription account keeps its own `display_name`
     /// for how its plan names it.
@@ -259,6 +262,9 @@ pub const Definition = struct {
     pub fn model(self: Definition, id: []const u8) ?*const ModelMetadata {
         if (id.len > max_model_bytes) return null;
         for (self.model_metadata) |*metadata| {
+            if (std.mem.eql(u8, metadata.id, id)) return metadata;
+        }
+        for (self.model_aliases) |*metadata| {
             if (std.mem.eql(u8, metadata.id, id)) return metadata;
         }
         return null;
@@ -537,7 +543,8 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         model_defaults = try parse_model(owned, protocol, "", defaults, at);
         leave(at);
     }
-    const model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(owned, protocol, metadata, at) else &.{};
+    const parsed_models = if (value.object.get("model_metadata")) |metadata| try parse_metadata(owned, protocol, metadata, at) else &.{};
+    const models = if (auth == .antigravity_plan) try antigravity_catalog.normalizeSaved(owned, parsed_models) else antigravity_catalog.SavedModels{ .visible = parsed_models };
     const model_overrides = if (value.object.get("model_overrides")) |overrides| try parse_overrides(owned, overrides, at) else &.{};
     const context_limit = try positive_limit(value, "context_limit", at);
     var custom_name: ?[]const u8 = null;
@@ -584,7 +591,8 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         .timeouts = timeouts,
         .fetch_models = fetch_models,
         .model_defaults = model_defaults,
-        .model_metadata = model_metadata,
+        .model_metadata = models.visible,
+        .model_aliases = models.aliases,
         .custom_name = custom_name,
         .context_limit = context_limit,
         .model_overrides = model_overrides,
