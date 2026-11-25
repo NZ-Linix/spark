@@ -11,6 +11,7 @@ import { historyItems } from "./session_view";
 import { applySnapshot, fingerprint, Library, type LibrarySnapshot, PROMPT_DIR } from "./library";
 import { Profile } from "./providers";
 import { type LibraryOp, Mirror } from "./sync";
+import { TitleService } from "./session_titles";
 
 /** the spark this checkout builds; the provider checks run it against a scratch profile */
 const SPARK = process.env.SPARK_BIN ?? resolve(import.meta.dir, "../../zig-out/bin/spark");
@@ -22,6 +23,32 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 const session = (id: string, updatedAt = "2026-11-01T00:00:00.000Z"): SessionInfo => ({ id, title: id, cwd: "/Users/example/p", updatedAt, live: false, running: false, origin: "phone" });
+
+test("session titles require private OpenRouter routing and never retry without it", async () => {
+  const calls: any[] = [];
+  const scope = "mock-title-client-token";
+  let status = 200;
+  const service = new TitleService("mock-openrouter-key", scope, (async (url, init) => {
+    expect(url).toBe("https://openrouter.ai/api/v1/chat/completions");
+    expect(init?.redirect).toBe("error");
+    calls.push(JSON.parse(String(init?.body)));
+    return status === 200 ? Response.json({ choices: [{ message: { content: '"Rainbows for Science Class"\nExplanation' } }] }) : new Response(null, { status });
+  }) as typeof fetch);
+  const ask = (prompt: string) => service.handle(new Request("https://relay.test/api/session-title", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt }),
+  }), "test-client");
+  expect(service.accepts(scope)).toBe(true);
+  expect(service.accepts("different-token")).toBe(false);
+  expect(await (await ask("Explain the physics of rainbows.")).json()).toEqual({ title: "Rainbows for Science Class" });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toMatchObject({ model: "z-ai/glm-5.3-flash", provider: { zdr: true, data_collection: "deny" } });
+  expect(calls[0].messages[1].content).toContain("Explain the physics of rainbows.");
+  expect((await ask("x".repeat(2049))).status).toBe(400);
+  status = 404;
+  expect((await ask("No private endpoint")).status).toBe(503);
+  expect(calls).toHaveLength(2);
+  expect(calls[1].provider).toEqual(calls[0].provider);
+});
 
 describe("PhoneSessions", () => {
   test("adds, survives a restart, and prunes what spark no longer lists", () => {

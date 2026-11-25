@@ -1951,20 +1951,16 @@ fn maybeStartAskTitleTask(
     if (ctx.session.agent.history.items.len != 0) return null;
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const provider_title_model = bundle.title_model orelse return null;
-    const title_model = provider_title_model;
-    const agent_stream = bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
-    // A custom connection may need no key; its adapter checks the one it gets.
-    if (ctx.credential_source != .host_managed and ctx.credential_source != .configured and ctx.api_key.len == 0) return null;
-    const task = session_title_generation.Task.create(.{
+    const can_use_chat_provider = ctx.credential_source == .host_managed or ctx.credential_source == .configured or ctx.api_key.len > 0;
+    const task = (session_title_generation.Task.create(.{
         .session_id = session_id,
-        .model = title_model,
+        .model = if (can_use_chat_provider) bundle.title_model else null,
         .prompt_excerpt = excerpt,
         .api_key = if (ctx.api_key.len > 0) ctx.api_key else null,
         .credential_source = ctx.credential_source,
-        .stream_provider = agent_stream,
-    }) catch return null;
+        .stream_provider = bundle.agent_stream,
+    }) catch return null) orelse return null;
     task.spawn() catch |err| {
         debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
         task.destroy();

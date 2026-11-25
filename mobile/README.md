@@ -44,6 +44,12 @@ The cloud shows every chat. The Mac shows only the chats started from the phone,
 
 Open a running Mac chat from the sidebar to see its reply as it streams. You can send a message into the same terminal session, including while spark is working, or stop the active turn. The terminal still owns the session and uses its current model and permissions. The phone doesn't change the terminal's settings or answer its dialogs. Older Mac processes remain read-only until they close; restart them with the updated CLI for live access.
 
+### Session titles
+
+A private relay can generate a short title for a new terminal, Cloud, or mobile chat. Spark sends up to 2 KiB of the first prompt's text to that relay, without files, attachments, or later messages. The relay requests `z-ai/glm-5.3-flash` through OpenRouter with zero data retention and data collection denied. If no matching endpoint can answer in time, Spark keeps the locally derived title. A title you set yourself always wins. Turn off **Session titles** in `/settings`, or set `session_titles` to `false` in the profile running the chat, to skip the request.
+
+Cloud profiles and updated paired Mac bridges pick up the relay's title service automatically. On an unpaired machine, save `session-title-relay.json` in the Spark profile with mode `0600` and fields `relay` (the HTTPS relay base URL) and `token` (the relay operator's title-only token). The OpenRouter key stays on the VPS. The relay reads it and the title-only token from its systemd `spark-session-titles` credential (a JSON object with `key` and `token`). Open relays do not provide this service.
+
 ## Providers, prompts, and MCP
 
 The relay keeps one library of providers, prompts, and MCP servers that the cloud and every paired Mac share. It lives in `$SPARK_RELAY_DATA/library`. The first time a relay starts with a library, it fills it from the providers its cloud profiles already have.

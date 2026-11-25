@@ -17,7 +17,8 @@ import { Host } from "./host";
 import { TerminalSessions } from "./terminal_sessions";
 import { runningSessions } from "./mac_sessions";
 import { PhoneSessions } from "./phone_sessions";
-import { loginShellVariable, Profile } from "./providers";
+import { loginShellVariable, Profile, writeAtomic } from "./providers";
+import { MANAGED_TITLE_RELAY_FILE } from "./session_titles";
 import type { Request } from "./protocol";
 import { SHARED_PLANS_FILE } from "./plan_accounts";
 import { fingerprint } from "./library";
@@ -192,6 +193,17 @@ function serve(c: Config, onPaired?: (device: string) => void, quiet = false) {
         return;
       }
       if (m.relay === "library" && m.library) {
+        if (m.sessionTitles !== undefined) {
+          try {
+            const file = join(SPARK_HOME, MANAGED_TITLE_RELAY_FILE);
+            if (m.sessionTitles === true) {
+              mkdirSync(SPARK_HOME, { recursive: true, mode: 0o700 });
+              writeAtomic(file, c);
+            } else rmSync(file, { force: true });
+          } catch {
+            console.error("Could not update the session title relay settings.");
+          }
+        }
         void mirror.receive(m.library);
         return;
       }
@@ -335,6 +347,7 @@ switch (command) {
     rmSync(SESSION_PROMPTS, { force: true });
     rmSync(LIBRARY_STATE, { force: true });
     rmSync(join(SPARK_HOME, SHARED_PLANS_FILE), { force: true });
+    rmSync(join(SPARK_HOME, MANAGED_TITLE_RELAY_FILE), { force: true });
     console.log("This Mac is unpaired. Run spark pair to pair again.");
     break;
   default:

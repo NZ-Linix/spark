@@ -983,21 +983,17 @@ fn maybeStartAcpTitleTask(
     if (session.session_rt.agent.history.items.len != 0) return;
     const session_id = if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
-    const provider_title_model = bundle.title_model orelse return;
-    const title_model = provider_title_model;
-    const agent_stream = bundle.agent_stream orelse return;
     const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
-    // A custom connection may need no key; its adapter checks the one it gets.
-    if (session.credential_source != .host_managed and session.credential_source != .configured and session.api_key.len == 0) return;
-    const task = session_title_generation.Task.create(.{
+    const can_use_chat_provider = session.credential_source == .host_managed or session.credential_source == .configured or session.api_key.len > 0;
+    const task = (session_title_generation.Task.create(.{
         .observer = observer,
         .session_id = session_id,
-        .model = title_model,
+        .model = if (can_use_chat_provider) bundle.title_model else null,
         .prompt_excerpt = excerpt,
         .api_key = if (session.api_key.len > 0) session.api_key else null,
         .credential_source = session.credential_source,
-        .stream_provider = agent_stream,
-    }) catch return;
+        .stream_provider = bundle.agent_stream,
+    }) catch return) orelse return;
     task.spawn() catch |err| {
         debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
         task.destroy();

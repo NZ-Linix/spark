@@ -2403,7 +2403,7 @@ pub fn Runtime(comptime App: type) type {
             const session_id = activeSessionId(agent) orelse return;
             const gate: session_title_generation.Gate = .{
                 .setting_enabled = app.session_title_generation,
-                .provider_supports_titles = title_model != null,
+                .provider_supports_titles = true, // Task.create also checks for an authenticated relay.
                 .session_untitled = agent.session_title.items.len == 0 and
                     agent.session.agent.history.items.len == 0,
                 .recovery_replay = false,
@@ -2419,19 +2419,19 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            const credential_source = app.auth.credentialSource() orelse return;
+            const credential_source = app.auth.credentialSource();
 
-            const task = session_title_generation.Task.create(.{
+            const task = (session_title_generation.Task.create(.{
                 .session_id = session_id,
-                .model = title_model.?,
+                .model = if (credential_source != null) title_model else null,
                 .prompt_excerpt = excerpt,
                 .api_key = app.auth.apiKey(),
                 .credential_source = credential_source,
                 .stream_provider = app.agentStreamProvider(),
             }) catch |err| {
-                agent.session_persistence.title_generation.recordSpawnFailure(session_id, title_model.?, err);
+                agent.session_persistence.title_generation.recordSpawnFailure(session_id, title_model orelse "relay", err);
                 return;
-            };
+            }) orelse return;
             task.spawn() catch |err| {
                 debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
                 agent.session_persistence.title_generation.recordSpawnFailure(session_id, title_model.?, err);

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { traceReportNames, waitForNewTraceReport, type TraceReport } from "./trace-report";
 import { SPARK_BIN, runFx } from "../evals/eval-helpers";
 import { logLines, rootSessionIds, storeRoot } from "./saved-sessions";
+import { createConfiguredProviderFixture } from "./fixtures/chat-completions";
 import {
   bearer,
   rotateFxLogin,
@@ -70,7 +71,7 @@ function baseEnv(root: FixtureRoot, gateway: { baseUrl: string; chatUrl: string 
 }
 
 /// Each saved session's title: its log's newest title setting.
-function sessionTitles(root: FixtureRoot): string[] {
+function sessionTitles(root: Pick<FixtureRoot, "home">): string[] {
   if (!existsSync(storeRoot(root.home))) return [];
   return rootSessionIds(root.home).flatMap((id) => {
     const title = (logLines(root.home, id) as any[]).filter((line) => line.kind === "set" && line.key === "title").at(-1)?.value;
@@ -110,6 +111,47 @@ test("spark ask generates a model title for a fresh session", async () => {
     expect(list.stdout).toContain(GENERATED_TITLE);
   } finally {
     gateway.stop();
+  }
+});
+
+test("spark ask uses the private title relay without sending chat credentials or falling back to the chat model", async () => {
+  const token = "mock_title_relay_token_0123456789abc";
+  const requests: { path: string; authorization: string | null; body: unknown }[] = [];
+  let available = true;
+  const relay = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+    requests.push({ path: new URL(req.url).pathname, authorization: req.headers.get("authorization"), body: await req.json() });
+    return available ? Response.json({ title: "Science Class Rainbows" }) : new Response(null, { status: 503 });
+  } });
+  const provider = createConfiguredProviderFixture();
+  try {
+    const settings = { ...provider.settings, provider: "remote", providers: {
+      ...provider.settings.providers,
+      remote: { ...provider.settings.providers.remote, title_model: "remote-model" },
+    } };
+    writeFileSync(provider.settingsPath, JSON.stringify(settings));
+    writeFileSync(join(provider.home, ".spark", "session-title-relay.json"), JSON.stringify({ relay: `http://127.0.0.1:${relay.port}`, token }), { mode: 0o600 });
+    const prompt = "Explain how rainbows form.";
+    const ask = () => runFx(["ask", prompt], { cwd: provider.workspace, env: provider.env });
+    const chatCalls = () => provider.requests.filter(r => r.path === "/v1/chat/completions");
+    const answer = await ask();
+    expect(answer.code, answer.stderr).toBe(0);
+    expect(requests).toEqual([{ path: "/api/session-title", authorization: `Bearer ${token}`, body: { prompt } }]);
+    expect(sessionTitles(provider)).toEqual(["Science Class Rainbows"]);
+    expect(chatCalls()).toHaveLength(1);
+    expect(chatCalls()[0]?.authorization).toBe("Bearer own-provider-token");
+
+    available = false;
+    expect((await ask()).code).toBe(0);
+    expect(requests).toHaveLength(2);
+    expect(sessionTitles(provider)).toContain(prompt);
+    expect(chatCalls()).toHaveLength(2);
+
+    writeFileSync(provider.settingsPath, JSON.stringify({ ...settings, session_titles: false }));
+    expect((await ask()).code).toBe(0);
+    expect(requests).toHaveLength(2);
+  } finally {
+    relay.stop(true);
+    provider.close();
   }
 });
 

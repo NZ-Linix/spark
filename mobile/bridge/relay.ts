@@ -15,12 +15,14 @@
  */
 import type { ServerWebSocket } from "bun";
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, watchFile } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, watchFile } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Host } from "./host";
 import { applySnapshot, fingerprint, Library } from "./library";
 import { PLAN_STORE_ENV } from "./plan_accounts";
 import type { Event, Request } from "./protocol";
+import { writeAtomic } from "./providers";
+import { loadTitleService, MANAGED_TITLE_RELAY_FILE } from "./session_titles";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const DATA = process.env.SPARK_RELAY_DATA ?? join(import.meta.dir, "data");
@@ -38,6 +40,7 @@ const HOSTNAME = process.env.HOST ?? "0.0.0.0";
  */
 const ENROLL = process.env.SPARK_RELAY_ENROLL ?? "";
 const OPEN = process.env.SPARK_RELAY_OPEN === "1";
+const titles = OPEN ? undefined : loadTitleService();
 
 type DeviceRecord = { name: string; hash: string; created: string };
 type HostRecord = { name: string; hash: string; devices: string[]; created: string };
@@ -55,6 +58,7 @@ function save() {
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const id = () => randomBytes(9).toString("base64url");
 const secret = () => randomBytes(32).toString("base64url");
+const cloudTitleToken = titles ? secret() : undefined;
 
 /** tokens read `<id>.<secret>`; only a hash of the secret is kept */
 function check<T extends { hash: string }>(table: Record<string, T>, token: string | null): [string, T] | null {
@@ -169,12 +173,15 @@ function cloudFor(device: string): Host {
   mkdirSync(work, { recursive: true });
   mkdirSync(home, { recursive: true, mode: 0o700 });
   applySnapshot(home, library.snapshot());
+  const titleConfig = join(home, MANAGED_TITLE_RELAY_FILE);
+  if (cloudTitleToken) writeAtomic(titleConfig, { relay: `http://${HOSTNAME === "::" || HOSTNAME === "::1" ? "[::1]" : "127.0.0.1"}:${PORT}`, token: cloudTitleToken });
+  else rmSync(titleConfig, { force: true });
   const h = new Host({
     info: { name: "Cloud", kind: "cloud", home: work, platform: process.platform },
     spark: SPARK,
     root: work,
     confine: true,
-    env: () => ({ ...library.profile.env(), SPARK_HOME: home, [PLAN_STORE_ENV]: library.planHome }),
+    env: () => ({ ...library.profile.env(), SPARK_HOME: home, [PLAN_STORE_ENV]: library.planHome, CREDENTIALS_DIRECTORY: undefined }),
     library,
     prompts: { home, sessions: join(base, "session-prompts.json") },
     send: (event: Event) => toDevice(device, { host: "cloud", msg: event }),
@@ -285,6 +292,16 @@ Bun.serve<{ kind: "device" | "host"; id: string }, {}>({
       return json({ hosts: hostsFor(auth[0]) });
     }
 
+    if (path === "/api/session-title" && req.method === "POST") {
+      if (!titles) return json({ error: "Session titles are unavailable." }, 404);
+      const token = req.headers.get("authorization")?.match(/^Bearer ([A-Za-z0-9_.-]{24,256})$/)?.[1];
+      if (!token) return json({ error: "Unauthorized." }, 401);
+      const host = check(state.hosts, token);
+      const principal = host ? `host:${host[0]}` : token === cloudTitleToken ? "cloud" : titles.accepts(token) ? "title-client" : undefined;
+      if (!principal) return json({ error: "Unauthorized." }, 403);
+      return titles.handle(req, principal);
+    }
+
     const planToken = path.match(/^\/api\/plan-token\/([a-z0-9-]+)$/);
     if (planToken && req.method === "POST" && library.planHome) {
       if (!check(state.hosts, req.headers.get("authorization")?.match(/^Bearer (.+)$/)?.[1] ?? null)) return json({ error: "Unknown Mac." }, 403);
@@ -324,7 +341,7 @@ Bun.serve<{ kind: "device" | "host"; id: string }, {}>({
         hostSockets.get(id)?.close(4000, "Replaced by a newer connection.");
         hostSockets.set(id, ws);
         announce(id);
-        ws.send(JSON.stringify({ relay: "library", library: library.snapshot() }));
+        ws.send(JSON.stringify({ relay: "library", library: library.snapshot(), sessionTitles: !!titles }));
       }
     },
     message(ws, raw) {

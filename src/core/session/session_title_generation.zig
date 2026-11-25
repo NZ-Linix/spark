@@ -9,6 +9,7 @@ const gateway_step = @import("../agent/runtime/gateway_step.zig");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
+const title_relay = @import("session_title_relay.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -117,6 +118,7 @@ pub const Request = struct {
     session_id: ?[]const u8 = null,
     prompt_excerpt: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    relay: ?title_relay.Route = null,
     timeout_ms: u32 = default_timeout_ms,
 };
 
@@ -160,6 +162,16 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
         .raw = .fromMilliseconds(request.timeout_ms),
     });
     if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
+    if (request.relay) |relay| {
+        const answer = relay.generate(alloc, request.prompt_excerpt, request.cancel_flag, deadline) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return .{ .unavailable = .{ .reason = if (request.cancel_flag.load(.seq_cst)) .cancelled else .transport_error, .detail = @errorName(err) } };
+        } orelse return .{ .unavailable = .{ .reason = .provider_failure } };
+        defer alloc.free(answer);
+        if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
+        const title = (try sanitizeGeneratedTitle(alloc, answer)) orelse return .{ .unavailable = .{ .reason = .unsanitizable } };
+        return .{ .generated = title };
+    }
     var sent = try send(alloc, request, request.api_key, deadline);
     defer sent.deinit(alloc);
     return finish(alloc, request, sent);
@@ -274,6 +286,7 @@ pub const Task = struct {
     account_id: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
     stream_provider: stream_provider.Provider,
+    relay: ?title_relay.Route = null,
     title: ?[]u8 = null,
     failure: ?anyerror = null,
     started_at_ms: i64 = 0,
@@ -286,27 +299,30 @@ pub const Task = struct {
     pub const Init = struct {
         observer: ?*observation.Observer = null,
         session_id: []const u8,
-        model: []const u8,
+        model: ?[]const u8,
         prompt_excerpt: []const u8,
         api_key: ?[]const u8 = null,
         account_id: ?[]const u8 = null,
         credential_source: ?types.CredentialSource = null,
-        stream_provider: stream_provider.Provider,
+        stream_provider: ?stream_provider.Provider,
     };
 
     /// Copies every input; the task owns its copies. Uses c_allocator because
     /// the task outlives the caller's scope and is joined from any surface.
-    pub fn create(init: Init) !*Task {
+    pub fn create(init: Init) !?*Task {
         const alloc = std.heap.c_allocator;
+        const relay = try title_relay.load(alloc);
+        errdefer if (relay) |route| route.deinit(alloc);
+        if (relay == null and (init.model == null or init.stream_provider == null)) return null;
         const session_id = try alloc.dupe(u8, init.session_id);
         errdefer alloc.free(session_id);
-        const model = try alloc.dupe(u8, init.model);
+        const model = try alloc.dupe(u8, if (relay != null) title_relay.model else init.model.?);
         errdefer alloc.free(model);
         const prompt_excerpt = try alloc.dupe(u8, init.prompt_excerpt);
         errdefer alloc.free(prompt_excerpt);
-        const api_key: ?[]u8 = if (init.api_key) |value| try alloc.dupe(u8, value) else null;
+        const api_key: ?[]u8 = if (relay == null) if (init.api_key) |value| try alloc.dupe(u8, value) else null else null;
         errdefer if (api_key) |value| alloc.free(value);
-        const account_id: ?[]u8 = if (init.account_id) |value| try alloc.dupe(u8, value) else null;
+        const account_id: ?[]u8 = if (relay == null) if (init.account_id) |value| try alloc.dupe(u8, value) else null else null;
         errdefer if (account_id) |value| alloc.free(value);
 
         const task = try alloc.create(Task);
@@ -318,7 +334,8 @@ pub const Task = struct {
             .api_key = api_key,
             .account_id = account_id,
             .credential_source = init.credential_source,
-            .stream_provider = init.stream_provider,
+            .stream_provider = init.stream_provider orelse stream_provider.unavailable_provider,
+            .relay = relay,
         };
         return task;
     }
@@ -376,6 +393,7 @@ pub const Task = struct {
         alloc.free(self.session_id);
         alloc.free(self.model);
         alloc.free(self.prompt_excerpt);
+        if (self.relay) |route| route.deinit(alloc);
         if (self.api_key) |key| {
             std.crypto.secureZero(u8, key);
             alloc.free(key);
@@ -406,6 +424,8 @@ pub const Task = struct {
             .session_id = self.session_id,
             .prompt_excerpt = self.prompt_excerpt,
             .cancel_flag = &self.cancel_requested,
+            .relay = self.relay,
+            .timeout_ms = if (self.relay != null) 4_000 else default_timeout_ms,
         }) catch |err| {
             self.failure = err;
             self.status = .unavailable;
