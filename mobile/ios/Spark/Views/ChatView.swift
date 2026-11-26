@@ -525,7 +525,7 @@ private struct ScrollFinder: UIViewRepresentable {
       if r.state == .ended { tap?() }
     }
 
-    func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool { tap != nil }
+    override func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool { tap != nil }
 
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
       true
@@ -632,31 +632,8 @@ private struct QueuePanel: View {
       .foregroundStyle(Color.dim)
       .padding(.horizontal, 6)
       ForEach(chat.queue) { item in
-        HStack(spacing: 10) {
-          Text(item.text)
-            .font(.geist(14))
-            .foregroundStyle(Color(white: 0.85))
-            .lineLimit(2)
-            .frame(maxWidth: .infinity, alignment: .leading)
-          if chat.queueSending == item.id {
-            ProgressView().controlSize(.mini).accessibilityLabel("Sending")
-          } else {
-            Button { remove(item.id) } label: {
-              Image(systemName: "xmark")
-                .font(.system(size: 10, weight: .bold))
-                .frame(width: 24, height: 24)
-                .background(Color.white.opacity(0.1), in: .circle)
-                .contentShape(.circle)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Remove queued message")
-          }
-        }
-        .padding(.leading, 12)
-        .padding(.trailing, 6)
-        .padding(.vertical, 7)
-        .background(Color.white.opacity(0.06), in: .rect(cornerRadius: 14, style: .continuous))
-        .transition(.asymmetric(insertion: .move(edge: .bottom).combined(with: .opacity), removal: .opacity.combined(with: .scale(0.96))))
+        QueueRow(text: item.text, sending: chat.queueSending == item.id) { remove(item.id) }
+          .transition(QueueRow.transition)
       }
     }
     .padding(8)
@@ -676,6 +653,44 @@ private struct QueuePanel: View {
     case .unconfirmed?: return "\(count) · checking whether the last one arrived…"
     case nil: return chat.queueSending != nil ? "Sending…" : "\(count) · sends when spark finishes"
     }
+  }
+}
+
+private struct QueueRow: View {
+  let text: String
+  let sending: Bool
+  let remove: () -> Void
+
+  static let transition: AnyTransition = .asymmetric(
+    insertion: AnyTransition.move(edge: .bottom).combined(with: .opacity),
+    removal: AnyTransition.opacity.combined(with: .scale(scale: 0.96))
+  )
+
+  var body: some View {
+    HStack(spacing: 10) {
+      Text(text)
+        .font(.geist(14))
+        .foregroundStyle(Color(white: 0.85))
+        .lineLimit(2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+      if sending {
+        ProgressView().controlSize(.mini).accessibilityLabel("Sending")
+      } else {
+        Button(action: remove) {
+          Image(systemName: "xmark")
+            .font(.system(size: 10, weight: .bold))
+            .frame(width: 24, height: 24)
+            .background(Color.white.opacity(0.1), in: .circle)
+            .contentShape(.circle)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Remove queued message")
+      }
+    }
+    .padding(.leading, 12)
+    .padding(.trailing, 6)
+    .padding(.vertical, 7)
+    .background(Color.white.opacity(0.06), in: .rect(cornerRadius: 14, style: .continuous))
   }
 }
 
